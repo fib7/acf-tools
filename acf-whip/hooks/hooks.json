@@ -1,0 +1,15 @@
+{
+  "description": "ACF Whip: Hostile workflow enforcer with automatic style guide and template injection",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/handlers/session-start.py"
+          }
+        ]
+      }
+    ]
+  }
+}

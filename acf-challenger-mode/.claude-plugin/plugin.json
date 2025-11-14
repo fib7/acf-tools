@@ -1,0 +1,20 @@
+{
+  "name": "acf-challenger-mode",
+  "version": "1.1.0",
+  "description": "Reasoning validation mode - Systematic logic enforcer who rigorously validates completeness, consistency, and coherence. Perfect for requirements clarification, architecture review, and blocking execution on incomplete specifications.",
+  "author": {
+    "name": "ACF Project",
+    "email": "acf@fib7.ai"
+  },
+  "homepage": "https://github.com/fib7/acf-tools",
+  "repository": "https://github.com/fib7/acf-tools",
+  "license": "Proprietary",
+  "keywords": [
+    "cognitive-mode",
+    "validation",
+    "reasoning",
+    "challenger",
+    "acf",
+    "logic-validation"
+  ]
+}

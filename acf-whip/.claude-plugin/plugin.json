@@ -1,0 +1,22 @@
+{
+  "name": "acf-whip",
+  "version": "1.0.2",
+  "description": "Hostile workflow enforcer. Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates.",
+  "author": {
+    "name": "ACF Tools Team",
+    "email": "acf@fib7.ai"
+  },
+  "homepage": "https://github.com/fib7/acf-tools",
+  "repository": "https://github.com/fib7/acf-tools",
+  "license": "Proprietary",
+  "keywords": [
+    "acf",
+    "backlog",
+    "workflow",
+    "task-management",
+    "quality-enforcement",
+    "automation",
+    "agent-generation"
+  ],
+  "commands": "./commands/"
+}

@@ -1,0 +1,111 @@
+{
+  "name": "acf-tools",
+  "description": "ACF Cognitive Toolkit - Specialized cognitive modes for Agentic Continuous Flow workflows including reasoning validation, production verification, knowledge validation, and complexity navigation",
+  "owner": {
+    "name": "ACF Project",
+    "email": "acf@fib7.ai"
+  },
+  "plugins": [
+    {
+      "name": "acf-challenger-mode",
+      "description": "Reasoning validation mode - Intellectually aggressive challenger who attacks every gap in logic and consistency. Perfect for requirements clarification, architecture review, and agent output validation.",
+      "version": "1.1.0",
+      "author": {
+        "name": "ACF Project",
+        "email": "acf@fib7.ai"
+      },
+      "source": "./acf-challenger-mode",
+      "category": "productivity"
+    },
+    {
+      "name": "acf-arazor-mode",
+      "description": "Production verification mode - Ruthless honesty enforcer with zero tolerance for false production claims. Binary outcomes only. Perfect for deployment readiness checks and status reporting.",
+      "version": "1.0.2",
+      "author": {
+        "name": "ACF Project",
+        "email": "acf@fib7.ai"
+      },
+      "source": "./acf-arazor-mode",
+      "category": "productivity"
+    },
+
+    {
+      "name": "acf-librarian",
+      "description": "Convention enforcement mode - The stern librarian enforces ACF naming and organization standards through context injection. Auto-initializes docs/acf/organization.md, audits compliance, and ensures everything stays in its proper place.",
+      "version": "1.1.0",
+      "author": {
+        "name": "ACF Project",
+        "email": "acf@fib7.ai"
+      },
+      "source": "./acf-librarian",
+      "category": "productivity",
+      "tags": [
+        "conventions",
+        "organization",
+        "naming",
+        "documentation",
+        "quality-gates",
+        "context-injection"
+      ]
+    },
+    {
+      "name": "acf-whip",
+      "description": "Hostile workflow enforcer. Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates.",
+      "version": "1.0.2",
+      "author": {
+        "name": "ACF Tools Team",
+        "email": "acf@fib7.ai"
+      },
+      "source": "./acf-whip",
+      "category": "productivity",
+      "tags": [
+        "acf",
+        "backlog",
+        "workflow",
+        "task-management",
+        "quality-enforcement",
+        "automation",
+        "agent-generation"
+      ]
+    },
+    {
+      "name": "acf-nitro",
+      "description": "Parallel execution enforcement mode - Enthusiastic speed demon who catches sequential execution violations and calculates time waste. Enforces TodoWrite batching, parallel Task spawning, and parallel tool calls.",
+      "version": "1.0.2",
+      "author": {
+        "name": "ACF Project",
+        "email": "acf@fib7.ai"
+      },
+      "source": "./acf-nitro",
+      "category": "productivity",
+      "tags": [
+        "performance",
+        "parallel-execution",
+        "enforcement",
+        "speed-optimization",
+        "acf",
+        "nitro"
+      ]
+    },
+    {
+      "name": "acf-mission-control",
+      "description": "Mission Control HUD for Claude Code - Track position, git branch, and context fuel with color-coded bar (green → yellow → red). Full situational awareness.",
+      "version": "1.0.2",
+      "author": {
+        "name": "ACF Project",
+        "email": "acf@fib7.ai"
+      },
+      "source": "./acf-mission-control",
+      "category": "productivity",
+      "tags": [
+        "status-line",
+        "context-tracking",
+        "hud",
+        "mission-control",
+        "acf",
+        "colored-output",
+        "python"
+      ]
+    }
+  ]
+}

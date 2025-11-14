@@ -1,0 +1,20 @@
+{
+  "name": "acf-librarian",
+  "version": "1.1.0",
+  "description": "SHHH! The librarian enforces naming and organization conventions. Everything must be in its proper place.",
+  "author": {
+    "name": "ACF Tools",
+    "email": "acf@example.com"
+  },
+  "license": "Proprietary",
+  "keywords": [
+    "acf",
+    "conventions",
+    "organization",
+    "naming",
+    "git",
+    "commit",
+    "librarian"
+  ],
+  "commands": "./commands/"
+}

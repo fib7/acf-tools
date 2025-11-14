@@ -1,0 +1,56 @@
+# Pre-commit hooks for Python projects
+# Install: https://pre-commit.com/
+# Usage: pre-commit install
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+      - id: check-toml
+      - id: check-json
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.6
+    hooks:
+      - id: ruff
+        args: ['--fix', '--exit-non-zero-on-fix']
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.7.1
+    hooks:
+      - id: mypy
+        args: ['--strict', '--ignore-missing-imports']
+        additional_dependencies: [types-all]
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: uv run pytest
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: pytest-cov
+        name: pytest with coverage
+        entry: uv run pytest --cov=src --cov-fail-under=80
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
+
+# PARAMETERIZE: Customize based on your Python project needs
+# - Replace 'uv run' with 'poetry run' or 'python -m' as needed
+# - Adjust mypy args for your type checking needs
+# - Adjust pytest args for your test suite
+# - Add bandit for security scanning
+# - Add safety for dependency vulnerability checking

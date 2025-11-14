@@ -1,0 +1,15 @@
+{
+  "description": "ACF Librarian: Initializes and injects naming/organization conventions on session start",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/handlers/session-start.py"
+          }
+        ]
+      }
+    ]
+  }
+}
