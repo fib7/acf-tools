@@ -166,8 +166,8 @@ Follows them automatically throughout session
 | `hooks/handlers/session-start.py` | Initialize & inject both convention sets |
 | `content/organization-template.md` | Default ACF organization conventions |
 | `content/git-commit-conventions-template.md` | Default git conventions |
-| `commands/audit-acf-conventions.md` | Compliance checker |
-| `commands/commit.md` | Conventional commit enforcer |
+| `skills/audit-acf-conventions/SKILL.md` | Compliance checker |
+| `skills/commit/SKILL.md` | Conventional commit enforcer |
 | `docs/acf/organization.md` | Your project's organization conventions (created by hook) |
 | `docs/acf/git/commit-conventions.md` | Your project's git conventions (created by hook) |
 
@@ -610,7 +610,7 @@ The librarian welcomes contributions to improve the default conventions template
 
 ### Improving Audit Logic
 
-1. Edit `commands/audit-acf-conventions.md`
+1. Edit `skills/audit-acf-conventions/SKILL.md`
 2. Add new violation detection
 3. Provide actionable fixes
 4. Test with real projects

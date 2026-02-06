@@ -1,7 +1,13 @@
 ---
 name: retro
 description: Conduct retrospective analysis of blocked/rejected tasks and create improvement tasks
-allowed-tools: [Bash, Grep, Glob, Read, Task, TodoWrite]
+allowed-tools:
+  - Bash
+  - Grep
+  - Glob
+  - Read
+  - Task
+  - TodoWrite
 ---
 
 # /retro - Retrospective Analysis

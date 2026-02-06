@@ -1,7 +1,12 @@
 ---
 name: go
 description: Continuous backlog execution until 100% tasks reach terminal states (accepted/blocked)
-allowed-tools: [Bash, Glob, Read, TodoWrite, Task]
+allowed-tools:
+  - Bash
+  - Glob
+  - Read
+  - TodoWrite
+  - Task
 ---
 
 # /go - Continuous Backlog Execution

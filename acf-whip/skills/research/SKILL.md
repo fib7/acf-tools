@@ -1,7 +1,20 @@
 ---
 name: research
 description: Conduct research using MCP tools, create temporal documentation, generate backlog task
-allowed-tools: [Bash, Grep, Glob, Read, Task, TodoWrite, mcp__perplexity__perplexity_search_web, mcp__context7__resolve-library-id, mcp__context7__get-library-docs, mcp__figma-dev-mode-mcp-server__get_code, mcp__figma-dev-mode-mcp-server__get_variable_defs, mcp__figma-dev-mode-mcp-server__get_screenshot]
+argument-hint: "[topic]"
+allowed-tools:
+  - Bash
+  - Grep
+  - Glob
+  - Read
+  - Task
+  - TodoWrite
+  - mcp__perplexity__perplexity_search_web
+  - mcp__context7__resolve-library-id
+  - mcp__context7__get-library-docs
+  - mcp__figma-dev-mode-mcp-server__get_code
+  - mcp__figma-dev-mode-mcp-server__get_variable_defs
+  - mcp__figma-dev-mode-mcp-server__get_screenshot
 ---
 
 # /research - Research Workflow

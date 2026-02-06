@@ -1,12 +1,10 @@
 ---
 name: commit
 description: Stage and commit changes following conventional commit format. Atomic commits, never bypasses pre-commit hooks, minimal communication style.
-dependencies:
-  required: []
-  references:
-    - docs/acf/git/commit-conventions.md
-    - Project-specific git conventions
-allowed-tools: [Bash, Read, Grep]
+allowed-tools:
+  - Bash
+  - Read
+  - Grep
 ---
 
 # commit - Create git commit following conventions

@@ -1,7 +1,14 @@
 ---
 name: audit-acf-conventions
 description: Check project compliance with ACF naming and organization conventions. Use --fix flag to automatically fix all violations.
-allowed-tools: [Read, Glob, Grep, Bash, Write, Edit]
+argument-hint: "[--fix]"
+allowed-tools:
+  - Read
+  - Glob
+  - Grep
+  - Bash
+  - Write
+  - Edit
 ---
 
 # ACF Audit: Convention Compliance Checker
@@ -24,6 +31,10 @@ Scan the current project for violations of ACF naming and organization conventio
 - ✅ You have the ACF conventions in your context (from SessionStart hook)
 - ✅ You're in a project root directory (not inside subdirectories)
 - ✅ `docs/acf/organization.md` exists (should be auto-created by plugin)
+
+**If `docs/acf/organization.md` is missing or empty**:
+- **Fix mode** (`--fix`): Initialize it from the plugin template at `${CLAUDE_PLUGIN_ROOT}/content/organization-template.md` and continue
+- **Audit mode**: Report as a critical violation and continue checking other categories
 
 ---
 
@@ -64,15 +75,104 @@ fi
 
 ### Algorithm
 
+#### 0. Initialize Core Files (Fix Mode Bootstrap)
+
+**Before any audit checks**, ensure core ACF files exist. This allows fix mode to bootstrap a project from scratch.
+
+**A. Initialize `docs/acf/organization.md`** (if missing or empty):
+
+```bash
+org_file="docs/acf/organization.md"
+
+if [ ! -f "$org_file" ] || [ ! -s "$org_file" ]; then
+    if [ "$fix_mode" = true ]; then
+        mkdir -p docs/acf
+        # Read template from plugin and write to project
+        cat "${CLAUDE_PLUGIN_ROOT}/content/organization-template.md" > "$org_file"
+        echo "✅ Initialized docs/acf/organization.md from plugin template"
+    else
+        echo "❌ CRITICAL: docs/acf/organization.md is missing or empty"
+        echo "   📋 Run with --fix to initialize from plugin template"
+        echo "   💡 Or run /clear to trigger SessionStart hook"
+        # Continue audit with built-in defaults from context
+    fi
+fi
+```
+
+**B. Initialize `CLAUDE.md`** (if missing):
+
+```bash
+if [ ! -f "CLAUDE.md" ]; then
+    if [ "$fix_mode" = true ]; then
+        project_name=$(basename $(pwd))
+        # Create minimal CLAUDE.md with ACF conventions reference
+        # Content: project header, ACF definition, conventions reference
+        echo "✅ Created CLAUDE.md with ACF conventions reference"
+    else
+        echo "❌ CLAUDE.md is missing"
+        echo "   📋 Run with --fix to create with ACF conventions"
+    fi
+fi
+```
+
+**Fix mode CLAUDE.md template** (write if missing):
+
+```markdown
+# {PROJECT_NAME} - AI Assistant Instructions
+
+## Agentic Continuous Flow (ACF)
+
+**ACF is software development for a world where intelligence exists in silicon as well as carbon.** Humans shift from writing code to governing intelligent agent swarms. Knowledge (ontologies, policies, constraints) becomes the product; code is ephemeral output regenerated on demand.
+
+---
+
+## Conventions
+
+- **Organization**: `docs/acf/organization.md` (naming, directory structure, documentation standards)
+- **Git**: `docs/acf/git/commit-conventions.md` (conventional commits, atomic commits)
+- **Audit**: Run `/audit-acf-conventions` to check compliance, `--fix` to auto-fix
+```
+
+**C. Ensure `CLAUDE.md` references conventions** (if exists but missing reference):
+
+If `CLAUDE.md` exists but does NOT contain a reference to `docs/acf/organization.md`:
+
+```bash
+if [ -f "CLAUDE.md" ] && ! grep -q "docs/acf/organization.md" CLAUDE.md; then
+    if [ "$fix_mode" = true ]; then
+        # Append conventions section to existing CLAUDE.md
+        echo "✅ Added conventions reference to CLAUDE.md"
+    else
+        echo "❌ CLAUDE.md exists but does not reference ACF conventions"
+        echo "   📋 Run with --fix to add conventions section"
+    fi
+fi
+```
+
+**Append this block** to existing CLAUDE.md (fix mode only):
+
+```markdown
+
+---
+
+## Conventions
+
+- **Organization**: `docs/acf/organization.md` (naming, directory structure, documentation standards)
+- **Git**: `docs/acf/git/commit-conventions.md` (conventional commits, atomic commits)
+- **Audit**: Run `/audit-acf-conventions` to check compliance, `--fix` to auto-fix
+```
+
+---
+
 #### 1. Read Project Conventions
 
-First, read `docs/acf/organization.md` to confirm the conventions you'll be checking against:
+Read `docs/acf/organization.md` to confirm the conventions you'll be checking against:
 
 ```bash
 cat docs/acf/organization.md
 ```
 
-This ensures you're checking against the project's actual conventions (which may be customized).
+This ensures you're checking against the project's actual conventions (which may be customized). If the file was just initialized in Step 0, the default template conventions apply.
 
 ---
 
@@ -578,6 +678,7 @@ done
 if [ "$fix_mode" = true ]; then
     echo ""
     echo "🎯 Fix Summary:"
+    echo "   Core files initialized: docs/acf/organization.md, CLAUDE.md (if missing)"
     echo "   Directories created: ${#missing_dirs[@]}"
     echo "   Files renamed (temporal): ${#temporal_violations[@]}"
     echo "   Files renamed (timeless): ${#timeless_violations[@]}"
@@ -604,6 +705,9 @@ fi
 📚 The librarian has reviewed your project...
 
 ---
+
+## Core Files
+[violations or ✅ docs/acf/organization.md present, ✅ CLAUDE.md present with conventions reference]
 
 ## Directory Structure
 [violations or ✅ All required directories present]
@@ -651,6 +755,11 @@ fi
 ---
 
 ## Fixes Applied
+
+### Core Files (Bootstrap)
+✅ Initialized docs/acf/organization.md from plugin template
+✅ Created CLAUDE.md with ACF conventions reference
+   (or: ✅ Added conventions reference to existing CLAUDE.md)
 
 ### Directory Structure
 ✅ Created 3 missing directories:
@@ -789,19 +898,33 @@ The conventions are already in your session context from the SessionStart hook. 
 
 ## Error Handling
 
-If `docs/acf/organization.md` doesn't exist:
+If `docs/acf/organization.md` doesn't exist or is empty:
+
+**Fix mode** (`--fix`):
 ```
-⚠️ Warning: docs/acf/organization.md not found!
-
-The ACF Librarian plugin should have created this file on session start.
-
-Possible issues:
-- Plugin not enabled (/plugin enable acf-librarian)
-- Session hasn't been started yet (/clear to reload)
-- File was deleted (disable and re-enable plugin to recreate)
-
-Cannot proceed with audit without conventions document.
+📚 docs/acf/organization.md missing or empty - initializing from plugin template...
+✅ Initialized docs/acf/organization.md with default conventions
+   (you may customize this file and /clear to reload)
 ```
+The audit creates the file from `${CLAUDE_PLUGIN_ROOT}/content/organization-template.md` and continues normally.
+
+**Audit mode** (no `--fix`):
+```
+❌ CRITICAL: docs/acf/organization.md is missing or empty!
+
+Fix options:
+- Run /audit-acf-conventions --fix (creates from plugin template)
+- Run /clear (triggers SessionStart hook to create it)
+- Enable plugin: /plugin enable acf-librarian, then /clear
+
+Continuing audit with conventions from session context...
+```
+The audit still runs using conventions already injected by the SessionStart hook, but reports the missing file as a violation.
+
+If `CLAUDE.md` doesn't exist:
+
+**Fix mode**: Creates minimal CLAUDE.md with project header and ACF conventions reference.
+**Audit mode**: Reports as violation with fix suggestion.
 
 ---
 

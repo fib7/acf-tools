@@ -1,7 +1,16 @@
 ---
 name: whip-add-agents
 description: Agent + Manifest Generator - Analyzes repository and creates missing specialist agents following ACF conventions
-allowed-tools: [Bash, Read, Write, Glob, Grep, TodoWrite, Task, mcp__perplexity__perplexity_search_web]
+argument-hint: "[agent-types...]"
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Glob
+  - Grep
+  - TodoWrite
+  - Task
+  - mcp__perplexity__perplexity_search_web
 ---
 
 # /whip-add-agents - Agent + Manifest Generator

@@ -1,7 +1,17 @@
 ---
 name: task
 description: Decompose scope into atomic tasks using task-engineer agents. Pure orchestration - NEVER implements anything.
-allowed-tools: [Read, Grep, Glob, TodoWrite, Task, mcp__perplexity__perplexity_search_web, mcp__context7__resolve-library-id, mcp__context7__get-library-docs, mcp__figma-dev-mode-mcp-server__get_code]
+argument-hint: "[scope description]"
+allowed-tools:
+  - Read
+  - Grep
+  - Glob
+  - TodoWrite
+  - Task
+  - mcp__perplexity__perplexity_search_web
+  - mcp__context7__resolve-library-id
+  - mcp__context7__get-library-docs
+  - mcp__figma-dev-mode-mcp-server__get_code
 ---
 
 # /task - Pure Orchestration & Task Decomposition

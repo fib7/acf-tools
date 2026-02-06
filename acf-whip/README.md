@@ -932,13 +932,13 @@ ls -la  # Verify go.mod, package.json, etc. exist
 plugins/acf-whip/
 ├── .claude-plugin/
 │   └── plugin.json              # Plugin manifest
-├── commands/                     # 6 slash commands
-│   ├── task.md
-│   ├── go.md
-│   ├── retro.md
-│   ├── research.md
-│   ├── whip-init.md
-│   └── whip-add-agents.md
+├── skills/                      # 6 slash commands
+│   ├── task/SKILL.md
+│   ├── go/SKILL.md
+│   ├── retro/SKILL.md
+│   ├── research/SKILL.md
+│   ├── whip-init/SKILL.md
+│   └── whip-add-agents/SKILL.md
 ├── hooks/
 │   ├── hooks.json
 │   └── handlers/

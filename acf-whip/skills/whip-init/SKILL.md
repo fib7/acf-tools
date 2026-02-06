@@ -1,7 +1,15 @@
 ---
 name: whip-init
 description: Initialize ACF Whip backlog workflow system in project
-allowed-tools: [Bash, Write, Read, Edit, Glob, Grep, AskUserQuestion]
+argument-hint: "[--with-specialists]"
+allowed-tools:
+  - Bash
+  - Write
+  - Read
+  - Edit
+  - Glob
+  - Grep
+  - AskUserQuestion
 ---
 
 # /whip-init - Initialize Backlog Workflow

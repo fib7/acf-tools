@@ -32,7 +32,7 @@
     {
       "name": "acf-librarian",
       "description": "Convention enforcement mode - The stern librarian enforces ACF naming and organization standards through context injection. Auto-initializes docs/acf/organization.md, audits compliance, and ensures everything stays in its proper place.",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "author": {
         "name": "ACF Project",
         "email": "acf@fib7.ai"
@@ -51,7 +51,7 @@
     {
       "name": "acf-whip",
       "description": "Hostile workflow enforcer. Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates.",
-      "version": "1.0.2",
+      "version": "1.1.0",
       "author": {
         "name": "ACF Tools Team",
         "email": "acf@fib7.ai"
