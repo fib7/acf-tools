@@ -767,33 +767,19 @@ Automatically initializes on every session:
 # Location: hooks/handlers/session-start.py
 
 def main():
-    # 1. Check/copy docs to docs/acf/
+    # 1. Check/copy docs to docs/acf/ (only when missing)
     check_and_copy("task-descriptions.md", "docs/acf/style/")
     check_and_copy("task-template.md", "docs/acf/backlog/")
     check_and_copy("workflow.md", "docs/acf/backlog/")
 
-    # 2. Generate .backlog/README.md with installed agents
-    generate_backlog_readme()  # Scans .claude/agents/, replaces {{IMPLEMENTER_AGENTS}}
+    # 2. Warn if .backlog/ is missing (README.md is not auto-generated)
 
     # 3. Inject style guide into session context
     return hookSpecificOutput with style guide enforcement
 ```
 
-### .backlog/README.md Generation
-
-Dynamic generation with actual installed agents:
-
-```markdown
-### Implementation Agents
-- **{{IMPLEMENTER_AGENTS}}**: Specialist implementation agents
-```
-
-After SessionStart hook:
-
-```markdown
-### Implementation Agents
-- **go-engineer, react-engineer, k8s-engineer**: Specialist implementation agents
-```
+`.backlog/README.md` is created once by `/whip-init` and never rewritten by the
+SessionStart hook — user edits are preserved across sessions.
 
 ---
 

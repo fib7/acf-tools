@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ACF Whip SessionStart Hook
-Ensures task description style guide, task template, workflow docs, and backlog README are initialized.
+Ensures task description style guide, task template, and workflow docs are initialized.
 """
 import json
 import sys
@@ -29,51 +29,6 @@ def check_and_copy(plugin_path: Path, target_path: Path) -> bool:
     return False  # Already exists
 
 
-def generate_backlog_readme(plugin_root: Path) -> None:
-    """
-    Generate .backlog/README.md with actual installed agents.
-
-    Scans .claude/agents/ directory for installed agents and updates
-    the {{IMPLEMENTER_AGENTS}} placeholder in the template.
-
-    Args:
-        plugin_root: Root directory of the plugin
-    """
-    template_path = plugin_root / "content" / "backlog" / "README.sample.md"
-    target_path = Path(".backlog/README.md")
-
-    if not template_path.exists():
-        # Template not yet in plugin (will be created later)
-        return
-
-    # Read template
-    with open(template_path, 'r', encoding='utf-8') as f:
-        template = f.read()
-
-    # Detect installed agents
-    installed_agents = []
-    agents_dir = Path(".claude/agents")
-    if agents_dir.exists():
-        for agent_file in agents_dir.glob("*.md"):
-            agent_name = agent_file.stem
-            # Skip hidden files
-            if not agent_name.startswith('.'):
-                installed_agents.append(agent_name)
-
-    # Replace placeholders
-    if installed_agents:
-        agent_list = ", ".join(sorted(installed_agents))
-    else:
-        agent_list = "task-engineer, quality-reviewer"
-
-    content = template.replace("{{IMPLEMENTER_AGENTS}}", agent_list)
-
-    # Write customized README
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(target_path, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-
 def main() -> None:
     """Main entry point for SessionStart hook."""
     try:
@@ -97,11 +52,9 @@ def main() -> None:
             Path("docs/acf/backlog/workflow.md")
         )
 
-        # 4. Generate/update .backlog/README.md with installed agents
+        # 4. Warn if .backlog/ is missing (README.md is no longer auto-generated)
         backlog_warning = ""
-        if Path(".backlog").exists():
-            generate_backlog_readme(plugin_root)
-        else:
+        if not Path(".backlog").exists():
             backlog_warning = "\n\n⚠️ **WARNING**: `.backlog/` directory not found. Run `/whip-init` to initialize backlog workflow, install agents, and configure quality gates.\n"
 
         # 5. Build context with style guide for immediate injection
