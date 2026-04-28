@@ -45,6 +45,10 @@ color: magenta
 - Metrics analysis (cycle time, rejection rate{sla_compliance_metric})
 - Agent instruction updates
 
+## Concurrency
+
+`Worktree:` is required when retro proposes changes to `.claude/agents/*.md` or other code. For pure retrospective documents under `docs/retro/`, `Worktree:` may be omitted. When `Worktree:` is set, invoke `clean-checkout-before-task` as Step 0 before any edit.
+
 ## Authority
 
 **CAN:**

@@ -125,6 +125,34 @@ Every task description MUST:
 - Understanding library capabilities when creating technical tasks
 - Checking framework features that tasks will implement
 
+## 🔁 Concurrency Metadata (MANDATORY for code-mutating tasks)
+
+Every task you create that mutates code MUST declare two front-matter fields:
+
+- `Worktree: <slug>` (kebab-case)
+- `PR Group: <slug>` (defaults to the same slug)
+
+**The slug rule**: one slug per disjoint surface area. Tasks that touch the same files or the same module share a slug; tasks that touch independent surfaces get different slugs.
+
+**Why this matters**: the orchestrator (`/go`) groups pending tasks by `Worktree:` and dispatches at most one specialist per slug. Tasks sharing a slug run strictly sequentially. Tasks with different slugs run in parallel. Wrong slugs cause either (a) collisions if you put truly overlapping tasks in different slugs, or (b) lost parallelism if you put truly independent tasks in the same slug. Be honest about scope.
+
+**Heuristic**:
+
+- One feature touching one module → one slug, possibly multiple sibling tasks (same `PR Group:`).
+- Two features touching independent modules → two slugs.
+- Cross-cutting refactor → one slug for the whole refactor; serialize.
+- Task is research-only or doc-only outside `docs/` is not mutated → `Worktree:` may be omitted; the agent will not invoke `clean-checkout-before-task`.
+
+**Banned patterns**:
+
+- `Worktree: feature-NNN-task-name` (one slug per task) - defeats the purpose; siblings should share a slug.
+- Free-form names with spaces or slashes - kebab-case only.
+- Slug not matching any actual code-touching scope - if in doubt, ask the operator.
+
+The orchestrator derives the worktree path as `.worktree/<slug>` (singular, dot-prefixed, repo root) and the branch as `worktree/<slug>`. You do not create the worktree; specialists do via the `clean-checkout-before-task` skill.
+
+---
+
 ## Authority
 
 **CAN:**
@@ -132,6 +160,7 @@ Every task description MUST:
 - Create task files in `.backlog/pending/`
 - Assign tasks to agents
 - Set priorities and dependencies
+- Set `Worktree:` and `PR Group:` (mandatory for code-mutating tasks)
 - Write acceptance criteria **following style guide**
 - Commit task files to git
 
@@ -188,6 +217,7 @@ Follow structure from `docs/acf/backlog/task-template.md`:
 - **Tech stack specified**: Agent knows what tools to use
 - **"Out of Scope" present**: What NOT to do (mandatory)
 - **Documentation references exist**: All listed docs exist
+- **`Worktree:` and `PR Group:` present** for code-mutating tasks (kebab-case slug; siblings share)
 
 ### Step 6: Create Task File
 - Create in `.backlog/pending/` with filename: `[category]-[XXX]-[descriptive-name].md`

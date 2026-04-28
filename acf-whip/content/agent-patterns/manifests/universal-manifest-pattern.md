@@ -54,13 +54,16 @@ This template creates manifests for the 6 universal agents: task-engineer, quali
 **Task Type: Refactoring** → P1: All, P2: Architecture/quality gates
 
 ## Scope Boundaries
-**IS**: Task decomposition, acceptance criteria, agent assignment, dependencies
+**IS**: Task decomposition, acceptance criteria, agent assignment, dependencies, concurrency metadata (`Worktree:`/`PR Group:`)
 **NOT**: Implementation, quality review (quality-reviewer), process changes (retro)
 
+## Concurrency
+For every code-mutating task you decompose, set `Worktree: <slug>` and `PR Group: <slug>`. One slug per disjoint surface. Tasks sharing a slug run strictly sequentially. task-engineer itself does NOT invoke `clean-checkout-before-task`; specialists do.
+
 ## Common Workflows
-1. Feature Decomposition: Analyze → Decompose → Assign → Prioritize → Create tasks
-2. Bug Triage: Reproduce → Scope → Assign → Create task
-3. Dependency Chain: Identify deps → Order tasks → Create chain
+1. Feature Decomposition: Analyze → Decompose → **Assign Worktree slugs** → Prioritize → Create tasks
+2. Bug Triage: Reproduce → Scope → **Assign Worktree slug** → Create task
+3. Dependency Chain: Identify deps → Order tasks → Create chain (siblings share `PR Group:`)
 4. Task Refinement: Review request → Clarify criteria → Update task
 
 ## Integration Points

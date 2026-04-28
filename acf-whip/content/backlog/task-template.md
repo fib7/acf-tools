@@ -12,6 +12,8 @@
 - **Priority**: [blocker|critical|high|medium|low]
 - **Estimated Hours**: [realistic estimate]
 - **Assigned Agent**: [go-engineer|python-ml-engineer|data-engineer|temporal-engineer|ml-ops-engineer|k8s-engineer|event-engineer|react-engineer|database-engineer|devops|test-engineer|quality-reviewer|task-engineer|retro|precommit|lean-architect]
+- **Worktree**: [kebab-case-slug] (required for code-mutating tasks; orchestrator dispatches one specialist per worktree-slug; tasks sharing a slug run strictly sequentially)
+- **PR Group**: [kebab-case-slug] (defaults to the same value as Worktree; sibling tasks ship together as one PR)
 - **Dependencies**: [task-id-1, task-id-2] or "none"
 - **Rejection Count**: 0 (max 5; quality-reviewer increments on reject; after 5th rejection, task-engineer redesigns)
 - **Created By**: task-engineer
@@ -96,6 +98,14 @@
 | Date Time                    | From  | To      | Agent         | Reason/Comment        |
 | ---------------------------- | ----- | ------- | ------------- | --------------------- |
 | $(date +"%Y-%m-%d %H:%M:%S") | draft | pending | task-engineer | Initial task creation |
+
+**Concurrency token (mandatory for code-mutating tasks)**: implementer specialists and quality-reviewer invoke `clean-checkout-before-task` as Step 0. The skill appends a line in this exact form:
+
+```
+| <UTC ts> | clean-checkout | ok | clean-checkout-before-task | <slug> | <branch> |
+```
+
+Quality-reviewer auto-rejects any task in `.backlog/in-review/` whose transition log lacks at least one `clean-checkout | ok` line.
 
 ## Implementation Notes
 
@@ -216,6 +226,8 @@ nothing to commit, working tree clean
 
 ### 2. Task Pickup (implementation agents)
 
+- MUST invoke `clean-checkout-before-task` as Step 0 (creates worktree, validates branch, logs OK token)
+- All subsequent edits, state moves, and commits happen inside the worktree on `worktree/<slug>` (never on `main`)
 - MUST add transition log entry BEFORE starting work
 - MUST commit task file when moving to in-progress
 - MUST update implementation notes during work (commit after each update to avoid conflicts)
@@ -231,14 +243,18 @@ nothing to commit, working tree clean
 
 ### 4. Quality Review (quality-reviewer)
 
+- MUST invoke `clean-checkout-before-task` as Step 0 (idempotent; validates the worktree the implementer used)
+- MUST verify the transition log contains at least one `clean-checkout | ok` line; auto-reject if absent
 - MUST add review comments in designated section
 - MUST update transition log with decision
-- MUST commit task file with review
+- MUST commit task file with review (inside the worktree on `worktree/<slug>`)
 - MUST provide specific feedback if rejected
 
 ---
 
 ## Git Commit Protocol
+
+**Where commits land**: task-engineer commits on `main` (creating tasks in `.backlog/pending/`). Implementer specialists and quality-reviewer commit inside the worktree on `worktree/<slug>`; integration to `main` is a project-decided step (PR via `gh pr create` or fast-forward merge) and is outside the per-task workflow.
 
 ### When Creating Task (task-engineer)
 

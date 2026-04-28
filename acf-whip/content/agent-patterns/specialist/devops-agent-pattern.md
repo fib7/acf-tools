@@ -47,6 +47,12 @@ color: yellow
 - Troubleshooting and debugging
 - Service health checks
 
+## Workflow Protocol
+
+**Step 0 (MANDATORY before any edit)**: Invoke the `clean-checkout-before-task` skill. It resolves the task's `Worktree:` slug, lazy-creates `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and logs `clean-checkout: ok` to the task transition log. Without that token, quality-reviewer auto-rejects.
+
+After Step 0 succeeds, all reads, edits, state moves, and commits happen inside the worktree on `worktree/<slug>`. Never commit on `main`.
+
 ## Authority
 
 **CAN:**

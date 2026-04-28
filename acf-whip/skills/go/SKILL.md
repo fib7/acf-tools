@@ -30,7 +30,7 @@ pending → in-progress → completed → in-review → [accepted | rejected]
 Execute backlog continuously:
 1. Loop until ALL tasks in terminal states (accepted/blocked)
 2. Process ALL state transitions each iteration
-3. Spawn agents in parallel for independent tasks
+3. Partition pending tasks by `Worktree:` slug; dispatch at most one specialist per slug, in parallel across slugs
 4. Quality gate auto-fix before processing
 5. Exit only when 100% complete OR user intervention needed
 
@@ -46,7 +46,7 @@ WHILE (terminal_tasks < total_tasks):
   1. Quality Gate Auto-Fix (stack-specific)
   2. Scan ALL Workflow States
   3. Process ALL Transitions (TodoWrite single call)
-  4. Spawn Agents in Parallel
+  4. Partition pending by Worktree slug; dispatch one specialist per slug (parallel across slugs)
   5. Check Completion (exit if 100%, else CONTINUE)
   6. Prevent Infinite Loop (max 1000 iterations)
 ```
@@ -288,34 +288,65 @@ TodoWrite({
 
 ---
 
-## Step 4: Spawn Agents in Parallel
+## Step 4: Partition by Worktree, Then Spawn
 
-Launch appropriate agents for each transition type.
+**Concurrency rule (MANDATORY)**: parallel across worktrees, sequential within a worktree. Each task declares `Worktree: <slug>` in its front-matter. Specialists invoke `clean-checkout-before-task` as Step 0; that skill uses git's worktree branch registry as the lock. Do not bypass the partition.
+
+### Step 4a: Partition pending tasks by Worktree
+
+```bash
+# For each pending task, extract its Worktree slug.
+# Group tasks by slug. Within each group, order by priority (blocker > critical > high > medium > low).
+# Skip any group whose .backlog/in-progress/ already has a task with the same Worktree slug.
+```
+
+Implementation in shell:
+
+```bash
+declare -A IN_PROGRESS_SLUGS
+for f in .backlog/in-progress/*.md; do
+  [ -f "$f" ] || continue
+  slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+  [ -n "$slug" ] && IN_PROGRESS_SLUGS["$slug"]=1
+done
+
+declare -a DISPATCH_QUEUE
+declare -A SEEN_SLUGS
+for f in $(ls -1 .backlog/pending/*.md 2>/dev/null | sort); do
+  slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+  [ -z "$slug" ] && continue   # research/docs-only tasks; dispatch directly without partitioning
+  [ -n "${IN_PROGRESS_SLUGS[$slug]:-}" ] && continue   # group already busy
+  [ -n "${SEEN_SLUGS[$slug]:-}" ] && continue   # already picked one task from this group this iteration
+  SEEN_SLUGS["$slug"]=1
+  DISPATCH_QUEUE+=("$f")
+done
+```
+
+### Step 4b: Spawn one specialist per worktree-group
+
+For each task in `DISPATCH_QUEUE`, spawn the assigned specialist. All spawns happen in parallel because each operates on a distinct `Worktree:` slug, hence a distinct branch and worktree. There is no shared `.git/index` between them.
+
+Use a single message with one Task call per `DISPATCH_QUEUE` entry:
+
+```markdown
+Agent 1 (Worktree: alpha): go-engineer for implement feature-003
+Agent 2 (Worktree: beta): react-engineer for implement feature-007
+Agent 3 (Worktree: gamma): quality-reviewer for review feature-004
+```
+
+**Within-group serialization**: tasks sharing a slug are NOT dispatched in the same iteration; they wait until the in-progress task in their slug terminates.
 
 ### Agent Type Selection
 
-| Transition | Agent Type | Purpose |
-|------------|------------|---------|
-| retry (rejected→pending) | task-engineer | Handle retry, update rejection_count |
-| unblock (blocked→pending) | task-engineer | Resolve blocker, validate dependencies |
-| start (pending→in-progress) | **specialist agent** | Implement task (go-engineer, react-engineer, etc.) |
-| review (completed→in-review→[accepted\|rejected]) | quality-reviewer | Accept or reject |
-| timeout (in-progress→blocked) | task-engineer | Document timeout reason, create blocker report |
+| Transition | Agent Type | Purpose | Honors Worktree partition? |
+|------------|------------|---------|----------------------------|
+| retry (rejected→pending) | task-engineer | Handle retry, update rejection_count | No (no code mutation) |
+| unblock (blocked→pending) | task-engineer | Resolve blocker, validate dependencies | No |
+| start (pending→in-progress) | **specialist agent** | Implement task (go-engineer, react-engineer, etc.); MUST invoke clean-checkout-before-task as Step 0 | **Yes** |
+| review (completed→in-review→[accepted\|rejected]) | quality-reviewer | Accept or reject; MUST verify clean-checkout token | **Yes** |
+| timeout (in-progress→blocked) | task-engineer | Document timeout reason, create blocker report | No |
 
-### Parallel Agent Spawning
-
-Use single message with multiple Task calls:
-
-```markdown
-Agent 1: task-engineer for retry feature-001
-Agent 2: task-engineer for unblock feature-002
-Agent 3: go-engineer for implement feature-003
-Agent 4: react-engineer for implement feature-007
-Agent 5: quality-reviewer for review feature-004
-Agent 6: task-engineer for timeout feature-005
-```
-
-**Critical**: All agents execute in parallel for independent tasks.
+task-engineer transitions execute serially on `main` (they only mutate `.backlog/`, no code). Specialist and quality-reviewer transitions execute in parallel only across distinct `Worktree:` slugs.
 
 ### Specialist Agent Assignment
 

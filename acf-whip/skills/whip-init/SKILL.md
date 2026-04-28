@@ -92,6 +92,32 @@ echo "✓ .backlog/ structure verified:"
 ls -1 .backlog/ | grep -v README.md | xargs -I {} echo "  - {}"
 ```
 
+### Step 3.5: Configure Worktree Concurrency
+
+Add `.worktree/` to `.gitignore` so per-task isolated worktrees do not pollute `main`. This is mandatory for the concurrency model documented in `docs/acf/backlog/workflow.md`.
+
+```bash
+if [ -f .gitignore ]; then
+  if ! grep -qxF '.worktree/' .gitignore; then
+    printf '\n# ACF Whip per-task worktrees (created by clean-checkout-before-task skill)\n.worktree/\n' >> .gitignore
+    echo "✓ Added .worktree/ to .gitignore"
+  else
+    echo "✓ .gitignore already contains .worktree/"
+  fi
+else
+  printf '# ACF Whip per-task worktrees (created by clean-checkout-before-task skill)\n.worktree/\n' > .gitignore
+  echo "✓ Created .gitignore with .worktree/ entry"
+fi
+```
+
+The `clean-checkout-before-task` skill (shipped with this plugin at `${CLAUDE_PLUGIN_ROOT}/skills/clean-checkout-before-task/SKILL.md`) is auto-discovered by Claude Code; no copy step required. Specialists invoke it via the `Skill` tool. Verify availability:
+
+```bash
+if [ ! -f "${CLAUDE_PLUGIN_ROOT}/skills/clean-checkout-before-task/SKILL.md" ]; then
+  echo "WARN: clean-checkout-before-task skill missing from plugin install. Concurrency model will not work." >&2
+fi
+```
+
 ### Step 4: Install Quality Gate Configuration
 
 **Install pre-commit configuration** (skip if `.pre-commit-config.yaml` exists):

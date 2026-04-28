@@ -50,11 +50,14 @@ Pattern for `docs/agents/{stack}-engineer.md` with Priority 1/2/3 structure (58-
 ```
 Coverage: Pipeline 90-95%, Core 90%, Services 85-90%, Utils 85%
 
+## Concurrency
+**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. All commits land on `worktree/<slug>`, never on `main`. Token `clean-checkout: ok` must appear in the task transition log.
+
 ## Common Workflows
-1. New Feature: Read P1 → Implement → Test → Quality gates → Evidence
-2. Bug Fix: Reproduce → Fix → Test → Quality gates → Evidence  
-3. Refactoring: Ensure tests → Incremental changes → Quality gates
-4. Handoff: Complete criteria → Quality gates → Evidence → Move to completed
+1. New Feature: Step 0 → Read P1 → Implement → Test → Quality gates → Evidence
+2. Bug Fix: Step 0 → Reproduce → Fix → Test → Quality gates → Evidence
+3. Refactoring: Step 0 → Ensure tests → Incremental changes → Quality gates
+4. Handoff: Complete criteria → Quality gates → Evidence → Move to completed (in worktree)
 
 ## Integration Points
 **From**: task-engineer (tasks), **To**: quality-reviewer (completed), lean-architect (architecture)

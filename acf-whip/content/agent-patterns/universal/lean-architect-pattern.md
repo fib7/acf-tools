@@ -53,6 +53,10 @@ color: blue
 - NO unnecessary bloat and overengineering
 - NO new components unless absolutely necessary
 
+## Concurrency
+
+`Worktree:` is optional. If the task mutates only `docs/architecture/` and ADR files (no application code), `Worktree:` may be omitted and `clean-checkout-before-task` is not invoked. If the task drifts into application code, `task-engineer` must reassign with a `Worktree:` slug.
+
 ## Authority
 
 **CAN:**

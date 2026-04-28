@@ -33,9 +33,11 @@
 | **acf-nitro** | Cognitive | Parallel execution enforcer | 5 |
 | **acf-mission-control** | Functional | Status line HUD | 5 |
 | **acf-librarian** | Functional | Convention enforcement | 5 |
-| **acf-whip** | Functional | Backlog workflow automation | 35 |
+| **acf-whip** | Functional | Backlog workflow automation (concurrency-safe) | 36 |
 
-**Total**: 60 plugin files + 3 project files + marketplace.json = 64 files
+**Total**: 61 plugin files + 3 project files + marketplace.json = 65 files
+
+**acf-whip 1.2.0** introduces the `clean-checkout-before-task` skill, which uses git's worktree branch registry as the lock primitive for parallel agent execution. Tasks declare `Worktree:` and `PR Group:` slugs; `/go` partitions on `Worktree:` and dispatches at most one specialist per slug. See `acf-whip/content/backlog/workflow.md`.
 
 **Plugin architecture**: Each plugin is fully self-contained with no cross-dependencies. Users can install any combination.
 
@@ -348,6 +350,6 @@ The plugins themselves CREATE documentation when installed in user projects:
 ---
 
 **Repository Version**: v1.0
-**Last Updated**: 2025-11-13
+**Last Updated**: 2026-04-28
 **Marketplace Plugins**: 6
-**Total Files**: 64
+**Total Files**: 65

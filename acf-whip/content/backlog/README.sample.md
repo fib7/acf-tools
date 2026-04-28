@@ -58,11 +58,24 @@ ALL agents MUST read on receiving a task:
 4. **Workflow Details** (`docs/acf/backlog/workflow.md`) - State machine, transition rules
 5. **Agent Manifest** (`docs/agents/{agent-name}.md`) - Agent-specific Priority 1/2/3 docs
 
+## Concurrency Model (CRITICAL)
+
+**Parallel across worktrees, sequential within a worktree.** Every code-mutating task declares:
+
+- `Worktree: <slug>` (required) — implementer specialists run one-at-a-time per worktree slug
+- `PR Group: <slug>` (defaults to Worktree value) — sibling tasks ship together
+
+Implementer specialists and quality-reviewer invoke the `clean-checkout-before-task` skill as Step 0. The skill creates a git worktree at `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and logs the `clean-checkout: ok` token to the task transition log. Without that token, quality-reviewer auto-rejects.
+
+All implementer/reviewer commits land on `worktree/<slug>`, never on `main`. Integration to `main` (PR via `gh pr create` or fast-forward merge) is project-decided.
+
+See `docs/acf/backlog/workflow.md` for the full state machine and dispatch rules.
+
 ## Task File Template
 
 Every task file MUST follow this structure (from `docs/acf/backlog/task-template.md`):
 
-1. **Metadata**: ID, status, priority, hours, agent, dependencies, rejection_count, timestamps
+1. **Metadata**: ID, status, priority, hours, agent, **Worktree**, **PR Group**, dependencies, rejection_count, timestamps
 2. **Description**: Binary outcome (WHAT/WHY only, no HOW)
 3. **Acceptance Criteria**: Checkboxes, testable, binary
 4. **Technical Requirements**: Implementation details, testing, performance
@@ -133,27 +146,30 @@ This project uses a **3-level priority system**:
 
 ### For Implementer Agents (Specialists)
 
-1. **Read Priority 1 Docs**: This README, style guide, task template, manifest
-2. **Move to in-progress**: Start of work
-3. **Update Transition Log**: Every state change with timestamp
-4. **Implement Task**: Decide HOW (task specifies WHAT/WHY)
-5. **Run Quality Gates**: ALL stack-specific quality gates MUST pass
-6. **Provide Complete Evidence**: Command outputs, test results, coverage, commit
-7. **Move to completed**: After all criteria met and evidence provided
-8. **Commit with Task File**: Atomic commit (code + task file)
+1. **Step 0: clean-checkout-before-task**: Invoke the skill before any edit; it creates the worktree, validates the branch, logs the OK token. Without the token, quality-reviewer rejects.
+2. **Read Priority 1 Docs**: This README, style guide, task template, manifest
+3. **Move to in-progress**: Start of work (state move happens inside the worktree)
+4. **Update Transition Log**: Every state change with timestamp
+5. **Implement Task**: Decide HOW (task specifies WHAT/WHY); all edits happen inside `.worktree/<slug>` on branch `worktree/<slug>`
+6. **Run Quality Gates**: ALL stack-specific quality gates MUST pass
+7. **Provide Complete Evidence**: Command outputs, test results, coverage, commit SHA on `worktree/<slug>`
+8. **Move to completed**: After all criteria met and evidence provided
+9. **Commit with Task File**: Atomic commit (code + task file) on `worktree/<slug>`. Never commit on `main`.
 
 ### For quality-reviewer
 
-1. **Read Priority 1 Docs**: This README, workflow, quality gates
-2. **Move to in-review**: Start of review
-3. **Verify ALL Acceptance Criteria**: Every checkbox must be checked
-4. **Check rejection_count**: If ≥5, escalate to task-engineer (don't reject again)
-5. **Validate Quality Gates**: ALL commands must have complete output
-6. **Check Test Coverage**: Meet thresholds (API 90-95%, Core 90%, Services 85-90%, Utils 85%)
-7. **Binary Decision**: Accept OR reject (no partial approvals)
-8. **MANDATORY: Move to Terminal State**: accepted/ OR rejected/ (NEVER leave in in-review/)
-9. **Update rejection_count**: Increment if rejecting
-10. **Commit**: `review: accept|reject {task-id}`
+1. **Step 0: clean-checkout-before-task**: Invoke the skill (idempotent; validates the worktree the implementer used)
+2. **Verify clean-checkout token**: Transition log MUST contain at least one `clean-checkout | ok` line. Auto-reject if absent.
+3. **Read Priority 1 Docs**: This README, workflow, quality gates
+4. **Move to in-review**: Start of review (inside the worktree)
+5. **Verify ALL Acceptance Criteria**: Every checkbox must be checked
+6. **Check rejection_count**: If ≥5, escalate to task-engineer (don't reject again)
+7. **Validate Quality Gates**: ALL commands must have complete output
+8. **Check Test Coverage**: Meet thresholds (API 90-95%, Core 90%, Services 85-90%, Utils 85%)
+9. **Binary Decision**: Accept OR reject (no partial approvals)
+10. **MANDATORY: Move to Terminal State**: accepted/ OR rejected/ (NEVER leave in in-review/) inside the worktree
+11. **Update rejection_count**: Increment if rejecting
+12. **Commit**: `review: accept|reject {task-id}` on `worktree/<slug>`
 
 ## Quality Gates Integration
 
