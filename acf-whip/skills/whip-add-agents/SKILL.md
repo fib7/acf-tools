@@ -304,12 +304,16 @@ See manifest for complete quality gate requirements: `docs/agents/{agent-name}.m
 
 ## Workflow Protocol
 
+**Step 0 (MANDATORY before any edit)**: Invoke the `clean-checkout-before-task` skill. It resolves the task's `Worktree:` slug, lazy-creates `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and logs `clean-checkout: ok` to the task transition log. Without that token, quality-reviewer auto-rejects.
+
+After Step 0 succeeds, all reads, edits, state moves, and commits happen inside the worktree on `worktree/<slug>`. Never commit on `main`.
+
 1. Read Priority 1 docs from manifest
 2. Load task-specific docs based on navigation guidance
 3. Implement following manifest workflows
 4. Run all quality gates
 5. Provide evidence of completion
-6. Update task status and commit
+6. Update task status and commit (inside the worktree on `worktree/<slug>`)
 ```
 
 #### Variable Replacement

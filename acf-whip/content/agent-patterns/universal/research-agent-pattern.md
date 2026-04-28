@@ -42,6 +42,10 @@ You are a specialized Research and Analysis Agent focused on conducting in-depth
 - Provide comparative analyses with evidence-based recommendations
 - Investigate best practices and implementation patterns
 
+## Concurrency
+
+`Worktree:` is optional. If the task mutates only `docs/research/` and no application code, `Worktree:` may be omitted and `clean-checkout-before-task` is not invoked. If the task ends up touching code outside `docs/`, `task-engineer` must reassign with a `Worktree:` slug.
+
 ## Research Document Standards
 
 All research documents MUST follow this structure:

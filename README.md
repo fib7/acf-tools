@@ -24,7 +24,7 @@ Specialized cognitive modes that enforce specific thinking patterns and validati
 Functional tools for ACF workflow automation and convention enforcement:
 
 - **acf-librarian** - Convention enforcement through context injection, auto-initializes organization standards, audits compliance
-- **acf-whip** - Task workflow enforcer with zero tolerance backlog automation from decomposition to acceptance
+- **acf-whip** - Task workflow enforcer with zero tolerance backlog automation from decomposition to acceptance. **Concurrency-safe** as of 1.2.0: tasks declare `Worktree:` and `PR Group:` slugs; `/go` partitions on `Worktree:` and dispatches at most one specialist per slug. Specialists invoke `clean-checkout-before-task` (Step 0) which uses git's worktree branch registry as the lock. No custom locks, daemons, or schedulers.
 
 ---
 
@@ -128,7 +128,7 @@ claude plugin validate .
 |---------|----------------|---------|
 | `/whip-init` | `--priority=3-level\|5-level`<br>`--coverage=60\|80\|95`<br>`--strict\|--standard`<br>`--with-specialists` | Initialize backlog workflow: creates `.backlog/` structure, installs quality gates, generates universal agents + manifests. Use `--with-specialists` to auto-generate stack-specific agents (python-engineer, react-engineer, etc.) |
 | `/task "<scope>"` | Scope description (string) | Decompose scope into atomic backlog tasks. Pure orchestration - analyzes requirements via Perplexity/Context7/Figma, creates tasks following WHAT/WHY style (never HOW), spawns task-engineer agents in parallel |
-| `/go` | None | Continuous backlog execution until 100% complete. Loops through: quality gate auto-fix → scan states → process transitions → spawn agents in parallel → check completion. Terminal states: accepted/blocked |
+| `/go` | None | Continuous backlog execution until 100% complete. Loops through: quality gate auto-fix → scan states → process transitions → **partition pending by `Worktree:` slug → dispatch one specialist per slug (parallel across slugs)** → check completion. Terminal states: accepted/blocked |
 | `/research "<topic>"` | Topic description (string) | Conduct research using MCP tools (Perplexity, Context7, Figma). Creates temporal doc `docs/research/YYYYMMDD-topic.md`, generates backlog task from findings |
 | `/retro` | `--focus=<area>` (optional)<br>`--agent=<name>` (optional)<br>`--timeframe=<days>` (optional) | Retrospective analysis of blocked/rejected tasks. Applies Five Whys methodology, identifies systemic issues, creates improvement tasks in `.backlog/pending/` |
 | `/whip-add-agents` | `--backend=go\|python\|nodejs\|rust`<br>`--frontend=react\|nextjs\|vue\|angular`<br>`--data=dagster\|bentoml\|airflow`<br>`--infrastructure=k8s\|docker\|terraform`<br>`--specialized=temporal\|event-bus\|graphql` | Generate specialist agents + manifests from patterns. Auto-detects tech stack if no flags provided. Creates agent implementation (`.claude/agents/`) + comprehensive manifest (`docs/agents/`) with Priority 1/2/3 structure |

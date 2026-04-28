@@ -56,12 +56,15 @@ Pattern for `docs/agents/devops.md` with Priority 1/2/3 structure and project-sp
 
 ---
 
+## Concurrency
+**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. All commits land on `worktree/<slug>`, never on `main`. Token `clean-checkout: ok` must appear in the task transition log.
+
 ## Common Workflows
 
-1. **Local Deploy**: Config → Deploy → Verify → Troubleshoot
-2. **CI Pipeline**: Configure → Test → Deploy → Monitor
-3. **Monitoring**: Install → Configure → Test → Document
-4. **Troubleshoot**: Logs → Metrics → Debug → Fix
+1. **Local Deploy**: Step 0 → Config → Deploy → Verify → Troubleshoot
+2. **CI Pipeline**: Step 0 → Configure → Test → Deploy → Monitor
+3. **Monitoring**: Step 0 → Install → Configure → Test → Document
+4. **Troubleshoot**: Step 0 → Logs → Metrics → Debug → Fix
 
 ---
 
@@ -231,12 +234,15 @@ ops/scripts/health_check.sh
 
 ---
 
+## Concurrency
+**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. All commits land on `worktree/<slug>`, never on `main`. Token `clean-checkout: ok` must appear in the task transition log.
+
 ## Common Workflows
 
-1. **Local Deploy**: Config → Deploy → Verify → Troubleshoot
-2. **CI Pipeline**: Configure → Test → Deploy → Monitor
-3. **Monitoring**: Install → Configure → Test → Document
-4. **Troubleshoot**: Logs → Metrics → Debug → Fix
+1. **Local Deploy**: Step 0 → Config → Deploy → Verify → Troubleshoot
+2. **CI Pipeline**: Step 0 → Configure → Test → Deploy → Monitor
+3. **Monitoring**: Step 0 → Install → Configure → Test → Document
+4. **Troubleshoot**: Step 0 → Logs → Metrics → Debug → Fix
 
 ---
 

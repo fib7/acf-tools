@@ -98,6 +98,14 @@ This is a workflow violation that breaks the backlog state machine.
 
 ## Review Protocol
 
+### Step 0: clean-checkout-before-task (MANDATORY)
+
+Invoke the `clean-checkout-before-task` skill before any review action. This is idempotent: if the implementer already created `.worktree/<slug>`, the skill validates the existing worktree and re-logs an OK token. All subsequent state moves and commits happen inside the worktree on `worktree/<slug>`.
+
+### Step 0.5: Verify clean-checkout token from implementer
+
+Before reading the task body, grep the transition log for at least one `clean-checkout | ok` line written by the implementer. If absent, **auto-reject without further review**. Reason: "missing clean-checkout token; implementer did not invoke clean-checkout-before-task". Increment rejection_count, move to `.backlog/rejected/`, commit on `worktree/<slug>`.
+
 ### Step 1: Get Timestamp
 ```bash
 date +"%Y-%m-%d %H:%M:%S"
@@ -169,16 +177,18 @@ date +"%Y-%m-%d %H:%M:%S"
 
 ### Step 10: Binary Decision
 
+All file moves and commits in this step happen inside `.worktree/<slug>` on branch `worktree/<slug>`. The worktree was already created by the implementer; you re-entered it via Step 0.
+
 #### If Accepting:
 1. Update transition log:
 ```markdown
 | 2025-11-07 14:45:00 | in-review | accepted | quality-reviewer | All criteria met, quality gates passed |
 ```
-2. Move to accepted:
+2. Move to accepted (inside the worktree):
 ```bash
 mv .backlog/in-review/{task-file}.md .backlog/accepted/
 ```
-3. Commit:
+3. Commit on `worktree/<slug>`:
 ```bash
 git add .backlog/accepted/{task-file}.md
 git commit -m "review: accept {task-id}"
@@ -191,15 +201,17 @@ git commit -m "review: accept {task-id}"
 ```markdown
 | 2025-11-07 14:45:00 | in-review | rejected | quality-reviewer | Coverage below threshold (75% vs 85% required). Failure: [specific issues] |
 ```
-4. Move to rejected:
+4. Move to rejected (inside the worktree):
 ```bash
 mv .backlog/in-review/{task-file}.md .backlog/rejected/
 ```
-5. Commit:
+5. Commit on `worktree/<slug>`:
 ```bash
 git add .backlog/rejected/{task-file}.md
 git commit -m "review: reject {task-id} - {brief-reason}"
 ```
+
+After accept/reject, integration of `worktree/<slug>` into `main` (PR via `gh pr create` or fast-forward merge) is project-decided and outside this protocol.
 
 ### Step 11: MANDATORY Terminal State Confirmation
 **Verify**:

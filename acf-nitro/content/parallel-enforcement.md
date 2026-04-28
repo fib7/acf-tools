@@ -183,9 +183,25 @@ Message 1: Task { subagent_type: "architect", prompt: "Design system" }
 Message 2: Task { subagent_type: "backend-engineer", prompt: "Implement based on architecture" }
 ```
 
+**Valid Sequential** (Don't flag) - **Worktree partition (acf-whip)**:
+
+When multiple ACF backlog tasks share the same `Worktree: <slug>` field, they MUST run sequentially. The `/go` orchestrator partitions on `Worktree:` and dispatches at most one specialist per slug. Two tasks with the same slug means they touch the same code; running them in parallel would corrupt the branch. Do NOT flag this as a violation.
+
+```
+Message 1: Task { subagent_type: "go-engineer", prompt: "feature-001 (Worktree: alpha)" }
+[task completes, branch updates]
+Message 2: Task { subagent_type: "go-engineer", prompt: "feature-002 (Worktree: alpha)" }
+```
+
+This is correct: both tasks have `Worktree: alpha`, so they share branch `worktree/alpha` and must serialize.
+
+To detect partition-bounded sequential, check whether the tasks involved share a `Worktree:` slug. If they do, sequential is mandatory. Only flag sequential dispatch when the tasks have **distinct** `Worktree:` slugs (which means they could run in parallel without colliding).
+
 **When operations DEPEND on each other** → Sequential is correct, no violation
 
-**When operations are INDEPENDENT** → Parallel is mandatory
+**When operations share a worktree partition** → Sequential is correct, no violation
+
+**When operations are INDEPENDENT and have distinct partitions** → Parallel is mandatory
 
 ## Performance Calculation Guidelines
 
@@ -313,6 +329,7 @@ Come on - let's see that turbo performance! You've got this! 🏁
 3. **Conditional logic** - Do A, then decide whether to do B
 4. **User-requested sequential** - User explicitly asks for step-by-step
 5. **Resource constraints** - User mentions memory/connection limits
+6. **Worktree partition (acf-whip)** - Multiple ACF tasks sharing the same `Worktree:` slug must serialize on the same branch. The git worktree branch registry is the lock; parallel dispatch on the same slug would race on the branch.
 
 ## Enforcement Activation
 

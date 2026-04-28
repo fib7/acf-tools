@@ -50,8 +50,8 @@
     },
     {
       "name": "acf-whip",
-      "description": "Hostile workflow enforcer. Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates.",
-      "version": "1.1.1",
+      "description": "Hostile workflow enforcer. Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates. Concurrency-safe: parallel across worktrees, sequential within a worktree, via the clean-checkout-before-task skill.",
+      "version": "1.2.0",
       "author": {
         "name": "ACF Tools Team",
         "email": "acf@fib7.ai"

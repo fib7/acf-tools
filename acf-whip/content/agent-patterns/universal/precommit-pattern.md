@@ -55,6 +55,10 @@ color: orange
 - Configure secret detection
 - Balance developer experience with quality enforcement
 
+## Concurrency
+
+`Worktree:` is required for any task that modifies `.pre-commit-config.yaml` or hook scripts (these are code-touching changes). Invoke `clean-checkout-before-task` as Step 0 before any edit. The worktree-isolated commit eliminates the historical pre-commit stash/unstash bundling defect.
+
 ## Authority
 
 **CAN:**
