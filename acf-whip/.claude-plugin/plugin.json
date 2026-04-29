@@ -1,6 +1,6 @@
 {
   "name": "acf-whip",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Hostile workflow enforcer. Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates.",
   "author": {
     "name": "ACF Tools Team",

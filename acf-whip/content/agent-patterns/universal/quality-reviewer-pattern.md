@@ -211,7 +211,7 @@ git add .backlog/rejected/{task-file}.md
 git commit -m "review: reject {task-id} - {brief-reason}"
 ```
 
-After accept/reject, integration of `worktree/<slug>` into `main` (PR via `gh pr create` or fast-forward merge) is project-decided and outside this protocol.
+Your job ends here. Integration of `worktree/<slug>` into the local trunk is owned by `/go`'s `integrate-worktree` skill, invoked by the orchestrator after dispatch returns. You never touch the trunk's `.git/index`. (If the project's `CLAUDE.md` directs PR-based integration instead, the orchestrator follows that — still none of your concern.)
 
 ### Step 11: MANDATORY Terminal State Confirmation
 **Verify**:
