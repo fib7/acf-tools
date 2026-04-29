@@ -28,27 +28,58 @@ pending → in-progress → completed → in-review → [accepted | rejected]
 ## Purpose
 
 Execute backlog continuously:
-1. Loop until ALL tasks in terminal states (accepted/blocked)
-2. Process ALL state transitions each iteration
-3. Partition pending tasks by `Worktree:` slug; dispatch at most one specialist per slug, in parallel across slugs
-4. Quality gate auto-fix before processing
-5. Exit only when 100% complete OR user intervention needed
+1. Capture trunk identity at startup (refuse on detached HEAD).
+2. Loop until ALL tasks reach terminal states.
+3. Process ALL state transitions each iteration, gating on dependencies.
+4. Partition pending tasks by `Worktree:` slug; dispatch at most one specialist per slug, in parallel across slugs.
+5. After dispatch returns, integrate every newly-accepted worktree into the local trunk in dependency-topological order (default behavior; see "Integration mode" below).
+6. Quality gate auto-fix before processing.
+7. Exit only when 100% complete OR user intervention needed.
 
-**CRITICAL**: This command does NOT terminate after one pass. It continues looping until backlog complete.
+**CRITICAL**: This command does NOT terminate after one pass. It continues looping until backlog complete AND every accepted worktree is folded into trunk.
+
+## Integration mode
+
+**Default**: at the end of each iteration, the orchestrator folds every newly-accepted worktree branch into the branch checked out at the repo root (the local trunk) via the `integrate-worktree` skill. Linear history; conflicts resolved intelligently by the task's `assigned_agent`.
+
+**Override**: if the project's `CLAUDE.md` (or any other persistent agent instructions) directs a different integration strategy — for example "open a PR per PR Group via `gh pr create` instead of merging locally" — follow those instructions and skip Step 4.5. In that mode, the loop reverts to the 1.2.0 terminal check (`accepted ∪ blocked`); operator handles integration.
+
+The orchestrator decides which mode to use by reading project instructions (already loaded into Claude's context); no plugin code special-cases the override.
 
 ---
 
 ## Continuous Execution Loop
 
 ```yaml
+PRE-LOOP: Capture trunk identity (refuse on detached HEAD).
 WHILE (terminal_tasks < total_tasks):
   iteration++
   1. Quality Gate Auto-Fix (stack-specific)
   2. Scan ALL Workflow States
-  3. Process ALL Transitions (TodoWrite single call)
+  3. Process ALL Transitions (TodoWrite single call), gating on dependencies
   4. Partition pending by Worktree slug; dispatch one specialist per slug (parallel across slugs)
+  4.5. Integrate Newly-Accepted (default mode): topo-sort by deps; merge into local trunk
   5. Check Completion (exit if 100%, else CONTINUE)
   6. Prevent Infinite Loop (max 1000 iterations)
+POST-LOOP: Final integration drain (defensive).
+```
+
+---
+
+## Pre-Loop: Capture Trunk Identity
+
+Before iteration begins, snapshot the branch checked out at the repo root and export it as environment variables for every dispatched skill (`clean-checkout-before-task`, `integrate-worktree`).
+
+```bash
+export ACFW_TRUNK_ROOT=$(git rev-parse --show-toplevel)
+export ACFW_TRUNK_BRANCH=$(git -C "$ACFW_TRUNK_ROOT" symbolic-ref --short HEAD 2>/dev/null)
+export ACFW_TRUNK_SHA_AT_START=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
+
+if [ -z "$ACFW_TRUNK_BRANCH" ]; then
+  echo "❌ FATAL: HEAD is detached at $ACFW_TRUNK_ROOT. /go requires a branch checked out at the repo root." >&2
+  exit 1
+fi
+echo "🌳 Trunk: $ACFW_TRUNK_BRANCH @ $ACFW_TRUNK_SHA_AT_START"
 ```
 
 ---
@@ -73,8 +104,15 @@ while [ $iteration -lt $max_iterations ]; do
 
   # ... process workflow ...
 
-  # Check completion
-  terminal_count=$(ls -1 .backlog/accepted/*.md .backlog/blocked/*.md 2>/dev/null | wc -l)
+  # Count terminal tasks. In default (auto-merge) mode, an accepted task is terminal
+  # only if its Integrated-At: is set. In override (PR) mode, accepted alone is terminal.
+  if [ "$ACFW_INTEGRATION_OVERRIDE" = "1" ]; then
+    terminal_count=$(ls -1 .backlog/accepted/*.md .backlog/blocked/*.md 2>/dev/null | wc -l)
+  else
+    integrated_count=$(grep -lE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' .backlog/accepted/*.md 2>/dev/null | wc -l)
+    blocked_count=$(ls -1 .backlog/blocked/*.md 2>/dev/null | wc -l)
+    terminal_count=$((integrated_count + blocked_count))
+  fi
   total_count=$(find .backlog -name "*.md" ! -path "*/.git/*" ! -name "README.md" ! -name ".gitkeep" | wc -l)
 
   if [ $terminal_count -eq $total_count ] && [ $total_count -gt 0 ]; then
@@ -207,28 +245,29 @@ For each task in `.backlog/rejected/`:
 #### B. Unblock Tasks with Resolved Dependencies
 
 For each task in `.backlog/blocked/`:
-1. Read `dependencies` from task metadata
-2. Check if all dependencies in `.backlog/accepted/`
-3. If resolved: Unblock (blocked→pending)
-
-```javascript
-{
-  content: "Unblock feature-002 (dependencies resolved: feature-001)",
-  status: "pending",
-  activeForm: "Unblocking feature-002"
-}
-```
+1. Read `Dependencies` from task metadata.
+2. For each dependency `dep`, check the **dependency-gating rule** below.
+3. If all deps satisfied: Unblock (blocked→pending).
 
 #### C. Start Pending Tasks
 
 For each task in `.backlog/pending/`:
-1. Check no blocking dependencies
-2. Check priority (process by priority order)
-3. Queue for start (pending→in-progress)
+1. For each dependency `dep`, apply the **dependency-gating rule** below. Tasks failing the check stay in `pending/` for this iteration.
+2. Check priority (process by priority order).
+3. Queue for start (pending→in-progress).
+
+#### Dependency-gating rule (used by B and C, and also by Step 4a partition)
+
+A task may dispatch only from a codebase that already contains all its dependencies. For each dep:
+
+- **Same-slug dep** (dep's `Worktree:` equals this task's `Worktree:`): satisfied as soon as `dep` is in `.backlog/accepted/`. Its commits already live on the shared `worktree/<slug>` branch and will be present in the worktree when the within-slug serializer picks the next task.
+- **Cross-slug dep** (different `Worktree:` slug): `dep` must be in `.backlog/accepted/` **AND** have a non-empty `Integrated-At:` field, i.e. its commits are on the local trunk. Acceptance alone is not enough — the dependent's worktree only sees cross-slug commits after `clean-checkout-before-task` Step 5 fast-forwards from the now-advanced trunk.
+
+In override (PR) mode, where there is no `Integrated-At:` field because no auto-merge happens, treat acceptance as sufficient for cross-slug deps too (operator is responsible for ordering).
 
 ```javascript
 {
-  content: "Process feature-003 (pending→in-progress)",
+  content: "Process feature-003 (pending→in-progress, deps integrated)",
   status: "pending",
   activeForm: "Processing feature-003"
 }
@@ -298,6 +337,7 @@ TodoWrite({
 # For each pending task, extract its Worktree slug.
 # Group tasks by slug. Within each group, order by priority (blocker > critical > high > medium > low).
 # Skip any group whose .backlog/in-progress/ already has a task with the same Worktree slug.
+# Skip any task whose dependencies are not yet satisfied (see dependency-gating rule above).
 ```
 
 Implementation in shell:
@@ -317,9 +357,33 @@ for f in $(ls -1 .backlog/pending/*.md 2>/dev/null | sort); do
   [ -z "$slug" ] && continue   # research/docs-only tasks; dispatch directly without partitioning
   [ -n "${IN_PROGRESS_SLUGS[$slug]:-}" ] && continue   # group already busy
   [ -n "${SEEN_SLUGS[$slug]:-}" ] && continue   # already picked one task from this group this iteration
+  # Apply dependency-gating rule (see Step 3): skip if any dep unsatisfied.
+  # Cross-slug dep needs Integrated-At; same-slug dep needs accepted/.
+  deps_ok=$(./.claude/skills/go/check-deps.sh "$f")  # conceptual; real impl inlines the check
+  [ "$deps_ok" != "ok" ] && continue
   SEEN_SLUGS["$slug"]=1
   DISPATCH_QUEUE+=("$f")
 done
+```
+
+The dep-check (inlined, not a separate script) for each task `$f`:
+
+```bash
+THIS_SLUG=$(grep -E '^- \*\*Worktree\*\*:' "$f" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+DEPS=$(grep -E '^- \*\*Dependencies\*\*:' "$f" | sed -E 's/.*Dependencies\*\*:[[:space:]]*//')
+[ "$DEPS" = "none" ] || [ -z "$DEPS" ] && return 0
+
+for dep_id in $(echo "$DEPS" | tr ',' '\n' | tr -d '[:space:]'); do
+  dep_file=$(ls .backlog/accepted/${dep_id}*.md 2>/dev/null | head -1)
+  [ -z "$dep_file" ] && return 1   # dep not accepted
+  dep_slug=$(grep -E '^- \*\*Worktree\*\*:' "$dep_file" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+  if [ "$dep_slug" != "$THIS_SLUG" ]; then
+    # Cross-slug: require Integrated-At
+    integrated=$(grep -E '^- \*\*Integrated-At\*\*:' "$dep_file" | sed -E 's/.*Integrated-At\*\*:[[:space:]]*//' | tr -d '[:space:]')
+    [ -z "$integrated" ] && return 1
+  fi
+done
+return 0
 ```
 
 ### Step 4b: Spawn one specialist per worktree-group
@@ -361,20 +425,71 @@ If no specialist assigned, use task-engineer for guidance.
 
 ---
 
-## Step 5: Check Completion
+## Step 4.5: Integrate Newly-Accepted (default mode only)
 
-After all agents complete in iteration:
+After dispatch returns and specialists have moved their tasks to `.backlog/accepted/`, fold every newly-accepted worktree into the local trunk. The orchestrator (this skill, running as the parent agent) is the **only writer of trunk's `.git/index`**; no parallelism here.
+
+**Skip this step entirely if project instructions (CLAUDE.md, AGENTS.md, etc.) direct a different integration strategy** (e.g. "open a PR per PR Group via `gh pr create` instead"). In that case, leave accepted tasks with empty `Integrated-At:` and let the operator handle integration; the loop's terminal check falls back to `accepted ∪ blocked`.
+
+### Step 4.5a: Topologically sort unintegrated accepted tasks
+
+Read `.backlog/accepted/*.md`. For each task whose `Integrated-At:` is empty, add it to the integration queue. Sort the queue so that, for any cross-slug dep, the dep is integrated before the dependent. Same-slug ordering is implicit (rebase preserves intra-branch order).
 
 ```bash
-# Count terminal states
-accepted_count=$(ls -1 .backlog/accepted/*.md 2>/dev/null | wc -l)
+declare -a INTEGRATE_QUEUE
+for f in .backlog/accepted/*.md; do
+  [ -f "$f" ] || continue
+  integrated=$(grep -E '^- \*\*Integrated-At\*\*:' "$f" | sed -E 's/.*Integrated-At\*\*:[[:space:]]*//' | tr -d '[:space:]')
+  [ -z "$integrated" ] && INTEGRATE_QUEUE+=("$f")
+done
+
+# Topo-sort INTEGRATE_QUEUE by cross-slug deps (dep first). Implementation: simple
+# Kahn's algorithm over the dep edges among queue members.
+```
+
+### Step 4.5b: Integrate sequentially
+
+```bash
+for task_file in "${SORTED_QUEUE[@]}"; do
+  if Skill integrate-worktree "$task_file"; then
+    echo "✓ integrated: $(basename "$task_file" .md)"
+  else
+    rc=$?
+    if [ $rc -eq 6 ]; then
+      echo "✗ resolver failed: $(basename "$task_file" .md) → rejected/, will retry next iteration"
+    elif [ $rc -eq 10 ]; then
+      echo "↻ transient: $(basename "$task_file" .md) → leave accepted, retry next iteration"
+    else
+      echo "⚠ integrate-worktree exit $rc on $(basename "$task_file" .md)"
+    fi
+  fi
+done
+```
+
+The orchestrator invokes the `integrate-worktree` skill once per task. The skill itself owns the FF → rebase → resolver-dispatch ladder, the cleanup of empty worktrees, and writing `Integrated-At:` on success.
+
+---
+
+## Step 5: Check Completion
+
+After all agents complete in iteration AND Step 4.5 has integrated newly-accepted tasks:
+
+```bash
+# Count terminal states. Default mode: accepted tasks must have Integrated-At set.
+if [ "$ACFW_INTEGRATION_OVERRIDE" = "1" ]; then
+  accepted_count=$(ls -1 .backlog/accepted/*.md 2>/dev/null | wc -l)
+  integrated_count=$accepted_count   # treat accepted as terminal in override mode
+else
+  accepted_count=$(ls -1 .backlog/accepted/*.md 2>/dev/null | wc -l)
+  integrated_count=$(grep -lE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' .backlog/accepted/*.md 2>/dev/null | wc -l)
+fi
 blocked_count=$(ls -1 .backlog/blocked/*.md 2>/dev/null | wc -l)
-terminal_count=$((accepted_count + blocked_count))
+terminal_count=$((integrated_count + blocked_count))
 
 # Count total tasks
 total_count=$(find .backlog -name "*.md" ! -path "*/.git/*" ! -name "README.md" ! -name ".gitkeep" | wc -l)
 
-echo "📊 Progress: $terminal_count / $total_count terminal ($accepted_count accepted, $blocked_count blocked)"
+echo "📊 Progress: $terminal_count / $total_count terminal ($integrated_count integrated, $accepted_count accepted, $blocked_count blocked)"
 ```
 
 ### Exit Conditions
@@ -383,7 +498,8 @@ echo "📊 Progress: $terminal_count / $total_count terminal ($accepted_count ac
 ```bash
 if [ $terminal_count -eq $total_count ] && [ $total_count -gt 0 ]; then
   echo "✅ Backlog 100% complete!"
-  echo "   Accepted: $accepted_count"
+  echo "   Integrated: $integrated_count"
+  echo "   Accepted (unintegrated): $((accepted_count - integrated_count))"
   echo "   Blocked: $blocked_count"
   exit 0
 fi
@@ -426,6 +542,22 @@ If completion check passes, return to Step 1 for next iteration:
 ```bash
 echo "🔄 Starting iteration $((iteration + 1))..."
 # Return to Step 1: Quality Gate Auto-Fix
+```
+
+---
+
+## Post-Loop: Final Integration Drain (default mode)
+
+Defensive: in case the last iteration accepted tasks but exited the loop before reaching Step 4.5 (e.g. progress-detector early-exit), run the integration step once more before returning. Skip in override mode.
+
+```bash
+if [ "$ACFW_INTEGRATION_OVERRIDE" != "1" ]; then
+  for f in .backlog/accepted/*.md; do
+    [ -f "$f" ] || continue
+    integrated=$(grep -E '^- \*\*Integrated-At\*\*:' "$f" | sed -E 's/.*Integrated-At\*\*:[[:space:]]*//' | tr -d '[:space:]')
+    [ -z "$integrated" ] && Skill integrate-worktree "$f"
+  done
+fi
 ```
 
 ---

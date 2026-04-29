@@ -15,6 +15,7 @@
 - **Worktree**: [kebab-case-slug] (required for code-mutating tasks; orchestrator dispatches one specialist per worktree-slug; tasks sharing a slug run strictly sequentially)
 - **PR Group**: [kebab-case-slug] (defaults to the same value as Worktree; sibling tasks ship together as one PR)
 - **Dependencies**: [task-id-1, task-id-2] or "none"
+- **Integrated-At**: (left blank by task-engineer; written by `integrate-worktree` after a successful merge into the local trunk; format: trunk SHA after merge)
 - **Rejection Count**: 0 (max 5; quality-reviewer increments on reject; after 5th rejection, task-engineer redesigns)
 - **Created By**: task-engineer
 - **Created At**: $(date +"%Y-%m-%d %H:%M:%S") UTC
@@ -106,6 +107,20 @@
 ```
 
 Quality-reviewer auto-rejects any task in `.backlog/in-review/` whose transition log lacks at least one `clean-checkout | ok` line.
+
+**Integration token (default mode, written by `integrate-worktree` after FF-merge into local trunk)**:
+
+```
+| <UTC ts> | accepted | accepted | integrate-worktree | <slug> | <trunk-sha-after> | integrated |
+```
+
+If the task could not be auto-merged because a rebase conflict could not be resolved, `integrate-worktree` instead increments `Rejection Count`, moves the file to `.backlog/rejected/`, and appends:
+
+```
+| <UTC ts> | accepted | rejected | integrate-worktree | <slug> | conflict-unresolved by <agent> |
+```
+
+The existing rejection/retry/block machinery picks up from there.
 
 ## Implementation Notes
 
@@ -254,7 +269,7 @@ nothing to commit, working tree clean
 
 ## Git Commit Protocol
 
-**Where commits land**: task-engineer commits on `main` (creating tasks in `.backlog/pending/`). Implementer specialists and quality-reviewer commit inside the worktree on `worktree/<slug>`; integration to `main` is a project-decided step (PR via `gh pr create` or fast-forward merge) and is outside the per-task workflow.
+**Where commits land**: task-engineer commits on the trunk branch (the branch checked out at the repo root) when creating tasks in `.backlog/pending/`. Implementer specialists and quality-reviewer commit inside the worktree on `worktree/<slug>`. Integration into the local trunk is performed automatically by `/go`'s `integrate-worktree` skill at the end of each iteration (default mode), or skipped in favor of project-defined PR creation if `CLAUDE.md` directs otherwise.
 
 ### When Creating Task (task-engineer)
 

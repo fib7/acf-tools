@@ -55,23 +55,31 @@ if [ -z "$SLUG" ]; then
 fi
 ```
 
-### Step 2: Derive paths
+### Step 2: Derive paths and resolve trunk
 
 One rule, no free-form names. Mismatch is a fatal error.
 
+`$ACFW_TRUNK_ROOT` and `$ACFW_TRUNK_BRANCH` are exported by `/go` at startup (the branch checked out at the repo root). If they are not set, the agent is running this skill outside `/go`'s orchestration — fall back to `git rev-parse --show-toplevel` and the current HEAD's branch name.
+
 ```bash
-REPO_ROOT=$(git rev-parse --show-toplevel)
+REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}"
+TRUNK_BRANCH="${ACFW_TRUNK_BRANCH:-$(git -C "$REPO_ROOT" symbolic-ref --short HEAD 2>/dev/null)}"
 WORKTREE_PATH="$REPO_ROOT/.worktree/$SLUG"
 BRANCH="worktree/$SLUG"
+
+if [ -z "$TRUNK_BRANCH" ]; then
+  echo "FATAL: cannot resolve trunk branch (HEAD detached?). Refuse to create worktree." >&2
+  exit 5
+fi
 ```
 
 ### Step 3: Lazy-create the worktree
 
-If the worktree directory does not exist, create it. If `git worktree add` fails because the branch already exists in another worktree, the failure is the lock: stop and report.
+If the worktree directory does not exist, create it based on the local trunk branch. If `git worktree add` fails because the branch already exists in another worktree, the failure is the lock: stop and report.
 
 ```bash
 if [ ! -d "$WORKTREE_PATH" ]; then
-  if ! git worktree add "$WORKTREE_PATH" -b "$BRANCH" origin/main 2>/tmp/worktree-err; then
+  if ! git -C "$REPO_ROOT" worktree add "$WORKTREE_PATH" -b "$BRANCH" "$TRUNK_BRANCH" 2>/tmp/worktree-err; then
     echo "FATAL: cannot create worktree for $SLUG. Likely another agent owns branch $BRANCH." >&2
     cat /tmp/worktree-err >&2
     exit 2
@@ -92,16 +100,16 @@ if [ "$ACTUAL_BRANCH" != "$BRANCH" ]; then
 fi
 ```
 
-### Step 5: Sync to origin/main (fast-forward only)
+### Step 5: Sync to local trunk (fast-forward only)
 
-Picks up any work merged to main while this worktree was idle. Fast-forward only; never rebases or merges (those are integration concerns, not concurrency concerns).
+Picks up any sibling worktrees' commits already integrated into the local trunk by `/go`'s integration step. Fast-forward only; never rebases or merges in this skill (rebase + intelligent conflict resolution belong to the `integrate-worktree` skill at integration time, not here).
 
 ```bash
-git -C "$WORKTREE_PATH" fetch origin main --quiet
-if ! git -C "$WORKTREE_PATH" merge --ff-only origin/main 2>/tmp/ff-err; then
-  echo "WARN: cannot fast-forward $BRANCH to origin/main. Branch has diverged." >&2
+git -C "$WORKTREE_PATH" fetch "$REPO_ROOT" "$TRUNK_BRANCH:refs/acfw/trunk-snapshot" --quiet
+if ! git -C "$WORKTREE_PATH" merge --ff-only refs/acfw/trunk-snapshot 2>/tmp/ff-err; then
+  echo "WARN: cannot fast-forward $BRANCH to $TRUNK_BRANCH. Branch has diverged." >&2
   cat /tmp/ff-err >&2
-  echo "Continue with caution; reviewer will see the divergence at integration time." >&2
+  echo "Continue with caution; integrate-worktree will rebase + resolve at integration time." >&2
 fi
 ```
 
@@ -150,6 +158,7 @@ echo "$WORKTREE_PATH"
 | 2 | `git worktree add` failed: branch in use elsewhere | Defer; another agent owns this slug. Try a different task. |
 | 3 | Worktree exists but is on the wrong branch | Stop, report; manual intervention required |
 | 4 (reserved) | Repo root not resolvable | Misconfigured project; report to operator |
+| 5 | Trunk branch not resolvable (detached HEAD) | Refuse; operator must check out a branch at the repo root |
 
 The skill never modifies `main`. It never deletes worktrees. It never force-pushes. Cleanup is an operator concern (run `git worktree remove` after the branch is integrated).
 
@@ -167,7 +176,7 @@ After this skill returns, the agent:
 6. quality-reviewer invokes this skill (idempotent: worktree exists, OK token already logged from Step 7 of the prior call; the reviewer's call validates branch and re-logs a fresh OK token).
 7. quality-reviewer moves to `.backlog/in-review/` in the worktree, reviews, moves to `.backlog/accepted/` or `.backlog/rejected/`.
 
-Integration of `worktree/<slug>` into `main` (PR via `gh pr create` or fast-forward merge) is a project-decided step outside this skill's scope. The skill produces a clean branch ready to integrate; the project's CLAUDE.md says how integration happens.
+Integration of `worktree/<slug>` into the local trunk is performed by `/go`'s `integrate-worktree` skill at the end of each iteration: fast-forward by default, with rebase + specialist-driven conflict resolution as fallback. If the project's CLAUDE.md (or other persistent agent instructions) directs a different integration strategy — e.g. opening a PR per `PR Group:` via `gh pr create` — the orchestrator follows those instructions instead, per Claude's instruction-priority hierarchy.
 
 ---
 
