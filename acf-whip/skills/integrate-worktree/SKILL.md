@@ -11,6 +11,36 @@ allowed-tools:
 
 Single-slug integration primitive. The orchestrator (`/go`) calls this once per accepted-but-unintegrated task, sequentially, in dependency-topological order. Specialists never call this — they never write to trunk's `.git/index`.
 
+### Lock-file backoff (used throughout this skill)
+
+Every git invocation against trunk's index or a worktree's index goes through this helper. The lock file is **never removed**; we sleep and retry, letting the holding process finish.
+
+```bash
+git_with_lock_backoff() {
+  local attempt=0 max=3 delay=1 rc
+  while [ $attempt -lt $max ]; do
+    if git "$@" 2>/tmp/acfw-git-err; then
+      return 0
+    fi
+    rc=$?
+    if grep -qE 'index\.lock|Unable to create.*lock' /tmp/acfw-git-err; then
+      attempt=$((attempt + 1))
+      [ $attempt -ge $max ] && break
+      sleep $delay
+      delay=$((delay * 2))
+      continue
+    fi
+    cat /tmp/acfw-git-err >&2
+    return $rc
+  done
+  echo "FATAL: git lock contention persisted; another process holds .git/index.lock" >&2
+  cat /tmp/acfw-git-err >&2
+  return 99
+}
+```
+
+Backoff schedule: 1s → 2s → 4s, three attempts. Worst case ~7s before surfacing failure. `/go` treats exit 99 as a transient error and retries next iteration.
+
 The mechanism: fast-forward `worktree/<slug>` into the local trunk branch (captured at `/go` startup as `$ACFW_TRUNK_BRANCH` in `$ACFW_TRUNK_ROOT`). If FF is impossible because trunk has advanced, rebase the worktree onto trunk and retry FF. If the rebase produces conflicts, dispatch the task's `assigned_agent` as a conflict resolver in the worktree, with full context of the conflicting commits and their source tasks; on resolution, retry FF. If the resolver fails, route the task back to `.backlog/rejected/` so the existing retry/block machinery handles it.
 
 **Default applies unless project instructions override.** If the project's `CLAUDE.md` (or any other persistent agent instructions) directs a different integration strategy — e.g. "open a PR per PR Group via `gh pr create` instead of merging locally" — the orchestrator follows those instructions and does not invoke this skill, per Claude's instruction-priority hierarchy.
@@ -54,17 +84,18 @@ BRANCH="worktree/$SLUG"
 Cheap; no working-tree change in trunk.
 
 ```bash
-git -C "$ACFW_TRUNK_ROOT" fetch . "$BRANCH:refs/acfw/$SLUG" --quiet || {
-  echo "WARN: fetch $BRANCH failed; will retry next iteration" >&2
+if ! git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" fetch . "$BRANCH:refs/acfw/$SLUG" --quiet; then
+  rc=$?
+  echo "WARN: fetch $BRANCH failed (exit $rc); will retry next iteration" >&2
   exit 10  # transient; orchestrator leaves task accepted, retries next iter
-}
+fi
 ```
 
 ### Step 3: Try fast-forward into trunk
 
 ```bash
 TRUNK_SHA_BEFORE=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
-if git -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/$SLUG" 2>/tmp/ff-err; then
+if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/$SLUG"; then
   TRUNK_SHA_AFTER=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
   goto_success
 fi
@@ -77,11 +108,11 @@ If the merge succeeded → goto Step 7 (success). Otherwise fall through to reba
 The rebase happens inside the worktree, never on trunk.
 
 ```bash
-git -C "$WORKTREE" fetch "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH:refs/acfw/trunk-snapshot" --quiet
-if git -C "$WORKTREE" rebase refs/acfw/trunk-snapshot 2>/tmp/rebase-err; then
+git_with_lock_backoff -C "$WORKTREE" fetch "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH:refs/acfw/trunk-snapshot" --quiet
+if git_with_lock_backoff -C "$WORKTREE" rebase refs/acfw/trunk-snapshot; then
   # Clean rebase. Refresh refs/acfw/<slug> and retry FF.
-  git -C "$ACFW_TRUNK_ROOT" fetch . "$BRANCH:refs/acfw/$SLUG" --quiet --force
-  if git -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/$SLUG"; then
+  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" fetch . "$BRANCH:refs/acfw/$SLUG" --quiet --force
+  if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/$SLUG"; then
     TRUNK_SHA_AFTER=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
     goto_success
   fi
@@ -163,8 +194,8 @@ if grep -qE '^\| .* FATAL:' "$TASK_FILE"; then
 fi
 
 # Refresh and retry FF.
-git -C "$ACFW_TRUNK_ROOT" fetch . "$BRANCH:refs/acfw/$SLUG" --quiet --force
-if git -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/$SLUG"; then
+git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" fetch . "$BRANCH:refs/acfw/$SLUG" --quiet --force
+if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/$SLUG"; then
   TRUNK_SHA_AFTER=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
   goto_success
 fi
@@ -189,8 +220,8 @@ printf '| %s | accepted | rejected | integrate-worktree | %s | %s |\n' "$TS" "$S
 
 # Move on the trunk's filesystem (orchestrator owns trunk; this is allowed)
 mv "$TASK_FILE" "$ACFW_TRUNK_ROOT/.backlog/rejected/$(basename "$TASK_FILE")"
-git -C "$ACFW_TRUNK_ROOT" add ".backlog/accepted/$(basename "$TASK_FILE")" ".backlog/rejected/$(basename "$TASK_FILE")"
-git -C "$ACFW_TRUNK_ROOT" commit -m "integrate: reject $TASK_ID ($REASON)" --quiet
+git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" add ".backlog/accepted/$(basename "$TASK_FILE")" ".backlog/rejected/$(basename "$TASK_FILE")"
+git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" commit -m "integrate: reject $TASK_ID ($REASON)" --quiet
 exit 6
 ```
 
@@ -214,16 +245,16 @@ rm -f "$TASK_FILE_ON_TRUNK.bak"
 printf '| %s | accepted | accepted | integrate-worktree | %s | %s | integrated |\n' \
   "$TS" "$SLUG" "$TRUNK_SHA_AFTER" >> "$TASK_FILE_ON_TRUNK"
 
-git -C "$ACFW_TRUNK_ROOT" add ".backlog/accepted/$(basename "$TASK_FILE")"
-git -C "$ACFW_TRUNK_ROOT" commit -m "integrate: $TASK_ID ($SLUG -> $ACFW_TRUNK_BRANCH)" --quiet
+git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" add ".backlog/accepted/$(basename "$TASK_FILE")"
+git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" commit -m "integrate: $TASK_ID ($SLUG -> $ACFW_TRUNK_BRANCH)" --quiet
 
 # Cleanup: remove worktree iff no more pending/in-progress tasks share the slug
 REMAINING=$(grep -lE "^- \*\*Worktree\*\*:[[:space:]]*$SLUG[[:space:]]*\$" \
   "$ACFW_TRUNK_ROOT/.backlog/pending/"*.md \
   "$ACFW_TRUNK_ROOT/.backlog/in-progress/"*.md 2>/dev/null | wc -l)
 if [ "$REMAINING" -eq 0 ]; then
-  git -C "$ACFW_TRUNK_ROOT" worktree remove --force "$WORKTREE" 2>/dev/null || true
-  git -C "$ACFW_TRUNK_ROOT" branch -d "$BRANCH" 2>/dev/null || true
+  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" worktree remove --force "$WORKTREE" 2>/dev/null || true
+  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" branch -d "$BRANCH" 2>/dev/null || true
 fi
 
 exit 0
@@ -239,6 +270,7 @@ exit 0
 | 1 | Task missing `Worktree:` field | Programmer error in task-engineer; surface to operator |
 | 6 | Conflict could not be resolved | Task is now in `.backlog/rejected/`; existing retry path takes over next iteration |
 | 10 | Transient git error (fetch/network) | Leave task in `accepted/`; retry next iteration |
+| 99 | Lock contention persisted past backoff (`.git/index.lock` held by another process for >7s) | Treat as transient; leave task in `accepted/`; retry next iteration |
 
 The skill never modifies any worktree other than the slug it was called with. It never force-pushes. It never abandons trunk in a partially-merged state — every mutation is one atomic `merge --ff-only` followed by an atomic file move + commit.
 

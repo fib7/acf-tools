@@ -10,22 +10,33 @@ pending → in-progress → completed → in-review → [accepted|rejected]
 
 ## State Transition Authority
 
-| From | To | WHO moves file & updates transition log |
-|------|----|-----------------------------------------|
-| N/A | pending | task-engineer |
-| pending | in-progress | Implementer agent |
-| in-progress | blocked | Implementer agent |
-| blocked | in-progress | Implementer agent |
-| in-progress | completed | Implementer agent |
-| completed | in-review | quality-reviewer |
-| in-review | accepted | quality-reviewer |
-| in-review | rejected | quality-reviewer |
-| rejected | in-progress | Implementer agent (retry, max 5 attempts) |
+All `.backlog/` state moves happen at the **repo root** (`$ACFW_TRUNK_ROOT`) on the **trunk branch**. The orchestrator (`/go`) is the single writer of `.backlog/` files; specialists and quality-reviewer signal their decisions via the `ACFW-RESULT` marker in their Task() return, and the orchestrator performs the corresponding move + commit on trunk.
 
-**Retry limit**: Rejected tasks can return to in-progress up to 5 times. After 5th rejection, task-engineer must redesign or archive.
+| From | To | WHO performs the move (at root, on trunk) |
+|------|----|-------------------------------------------|
+| N/A | pending | task-engineer (creation, at root, never in a worktree) |
+| pending | in-progress | `/go` orchestrator (pre-move + commit before dispatching specialist) |
+| in-progress | completed | `/go` orchestrator on specialist's `transition: completed` signal |
+| in-progress | blocked | `/go` orchestrator on specialist's `transition: blocked` signal |
+| completed | in-review | `/go` orchestrator (pre-move before dispatching quality-reviewer) |
+| in-review | accepted | `/go` orchestrator on reviewer's `transition: accepted` signal |
+| in-review | rejected | `/go` orchestrator on reviewer's `transition: rejected` signal (also increments Rejection Count) |
+| rejected | pending | task-engineer (retry, at root); max 5 attempts |
+| blocked | pending | task-engineer (unblock when deps resolved, at root) |
+| rejected | blocked | task-engineer (redesign at >5 rejections, at root) |
 
-**File move + transition log update = ATOMIC** (same commit).
+**task-engineer never enters a worktree.** It never invokes `clean-checkout-before-task`. All its operations are on `.backlog/` at the repo root, committed to the trunk branch.
+
+**Specialists** still do code work inside `.worktree/<slug>` on `worktree/<slug>` — that is unchanged. Their commits on the worktree branch contain code only; they do NOT move task files and do NOT commit `.backlog/` changes on the worktree branch.
+
+**Retry limit**: Rejected tasks can return to in-progress up to 5 times. After 5th rejection, task-engineer redesigns (rejected → blocked) at root.
+
+**File move + transition log update = ATOMIC** (same commit on trunk).
 **Timestamp command**: `date +"%Y-%m-%d %H:%M:%S"` (never placeholder).
+
+## Git lock-file policy
+
+Every git command issued by acf-whip skills (orchestrator commits, worktree creation, FF merges, rebases, fetches, stashes) goes through a backoff helper. If `.git/index.lock` is held by another process, the helper sleeps and retries (1s → 2s → 4s, three attempts total, ~7s worst case). **The lock file is never removed.** After exhausting retries the operation surfaces exit code 99; the orchestrator treats it as transient and retries the affected operation next iteration.
 
 ## Concurrency Model
 

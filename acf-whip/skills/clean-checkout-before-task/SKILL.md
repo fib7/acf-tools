@@ -14,6 +14,36 @@ The mechanism: each task declares `Worktree: <slug>` in its front-matter. This s
 
 **The lock is git itself.** `git worktree add -b <branch>` fails when the branch is already checked out elsewhere; that failure is the mutual-exclusion primitive. No custom lock files, daemons, or schedulers.
 
+### Lock-file backoff (used throughout this skill)
+
+Git invocations that touch a shared `.git/index` (the trunk's, or this worktree's after creation) go through this helper. The lock file is **never removed** — we sleep and retry, letting the holding process finish.
+
+```bash
+git_with_lock_backoff() {
+  local attempt=0 max=3 delay=1 rc
+  while [ $attempt -lt $max ]; do
+    if git "$@" 2>/tmp/acfw-git-err; then
+      return 0
+    fi
+    rc=$?
+    if grep -qE 'index\.lock|Unable to create.*lock' /tmp/acfw-git-err; then
+      attempt=$((attempt + 1))
+      [ $attempt -ge $max ] && break
+      sleep $delay
+      delay=$((delay * 2))
+      continue
+    fi
+    cat /tmp/acfw-git-err >&2
+    return $rc
+  done
+  echo "FATAL: git lock contention persisted; another process holds .git/index.lock" >&2
+  cat /tmp/acfw-git-err >&2
+  return 99
+}
+```
+
+Backoff: 1s → 2s → 4s. After exhausting retries, the skill exits with code 99; the caller (orchestrator or specialist) treats this as a transient failure.
+
 ---
 
 ## When to invoke
@@ -22,7 +52,7 @@ The mechanism: each task declares `Worktree: <slug>` in its front-matter. This s
 |---|---|
 | Implementer specialist (backend, frontend, data, devops, infrastructure) | Step 0, before reading task implementation requirements |
 | quality-reviewer | Before moving the task to `.backlog/in-review/` |
-| task-engineer | Not required (creates files in `.backlog/pending/` only; no code mutation) |
+| task-engineer | **MUST NOT invoke.** task-engineer always operates on `.backlog/` at the repo root on the trunk branch — never inside a worktree. Creating, retrying, unblocking, or redesigning tasks all happen at root. |
 | research-agent, lean-architect, retro, precommit | Only if the task mutates code outside `docs/`. Set `Worktree:` on those tasks; otherwise skip. |
 
 ---
@@ -79,9 +109,10 @@ If the worktree directory does not exist, create it based on the local trunk bra
 
 ```bash
 if [ ! -d "$WORKTREE_PATH" ]; then
-  if ! git -C "$REPO_ROOT" worktree add "$WORKTREE_PATH" -b "$BRANCH" "$TRUNK_BRANCH" 2>/tmp/worktree-err; then
+  if ! git_with_lock_backoff -C "$REPO_ROOT" worktree add "$WORKTREE_PATH" -b "$BRANCH" "$TRUNK_BRANCH"; then
+    rc=$?
+    [ $rc -eq 99 ] && exit 99
     echo "FATAL: cannot create worktree for $SLUG. Likely another agent owns branch $BRANCH." >&2
-    cat /tmp/worktree-err >&2
     exit 2
   fi
 fi
@@ -105,10 +136,9 @@ fi
 Picks up any sibling worktrees' commits already integrated into the local trunk by `/go`'s integration step. Fast-forward only; never rebases or merges in this skill (rebase + intelligent conflict resolution belong to the `integrate-worktree` skill at integration time, not here).
 
 ```bash
-git -C "$WORKTREE_PATH" fetch "$REPO_ROOT" "$TRUNK_BRANCH:refs/acfw/trunk-snapshot" --quiet
-if ! git -C "$WORKTREE_PATH" merge --ff-only refs/acfw/trunk-snapshot 2>/tmp/ff-err; then
+git_with_lock_backoff -C "$WORKTREE_PATH" fetch "$REPO_ROOT" "$TRUNK_BRANCH:refs/acfw/trunk-snapshot" --quiet
+if ! git_with_lock_backoff -C "$WORKTREE_PATH" merge --ff-only refs/acfw/trunk-snapshot; then
   echo "WARN: cannot fast-forward $BRANCH to $TRUNK_BRANCH. Branch has diverged." >&2
-  cat /tmp/ff-err >&2
   echo "Continue with caution; integrate-worktree will rebase + resolve at integration time." >&2
 fi
 ```
@@ -120,7 +150,7 @@ Pre-commit hooks that stash/unstash are no longer a problem because each worktre
 ```bash
 TASK_ID=$(basename "$TASK_FILE" .md)
 if [ -n "$(git -C "$WORKTREE_PATH" status --porcelain)" ]; then
-  git -C "$WORKTREE_PATH" stash push -u -m "pre-task-start: $TASK_ID" --quiet || true
+  git_with_lock_backoff -C "$WORKTREE_PATH" stash push -u -m "pre-task-start: $TASK_ID" --quiet || true
 fi
 ```
 
@@ -159,6 +189,7 @@ echo "$WORKTREE_PATH"
 | 3 | Worktree exists but is on the wrong branch | Stop, report; manual intervention required |
 | 4 (reserved) | Repo root not resolvable | Misconfigured project; report to operator |
 | 5 | Trunk branch not resolvable (detached HEAD) | Refuse; operator must check out a branch at the repo root |
+| 99 | Lock contention persisted past backoff (`.git/index.lock` held >7s) | Treat as transient; orchestrator may retry the dispatch next iteration |
 
 The skill never modifies `main`. It never deletes worktrees. It never force-pushes. Cleanup is an operator concern (run `git worktree remove` after the branch is integrated).
 
