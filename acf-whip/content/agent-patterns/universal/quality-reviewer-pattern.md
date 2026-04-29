@@ -100,27 +100,22 @@ This is a workflow violation that breaks the backlog state machine.
 
 ### Step 0: clean-checkout-before-task (MANDATORY)
 
-Invoke the `clean-checkout-before-task` skill before any review action. This is idempotent: if the implementer already created `.worktree/<slug>`, the skill validates the existing worktree and re-logs an OK token. All subsequent state moves and commits happen inside the worktree on `worktree/<slug>`.
+Invoke the `clean-checkout-before-task` skill with `TASK_FILE` = the **root** path the orchestrator handed you (e.g. `$ACFW_TRUNK_ROOT/.backlog/in-review/<file>.md`). The skill is idempotent: it validates the existing worktree the implementer used and re-logs an OK token. **You do not move task files. You do not commit on `worktree/<slug>` for the task file.** The orchestrator performs the in-review→accepted/rejected move at root after you return.
 
 ### Step 0.5: Verify clean-checkout token from implementer
 
-Before reading the task body, grep the transition log for at least one `clean-checkout | ok` line written by the implementer. If absent, **auto-reject without further review**. Reason: "missing clean-checkout token; implementer did not invoke clean-checkout-before-task". Increment rejection_count, move to `.backlog/rejected/`, commit on `worktree/<slug>`.
+Before reading the task body, grep the transition log (in the root file) for at least one `clean-checkout | ok` line written by the implementer. If absent, **auto-reject** by returning the ACFW-RESULT marker with `transition: rejected` and `notes: "missing clean-checkout token; implementer did not invoke clean-checkout-before-task"`. Set `rejection_increment: 1`. The orchestrator will perform the move and increment.
 
 ### Step 1: Get Timestamp
 ```bash
 date +"%Y-%m-%d %H:%M:%S"
 ```
 
-### Step 2: Move to In-Review
-```bash
-mv .backlog/completed/{task-file}.md .backlog/in-review/
-```
+### Step 2: (no manual move)
+The orchestrator already moved the task `completed → in-review` at root before dispatching you. Skip.
 
-### Step 3: Log Review Start
-Update task file transition log:
-```markdown
-| 2025-11-07 14:30:00 | completed | in-review | quality-reviewer | Starting quality review |
-```
+### Step 3: Read the task at the root path
+Read the task body from the root file (`$TASK_FILE` argument). Do not duplicate or rewrite the transition log — the orchestrator appends transition entries when applying ACFW-RESULT.
 
 ### Step 4: Verify Acceptance Criteria
 Check ALL checkboxes in task file:
@@ -177,48 +172,38 @@ date +"%Y-%m-%d %H:%M:%S"
 
 ### Step 10: Binary Decision
 
-All file moves and commits in this step happen inside `.worktree/<slug>` on branch `worktree/<slug>`. The worktree was already created by the implementer; you re-entered it via Step 0.
+You **do not move the task file** and you **do not commit on `worktree/<slug>` for the task file**. You add quality review comments directly to the root task file (write the file at its root path; that's safe — only one reviewer per slug at a time per the orchestrator's partition), then return the ACFW-RESULT marker as the last block of your response. The orchestrator parses the marker and performs the in-review→accepted/rejected move at the repo root.
 
 #### If Accepting:
-1. Update transition log:
-```markdown
-| 2025-11-07 14:45:00 | in-review | accepted | quality-reviewer | All criteria met, quality gates passed |
+
 ```
-2. Move to accepted (inside the worktree):
-```bash
-mv .backlog/in-review/{task-file}.md .backlog/accepted/
-```
-3. Commit on `worktree/<slug>`:
-```bash
-git add .backlog/accepted/{task-file}.md
-git commit -m "review: accept {task-id}"
+ACFW-RESULT:
+  transition: accepted
+  commit_sha: n/a
+  rejection_increment: 0
+  notes: All criteria met, quality gates passed
 ```
 
 #### If Rejecting:
-1. Increment `rejection_count` in task metadata
-2. Add detailed quality review comments section
-3. Update transition log:
-```markdown
-| 2025-11-07 14:45:00 | in-review | rejected | quality-reviewer | Coverage below threshold (75% vs 85% required). Failure: [specific issues] |
+
+Add detailed quality review comments to the root task file (under the "Quality Review Comments" section), then return:
+
 ```
-4. Move to rejected (inside the worktree):
-```bash
-mv .backlog/in-review/{task-file}.md .backlog/rejected/
-```
-5. Commit on `worktree/<slug>`:
-```bash
-git add .backlog/rejected/{task-file}.md
-git commit -m "review: reject {task-id} - {brief-reason}"
+ACFW-RESULT:
+  transition: rejected
+  commit_sha: n/a
+  rejection_increment: 1
+  notes: Coverage below threshold (75% vs 85% required); see review comments for details
 ```
 
-Your job ends here. Integration of `worktree/<slug>` into the local trunk is owned by `/go`'s `integrate-worktree` skill, invoked by the orchestrator after dispatch returns. You never touch the trunk's `.git/index`. (If the project's `CLAUDE.md` directs PR-based integration instead, the orchestrator follows that — still none of your concern.)
+Your job ends here. The orchestrator performs the file move + `git mv` + commit on the trunk branch at root, and increments `Rejection Count` if you set `rejection_increment: 1`. Integration of `worktree/<slug>` (code) into the local trunk is also orchestrator-owned, via the `integrate-worktree` skill. You never touch trunk's `.git/index`. (If the project's `CLAUDE.md` directs PR-based integration instead, the orchestrator follows that — still none of your concern.)
 
-### Step 11: MANDATORY Terminal State Confirmation
-**Verify**:
-- Task is in `.backlog/accepted/` OR `.backlog/rejected/`
-- Task is NOT in `.backlog/in-review/`
-- Transition log has final state
-- Commit completed
+### Step 11: MANDATORY Marker Emission
+**Verify before returning**:
+- Your response ends with the ACFW-RESULT marker block (above).
+- `transition` is exactly `accepted` or `rejected`.
+- For rejection, `rejection_increment: 1` and the rejection reason is captured in `notes` (one line) plus the Quality Review Comments section in the task file.
+- You did NOT move the task file. You did NOT commit task-file changes on `worktree/<slug>`.
 
 ## Evidence Requirements
 

@@ -49,9 +49,9 @@ color: yellow
 
 ## Workflow Protocol
 
-**Step 0 (MANDATORY before any edit)**: Invoke the `clean-checkout-before-task` skill. It resolves the task's `Worktree:` slug, lazy-creates `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and logs `clean-checkout: ok` to the task transition log. Without that token, quality-reviewer auto-rejects.
+**Step 0 (MANDATORY before any edit)**: Invoke the `clean-checkout-before-task` skill with `TASK_FILE` = the root path the orchestrator handed you. It resolves the task's `Worktree:` slug, lazy-creates `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and appends `clean-checkout: ok` to the task transition log (in the root file). Without that token, quality-reviewer auto-rejects.
 
-After Step 0 succeeds, all reads, edits, state moves, and commits happen inside the worktree on `worktree/<slug>`. Never commit on `main`.
+After Step 0 succeeds, all CODE reads, edits, and commits happen inside the worktree on `worktree/<slug>`. **Do NOT move the task file. Do NOT commit any `.backlog/` changes on `worktree/<slug>`.** The orchestrator owns all `.backlog/` state moves at root. End your response with the ACFW-RESULT marker (`transition: completed | blocked`).
 
 ## Authority
 

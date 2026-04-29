@@ -50,8 +50,8 @@
     },
     {
       "name": "acf-whip",
-      "description": "Hostile workflow enforcer. Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates. Concurrency-safe: parallel across worktrees, sequential within a worktree. Autonomous integration: /go folds accepted worktrees into the local trunk each iteration with intelligent specialist-driven conflict resolution; dependency-gated dispatch ensures dependents only start from a codebase containing all integrated dependencies.",
-      "version": "1.2.1",
+      "description": "Hostile workflow enforcer. Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates. Concurrency-safe: parallel across worktrees, sequential within a worktree. Autonomous integration: /go folds accepted worktrees into the local trunk each iteration with intelligent specialist-driven conflict resolution; dependency-gated dispatch ensures dependents only start from a codebase containing all integrated dependencies. Backlog state synchronizes at the repo root: task-engineer always operates at root, and the orchestrator owns all .backlog/ state moves on the trunk branch. Lock-file backoff: never removes .git/index.lock; sleeps and retries (1s→2s→4s) when contended.",
+      "version": "1.2.2",
       "author": {
         "name": "ACF Tools Team",
         "email": "acf@fib7.ai"

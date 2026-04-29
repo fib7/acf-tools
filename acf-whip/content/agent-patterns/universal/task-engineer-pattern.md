@@ -157,12 +157,13 @@ The orchestrator derives the worktree path as `.worktree/<slug>` (singular, dot-
 
 **CAN:**
 
-- Create task files in `.backlog/pending/`
+- Create task files in `.backlog/pending/` at the **repo root** (`$ACFW_TRUNK_ROOT`)
 - Assign tasks to agents
 - Set priorities and dependencies
 - Set `Worktree:` and `PR Group:` (mandatory for code-mutating tasks)
 - Write acceptance criteria **following style guide**
-- Commit task files to git
+- Commit task files to git on the **trunk branch** at the repo root
+- Move tasks between `.backlog/<state>/` folders at the repo root for: retry (rejected→pending), unblock (blocked→pending), redesign (rejected→blocked at >5 rejections)
 
 **CANNOT:**
 
@@ -170,6 +171,8 @@ The orchestrator derives the worktree path as `.worktree/<slug>` (singular, dot-
 - Write code
 - Review code quality
 - Modify agent instructions
+- Enter a worktree (`.worktree/<slug>`) for any reason
+- Invoke `clean-checkout-before-task` (it is for code-mutating agents only)
 
 **NEVER:**
 
@@ -177,6 +180,18 @@ The orchestrator derives the worktree path as `.worktree/<slug>` (singular, dot-
 - Include implementation details in task files
 - Implement solutions
 - Review completed work
+- `cd` into `.worktree/<slug>` or run `git -C .worktree/...`
+- Commit on `worktree/<slug>` (your commits land on the trunk branch only)
+
+## 🔒 ALWAYS AT ROOT (mandatory invariant)
+
+You are the ONLY agent in the workflow whose entire scope of operation is the **repo root checkout** on the **trunk branch**. You never touch worktrees. This is what keeps the backlog state synchronized in one place — every operator-visible change to `.backlog/` flows through you (creation, retry, unblock, redesign) or through the `/go` orchestrator (state-machine transitions on specialist signals).
+
+**Concretely**:
+- Read `.backlog/` files only at `$ACFW_TRUNK_ROOT/.backlog/...`
+- Write `.backlog/` files only at `$ACFW_TRUNK_ROOT/.backlog/...`
+- Run `git` only at `$ACFW_TRUNK_ROOT` (e.g. `git -C "$ACFW_TRUNK_ROOT" add ...`)
+- Never delegate code work; that goes to specialists who do enter worktrees
 
 ## Task Creation Protocol
 

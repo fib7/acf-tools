@@ -75,19 +75,29 @@ See manifest for complete quality gate requirements: `docs/agents/{stack}-engine
 
 ## Integration Points
 
-**Receives From**: task-engineer via task files in `.backlog/pending/`
-**Delegates To**: quality-reviewer via completed tasks in `.backlog/completed/`
+**Receives From**: `/go` orchestrator. Orchestrator already moved the task `pending → in-progress` at the repo root before dispatching you, and passes `TASK_FILE` = the **root** path (e.g. `$ACFW_TRUNK_ROOT/.backlog/in-progress/<file>.md`).
+**Delegates To**: orchestrator. You return an ACFW-RESULT marker; the orchestrator schedules quality-reviewer on the next iteration.
 
 ## Workflow Protocol
 
-**Step 0 (MANDATORY before any edit)**: Invoke the `clean-checkout-before-task` skill. It resolves the task's `Worktree:` slug, lazy-creates `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and logs `clean-checkout: ok` to the task transition log. Without that token, quality-reviewer auto-rejects.
+**Step 0 (MANDATORY before any edit)**: Invoke the `clean-checkout-before-task` skill with `TASK_FILE` = the root path the orchestrator handed you. It resolves the task's `Worktree:` slug, lazy-creates `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and appends `clean-checkout: ok` to the task transition log (in the root file). Without that token, quality-reviewer auto-rejects.
 
-After Step 0 succeeds, all reads, edits, state moves, and commits happen inside the worktree on `worktree/<slug>`. Never commit on `main`.
+After Step 0 succeeds, all CODE reads, edits, and commits happen inside the worktree on `worktree/<slug>`. **Do NOT move the task file. Do NOT commit any `.backlog/` changes on `worktree/<slug>`.** The orchestrator owns all `.backlog/` state moves at root.
 
 1. Read Priority 1 docs from manifest
 2. Load task-specific docs based on navigation guidance
-3. Implement following manifest workflows
+3. Implement following manifest workflows (code only; commit code on `worktree/<slug>`)
 4. Run all quality gates
-5. Provide complete evidence
-6. Update task status and commit (inside the worktree on `worktree/<slug>`)
+5. Provide complete evidence (write evidence into the root task file directly)
+6. Return the ACFW-RESULT marker as the last block of your response:
+
+```
+ACFW-RESULT:
+  transition: completed | blocked
+  commit_sha: <sha of your final code commit on worktree/<slug>, or "n/a" if no commits>
+  rejection_increment: 0
+  notes: <one-line summary of what you did or why you blocked>
+```
+
+The orchestrator parses this and performs the in-progress → completed (or in-progress → blocked) move at root.
 ```

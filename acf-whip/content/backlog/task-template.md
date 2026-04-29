@@ -241,35 +241,39 @@ nothing to commit, working tree clean
 
 ### 2. Task Pickup (implementation agents)
 
-- MUST invoke `clean-checkout-before-task` as Step 0 (creates worktree, validates branch, logs OK token)
-- All subsequent edits, state moves, and commits happen inside the worktree on `worktree/<slug>` (never on `main`)
-- MUST add transition log entry BEFORE starting work
-- MUST commit task file when moving to in-progress
-- MUST update implementation notes during work (commit after each update to avoid conflicts)
-- MUST add evidence of completion
+- MUST invoke `clean-checkout-before-task` as Step 0 with `TASK_FILE` = the **root** path the orchestrator passed (creates worktree, validates branch, appends OK token to the root file)
+- All CODE reads, edits, and commits happen inside the worktree on `worktree/<slug>` (never on the trunk branch)
+- MUST NOT move task files between `.backlog/<state>/` folders — that's the orchestrator's job at root
+- MUST NOT commit `.backlog/` changes on `worktree/<slug>`
+- MUST add evidence of completion to the root task file (write the file directly at its root path)
+- MUST end response with the ACFW-RESULT marker (`transition: completed | blocked`)
 
 ### 3. Task Completion (implementation agents)
 
 - MUST check all acceptance criteria
 - MUST run quality gates and capture output (see docs/development/quality-gates.md)
-- MUST add evidence to task file BEFORE marking complete
-- MUST update transition log
-- MUST commit task file + implementation files together (atomic commit)
+- MUST add evidence to the root task file BEFORE returning the marker
+- MUST commit code (and only code) on `worktree/<slug>`
+- MUST return ACFW-RESULT with the final code commit SHA
 
 ### 4. Quality Review (quality-reviewer)
 
 - MUST invoke `clean-checkout-before-task` as Step 0 (idempotent; validates the worktree the implementer used)
-- MUST verify the transition log contains at least one `clean-checkout | ok` line; auto-reject if absent
-- MUST add review comments in designated section
-- MUST update transition log with decision
-- MUST commit task file with review (inside the worktree on `worktree/<slug>`)
-- MUST provide specific feedback if rejected
+- MUST verify the transition log contains at least one `clean-checkout | ok` line; emit `transition: rejected` with `rejection_increment: 1` if absent
+- MUST add review comments in designated section of the root task file
+- MUST end response with the ACFW-RESULT marker (`transition: accepted | rejected`)
+- MUST NOT move the task file (the orchestrator performs the in-review→accepted/rejected move at root)
+- MUST provide specific feedback in `notes` and the Quality Review Comments section if rejecting
 
 ---
 
 ## Git Commit Protocol
 
-**Where commits land**: task-engineer commits on the trunk branch (the branch checked out at the repo root) when creating tasks in `.backlog/pending/`. Implementer specialists and quality-reviewer commit inside the worktree on `worktree/<slug>`. Integration into the local trunk is performed automatically by `/go`'s `integrate-worktree` skill at the end of each iteration (default mode), or skipped in favor of project-defined PR creation if `CLAUDE.md` directs otherwise.
+**Where commits land**:
+- **task-engineer** commits on the trunk branch at the repo root (`.backlog/pending/` creations, retry/unblock/redesign moves). NEVER enters a worktree.
+- **`/go` orchestrator** commits all `.backlog/` state-machine moves on the trunk branch at the repo root (pending→in-progress, in-progress→completed/blocked, completed→in-review, in-review→accepted/rejected, accepted→accepted with `Integrated-At:`).
+- **Implementer specialists and quality-reviewer** commit only **code** inside `.worktree/<slug>` on `worktree/<slug>`. They do NOT move task files and do NOT commit `.backlog/` changes on the worktree branch — they signal state via the ACFW-RESULT marker; the orchestrator performs the move at root.
+- **`integrate-worktree`** (orchestrator-driven, default mode) FF-merges `worktree/<slug>` into the trunk branch at the end of each iteration. Override via `CLAUDE.md` (e.g. PR-per-group) is honored automatically.
 
 ### When Creating Task (task-engineer)
 

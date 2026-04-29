@@ -82,6 +82,98 @@ fi
 echo "🌳 Trunk: $ACFW_TRUNK_BRANCH @ $ACFW_TRUNK_SHA_AT_START"
 ```
 
+## Backlog state lives at root (single writer)
+
+The orchestrator (this skill, running as the parent agent at `$ACFW_TRUNK_ROOT` on the trunk branch) is the **only writer of `.backlog/` files**. Specialists and quality-reviewer **do not** move task files between state folders; they signal their decision via the `ACFW-RESULT` marker (defined below) on Task() return. The orchestrator parses the marker, performs the file move + `git mv` + commit on the trunk branch, then continues.
+
+**task-engineer transitions** (creation N/A→pending, retry rejected→pending, unblock blocked→pending, redesign rejected→blocked at >5 rejections) are likewise performed at root. task-engineer never invokes `clean-checkout-before-task` and never enters a worktree.
+
+**Specialists** still do code work in their worktrees on `worktree/<slug>` (no change). Their commits on the worktree branch contain code only; no `.backlog/` deltas.
+
+### ACFW-RESULT marker
+
+Every implementer specialist and quality-reviewer ends its Task() output with a single marker block parsed by the orchestrator:
+
+```
+ACFW-RESULT:
+  transition: completed | blocked | accepted | rejected
+  commit_sha: <sha on worktree/<slug>, or "n/a">
+  rejection_increment: 0 | 1
+  notes: <one-line reason; becomes the transition-log Reason field>
+```
+
+`transition` is one of:
+- `completed` (implementer finished implementation; orchestrator moves pending→completed at root, then schedules quality-reviewer)
+- `blocked` (implementer hit an unresolvable blocker mid-work; orchestrator moves in-progress→blocked at root)
+- `accepted` (quality-reviewer accepted; orchestrator moves in-review→accepted at root)
+- `rejected` (quality-reviewer rejected; orchestrator moves in-review→rejected at root and increments Rejection Count)
+
+If the marker is missing or malformed, the orchestrator treats the dispatch as a transient failure (leave task in current state, retry next iteration).
+
+### Lock-file backoff helper
+
+Used for the orchestrator's own `git mv`/`git commit` operations on trunk:
+
+```bash
+git_with_lock_backoff() {
+  local attempt=0 max=3 delay=1 rc
+  while [ $attempt -lt $max ]; do
+    if git "$@" 2>/tmp/acfw-git-err; then
+      return 0
+    fi
+    rc=$?
+    if grep -qE 'index\.lock|Unable to create.*lock' /tmp/acfw-git-err; then
+      attempt=$((attempt + 1))
+      [ $attempt -ge $max ] && break
+      sleep $delay
+      delay=$((delay * 2))
+      continue
+    fi
+    cat /tmp/acfw-git-err >&2
+    return $rc
+  done
+  echo "FATAL: git lock contention persisted; another process holds .git/index.lock" >&2
+  cat /tmp/acfw-git-err >&2
+  return 99
+}
+```
+
+Backoff: 1s → 2s → 4s. Never `rm` the lock; let the holding process finish.
+
+### Orchestrator move primitive
+
+After every Task() return, parse the marker and perform the move at root:
+
+```bash
+acfw_apply_result() {
+  local task_file="$1" from_state="$2" result="$3"
+  local transition reject_inc notes new_state
+  transition=$(echo "$result" | sed -nE 's/^[[:space:]]*transition:[[:space:]]*([a-z]+).*/\1/p')
+  reject_inc=$(echo "$result" | sed -nE 's/^[[:space:]]*rejection_increment:[[:space:]]*([0-9]+).*/\1/p')
+  notes=$(echo "$result" | sed -nE 's/^[[:space:]]*notes:[[:space:]]*(.*)/\1/p')
+  case "$transition" in
+    completed) new_state=completed ;;
+    blocked)   new_state=blocked   ;;
+    accepted)  new_state=accepted  ;;
+    rejected)  new_state=rejected  ;;
+    *) echo "WARN: missing/invalid ACFW-RESULT for $(basename "$task_file"); transient retry next iter" >&2; return 1 ;;
+  esac
+  local fname=$(basename "$task_file")
+  local TS=$(date -u +"%Y-%m-%d %H:%M:%S")
+  if [ "$reject_inc" = "1" ] && [ "$transition" = "rejected" ]; then
+    local rc=$(grep -E '^- \*\*Rejection Count\*\*:' "$task_file" | sed -E 's/.*Rejection Count\*\*:[[:space:]]*([0-9]+).*/\1/')
+    rc=${rc:-0}
+    sed -i.bak -E "s/^- \*\*Rejection Count\*\*:.*/- **Rejection Count**: $((rc + 1))/" "$task_file" && rm -f "$task_file.bak"
+  fi
+  printf '| %s | %s | %s | %s | %s |\n' "$TS" "$from_state" "$new_state" "${ASSIGNED_AGENT:-orchestrator}" "$notes" >> "$task_file"
+  mv "$task_file" "$ACFW_TRUNK_ROOT/.backlog/$new_state/$fname"
+  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" add ".backlog/$from_state/$fname" ".backlog/$new_state/$fname"
+  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" commit -m "task: $fname $from_state -> $new_state" --quiet
+}
+```
+
+Used after every specialist and quality-reviewer dispatch.
+
 ---
 
 ## Loop Implementation
@@ -149,7 +241,7 @@ gofmt -w .
 goimports -w . 2>/dev/null || true
 go mod tidy
 go test ./... || true  # Don't fail on test errors
-git stash push -m "acf-whip-go-autofixes" || true
+git_with_lock_backoff stash push -m "acf-whip-go-autofixes" || true
 ```
 
 ### Python
@@ -158,7 +250,7 @@ git stash push -m "acf-whip-go-autofixes" || true
 echo "🔧 Auto-fixing quality gates (Python)..."
 ruff check . --fix || true
 ruff format . || true
-git stash push -m "acf-whip-go-autofixes" || true
+git_with_lock_backoff stash push -m "acf-whip-go-autofixes" || true
 ```
 
 ### Node.js/TypeScript
@@ -167,7 +259,7 @@ git stash push -m "acf-whip-go-autofixes" || true
 echo "🔧 Auto-fixing quality gates (Node.js)..."
 npm run lint -- --fix 2>/dev/null || true
 npm run format 2>/dev/null || true
-git stash push -m "acf-whip-go-autofixes" || true
+git_with_lock_backoff stash push -m "acf-whip-go-autofixes" || true
 ```
 
 ### Next.js/React
@@ -177,7 +269,7 @@ echo "🔧 Auto-fixing quality gates (Next.js)..."
 pnpm lint --fix 2>/dev/null || true
 pnpm format 2>/dev/null || true
 rm -rf .next 2>/dev/null || true  # Clear build cache
-git stash push -m "acf-whip-go-autofixes" || true
+git_with_lock_backoff stash push -m "acf-whip-go-autofixes" || true
 ```
 
 **Purpose**: Eliminate trivial quality gate failures (formatting, linting) before processing tasks.
@@ -276,8 +368,9 @@ In override (PR) mode, where there is no `Integrated-At:` field because no auto-
 #### D. Review Completed Tasks (MANDATORY)
 
 For each task in `.backlog/completed/`:
-1. **MANDATORY**: Trigger quality review
-2. quality-reviewer moves to accepted/rejected
+1. **Orchestrator** at root: pre-move completed→in-review (atomic mv + commit on trunk).
+2. Dispatch quality-reviewer with `TASK_FILE=$ACFW_TRUNK_ROOT/.backlog/in-review/<file>.md`.
+3. On Task() return, orchestrator parses ACFW-RESULT and applies in-review→accepted or in-review→rejected via `acfw_apply_result`.
 
 ```javascript
 {
@@ -390,27 +483,51 @@ return 0
 
 For each task in `DISPATCH_QUEUE`, spawn the assigned specialist. All spawns happen in parallel because each operates on a distinct `Worktree:` slug, hence a distinct branch and worktree. There is no shared `.git/index` between them.
 
-Use a single message with one Task call per `DISPATCH_QUEUE` entry:
+The orchestrator pre-moves each task `pending → in-progress` at root (single writer, atomic), then dispatches:
+
+```bash
+for f in "${DISPATCH_QUEUE[@]}"; do
+  fname=$(basename "$f")
+  TS=$(date -u +"%Y-%m-%d %H:%M:%S")
+  printf '| %s | pending | in-progress | orchestrator | dispatch |\n' "$TS" >> "$f"
+  mv "$f" "$ACFW_TRUNK_ROOT/.backlog/in-progress/$fname"
+  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" add ".backlog/pending/$fname" ".backlog/in-progress/$fname"
+  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" commit -m "task: $fname pending -> in-progress" --quiet
+done
+```
+
+Then issue Task() calls in a single message (one per slug), passing the **root path** as `TASK_FILE`. The specialist prompt explicitly forbids moving the task file:
 
 ```markdown
-Agent 1 (Worktree: alpha): go-engineer for implement feature-003
-Agent 2 (Worktree: beta): react-engineer for implement feature-007
-Agent 3 (Worktree: gamma): quality-reviewer for review feature-004
+Agent 1 (Worktree: alpha): go-engineer
+  TASK_FILE=$ACFW_TRUNK_ROOT/.backlog/in-progress/feature-003.md
+  Rules: invoke clean-checkout-before-task as Step 0; do code work
+  inside .worktree/alpha; do NOT move the task file or commit any
+  .backlog/ changes; end your response with the ACFW-RESULT marker.
+Agent 2 (Worktree: beta): react-engineer (same rules)
+Agent 3 (Worktree: gamma): quality-reviewer (same rules; transition is accepted | rejected)
 ```
+
+After all Task() calls return, the orchestrator parses each agent's ACFW-RESULT marker and calls `acfw_apply_result` to perform the corresponding `.backlog/` move at root (in-progress→completed, or accepted→rejected, etc.).
 
 **Within-group serialization**: tasks sharing a slug are NOT dispatched in the same iteration; they wait until the in-progress task in their slug terminates.
 
 ### Agent Type Selection
 
-| Transition | Agent Type | Purpose | Honors Worktree partition? |
-|------------|------------|---------|----------------------------|
-| retry (rejected→pending) | task-engineer | Handle retry, update rejection_count | No (no code mutation) |
-| unblock (blocked→pending) | task-engineer | Resolve blocker, validate dependencies | No |
-| start (pending→in-progress) | **specialist agent** | Implement task (go-engineer, react-engineer, etc.); MUST invoke clean-checkout-before-task as Step 0 | **Yes** |
-| review (completed→in-review→[accepted\|rejected]) | quality-reviewer | Accept or reject; MUST verify clean-checkout token | **Yes** |
-| timeout (in-progress→blocked) | task-engineer | Document timeout reason, create blocker report | No |
+| Transition | Performed by | Notes |
+|------------|--------------|-------|
+| retry (rejected→pending) | task-engineer at root | Adjusts rejection_count narrative; orchestrator commits the move on trunk after task-engineer returns. task-engineer NEVER enters a worktree. |
+| unblock (blocked→pending) | task-engineer at root | Validates dependencies satisfied (cross-slug deps need `Integrated-At:`). |
+| dispatch (pending→in-progress) | **orchestrator** at root, before Task() | Single writer; atomic mv + commit on trunk before specialist starts. |
+| start work | specialist agent inside worktree | Reads task at root path; does code work in `.worktree/<slug>`; commits CODE only on `worktree/<slug>`; never moves task file. Returns ACFW-RESULT. |
+| in-progress→completed | **orchestrator** at root, on specialist's `transition: completed` signal | acfw_apply_result moves + commits on trunk. |
+| in-progress→blocked | **orchestrator** at root, on specialist's `transition: blocked` signal | Same. |
+| completed→in-review | **orchestrator** at root, before reviewer Task() | Pre-move + commit on trunk (mirrors dispatch). |
+| in-review→accepted | **orchestrator** at root, on reviewer's `transition: accepted` signal | acfw_apply_result. |
+| in-review→rejected | **orchestrator** at root, on reviewer's `transition: rejected` signal | acfw_apply_result; increments Rejection Count. |
+| timeout (in-progress→blocked, >48h) | orchestrator at root | Synthesizes a `transition: blocked` with notes "timeout >48h". |
 
-task-engineer transitions execute serially on `main` (they only mutate `.backlog/`, no code). Specialist and quality-reviewer transitions execute in parallel only across distinct `Worktree:` slugs.
+**The orchestrator is the only writer of `.backlog/` files.** Specialists' worktree-side commits contain code only. task-engineer transitions execute serially at root (no code mutation).
 
 ### Specialist Agent Assignment
 
