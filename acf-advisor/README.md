@@ -25,7 +25,7 @@ A lean plugin that ships a single `advisor` skill. Claude builds focused context
   ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
-- Env vars set in your shell (or sourced from a `.env`) — see [Configuration](#configuration).
+- Env vars set in your shell **or** in a `.env` anywhere from CWD up to the first `.git` (auto-loaded since v1.0.1). See [Configuration](#configuration).
 
 ### Install the plugin
 
@@ -54,6 +54,8 @@ All configuration is via environment variables. No config files.
 | Reasoning effort | `ADVISOR_REASONING_EFFORT` | default `high`; values: `low`, `medium`, `high`, `off` |
 | Thinking budget (tokens) | `ADVISOR_THINKING_BUDGET` | default `8000` |
 | HTTP timeout (seconds) | `ADVISOR_TIMEOUT` | default `180` |
+| Disable `.env` auto-load | `ADVISOR_NO_DOTENV=1` or `--no-dotenv` flag | auto-load on by default |
+| Override script path (dev) | `ACF_ADVISOR_BIN` | resolver falls back to plugin cache |
 
 Example `.env`:
 ```
@@ -62,7 +64,13 @@ LITELLM_BASE_URL=https://litellm.example.com/v1
 ADVISOR_MODEL=claude-sonnet-4-6
 ```
 
-Source it: `set -a && source .env && set +a` (or use your shell's loader).
+### `.env` auto-load (since v1.0.1)
+
+The script walks up from CWD looking for the first `.env`, stopping at the first match, a `.git` directory, or filesystem root. If found, it loads the file (and `.env.local` next to it, if present) into the process environment. **Already-set env vars are never overridden** — shell-exported wins, `.env` only fills gaps. A stderr line confirms what was loaded: `[advisor] loaded env from /path/to/.env (3 new vars)`.
+
+To disable: `--no-dotenv` flag or `ADVISOR_NO_DOTENV=1`.
+
+The format is plain `KEY=VALUE`, with `#` comments, optional `export` prefix, and surrounding `"`/`'` quotes stripped. **No** shell expansion or command substitution — if you need `$HOME` style interpolation, source via your shell instead.
 
 **Thinking mode is on by default.** That's the point — considered answers are worth the extra latency and reasoning-token cost. To turn it off for a single cheap call: `ADVISOR_REASONING_EFFORT=off`.
 
@@ -116,7 +124,9 @@ Skill: pre-flight env check
     ↓
 Skill: build context (Question / Context / What I've considered / What I want)
     ↓
-Skill: cat <<EOF | $CLAUDE_PLUGIN_ROOT/scripts/advisor.py
+Skill: resolve $ADVISOR_BIN (override → CLAUDE_PLUGIN_ROOT → cache glob)
+    ↓
+Skill: cat <<EOF | "$ADVISOR_BIN"
     ↓
 advisor.py: POST {BASE_URL}/chat/completions
             with reasoning_effort + thinking fields
@@ -145,12 +155,40 @@ LiteLLM and most OpenAI-compatible proxies pass through fields they don't recogn
 
 ### `advisor: missing API key`
 
+The script checks the process environment after `.env` auto-load. Diagnose:
+
 ```bash
-# Confirm vars are set in *your* shell (Claude inherits them)
-env | grep -E '(LITELLM|OPENAI)_API_KEY'
+# Was a .env loaded? Check the [advisor] sending: line — it shows dotenv=<path or 'none'>.
+echo "ping" | ./acf-advisor/scripts/advisor.py 2>&1 | grep '\[advisor\] '
 ```
 
-If nothing, source your `.env`: `set -a && source .env && set +a`.
+If `dotenv=none` is shown, you're not in a project that has a `.env` (or auto-load is disabled via `--no-dotenv` / `ADVISOR_NO_DOTENV=1`). Either `cd` into the project, add a `.env`, or shell-export the var: `export LITELLM_API_KEY=…`.
+
+If a `.env` was loaded but the var is still missing, the file doesn't define it (or has a typo): `grep LITELLM_API_KEY .env`.
+
+### `advisor: not found (tried ACF_ADVISOR_BIN, CLAUDE_PLUGIN_ROOT, ~/.claude/plugins/cache)`
+
+The skill's path resolver couldn't locate the script. Either the plugin isn't installed in this Claude Code instance (install with `/plugin install acf-advisor@acf-tools`), or you're working from source — set `ACF_ADVISOR_BIN` to your checkout:
+
+```bash
+export ACF_ADVISOR_BIN=/path/to/acf-tools/acf-advisor/scripts/advisor.py
+```
+
+### Why didn't I get reasoning tokens?
+
+If the stderr line shows `reasoning=0` and you see the note `reasoning fields sent but upstream returned 0 reasoning tokens`, one of these is true:
+
+- The model genuinely didn't engage thinking on this prompt (some reasoning models judge the prompt trivial and return immediately — the `gpt-5.5` model on a "ping" prompt is one such case).
+- The proxy stripped `reasoning_effort` / `thinking` before forwarding.
+- The model alias on your proxy points at a non-reasoning model.
+
+To diagnose, run with `--debug` and inspect the actual request body and what the proxy returned:
+
+```bash
+echo "your real question" | ./acf-advisor/scripts/advisor.py --debug 2>&1 | head -40
+```
+
+If you want to skip the thinking round-trip entirely on a model that doesn't support it: `ADVISOR_REASONING_EFFORT=off`.
 
 ### `advisor: missing model`
 
@@ -195,3 +233,8 @@ Proprietary — Copyright 2025 Fibonacci Seven, LLC. See [LICENSE](LICENSE).
 ## Summary
 
 Lean, env-var-driven, thinking-on-by-default. One skill, one script, one POST. When you want a considered second opinion without leaving your session.
+
+### Changelog
+
+- **v1.0.1** — `.env` auto-load (CWD upward to first `.git` boundary), layered script-path resolver in the skill (`ACF_ADVISOR_BIN` → `CLAUDE_PLUGIN_ROOT` → plugin cache glob), pre-flight `[advisor] sending: …` line, post-flight zero-reasoning notice, `--debug` flag with key redaction. No API changes.
+- **v1.0.0** — Initial release.
