@@ -18,6 +18,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -35,6 +36,72 @@ def env_or(*names: str, default: str | None = None) -> str | None:
         if v:
             return v
     return default
+
+
+def _parse_dotenv(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or not key.replace("_", "").isalnum():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def load_dotenv(start: Path | None = None, also_local: bool = True) -> Path | None:
+    """Walk up from `start` (default CWD) looking for the first .env.
+
+    Stop at the first directory that contains a .env, or that contains a .git
+    entry, or at filesystem root. Already-set env vars are never overridden.
+    Optionally also loads a sibling .env.local in that same directory.
+    Returns the path to the loaded .env, or None if none was found.
+    """
+    here = (start or Path.cwd()).resolve()
+    found: Path | None = None
+    for d in [here, *here.parents]:
+        candidate = d / ".env"
+        if candidate.is_file():
+            found = candidate
+            break
+        if (d / ".git").exists():
+            break
+    if found is None:
+        return None
+    parsed = _parse_dotenv(found.read_text(encoding="utf-8", errors="replace"))
+    if also_local:
+        local = found.parent / ".env.local"
+        if local.is_file():
+            parsed.update(
+                _parse_dotenv(local.read_text(encoding="utf-8", errors="replace"))
+            )
+    added = 0
+    for k, v in parsed.items():
+        if k not in os.environ:
+            os.environ[k] = v
+            added += 1
+    print(
+        f"[advisor] loaded env from {found} ({added} new var{'s' if added != 1 else ''})",
+        file=sys.stderr,
+    )
+    return found
+
+
+def redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    out = dict(headers)
+    if "Authorization" in out:
+        out["Authorization"] = "Bearer ***REDACTED***"
+    return out
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -168,7 +235,22 @@ def main() -> int:
         default=float(os.environ.get("ADVISOR_TIMEOUT", "180")),
         help="HTTP timeout in seconds (default: 180, env: ADVISOR_TIMEOUT).",
     )
+    ap.add_argument(
+        "--no-dotenv",
+        action="store_true",
+        default=os.environ.get("ADVISOR_NO_DOTENV") == "1",
+        help="Disable .env auto-load from CWD upward (env: ADVISOR_NO_DOTENV=1).",
+    )
+    ap.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print the JSON request body (key redacted) to stderr.",
+    )
     args = ap.parse_args()
+
+    dotenv_path: Path | None = None
+    if not args.no_dotenv:
+        dotenv_path = load_dotenv()
 
     api_key = env_or("LITELLM_API_KEY", "OPENAI_API_KEY")
     if not api_key:
@@ -211,6 +293,32 @@ def main() -> int:
         reasoning_effort=reasoning_effort,
         thinking_budget=thinking_budget,
     )
+
+    sending_parts = [
+        f"model={model}",
+        f"effort={reasoning_effort or 'off'}",
+        f"thinking_budget={thinking_budget if thinking_budget is not None else 'off'}",
+        f"dotenv={dotenv_path or 'none'}",
+    ]
+    print("[advisor] sending: " + " ".join(sending_parts), file=sys.stderr)
+
+    if args.debug:
+        debug_headers = redact_headers(
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+        )
+        print(
+            f"[advisor] debug: POST {base_url.rstrip('/')}/chat/completions",
+            file=sys.stderr,
+        )
+        print(f"[advisor] debug headers: {json.dumps(debug_headers)}", file=sys.stderr)
+        print(
+            f"[advisor] debug body: {json.dumps(payload, indent=2)}",
+            file=sys.stderr,
+        )
 
     include_temperature = True
     current_effort = reasoning_effort
@@ -268,6 +376,16 @@ def main() -> int:
         sys.stdout.write("\n")
 
     emit_usage(model, resp)
+
+    if current_effort is not None or current_budget is not None:
+        details = (resp.get("usage") or {}).get("completion_tokens_details") or {}
+        reasoning_tokens = details.get("reasoning_tokens")
+        if reasoning_tokens == 0:
+            print(
+                "[advisor] note: reasoning fields sent but upstream returned 0 reasoning tokens "
+                "(model/proxy may not support them - try ADVISOR_REASONING_EFFORT=off to skip the round-trip cost)",
+                file=sys.stderr,
+            )
     return 0
 
 

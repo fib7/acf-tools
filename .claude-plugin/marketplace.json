@@ -109,8 +109,8 @@
     },
     {
       "name": "acf-advisor",
-      "description": "Lean advisor skill - consult another LLM (with thinking/reasoning mode on) via any OpenAI-compatible endpoint for second opinions and design review. Env-var driven (LITELLM_API_KEY/LITELLM_BASE_URL/ADVISOR_MODEL or OPENAI_* fallbacks). Single uv-run script, stdlib only.",
-      "version": "1.0.0",
+      "description": "Lean advisor skill - consult another LLM (with thinking/reasoning mode on) via any OpenAI-compatible endpoint for second opinions and design review. Env-var driven (LITELLM_API_KEY/LITELLM_BASE_URL/ADVISOR_MODEL or OPENAI_* fallbacks). Auto-loads .env from CWD upward; layered script-path resolver. Single uv-run script, stdlib only.",
+      "version": "1.0.1",
       "author": {
         "name": "ACF Project",
         "email": "acf@fib7.ai"

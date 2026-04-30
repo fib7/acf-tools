@@ -25,16 +25,26 @@ allowed-tools:
 - When env vars aren't set and the user hasn't asked you to consult an external model.
 - Looping calls (this is one-shot; no conversation memory).
 
-## Pre-flight check
+## Pre-flight: resolve the script and check env
 
-Before invoking, verify the API key is present:
+The script auto-loads `.env` from CWD upward (stops at the first `.env`, a `.git` directory, or filesystem root). Already-set env vars are preserved — shell wins over `.env`. So as long as the user runs Claude from inside their project tree, no manual `source .env` is needed.
+
+`$CLAUDE_PLUGIN_ROOT` is unreliable in skill-spawned bash (substitution is broken in skill markdown — see anthropics/claude-code#9354). Use this layered resolver to find the script:
 
 ```bash
-test -n "$LITELLM_API_KEY" || test -n "$OPENAI_API_KEY" || \
-  echo "advisor: no API key set (LITELLM_API_KEY / OPENAI_API_KEY)"
+ADVISOR_BIN="${ACF_ADVISOR_BIN:-}"
+if [ -z "$ADVISOR_BIN" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "${CLAUDE_PLUGIN_ROOT}/scripts/advisor.py" ]; then
+  ADVISOR_BIN="${CLAUDE_PLUGIN_ROOT}/scripts/advisor.py"
+fi
+if [ -z "$ADVISOR_BIN" ]; then
+  ADVISOR_BIN=$(ls -1 "$HOME"/.claude/plugins/cache/*/acf-advisor/*/scripts/advisor.py 2>/dev/null | sort -V | tail -1)
+fi
+test -x "$ADVISOR_BIN" || { echo "advisor: not found (tried ACF_ADVISOR_BIN, CLAUDE_PLUGIN_ROOT, ~/.claude/plugins/cache); install via: /plugin install acf-advisor@acf-tools" >&2; exit 1; }
 ```
 
-If neither is set, **stop** and tell the user: "advisor needs `LITELLM_API_KEY` (or `OPENAI_API_KEY`) and `ADVISOR_MODEL` in the environment. Source your `.env` or export them, then retry."
+Resolution order: `$ACF_ADVISOR_BIN` (dev override) → `$CLAUDE_PLUGIN_ROOT/scripts/advisor.py` (best-effort) → highest-semver match in the plugin cache.
+
+You don't need to pre-check the API key — the script will error with `[advisor] missing API key: …` if neither `LITELLM_API_KEY` nor `OPENAI_API_KEY` is set after auto-load. If that happens, tell the user to add the var to their `.env` (or shell-export it) and retry.
 
 ## Context-building protocol
 
@@ -63,10 +73,10 @@ Assemble into a single text blob:
 
 ## Invocation
 
-Pipe the prompt to the script via stdin (handles arbitrary size). The script lives at `$CLAUDE_PLUGIN_ROOT/scripts/advisor.py` and is executed via uv (the shebang invokes `uv run --script`).
+Pipe the prompt to `"$ADVISOR_BIN"` via stdin (handles arbitrary size; uv runs the script via the PEP 723 shebang).
 
 ```bash
-cat <<'PROMPT' | "$CLAUDE_PLUGIN_ROOT/scripts/advisor.py"
+cat <<'PROMPT' | "$ADVISOR_BIN"
 ## Question
 Should I use a goroutine + channel or a sync.Mutex for this counter?
 
@@ -83,6 +93,17 @@ PROMPT
 
 **Heredoc rules**: use `'PROMPT'` (single-quoted) so `$`, backticks, and backslashes inside the prompt aren't expanded.
 
+**Combined invocation** (resolver + call in one bash block — easiest):
+
+```bash
+ADVISOR_BIN="${ACF_ADVISOR_BIN:-}"
+[ -z "$ADVISOR_BIN" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "${CLAUDE_PLUGIN_ROOT}/scripts/advisor.py" ] && ADVISOR_BIN="${CLAUDE_PLUGIN_ROOT}/scripts/advisor.py"
+[ -z "$ADVISOR_BIN" ] && ADVISOR_BIN=$(ls -1 "$HOME"/.claude/plugins/cache/*/acf-advisor/*/scripts/advisor.py 2>/dev/null | sort -V | tail -1)
+cat <<'PROMPT' | "$ADVISOR_BIN"
+…your structured prompt here…
+PROMPT
+```
+
 ## Response handling
 
 Show the advisor's reply to the user verbatim under a clear header, then add your own brief take:
@@ -97,7 +118,11 @@ Show the advisor's reply to the user verbatim under a clear header, then add you
 <one short paragraph: agree/disagree, caveats, what to actually do>
 ```
 
-Surface the `[advisor] model=… prompt=… completion=… reasoning=…` line from stderr so the user sees token usage. Thinking mode adds reasoning-token cost and latency by design — that's the tradeoff for considered answers.
+Surface the stderr observability lines to the user so they see what was sent and how much it cost:
+
+- `[advisor] sending: model=… effort=… thinking_budget=… dotenv=…` — confirms what was actually requested and which `.env` was loaded.
+- `[advisor] model=… prompt=… completion=… total=… reasoning=…` — token usage (per-call cost). Thinking mode adds reasoning-token cost and latency by design — that's the tradeoff for considered answers.
+- `[advisor] note: reasoning fields sent but upstream returned 0 reasoning tokens …` — informational; means the model or proxy didn't engage thinking. The reply is still valid; suggest `ADVISOR_REASONING_EFFORT=off` if the user wants to skip the cost on this model.
 
 If the script printed a `--- reasoning ---` block on stderr, the user can see the advisor's chain of thought there; don't re-print it on stdout unless the user asks.
 
@@ -109,11 +134,14 @@ Thinking mode is **on by default** (`reasoning_effort=high`, `thinking.budget_to
 
 | Symptom | Cause | Action |
 |---|---|---|
-| `[advisor] missing API key` | env not set | Tell user to source `.env` or export `LITELLM_API_KEY` |
-| `[advisor] missing model` | `ADVISOR_MODEL` not set | Ask user which model to use; suggest setting `ADVISOR_MODEL` |
+| `advisor: not found (tried ACF_ADVISOR_BIN, CLAUDE_PLUGIN_ROOT, ~/.claude/plugins/cache)` | plugin not installed in this Claude Code instance | Tell user to run `/plugin install acf-advisor@acf-tools`, or set `ACF_ADVISOR_BIN` to a checkout path |
+| `[advisor] missing API key` | env not set and no `.env` found | Tell user to add `LITELLM_API_KEY` to `.env` in their project, or export it; verify the script loaded the right `.env` (see `dotenv=` in the `sending:` line) |
+| `[advisor] missing model` | `ADVISOR_MODEL` not set | Ask user which model to use; suggest setting `ADVISOR_MODEL` in `.env` |
 | `HTTP 401` | bad key | Verify key is current; surface error to user |
 | `HTTP 404 model not found` | wrong model name for the endpoint | List available models, ask user to pick |
 | `upstream rejected reasoning fields` (auto-retry) | non-reasoning model | The script retries without thinking; reply will still come through |
+| `upstream rejected temperature override` (auto-retry) | reasoning-only model that doesn't accept `temperature` | Auto-retried with default temperature; reply will still come through |
+| `note: reasoning fields sent but upstream returned 0 reasoning tokens` | model/proxy ignored thinking fields | Informational — reply is fine. If user wants to avoid the wasted round-trip cost on this model, set `ADVISOR_REASONING_EFFORT=off` |
 | `network error` | endpoint unreachable | Confirm `LITELLM_BASE_URL` is correct and reachable |
 
 ## Critical rules
