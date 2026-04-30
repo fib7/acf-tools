@@ -8,7 +8,7 @@
 
 ## Plugin Collection
 
-This repository contains 6 specialized plugins for Agentic Continuous Flow workflows:
+This repository contains 7 specialized plugins for Agentic Continuous Flow workflows:
 
 ### Cognitive Modes (4 plugins)
 
@@ -19,12 +19,13 @@ Specialized cognitive modes that enforce specific thinking patterns and validati
 - **acf-nitro** - Parallel execution enforcement mode that catches sequential violations and enforces speed optimization
 - **acf-mission-control** - Status line HUD for tracking position, git branch, and context fuel with color-coded indicators
 
-### Workflow Tools (2 plugins)
+### Workflow Tools (3 plugins)
 
 Functional tools for ACF workflow automation and convention enforcement:
 
 - **acf-librarian** - Convention enforcement through context injection, auto-initializes organization standards, audits compliance
 - **acf-whip** - Task workflow enforcer with zero tolerance backlog automation from decomposition to acceptance. **Concurrency-safe** as of 1.2.0: tasks declare `Worktree:` and `PR Group:` slugs; `/go` partitions on `Worktree:` and dispatches at most one specialist per slug. Specialists invoke `clean-checkout-before-task` (Step 0) which uses git's worktree branch registry as the lock. No custom locks, daemons, or schedulers.
+- **acf-advisor** - Lean `advisor` skill for consulting another LLM (thinking/reasoning mode on by default) via any OpenAI-compatible endpoint. Env-var driven (`LITELLM_API_KEY` / `LITELLM_BASE_URL` / `ADVISOR_MODEL`, with `OPENAI_*` fallbacks). Single uv-run script, stdlib only. Use it for second opinions, design review, or domain expertise outside Claude's strengths.
 
 ---
 
@@ -117,6 +118,7 @@ claude plugin validate .
 | **acf-mission-control** | Functional | Status HUD | Color-coded context tracking (green→yellow→red), git branch display |
 | **acf-librarian** | Functional | Conventions | Auto-initializes docs/acf/organization.md, audit command, naming enforcement |
 | **acf-whip** | Functional | Workflow automation | Task decomposition, backlog state machine, quality gates, agent generation |
+| **acf-advisor** | Functional | Second-opinion LLM client | OpenAI-compatible endpoint, env-var configured, thinking mode on by default |
 
 ---
 

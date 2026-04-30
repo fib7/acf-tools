@@ -34,8 +34,9 @@
 | **acf-mission-control** | Functional | Status line HUD | 5 |
 | **acf-librarian** | Functional | Convention enforcement | 5 |
 | **acf-whip** | Functional | Backlog workflow automation (concurrency-safe) | 36 |
+| **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 5 |
 
-**Total**: 61 plugin files + 3 project files + marketplace.json = 65 files
+**Total**: 66 plugin files + 3 project files + marketplace.json = 70 files
 
 **acf-whip 1.2.0** introduces the `clean-checkout-before-task` skill, which uses git's worktree branch registry as the lock primitive for parallel agent execution. Tasks declare `Worktree:` and `PR Group:` slugs; `/go` partitions on `Worktree:` and dispatches at most one specialist per slug. See `acf-whip/content/backlog/workflow.md`.
 
@@ -57,7 +58,8 @@ acf-tools/
 ├── acf-nitro/                       # Parallel enforcement (5 files)
 ├── acf-mission-control/             # Status HUD (5 files)
 ├── acf-librarian/                   # Convention enforcement (5 files)
-└── acf-whip/                        # Workflow automation (35 files)
+├── acf-whip/                        # Workflow automation (35 files)
+└── acf-advisor/                     # Second-opinion LLM client (5 files)
 ```
 
 ---

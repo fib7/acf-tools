@@ -1,0 +1,21 @@
+{
+  "name": "acf-advisor",
+  "version": "1.0.0",
+  "description": "Lean advisor skill - consult another LLM (with thinking/reasoning mode on) via any OpenAI-compatible endpoint for second opinions and design review. Configured via env vars.",
+  "author": {
+    "name": "ACF Tools",
+    "email": "acf@fib7.ai"
+  },
+  "license": "Proprietary",
+  "keywords": [
+    "acf",
+    "advisor",
+    "llm",
+    "openai",
+    "litellm",
+    "second-opinion",
+    "reasoning",
+    "thinking"
+  ],
+  "skills": "./skills/"
+}
