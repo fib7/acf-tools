@@ -27,6 +27,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
 from lib.advisor import (  # noqa: E402
     AdvisorError,
     DEFAULT_SYSTEM_PROMPT,
+    check_env,
     env_or,
     load_dotenv,
     parse_model_list,
@@ -58,8 +59,8 @@ def main() -> int:
     ap.add_argument(
         "--timeout",
         type=float,
-        default=float(os.environ.get("ADVISOR_TIMEOUT", "180")),
-        help="HTTP timeout in seconds (default: 180, env: ADVISOR_TIMEOUT).",
+        default=float(os.environ.get("ADVISOR_TIMEOUT", "600")),
+        help="HTTP timeout in seconds (default: 600, env: ADVISOR_TIMEOUT).",
     )
     ap.add_argument(
         "--no-dotenv",
@@ -72,7 +73,17 @@ def main() -> int:
         action="store_true",
         help="Print the JSON request body (key redacted) to stderr.",
     )
+    ap.add_argument(
+        "--check-env",
+        action="store_true",
+        help="Resolve env (dotenv + shell) without any HTTP call. Exit 0 if api_key+model are set, 2 if missing. Prints structured one-liner to stderr.",
+    )
     args = ap.parse_args()
+
+    if args.check_env:
+        code, msg = check_env(load=not args.no_dotenv)
+        print(msg, file=sys.stderr)
+        return code
 
     dotenv_path: Path | None = None
     if not args.no_dotenv:
