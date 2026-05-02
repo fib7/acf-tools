@@ -17,6 +17,23 @@ Two skills, one shared code path.
 2. Builds focused context, trims to a sensible size, pipes to the endpoint with thinking on (`reasoning_effort: "high"` + `thinking: {budget_tokens: 8000}`; auto-falls-back if the upstream rejects either).
 3. Returns the advisor's reply verbatim, plus Claude's own brief take.
 
+### Local-team fallback (new in 1.2.0)
+
+When no LLM endpoint is configured (no `LITELLM_API_KEY` / `OPENAI_API_KEY` reachable via env or project `.env`, no `ADVISOR_MODEL` set), the `board` skill **does not error out**. Instead it falls back to local-team mode: each persona runs as a Claude subagent (`Agent` tool, `subagent_type: general-purpose`), dispatched in parallel from one message. Synthesis is produced directly by the orchestrator. **No external API calls.**
+
+The skill tells you explicitly when this happens:
+
+> No external advisor endpoint configured (no LITELLM_API_KEY/OPENAI_API_KEY in env or project .env). Falling back to local-team mode — each persona will run as a Claude subagent. No external API calls.
+
+The same dimension-extraction → priority pick → roster confirmation steps run as in the LLM path. Cross-model triangulation does not apply (all "models" are Claude). Per-persona output uses `### Advisor (local) — <name> says:` headers; the cost line is `[board:local] mode=local-team personas=N rounds=R subagent_calls=N×R`.
+
+To force the LLM path again, configure `LITELLM_API_KEY` + `ADVISOR_MODEL` in your project `.env` and re-invoke. The script's `--check-env` flag (also new in 1.2.0) lets you verify the resolution without making any HTTP call:
+
+```bash
+./acf-advisor/scripts/advisor.py --check-env
+# exit 0 → LLM path. exit 2 → local-team fallback.
+```
+
 ### Board of advisors (new in 1.1.0)
 
 1. Claude routes to the `board` skill when a decision spans ≥ 2 distinct dimensions of correctness OR is hard-to-reverse OR you explicitly ask for a panel.
@@ -68,9 +85,9 @@ All configuration is via environment variables. No config files.
 | Model **or** comma-delimited model pool | `ADVISOR_MODEL` | `OPENAI_MODEL` (no default — error if unset) |
 | Reasoning effort | `ADVISOR_REASONING_EFFORT` | default `high`; values: `low`, `medium`, `high`, `off` |
 | Thinking budget (tokens) | `ADVISOR_THINKING_BUDGET` | default `8000` |
-| HTTP timeout (seconds) | `ADVISOR_TIMEOUT` | default `180` |
+| HTTP timeout (seconds) | `ADVISOR_TIMEOUT` | default `600` (was `180` pre-v1.2.0) |
 | Board: max parallel persona calls | `BOARD_PARALLELISM` | default `5` |
-| Board: total timeout for the whole panel | `BOARD_TOTAL_TIMEOUT_SECONDS` | default `900` |
+| Board: total timeout for the whole panel | `BOARD_TOTAL_TIMEOUT_SECONDS` | default `1800` (was `900` pre-v1.2.0) |
 | Board: hard ceiling on `R` (round count) | `BOARD_MAX_ROUNDS` | default `5` |
 | Disable `.env` auto-load | `ADVISOR_NO_DOTENV=1` or `--no-dotenv` flag | auto-load on by default |
 | Override advisor.py path (dev) | `ACF_ADVISOR_BIN` | resolver falls back to plugin cache |
@@ -316,6 +333,13 @@ Lean, env-var-driven, thinking-on-by-default. Two skills (`advisor` for single s
 
 ### Changelog
 
+- **v1.2.0** — Scope discipline + local-team fallback + provider-compat fixes + higher timeouts:
+  - **Local-team fallback**: when no API endpoint is reachable (no key/model after `.env` auto-load + shell), the `board` skill switches to local-team mode — each persona runs as a parallel Claude subagent (`Agent` tool). Synthesis produced by the orchestrator. No external calls. Skill explicitly announces the mode switch. LLM path is unchanged when env IS configured.
+  - **New `--check-env` flag** on `advisor.py`: probes env (dotenv + shell) without any HTTP call. Exit 0 if `api_key + model` resolve, 2 if missing. Stderr emits a structured one-liner (`dotenv=… api_key=… model=… ok|missing=…`) used by the board skill to choose the execution path.
+  - **Skill scope discipline**: explicit "DO NOT pre-search env outside the dotenv chain" rule in both skill files. Prior live use surfaced the orchestrator improvising bash that read `$HOME/.claude/`, `$HOME/.config/`, `~/.zshrc`, etc. — strictly forbidden now. Trust `--check-env`'s answer.
+  - **Anthropic + thinking + temperature**: `looks_like_temperature_error()` now matches `"may only be set"` — catches `claude-opus-4-7`'s 400 when temperature ≠ 1 with thinking on. Auto-retry drops the explicit temperature and Anthropic uses its default. Was: hard 400.
+  - **Gemini 3 thinking_level conflict**: new `looks_like_thinking_budget_conflict()` heuristic + dedicated retry branch. When upstream errors with `thinking_level` / `Cannot specify both \`thinking\` …` (LiteLLM auto-maps `reasoning_effort` to `thinking_level` for Gemini 3 while we also send `thinking.budget_tokens`), drop ONLY `thinking.budget_tokens` and retry — keep `reasoning_effort` so thinking-on-via-thinking_level still works. Retry-branch ordering checks this BEFORE the broader `reasoning_field_error` branch (whose substrings overlap).
+  - **Higher default timeouts**: per-call `run_advisor(timeout=)` 180 → **600s**, board manifest `limits.call_timeout_seconds` 180 → **600**, `BOARD_TOTAL_TIMEOUT_SECONDS` env default 900 → **1800**. Thinking-heavy reasoners on complex prompts were being silently dropped at 180s. `ADVISOR_TIMEOUT` shell override unchanged. The CLI's `[advisor] sending: …` line now includes `timeout=Ns` so the effective per-call timeout is visible.
 - **v1.1.0** — Major capability addition (backward-compatible at the existing CLI):
   - **New `board` skill**: convene a multi-persona panel hypertailored to a specific decision. Personas synthesized per call from `persona-design/DESIGN.md`'s 7-step recipe. Mandatory dimension-extraction step (visible to user before persona composition) + structured persona template (Dimension / Lens / Bias / Blind spots / Output discipline) + static synthesizer prompt + 4 worked-example panels showing reasoning chains.
   - **New `scripts/board.py` orchestrator**: validates JSON manifest, runs personas in parallel via `ThreadPoolExecutor`, manages `R`-round structured transcript injection, runs final synthesis, returns structured markdown + aggregate cost broken down by model. Defined exit codes; SIGINT/SIGTERM-clean; total board timeout. NO direct HTTP — delegates to `lib.advisor.run_advisor()` for every call.

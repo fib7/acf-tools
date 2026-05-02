@@ -109,8 +109,8 @@
     },
     {
       "name": "acf-advisor",
-      "description": "Advisor + board-of-advisors skills. Single second opinion (advisor skill) OR multi-persona panel hypertailored to a specific decision (board skill). Personas synthesized per call from a structured recipe; round count chosen by deliberative judgment, not autonomous loops. Comma-delimited ADVISOR_MODEL declares a multi-model pool (round-robin auto-assignment, optional cross-model triangulation on a critical lens). Stdlib-only, lib/advisor.py is single source of truth shared by both scripts. Thinking/reasoning mode on by default.",
-      "version": "1.1.0",
+      "description": "Advisor + board-of-advisors skills. Single second opinion (advisor skill) OR multi-persona panel hypertailored to a specific decision (board skill). Personas synthesized per call from a structured recipe; round count chosen by deliberative judgment, not autonomous loops. Comma-delimited ADVISOR_MODEL declares a multi-model pool (round-robin auto-assignment, optional cross-model triangulation on a critical lens). Stdlib-only, lib/advisor.py is single source of truth shared by both scripts. Thinking/reasoning mode on by default. Local-team fallback when no API endpoint is configured (each persona runs as a Claude subagent, no external calls).",
+      "version": "1.2.0",
       "author": {
         "name": "ACF Project",
         "email": "acf@fib7.ai"
