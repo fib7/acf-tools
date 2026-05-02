@@ -1,19 +1,34 @@
 # ACF Advisor Plugin
 
-> Consult another LLM (with thinking mode on) for a second opinion.
+> Consult another LLM (with thinking mode on) for a second opinion. **Or convene a board of advisors** — multi-persona panel hypertailored to a specific decision.
 
-A lean plugin that ships a single `advisor` skill. Claude builds focused context from your project and pipes it to any OpenAI-compatible Chat Completions endpoint — LiteLLM, OpenAI, OpenRouter, an internal proxy — for an independent take. Thinking / reasoning mode is enabled by default.
+Two skills, one shared code path.
+
+- **`advisor`** — single second opinion. Claude builds focused context, pipes it to any OpenAI-compatible Chat Completions endpoint (LiteLLM / OpenAI / OpenRouter / internal proxy) with thinking mode on, returns the reply verbatim plus Claude's own take.
+- **`board`** *(new in 1.1.0)* — multi-persona panel. For non-trivial decisions spanning ≥ 2 dimensions, Claude composes 1–5 hypertailored personas using the synthesis recipe in `persona-design/`, runs them in parallel for `R` rounds (deliberatively chosen, not autonomously extended), and integrates a synthesis weighted by the user-confirmed priority dimension. Supports a multi-model pool via comma-delimited `ADVISOR_MODEL` (round-robin auto-assignment, optional cross-model triangulation on the critical lens).
 
 ---
 
-## What It Does
+## What it does
 
-1. **Adds the `advisor` skill** — Claude invokes it when you ask for a second opinion or it judges the question would benefit from one.
-2. **Builds context for you** — restates the question, gathers relevant files/errors/decisions, trims to a sensible size.
-3. **Calls the endpoint with thinking on** — sends both `reasoning_effort: "high"` (OpenAI o-series style) and `thinking: {type: enabled, budget_tokens: 8000}` (Anthropic-via-LiteLLM style). Falls back gracefully if the upstream rejects either field.
-4. **Returns both perspectives** — the advisor's reply verbatim, plus Claude's own brief take.
+### Single advisor (existing)
 
-**Not** for: quick lookups Claude can answer directly, or tasks you asked Claude to do (don't let it outsource its job).
+1. Claude invokes the `advisor` skill when you ask for a second opinion or judge the question would benefit from one.
+2. Builds focused context, trims to a sensible size, pipes to the endpoint with thinking on (`reasoning_effort: "high"` + `thinking: {budget_tokens: 8000}`; auto-falls-back if the upstream rejects either).
+3. Returns the advisor's reply verbatim, plus Claude's own brief take.
+
+### Board of advisors (new in 1.1.0)
+
+1. Claude routes to the `board` skill when a decision spans ≥ 2 distinct dimensions of correctness OR is hard-to-reverse OR you explicitly ask for a panel.
+2. **Extracts decision dimensions** as a numbered list and asks you to confirm + pick the most important one (priority dimension). This step is the load-bearing one — by the time the roster is shown, the decision is mostly made.
+3. **Composes personas** — one per confirmed dimension, decision-specific names (e.g. "token-lifecycle skeptic for OAuth-A→B migration", not "security auditor"), each with explicit blind spots.
+4. **Picks `R`** by deliberative judgment (default 1; up to 5 when personas trade off, decision is irreversible, etc.). User can override.
+5. **Distributes models** from the pool: round-robin by default, or cross-model triangulation when one specific lens is critical AND the pool offers genuinely different reasoners.
+6. **Confirms the roster with you** (free, no advisor cost) → builds JSON manifest → `board.py` runs personas in parallel via `ThreadPoolExecutor`.
+7. **Synthesizes** all takes into one recommendation, weighted by your priority dimension.
+8. Returns per-persona transcripts (using the same `### Advisor (model) — name says:` idiom as the single advisor) plus the synthesis block.
+
+**Not** for: quick lookups Claude can answer directly, tasks you asked Claude to do, or as a default for trivial second opinions (use the single `advisor` skill).
 
 ---
 
@@ -50,19 +65,39 @@ All configuration is via environment variables. No config files.
 |---|---|---|
 | API key | `LITELLM_API_KEY` | `OPENAI_API_KEY` |
 | Base URL | `LITELLM_BASE_URL` | `OPENAI_BASE_URL` (default: `https://api.openai.com/v1`) |
-| Model | `ADVISOR_MODEL` | `OPENAI_MODEL` (no default — error if unset) |
+| Model **or** comma-delimited model pool | `ADVISOR_MODEL` | `OPENAI_MODEL` (no default — error if unset) |
 | Reasoning effort | `ADVISOR_REASONING_EFFORT` | default `high`; values: `low`, `medium`, `high`, `off` |
 | Thinking budget (tokens) | `ADVISOR_THINKING_BUDGET` | default `8000` |
 | HTTP timeout (seconds) | `ADVISOR_TIMEOUT` | default `180` |
+| Board: max parallel persona calls | `BOARD_PARALLELISM` | default `5` |
+| Board: total timeout for the whole panel | `BOARD_TOTAL_TIMEOUT_SECONDS` | default `900` |
+| Board: hard ceiling on `R` (round count) | `BOARD_MAX_ROUNDS` | default `5` |
 | Disable `.env` auto-load | `ADVISOR_NO_DOTENV=1` or `--no-dotenv` flag | auto-load on by default |
-| Override script path (dev) | `ACF_ADVISOR_BIN` | resolver falls back to plugin cache |
+| Override advisor.py path (dev) | `ACF_ADVISOR_BIN` | resolver falls back to plugin cache |
+| Override board.py path (dev) | `ACF_BOARD_BIN` | resolver falls back to plugin cache |
+
+### `ADVISOR_MODEL` as a model pool (since v1.1.0)
+
+`ADVISOR_MODEL` accepts either a single model name (single-shot mode, unchanged from v1.0.x) or a comma-delimited list of model names (declaring a pool the board skill can distribute across).
 
 Example `.env`:
 ```
 LITELLM_API_KEY=sk-...
 LITELLM_BASE_URL=https://litellm.example.com/v1
+
+# Single-model — both skills use this model.
 ADVISOR_MODEL=claude-sonnet-4-6
+
+# OR multi-model pool — single advisor uses the first; board distributes across all.
+# ADVISOR_MODEL=gpt-5.5,gemini/gemini-3.1-pro-preview,claude-opus-4-6
 ```
+
+Pool semantics:
+
+- **`advisor` skill / CLI**: uses the first entry. `--model X` always overrides.
+- **`board` skill**: passes the full pool as `available_models` in the manifest. Personas with `model: null` get round-robin assignment from the pool (wraps when persona count > pool size). Personas with an explicit pinned model must use a name from the pool (validation catches typos like `claude-opus-4.7` vs `claude-opus-4-7`).
+- **Same model, multiple personas**: allowed and useful. Two personas with different system prompts on the same model produce different perspectives.
+- **Same persona, multiple models** (cross-model triangulation): also allowed. Two manifest entries with identical `system` + `display_name`, distinct `id`s, different `model` values are run as independent advisors. Useful when one specific lens is decision-critical and the pool has genuinely different reasoners — agreement-or-disagreement across models on that lens is itself the diagnostic. Costs roster slots; use deliberately.
 
 ### `.env` auto-load (since v1.0.1)
 
@@ -111,37 +146,82 @@ echo "..." | ./acf-advisor/scripts/advisor.py --model gpt-5
 
 ---
 
+### Direct CLI use of the board
+
+`scripts/board.py` reads a JSON manifest from stdin. The `board` skill normally builds it; but you can drive it directly for testing or scripting:
+
+```bash
+cat manifest.json | ./acf-advisor/scripts/board.py
+```
+
+Manifest schema is documented in `acf-advisor/scripts/board.py`'s docstring. Exit codes: `0` synthesis succeeded (possibly degraded), `10` invalid manifest, `20` zero persona successes, `30` synthesis failed, `124` total timeout, `130` interrupted.
+
+---
+
 ## How It Works
 
-**One file, one skill, one call.**
+**Two skills, one shared library, no script duplication.**
 
 ```
-User asks for a second opinion
-    ↓
-Claude invokes the `advisor` skill
-    ↓
-Skill: pre-flight env check
-    ↓
-Skill: build context (Question / Context / What I've considered / What I want)
-    ↓
-Skill: resolve $ADVISOR_BIN (override → CLAUDE_PLUGIN_ROOT → cache glob)
-    ↓
-Skill: cat <<EOF | "$ADVISOR_BIN"
-    ↓
-advisor.py: POST {BASE_URL}/chat/completions
-            with reasoning_effort + thinking fields
-    ↓
-advisor.py: prints reply to stdout, usage to stderr
-    ↓
-Claude shows reply verbatim + own take
+                          lib/advisor.py::run_advisor()
+                          (HTTP, auth, dotenv, retries — single source of truth)
+                                  ↑                        ↑
+                                  │                        │
+                  scripts/advisor.py                scripts/board.py
+                  (thin CLI wrapper)                 (panel orchestrator,
+                          ↑                          ThreadPoolExecutor)
+                          │                                ↑
+              skills/advisor/SKILL.md         skills/board/SKILL.md
+              (Q/Context/Considered/Want      (dimension extraction →
+              prompt format,                   roster confirm →
+              observability conventions,       manifest builder →
+              upstream-error table —           cross-references advisor
+              CANONICAL)                       skill, does NOT restate)
+                          ↑                                ↑
+                    user asks for                    user asks for a
+                    second opinion                   panel / multi-perspective
+```
+
+**Single advisor flow** (unchanged from v1.0.x):
+
+```
+User → Claude → advisor skill → advisor.py → POST /chat/completions → reply
+```
+
+**Board flow** (new in v1.1.0):
+
+```
+User → Claude → board skill →
+  step 1: extract dimensions, surface to user, get priority
+  step 2: pick R via deliberative criteria
+  step 3: compose 1–5 personas using persona-design/ recipe
+  step 4: assign models from ADVISOR_MODEL pool
+          (round-robin OR cross-model triangulation on priority lens)
+  step 5: confirm roster + R with user
+  step 6: build manifest → board.py
+                          board.py: ThreadPoolExecutor over personas,
+                                    R rounds, transcript injection between
+                                    rounds, final synthesis call,
+                                    aggregate cost broken down by model
+  step 7: render verbatim under per-persona "### Advisor (model) — name says:" headers
+          (same idiom as advisor skill — multiplied)
+  step 8: + Claude's brief take
 ```
 
 **Key files:**
 
 | File | Purpose |
 |---|---|
-| `scripts/advisor.py` | uv PEP 723 script; stdlib-only HTTP client |
-| `skills/advisor/SKILL.md` | When to use, how to build context, invocation pattern |
+| `lib/advisor.py` | Core module: `run_advisor()`, HTTP client, dotenv loader, retry logic, redaction. Single source of truth — both scripts import from here. Stdlib-only. |
+| `scripts/advisor.py` | uv PEP 723 thin CLI wrapper around `lib.advisor.run_advisor()`. CLI flags: `--system`/`--system-file` (mutually exclusive), `--model`, `--timeout`, `--no-dotenv`, `--debug`. |
+| `scripts/board.py` | uv PEP 723 panel orchestrator. Reads JSON manifest from stdin, validates schema, runs personas in parallel via `ThreadPoolExecutor`, manages `R` rounds, calls synthesizer, prints structured markdown to stdout + aggregate cost to stderr. NO direct HTTP — all advisor calls go through `lib.advisor.run_advisor()`. |
+| `skills/advisor/SKILL.md` | Single second-opinion protocol. Canonical for the structured prompt format, observability conventions, upstream-error table. |
+| `skills/board/SKILL.md` | Panel workflow: dimension extraction → roster confirmation → manifest build. Cross-references the advisor skill — does NOT restate the prompt format, error handling, or observability. |
+| `persona-design/DESIGN.md` | The 7-step synthesis recipe + "shapes too generic — and the specific versions they should become" anti-pattern table. Durable artifact. |
+| `persona-design/persona-template.md` | Structured template for persona system prompts (Dimension / Lens / Bias / Blind spots / Output discipline). Mandatory fields. |
+| `persona-design/synthesizer.md` | STATIC system prompt for the synthesis call. Not generated per call (avoids the synthesizer adopting a persona). |
+| `persona-design/convergence.md` | STATIC prompt for convergence-checking. Shipped but unused in v1.1.0; reserved for a future revision. |
+| `persona-design/examples/*.md` | Four worked panels (auth-redesign, perf-regression, data-migration, product-prioritization) showing reasoning chains: original prompt → extracted dimensions with reasoning → personas considered AND rejected → final roster → tier choice. Read for the *process*, not as templates. |
 
 **Reasoning fields, both styles:**
 - `reasoning_effort` (string `low`/`medium`/`high`) — OpenAI o-series.
@@ -232,9 +312,18 @@ Proprietary — Copyright 2025 Fibonacci Seven, LLC. See [LICENSE](LICENSE).
 
 ## Summary
 
-Lean, env-var-driven, thinking-on-by-default. One skill, one script, one POST. When you want a considered second opinion without leaving your session.
+Lean, env-var-driven, thinking-on-by-default. Two skills (`advisor` for single second opinions, `board` for hypertailored multi-persona panels), one shared core (`lib/advisor.py`), one POST per advisor call. When you want a considered take — solo or in concert — without leaving your session.
 
 ### Changelog
 
+- **v1.1.0** — Major capability addition (backward-compatible at the existing CLI):
+  - **New `board` skill**: convene a multi-persona panel hypertailored to a specific decision. Personas synthesized per call from `persona-design/DESIGN.md`'s 7-step recipe. Mandatory dimension-extraction step (visible to user before persona composition) + structured persona template (Dimension / Lens / Bias / Blind spots / Output discipline) + static synthesizer prompt + 4 worked-example panels showing reasoning chains.
+  - **New `scripts/board.py` orchestrator**: validates JSON manifest, runs personas in parallel via `ThreadPoolExecutor`, manages `R`-round structured transcript injection, runs final synthesis, returns structured markdown + aggregate cost broken down by model. Defined exit codes; SIGINT/SIGTERM-clean; total board timeout. NO direct HTTP — delegates to `lib.advisor.run_advisor()` for every call.
+  - **New `lib/advisor.py` module**: extracts core logic from `scripts/advisor.py` (HTTP, auth, dotenv, retries, redaction). Single source of truth shared by both scripts.
+  - **`scripts/advisor.py` refactored to thin CLI wrapper**. CLI behavior byte-for-byte unchanged for callers. Adds `--system-file` flag (mutually exclusive with `--system`); avoids leaking prompt content via `ps`. `looks_like_temperature_error()` now matches `"deprecated"` substring (catches the new Claude models that reject custom temperature with that wording).
+  - **`ADVISOR_MODEL` accepts a comma-delimited model pool**. Backward-compat: a single value works as before. Multi-value declares the candidate pool used by the board (round-robin auto-assignment, optional cross-model triangulation on a critical lens; same model allowed for multiple personas; same persona allowed across multiple models).
+  - **New env vars**: `BOARD_PARALLELISM` (default 5), `BOARD_TOTAL_TIMEOUT_SECONDS` (default 900), `BOARD_MAX_ROUNDS` (default 5), `ACF_BOARD_BIN` (dev path override).
+  - **Round count `R` chosen by deliberative judgment**, not autonomous loops. Default `R=1`; criteria for higher values when personas trade off, decisions are irreversible, etc. `R` is fixed at manifest-build time — no autonomous mid-run extension.
+  - **DRY enforced at three layers**: same `lib/` module, same skill protocol (board cross-references advisor), same per-persona output rendering idiom.
 - **v1.0.1** — `.env` auto-load (CWD upward to first `.git` boundary), layered script-path resolver in the skill (`ACF_ADVISOR_BIN` → `CLAUDE_PLUGIN_ROOT` → plugin cache glob), pre-flight `[advisor] sending: …` line, post-flight zero-reasoning notice, `--debug` flag with key redaction. No API changes.
 - **v1.0.0** — Initial release.

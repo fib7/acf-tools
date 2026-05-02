@@ -1,7 +1,7 @@
 {
   "name": "acf-advisor",
-  "version": "1.0.1",
-  "description": "Lean advisor skill - consult another LLM (with thinking/reasoning mode on) via any OpenAI-compatible endpoint for second opinions and design review. Configured via env vars.",
+  "version": "1.1.0",
+  "description": "Advisor + board-of-advisors skills - consult another LLM (with thinking/reasoning mode on) for a single second opinion, OR convene a multi-persona panel hypertailored to a specific decision. Personas synthesized per call from a structured recipe; round count chosen by deliberative judgment. Works against any OpenAI-compatible endpoint; comma-delimited ADVISOR_MODEL declares a multi-model pool.",
   "author": {
     "name": "ACF Tools",
     "email": "acf@fib7.ai"
@@ -10,6 +10,10 @@
   "keywords": [
     "acf",
     "advisor",
+    "board",
+    "panel",
+    "personas",
+    "multi-agent",
     "llm",
     "openai",
     "litellm",
