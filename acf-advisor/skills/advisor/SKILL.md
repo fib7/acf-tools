@@ -10,6 +10,8 @@ allowed-tools:
 
 # advisor - Consult another LLM for a second opinion
 
+> **For multi-dimensional decisions, see the `board` skill** (`../board/SKILL.md`). It convenes a panel of synthesized personas, each covering one dimension, and integrates them. Use this `advisor` skill when one second opinion is enough.
+
 ## When to use
 
 - The user asks for a "second opinion", "another model's take", "what would GPT/Gemini/Claude-via-LiteLLM say".
