@@ -31,6 +31,13 @@ allowed-tools:
 
 The script auto-loads `.env` from CWD upward (stops at the first `.env`, a `.git` directory, or filesystem root). Already-set env vars are preserved — shell wins over `.env`. So as long as the user runs Claude from inside their project tree, no manual `source .env` is needed.
 
+> **DO NOT pre-search for env vars outside the project tree.** The script already auto-loads `.env` from CWD upward, stopping at the first `.env`, a `.git` directory, or FS root. Already-exported shell vars are preserved. You **MUST NOT**:
+> - read `$HOME/.claude/**`, `$HOME/.config/**`, `$HOME/.zshrc`, `$HOME/.bashrc`, or any file outside CWD's ancestor chain
+> - run `env | grep` for keys (the script does this internally and reports what it found via the `[advisor] sending: dotenv=… ` line)
+> - probe alternative env file locations (`~/.config/qlaude/env`, `~/.claude/settings.json`, etc.)
+>
+> If you need a programmatic probe, run `"$ADVISOR_BIN" --check-env` (exits 0 if env OK, 2 if missing — no HTTP call). Otherwise let the script run; if env is missing it will print `[advisor] missing API key: …` or `[advisor] missing model: …` and exit. Surface that error verbatim and tell the user to add the var to their project `.env` (or shell-export it).
+
 `$CLAUDE_PLUGIN_ROOT` is unreliable in skill-spawned bash (substitution is broken in skill markdown — see anthropics/claude-code#9354). Use this layered resolver to find the script:
 
 ```bash
