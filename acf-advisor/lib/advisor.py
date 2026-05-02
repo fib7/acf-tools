@@ -262,6 +262,48 @@ def _emit_usage(model: str, resp: dict, log_prefix: str) -> dict:
     return fields
 
 
+def check_env(*, load: bool = True) -> tuple[int, str]:
+    """Probe env without making any network call.
+
+    Resolves the same vars as `run_advisor()` (api_key, base_url, model) and returns
+    (exit_code, message). Code 0 = env OK; 2 = something missing. The message is a
+    single-line stderr-style summary the CLI prints verbatim. Always non-network.
+
+    When `load=True`, runs `load_dotenv()` first so the project's .env is consulted
+    (matches the CLI's default behavior). Already-set shell vars still win.
+    """
+    dotenv_path = load_dotenv(log_prefix="[advisor:check-env]") if load else None
+
+    api_key = env_or("LITELLM_API_KEY", "OPENAI_API_KEY")
+    base_url = env_or(
+        "LITELLM_BASE_URL", "OPENAI_BASE_URL", default="https://api.openai.com/v1"
+    )
+    pool = parse_model_list(env_or("ADVISOR_MODEL", "OPENAI_MODEL"))
+    model = pool[0] if pool else None
+
+    missing = []
+    if not api_key:
+        missing.append("api_key")
+    if not model:
+        missing.append("model")
+
+    parts = [
+        f"dotenv={dotenv_path or 'none'}",
+        f"api_key={'set' if api_key else 'missing'}",
+        (
+            f"base_url={base_url}"
+            if env_or("LITELLM_BASE_URL", "OPENAI_BASE_URL")
+            else "base_url=default"
+        ),
+        f"model={model or 'missing'}",
+    ]
+    if missing:
+        parts.append(f"missing={','.join(missing)}")
+        return 2, "[advisor:check-env] " + " ".join(parts)
+    parts.append("ok")
+    return 0, "[advisor:check-env] " + " ".join(parts)
+
+
 def run_advisor(
     user_prompt: str,
     *,
@@ -269,7 +311,7 @@ def run_advisor(
     model: str | None = None,
     reasoning_effort: str | None = "high",
     thinking_budget: int | None = 8000,
-    timeout: float = 180.0,
+    timeout: float = 600.0,
     base_url: str | None = None,
     api_key: str | None = None,
     log_prefix: str = "[advisor]",
@@ -312,6 +354,7 @@ def run_advisor(
         f"model={model}",
         f"effort={reasoning_effort or 'off'}",
         f"thinking_budget={thinking_budget if thinking_budget is not None else 'off'}",
+        f"timeout={int(timeout)}s",
         f"dotenv={dotenv_path or 'none'}",
     ]
     print(f"{log_prefix} sending: " + " ".join(sending_parts), file=sys.stderr)

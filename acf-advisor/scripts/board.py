@@ -29,7 +29,7 @@ Manifest schema (validated before any LLM call):
   "synthesizer_system": "...",             # optional; default = static synthesizer prompt
   "synthesizer_model": "m1" | null,        # optional; defaults to available_models[0]
   "limits": {                              # optional
-    "call_timeout_seconds": 180,
+    "call_timeout_seconds": 600,
     "max_stdout_chars": 200000,
     "max_prompt_chars": 120000,
     "max_transcript_chars": 600000
@@ -82,8 +82,9 @@ EXIT_INTERRUPTED = 130
 # ---------- Defaults / env ----------
 
 DEFAULT_BOARD_PARALLELISM = 5
-DEFAULT_BOARD_TOTAL_TIMEOUT_SECONDS = 900
+DEFAULT_BOARD_TOTAL_TIMEOUT_SECONDS = 1800
 DEFAULT_BOARD_MAX_ROUNDS = 5
+DEFAULT_CALL_TIMEOUT_SECONDS = 600
 
 DEFAULT_SYNTHESIZER_SYSTEM = (
     "You are integrating N panel takes into one recommendation. Highlight points of "
@@ -204,7 +205,9 @@ def validate_manifest(m: dict) -> tuple[dict, list[str]]:
         ),
         "synthesizer_model": synth_model,
         "limits": {
-            "call_timeout_seconds": float(limits.get("call_timeout_seconds", 180)),
+            "call_timeout_seconds": float(
+                limits.get("call_timeout_seconds", DEFAULT_CALL_TIMEOUT_SECONDS)
+            ),
             "max_stdout_chars": int(limits.get("max_stdout_chars", 200000)),
             "max_prompt_chars": int(limits.get("max_prompt_chars", 120000)),
             "max_transcript_chars": int(limits.get("max_transcript_chars", 600000)),
@@ -526,6 +529,11 @@ def main() -> int:
         f"{LOG_PREFIX} convening: personas={len(assigned)} rounds={manifest['rounds']} "
         f"pool={','.join(manifest['available_models'])} "
         f"parallelism={parallelism} total_timeout={total_timeout}s",
+        file=sys.stderr,
+    )
+    print(
+        f"{LOG_PREFIX} limits: call_timeout_seconds={int(manifest['limits']['call_timeout_seconds'])} "
+        f"total_timeout_seconds={total_timeout} max_rounds={_env_int('BOARD_MAX_ROUNDS', DEFAULT_BOARD_MAX_ROUNDS)}",
         file=sys.stderr,
     )
 
