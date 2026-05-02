@@ -6,6 +6,7 @@ allowed-tools:
   - Read
   - Grep
   - Glob
+  - Agent
 ---
 
 # board - Convene a board of advisors
@@ -36,7 +37,7 @@ The board skill **composes** the advisor skill mechanically — same code path v
 
 If you find yourself about to write a structured-prompt template, an upstream-error table, or stderr observability conventions in this file — STOP. Cross-reference instead.
 
-## Pre-flight: resolve script paths and parse the model pool
+## Pre-flight: resolve script paths and probe env
 
 ```bash
 ADVISOR_BIN="${ACF_ADVISOR_BIN:-}"
@@ -48,9 +49,96 @@ BOARD_BIN="${ACF_BOARD_BIN:-}"
 [ -z "$BOARD_BIN" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "${CLAUDE_PLUGIN_ROOT}/scripts/board.py" ] && BOARD_BIN="${CLAUDE_PLUGIN_ROOT}/scripts/board.py"
 [ -z "$BOARD_BIN" ] && BOARD_BIN=$(ls -1 "$HOME"/.claude/plugins/cache/*/acf-advisor/*/scripts/board.py 2>/dev/null | sort -V | tail -1)
 test -x "$BOARD_BIN" || { echo "board: not found; install via: /plugin install acf-advisor@acf-tools" >&2; exit 1; }
+
+# Probe env. Exit 0 → LLM path. Exit 2 → local-team fallback (see below).
+"$ADVISOR_BIN" --check-env; ENV_RC=$?
 ```
 
-Read `ADVISOR_MODEL` (comma-delimited list); split into the `available_models` array for the manifest. A single-value env yields a single-element pool.
+> **DO NOT pre-search for env vars outside the project tree.** The script already auto-loads `.env` from CWD upward, stopping at the first `.env`, a `.git` directory, or FS root. Already-exported shell vars are preserved. You **MUST NOT**:
+> - read `$HOME/.claude/**`, `$HOME/.config/**`, `$HOME/.zshrc`, `$HOME/.bashrc`, or any file outside CWD's ancestor chain
+> - run `env | grep` for keys (the `--check-env` line shows what was resolved)
+> - probe alternative env file locations (`~/.config/qlaude/env`, `~/.claude/settings.json`, etc.)
+>
+> Trust `--check-env`'s answer. If it returns 2, branch to local-team fallback below. Do **not** fish for env in random places.
+
+Read `ADVISOR_MODEL` (comma-delimited list); split into the `available_models` array for the manifest. A single-value env yields a single-element pool. **Only read `ADVISOR_MODEL` when `ENV_RC == 0`** — local-team mode does not use it (no models, just subagents).
+
+## Execution path: LLM or local-team
+
+| `--check-env` exit | Path | What runs the personas |
+|---|---|---|
+| 0 | LLM path (default) | `board.py` → `lib.advisor.run_advisor()` per persona, parallel via `ThreadPoolExecutor`. The "Workflow" section below applies as written. |
+| 2 | Local-team fallback | Each persona becomes a parallel `Agent` tool call (`subagent_type: general-purpose`). No external API. Step 7 is replaced — see "Local-team fallback" below. |
+
+## Local-team fallback
+
+Triggered when `ENV_RC == 2`. The board still runs — just with no external API calls. Personas become local Claude subagents.
+
+### When local-team applies
+
+- No `LITELLM_API_KEY` / `OPENAI_API_KEY` reachable via env or project `.env` after `load_dotenv()`.
+- AND/OR no `ADVISOR_MODEL` / `OPENAI_MODEL` set.
+
+The user typically has not configured an LLM endpoint for this project yet. **Do not nag them to configure one** — proceed with local-team. If they later configure env, the LLM path activates automatically (no plugin reinstall needed).
+
+### Workflow (replaces step 7+8 of the LLM workflow)
+
+1. **Tell the user explicitly** what's happening, in one short paragraph:
+
+   ```
+   No external advisor endpoint configured (no LITELLM_API_KEY/OPENAI_API_KEY in env or
+   project .env). Falling back to local-team mode — each persona will run as a Claude
+   subagent. No external API calls.
+   ```
+
+2. **Same as steps 1–6 of the LLM workflow**: extract dimensions → priority pick → roster confirmation. These are skill-side and don't need API access.
+
+3. **Dispatch round 1**: ONE message containing N parallel `Agent` tool calls (one per persona). Each call uses:
+   - `subagent_type: "general-purpose"`
+   - `description`: `Advisor: <display_name>` (≤ 5 words, e.g. `Advisor: token-lifecycle skeptic`)
+   - `prompt`: the persona's full system text (Dimension / Lens / Bias / Blind spots / Output discipline) + the marker line below + the same `## Question / ## Context / ## What I've considered / ## What I want from you` user prompt the LLM path uses.
+
+   **Marker line** (verbatim, after the persona system text and before the user prompt):
+
+   > You are roleplaying as the advisor described above. Respond ONLY in that voice. Output discipline applies. Do not ask follow-up questions; if information is missing, name what's missing and proceed with stated assumptions.
+
+4. **Round k + 1** (only if `R ≥ 2`): NEW Agent dispatch per persona (subagents have no memory across calls). The prompt appends the structured prior-round transcript exactly as `board.py` does:
+
+   ```
+   ## Prior round (k=N) takes
+   ### Persona: <display_name> [<id>]
+   <verbatim>
+   ```
+
+   Each persona only sees prior-round (not mid-round) takes. Truncate per-take to `max_prompt_chars / personas` if needed.
+
+5. **Synthesis**: YOU (the orchestrator) produce the synthesis directly — one Claude turn, NOT another `Agent` dispatch. Use `persona-design/synthesizer.md` as your meta-prompt: weight by the user's priority dimension, name disagreement, no flattery, no filler. The orchestrator IS the synthesizer in this mode.
+
+6. **Render**: same idiom as the LLM path, with `(<model>)` replaced by `(local)`:
+
+   ```
+   ### Advisor (local) — <persona_display_name> says:
+
+   <verbatim subagent reply>
+   ```
+
+   For `R ≥ 2`, group by round under `## Round 1` / `## Round 2` headers as the LLM path does. End with `## Synthesis` block.
+
+7. **Cost line** (replaces `[board] aggregate: …`): print to user-visible output a single line at the end:
+
+   ```
+   [board:local] mode=local-team personas=N rounds=R subagent_calls=N×R
+   ```
+
+### Local-team constraints
+
+| Rule | Reason |
+|---|---|
+| All persona-cap and naming-test rules from the LLM path **still apply**. | Local-team is the same panel design, different runtime. |
+| **Cross-model triangulation is N/A.** All "models" are Claude. | Pool size = 0. There's no diversity to triangulate. If you would have used cloning across models in the LLM path, just keep one persona — cloning Claude across cloned slots adds noise, not signal. |
+| **R is fixed at manifest-build time** (same as LLM path). | No autonomous mid-run extension, ever. |
+| **`board.py` is NOT invoked** in local-team mode. | The orchestrator is pure skill markdown + Agent tool calls. No JSON manifest is built; no `[board]` stderr lines. |
+| **Synthesis is a Claude turn, not an Agent call.** | Avoids the synthesizer adopting a persona of its own. |
 
 ## Workflow
 
@@ -119,6 +207,8 @@ NOTE: <persona-name> cloned across <models> for cross-model triangulation on the
 Wait for user approve/edit/veto. **This step is free of advisor cost.**
 
 ### 7. Build the manifest, run the panel
+
+**If `ENV_RC == 2`, skip this step entirely — execute the Local-team fallback (above) instead.** Steps 1–6 still apply; only the dispatch mechanism differs. Do NOT build a manifest, do NOT invoke `board.py`.
 
 Manifest schema (validated by `board.py` before any LLM call):
 
