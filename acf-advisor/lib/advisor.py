@@ -198,6 +198,14 @@ def looks_like_reasoning_field_error(msg: str) -> bool:
     )
 
 
+def looks_like_thinking_budget_conflict(msg: str) -> bool:
+    """Provider routes thinking via thinking_level (e.g. Gemini 3) — drop only thinking_budget."""
+    needle = msg.lower()
+    return "thinking_level" in needle or (
+        "cannot specify both" in needle and "thinking" in needle
+    )
+
+
 def looks_like_temperature_error(msg: str) -> bool:
     needle = msg.lower()
     return "temperature" in needle and (
@@ -206,6 +214,7 @@ def looks_like_temperature_error(msg: str) -> bool:
         or "not supported" in needle
         or "only the default" in needle
         or "deprecated" in needle
+        or "may only be set" in needle
     )
 
 
@@ -339,14 +348,21 @@ def run_advisor(
 
     resp: dict | None = None
     last_msg: str | None = None
-    for _ in range(3):
+    for _ in range(4):
         try:
             resp = post_chat(resolved_base_url, resolved_api_key, payload, timeout)
             break
         except RuntimeError as e:
             msg = str(e)
             last_msg = msg
-            if (current_effort is not None or current_budget is not None) and \
+            if (current_budget is not None) and looks_like_thinking_budget_conflict(msg):
+                print(
+                    f"{log_prefix} upstream rejected thinking_budget (uses thinking_level); "
+                    "retrying without thinking.budget_tokens, keeping reasoning_effort",
+                    file=sys.stderr,
+                )
+                current_budget = None
+            elif (current_effort is not None or current_budget is not None) and \
                     looks_like_reasoning_field_error(msg):
                 print(
                     f"{log_prefix} upstream rejected reasoning fields; retrying without thinking mode",
