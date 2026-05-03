@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -22,6 +23,36 @@ DEFAULT_SYSTEM_PROMPT = (
     "If the question is underspecified, name what's missing rather than "
     "guessing. No filler, no flattery."
 )
+
+
+# Model-family → param-shape registry. First match wins.
+# Match by family stem (no version pin) so future minor versions inherit the profile.
+MODEL_PARAM_PROFILES: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"^(?:anthropic/)?claude-(?:opus|sonnet|haiku)-4-[7-9]\b"),
+        "claude_47_adaptive",
+    ),
+    (
+        re.compile(r"^(?:anthropic/)?claude-(?:opus|sonnet|haiku)-(?:3|4-[0-6])\b"),
+        "claude_legacy_thinking",
+    ),
+    (
+        re.compile(r"^gemini/gemini-[3-9]\b"),
+        "gemini_thinking_level",
+    ),
+    (
+        re.compile(r"^(?:openai/)?(?:gpt-5|o[1-9])\b"),
+        "openai_reasoning_only",
+    ),
+]
+
+
+def resolve_param_profile(model: str) -> str:
+    """Return the param-profile name for the given model, or "default" if no pattern matches."""
+    for pat, name in MODEL_PARAM_PROFILES:
+        if pat.match(model):
+            return name
+    return "default"
 
 
 @dataclass
@@ -147,15 +178,52 @@ def build_payload(
             {"role": "user", "content": user},
         ],
     }
-    if include_temperature:
+
+    reasoning_on = reasoning_effort is not None or thinking_budget is not None
+    profile = resolve_param_profile(model) if reasoning_on else "default"
+
+    if include_temperature and not reasoning_on:
         payload["temperature"] = 0.3
-    if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
-    if thinking_budget is not None:
-        payload["thinking"] = {
-            "type": "enabled",
-            "budget_tokens": thinking_budget,
-        }
+
+    if not reasoning_on:
+        return payload
+
+    # Effort string used by both Anthropic adaptive output_config and (via LiteLLM)
+    # Gemini's thinking_level. Falls back to "high" when only thinking_budget was supplied.
+    effort = reasoning_effort or "high"
+
+    if profile == "claude_47_adaptive":
+        # Anthropic Claude 4.7+ rejects thinking.type.enabled and any explicit reasoning_effort
+        # at the OpenAI-shape layer. Use adaptive thinking + output_config.effort.
+        payload["thinking"] = {"type": "adaptive"}
+        payload["output_config"] = {"effort": effort}
+    elif profile == "gemini_thinking_level":
+        # Gemini 3+: LiteLLM auto-maps reasoning_effort → thinking_level. Sending an additional
+        # `thinking` block triggers "cannot specify both thinking and thinking_level".
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+    elif profile == "openai_reasoning_only":
+        # OpenAI o-series and gpt-5 take reasoning_effort only; no `thinking` block.
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+    elif profile == "claude_legacy_thinking":
+        # Claude 3 and 4.0–4.6 use the legacy thinking shape; no reasoning_effort field.
+        if thinking_budget is not None:
+            payload["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget,
+            }
+    else:
+        # default / unknown — preserve historical behavior: send both fields, let the
+        # retry safety net in run_advisor() drop whatever upstream rejects.
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+        if thinking_budget is not None:
+            payload["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget,
+            }
+
     return payload
 
 
@@ -354,6 +422,7 @@ def run_advisor(
 
     sending_parts = [
         f"model={model}",
+        f"profile={resolve_param_profile(model)}",
         f"effort={reasoning_effort or 'off'}",
         f"thinking_budget={thinking_budget if thinking_budget is not None else 'off'}",
         f"timeout={int(timeout)}s",
