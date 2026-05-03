@@ -1,6 +1,6 @@
 {
   "name": "acf-advisor",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Advisor + board-of-advisors skills - consult another LLM (with thinking/reasoning mode on) for a single second opinion, OR convene a multi-persona panel hypertailored to a specific decision. Board dispatches each persona as a parallel Claude Agent subagent (visible/cancellable in UI); synthesis is the orchestrator's own turn weighted by the user-chosen priority dimension. Personas synthesized per call from a structured recipe. Works against any OpenAI-compatible endpoint; comma-delimited ADVISOR_MODEL declares a multi-model pool. Local-team fallback when no API endpoint is configured (each persona is a Claude subagent, no external calls).",
   "author": {
     "name": "ACF Tools",
