@@ -24,92 +24,113 @@ allowed-tools:
 
 - Simple lookups you can answer directly.
 - Tasks the user explicitly asked **you** to do — don't outsource your job.
-- When env vars aren't set and the user hasn't asked you to consult an external model.
 - Looping calls (this is one-shot; no conversation memory).
 
-## Pre-flight: resolve the script and check env
+## Pre-flight: resolve advisor.py
 
-The script auto-loads `.env` from CWD upward (stops at the first `.env`, a `.git` directory, or filesystem root). Already-set env vars are preserved — shell wins over `.env`. So as long as the user runs Claude from inside their project tree, no manual `source .env` is needed.
-
-> **DO NOT pre-search for env vars outside the project tree.** The script already auto-loads `.env` from CWD upward, stopping at the first `.env`, a `.git` directory, or FS root. Already-exported shell vars are preserved. You **MUST NOT**:
-> - read `$HOME/.claude/**`, `$HOME/.config/**`, `$HOME/.zshrc`, `$HOME/.bashrc`, or any file outside CWD's ancestor chain
-> - run `env | grep` for keys (the script does this internally and reports what it found via the `[advisor] sending: dotenv=… ` line)
-> - probe alternative env file locations (`~/.config/qlaude/env`, `~/.claude/settings.json`, etc.)
->
-> If you need a programmatic probe, run `"$ADVISOR_BIN" --check-env` (exits 0 if env OK, 2 if missing — no HTTP call). Otherwise let the script run; if env is missing it will print `[advisor] missing API key: …` or `[advisor] missing model: …` and exit. Surface that error verbatim and tell the user to add the var to their project `.env` (or shell-export it).
-
-`$CLAUDE_PLUGIN_ROOT` is unreliable in skill-spawned bash (substitution is broken in skill markdown — see anthropics/claude-code#9354). Use this layered resolver to find the script:
+`advisor.py` runs via `uv` (PEP 723 shebang) and auto-loads `.env` from the CWD upward. The script handles env resolution itself. **Do not probe env, do not read shell rc files, do not grep for keys.** If env is missing, the script exits with `[advisor] missing API key: …` or `[advisor] missing model: …` — surface that error verbatim to the user and tell them to add the missing var to their project `.env`.
 
 ```bash
-ADVISOR_BIN="${ACF_ADVISOR_BIN:-}"
-if [ -z "$ADVISOR_BIN" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "${CLAUDE_PLUGIN_ROOT}/scripts/advisor.py" ]; then
-  ADVISOR_BIN="${CLAUDE_PLUGIN_ROOT}/scripts/advisor.py"
-fi
-if [ -z "$ADVISOR_BIN" ]; then
-  ADVISOR_BIN=$(ls -1 "$HOME"/.claude/plugins/cache/*/acf-advisor/*/scripts/advisor.py 2>/dev/null | sort -V | tail -1)
-fi
-test -x "$ADVISOR_BIN" || { echo "advisor: not found (tried ACF_ADVISOR_BIN, CLAUDE_PLUGIN_ROOT, ~/.claude/plugins/cache); install via: /plugin install acf-advisor@acf-tools" >&2; exit 1; }
+ADVISOR_BIN="${ACF_ADVISOR_BIN:-${CLAUDE_PLUGIN_ROOT:-}/scripts/advisor.py}"
+[ -x "$ADVISOR_BIN" ] || ADVISOR_BIN="$(ls -1t "$HOME"/.claude/plugins/cache/*/acf-advisor/*/scripts/advisor.py 2>/dev/null | head -1)"
+test -x "$ADVISOR_BIN" || { echo "advisor: not found; install via /plugin install acf-advisor@acf-tools" >&2; exit 1; }
 ```
 
-Resolution order: `$ACF_ADVISOR_BIN` (dev override) → `$CLAUDE_PLUGIN_ROOT/scripts/advisor.py` (best-effort) → highest-semver match in the plugin cache.
+That's it. Pipe your prompt to `"$ADVISOR_BIN"`. The script handles dotenv, env validation, the HTTP call, and retries.
 
-You don't need to pre-check the API key — the script will error with `[advisor] missing API key: …` if neither `LITELLM_API_KEY` nor `OPENAI_API_KEY` is set after auto-load. If that happens, tell the user to add the var to their `.env` (or shell-export it) and retry.
+## Context-building protocol — the load-bearing step
 
-## Context-building protocol
+The advisor LLM has zero context — what you assemble is all it gets, and answer quality is upper-bounded by it. **Invest real effort here.** A perfect prompt against a weak context gets a mediocre answer. A strong context against a sharp question gets the second opinion you're paying for.
 
-The advisor LLM has zero context about this conversation. Build a focused prompt:
+### Mandatory checklist (every field is required)
 
-1. **One-sentence question** at the top.
-2. **Relevant artifacts** — read with Read/Grep, include only what's needed. Cap total context at ~20KB; if larger, summarize.
-3. **What you've considered** — your current take, alternatives ruled out, why.
-4. **What you want from the advisor** — "agree/disagree", "list risks", "name an alternative", etc.
+1. **Question** — one sentence, sharp and answerable as stated.
+   - BAD: "What do you think about our auth design?"
+   - GOOD: "Given a 50M-row users table, weekly schema migrations, and a hard requirement that no migration takes a write-lock > 30s, should we use shadow tables + dual-write or expand-contract with online DDL — and what's the second-order failure mode I'm most likely missing?"
+   - The question must encode the constraints that make the obvious answers wrong.
 
-Assemble into a single text blob:
+2. **Context** — every load-bearing fact, nothing else.
+   - **Code**: paste actual relevant excerpts (with file:line citations), not summaries. If a function's body matters for the reasoning, include it. If only the signature matters, include only the signature.
+   - **Errors**: paste verbatim error messages, stack traces, log lines. Not paraphrases.
+   - **Numbers**: concrete values that bound the problem (sizes, latencies, QPS, row counts, deadlines).
+   - **Constraints**: what rules out the obvious answers — performance budget, compliance, backwards compatibility, team capacity, deadline.
+   - **Architecture**: surrounding system shape *only insofar as it constrains the answer*. Not a tour of the repo.
+
+3. **What I've considered** — alternatives you've evaluated AND ruled out, with reasons.
+   - Format: "Considered X — ruled out because Y."
+   - Prevents the advisor from wasting a turn proposing what you've already discarded.
+   - If you haven't considered alternatives yet, do that work first, before calling the advisor.
+
+4. **Decision dimensions and priority** — which trade-offs are in play and which matters most.
+   - Name the top 1–2 dimensions and which is paramount. The advisor will weight its answer accordingly.
+
+5. **What I want from you** — concrete, named ask. Pick from:
+   - "Recommend one of {A, B, C} and name the second-order risk."
+   - "List the failure modes of approach X I haven't named."
+   - "Give me the strongest counterargument to my plan."
+   - "Identify the load-bearing assumption that, if wrong, breaks this whole approach."
+   - Avoid open-ended "what do you think?" — it produces vague answers.
+
+### Bloat audit — do this before sending
+
+Re-read the assembled prompt. For every paragraph, ask: **"Would the advisor's answer change if I deleted this?"**
+
+- No → delete it.
+- Yes → keep it; consider if it should be sharper or expanded.
+
+Specifically strip:
+
+- Framing/throat-clearing prose ("As you may know…", "Some background…", "Just to set context…")
+- File contents that are referenced but not central — summarize in one line instead
+- Conversation history (the advisor doesn't care how you got here)
+- Restated constraints (say each constraint once, in the place it's load-bearing)
+- "Here's some background" sections that are actually background
+
+### Size discipline
+
+Cap total assembled context at ~20KB. If load-bearing facts exceed 20KB, the question is too broad — narrow it. (If you're tempted to send 50KB, you're probably asking two questions; split into two advisor calls.)
+
+### Final structure
 
 ```
 ## Question
-<one sentence>
+<one sharp sentence>
 
 ## Context
-<files / errors / prior decisions, trimmed>
+<load-bearing facts only — code, errors, numbers, constraints, architecture-as-it-constrains>
 
 ## What I've considered
-<your current thinking + ruled-out alternatives>
+- Considered X — ruled out because Y.
+- Considered Z — ruled out because W.
+
+## Decision dimensions
+1. <dimension> (priority)
+2. <dimension>
 
 ## What I want from you
-<concrete ask>
+<one of the named asks above>
 ```
 
 ## Invocation
 
-Pipe the prompt to `"$ADVISOR_BIN"` via stdin (handles arbitrary size; uv runs the script via the PEP 723 shebang).
+Pipe the assembled prompt to `"$ADVISOR_BIN"` via stdin. Heredoc with single-quoted delimiter so `$`, backticks, and backslashes are not expanded:
 
 ```bash
 cat <<'PROMPT' | "$ADVISOR_BIN"
 ## Question
-Should I use a goroutine + channel or a sync.Mutex for this counter?
+…
 
 ## Context
-<paste the relevant ~50 lines>
+…
 
 ## What I've considered
-Mutex is simpler; channel feels idiomatic but I'm not sure it's worth the complexity here.
+…
+
+## Decision dimensions
+…
 
 ## What I want from you
-A direct recommendation and the one risk I'm most likely missing.
-PROMPT
-```
-
-**Heredoc rules**: use `'PROMPT'` (single-quoted) so `$`, backticks, and backslashes inside the prompt aren't expanded.
-
-**Combined invocation** (resolver + call in one bash block — easiest):
-
-```bash
-ADVISOR_BIN="${ACF_ADVISOR_BIN:-}"
-[ -z "$ADVISOR_BIN" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "${CLAUDE_PLUGIN_ROOT}/scripts/advisor.py" ] && ADVISOR_BIN="${CLAUDE_PLUGIN_ROOT}/scripts/advisor.py"
-[ -z "$ADVISOR_BIN" ] && ADVISOR_BIN=$(ls -1 "$HOME"/.claude/plugins/cache/*/acf-advisor/*/scripts/advisor.py 2>/dev/null | sort -V | tail -1)
-cat <<'PROMPT' | "$ADVISOR_BIN"
-…your structured prompt here…
+…
 PROMPT
 ```
 
@@ -127,36 +148,36 @@ Show the advisor's reply to the user verbatim under a clear header, then add you
 <one short paragraph: agree/disagree, caveats, what to actually do>
 ```
 
-Surface the stderr observability lines to the user so they see what was sent and how much it cost:
+Surface the stderr observability lines so the user sees what was sent and how much it cost:
 
-- `[advisor] sending: model=… effort=… thinking_budget=… dotenv=…` — confirms what was actually requested and which `.env` was loaded.
-- `[advisor] model=… prompt=… completion=… total=… reasoning=…` — token usage (per-call cost). Thinking mode adds reasoning-token cost and latency by design — that's the tradeoff for considered answers.
-- `[advisor] note: reasoning fields sent but upstream returned 0 reasoning tokens …` — informational; means the model or proxy didn't engage thinking. The reply is still valid; suggest `ADVISOR_REASONING_EFFORT=off` if the user wants to skip the cost on this model.
+- `[advisor] sending: model=… effort=… thinking_budget=… timeout=… dotenv=…` — confirms what was requested and which `.env` was loaded.
+- `[advisor] model=… prompt=… completion=… total=… reasoning=…` — token usage. Thinking mode adds reasoning-token cost and latency by design.
+- `[advisor] note: reasoning fields sent but upstream returned 0 reasoning tokens …` — informational; means the model or proxy didn't engage thinking. Reply is still valid; suggest `ADVISOR_REASONING_EFFORT=off` if the user wants to skip the cost on this model.
 
-If the script printed a `--- reasoning ---` block on stderr, the user can see the advisor's chain of thought there; don't re-print it on stdout unless the user asks.
+If the script printed a `--- reasoning ---` block on stderr, the user can see the advisor's chain of thought there; don't re-print it on stdout unless asked.
 
 ## Disable escape hatch
 
-Thinking mode is **on by default** (`reasoning_effort=high`, `thinking.budget_tokens=8000`). For a one-off cheap call, the user can set `ADVISOR_REASONING_EFFORT=off` in the environment before invoking. Don't disable it on your own — the whole point of the advisor is considered answers.
+Thinking mode is **on by default** (`reasoning_effort=high`, `thinking.budget_tokens=8000`). For a one-off cheap call, the user can set `ADVISOR_REASONING_EFFORT=off` in the environment. Don't disable it on your own — the whole point of the advisor is considered answers.
 
 ## Failure modes
 
 | Symptom | Cause | Action |
 |---|---|---|
-| `advisor: not found (tried ACF_ADVISOR_BIN, CLAUDE_PLUGIN_ROOT, ~/.claude/plugins/cache)` | plugin not installed in this Claude Code instance | Tell user to run `/plugin install acf-advisor@acf-tools`, or set `ACF_ADVISOR_BIN` to a checkout path |
-| `[advisor] missing API key` | env not set and no `.env` found | Tell user to add `LITELLM_API_KEY` to `.env` in their project, or export it; verify the script loaded the right `.env` (see `dotenv=` in the `sending:` line) |
+| `advisor: not found` | plugin not installed | Tell user to run `/plugin install acf-advisor@acf-tools`, or set `ACF_ADVISOR_BIN` to a checkout path |
+| `[advisor] missing API key` | env not set and no `.env` found | Tell user to add `LITELLM_API_KEY` to `.env` in their project, or shell-export it; verify the script loaded the right `.env` (see `dotenv=` in the `sending:` line) |
 | `[advisor] missing model` | `ADVISOR_MODEL` not set | Ask user which model to use; suggest setting `ADVISOR_MODEL` in `.env` |
 | `HTTP 401` | bad key | Verify key is current; surface error to user |
 | `HTTP 404 model not found` | wrong model name for the endpoint | List available models, ask user to pick |
 | `upstream rejected reasoning fields` (auto-retry) | non-reasoning model | The script retries without thinking; reply will still come through |
-| `upstream rejected temperature override` (auto-retry) | reasoning-only model that doesn't accept `temperature` | Auto-retried with default temperature; reply will still come through |
-| `note: reasoning fields sent but upstream returned 0 reasoning tokens` | model/proxy ignored thinking fields | Informational — reply is fine. If user wants to avoid the wasted round-trip cost on this model, set `ADVISOR_REASONING_EFFORT=off` |
+| `note: reasoning fields sent but upstream returned 0 reasoning tokens` | model/proxy ignored thinking fields | Informational. If user wants to avoid the wasted round-trip, set `ADVISOR_REASONING_EFFORT=off` |
 | `network error` | endpoint unreachable | Confirm `LITELLM_BASE_URL` is correct and reachable |
 
 ## Critical rules
 
-- **One-shot only**. Each invocation is independent. No conversation memory.
+- **Do not probe env outside the project.** No reading `~/.zshrc`, `~/.claude/`, `~/.config/`. The script handles env. If something is missing, the script tells you.
+- **One-shot only.** Each invocation is independent. No conversation memory.
 - **Never echo the API key** in any output, even on error.
-- **Cap context at ~20KB**. Trim or summarize if larger; the advisor doesn't need the entire file.
-- **Show the advisor's reply verbatim**. Don't paraphrase. Add your take separately so the user can compare.
-- **Thinking on by default**. Don't pass `ADVISOR_REASONING_EFFORT=off` unless the user asked.
+- **Cap context at ~20KB** and run the bloat audit before sending.
+- **Show the advisor's reply verbatim.** Don't paraphrase. Add your take separately so the user can compare.
+- **Thinking on by default.** Don't pass `ADVISOR_REASONING_EFFORT=off` unless the user asked.
