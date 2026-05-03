@@ -334,6 +334,8 @@ def run_advisor(
     Raises AdvisorError on failure (missing key/model, exhausted retries, network error,
     HTTP error not handled by retry, malformed response).
     """
+    timeout = max(timeout, 300.0)
+
     resolved_api_key = api_key or env_or("LITELLM_API_KEY", "OPENAI_API_KEY")
     if not resolved_api_key:
         raise AdvisorError("missing API key: set LITELLM_API_KEY or OPENAI_API_KEY")
@@ -359,12 +361,17 @@ def run_advisor(
     ]
     print(f"{log_prefix} sending: " + " ".join(sending_parts), file=sys.stderr)
 
+    # Reasoning-capable models reject `temperature` (Anthropic opus-4-7, OpenAI o-series, etc.).
+    # Skip it when thinking is on; only send it when both reasoning fields are off.
+    include_temperature = reasoning_effort is None and thinking_budget is None
+
     payload = build_payload(
         model=model,
         system=system_prompt,
         user=user_prompt,
         reasoning_effort=reasoning_effort,
         thinking_budget=thinking_budget,
+        include_temperature=include_temperature,
     )
 
     if debug:
@@ -385,7 +392,6 @@ def run_advisor(
             file=sys.stderr,
         )
 
-    include_temperature = True
     current_effort = reasoning_effort
     current_budget = thinking_budget
 

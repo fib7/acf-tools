@@ -59,8 +59,8 @@ def main() -> int:
     ap.add_argument(
         "--timeout",
         type=float,
-        default=float(os.environ.get("ADVISOR_TIMEOUT", "600")),
-        help="HTTP timeout in seconds (default: 600, env: ADVISOR_TIMEOUT).",
+        default=max(float(os.environ.get("ADVISOR_TIMEOUT", "600")), 300.0),
+        help="HTTP timeout in seconds (default: 600, minimum: 300, env: ADVISOR_TIMEOUT).",
     )
     ap.add_argument(
         "--no-dotenv",
