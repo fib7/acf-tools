@@ -26,29 +26,50 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 # Model-family → param-shape registry. First match wins.
-# Match by family stem (no version pin) so future minor versions inherit the profile.
+# Patterns match by provider/family name only; versions are intentionally not pinned so
+# new versions inherit the modern profile automatically.
 MODEL_PARAM_PROFILES: list[tuple[re.Pattern[str], str]] = [
-    (
-        re.compile(r"^(?:anthropic/)?claude-(?:opus|sonnet|haiku)-4-[7-9]\b"),
-        "claude_47_adaptive",
-    ),
-    (
-        re.compile(r"^(?:anthropic/)?claude-(?:opus|sonnet|haiku)-(?:3|4-[0-6])\b"),
-        "claude_legacy_thinking",
-    ),
-    (
-        re.compile(r"^gemini/gemini-[3-9]\b"),
-        "gemini_thinking_level",
-    ),
-    (
-        re.compile(r"^(?:openai/)?(?:gpt-5|o[1-9])\b"),
-        "openai_reasoning_only",
-    ),
+    (re.compile(r"^(?:anthropic/)?claude-(?:opus|sonnet|haiku)\b"), "claude_adaptive"),
+    (re.compile(r"^gemini/gemini\b"), "gemini_thinking_level"),
+    (re.compile(r"^(?:openai/)?(?:gpt|o\d+)\b"), "openai_reasoning_only"),
 ]
+
+KNOWN_PROFILES: frozenset[str] = frozenset(
+    {
+        "claude_adaptive",
+        "claude_legacy_thinking",
+        "gemini_thinking_level",
+        "openai_reasoning_only",
+        "default",
+    }
+)
+
+_warned_unknown_profile = False
 
 
 def resolve_param_profile(model: str) -> str:
-    """Return the param-profile name for the given model, or "default" if no pattern matches."""
+    """Return the param-profile name for the given model.
+
+    Resolution order:
+      1. ADVISOR_PROFILE env var, if set to a known profile name.
+      2. First MODEL_PARAM_PROFILES regex match.
+      3. "default".
+
+    Unknown ADVISOR_PROFILE values trigger a one-time stderr warning and fall through
+    to the regex/default path so a typo doesn't silently break routing.
+    """
+    global _warned_unknown_profile
+    override = os.environ.get("ADVISOR_PROFILE")
+    if override:
+        if override in KNOWN_PROFILES:
+            return override
+        if not _warned_unknown_profile:
+            print(
+                f"[advisor] warning: ADVISOR_PROFILE={override!r} is not one of "
+                f"{sorted(KNOWN_PROFILES)}; falling back to regex routing",
+                file=sys.stderr,
+            )
+            _warned_unknown_profile = True
     for pat, name in MODEL_PARAM_PROFILES:
         if pat.match(model):
             return name
@@ -170,7 +191,13 @@ def build_payload(
     reasoning_effort: str | None,
     thinking_budget: int | None,
     include_temperature: bool = True,
+    force_profile: str | None = None,
 ) -> dict:
+    """Build the chat-completions payload.
+
+    `force_profile`, when set, bypasses ADVISOR_PROFILE/regex resolution. Used by the
+    retry loop to pin `claude_adaptive` after upstream demands the adaptive shape.
+    """
     payload: dict = {
         "model": model,
         "messages": [
@@ -180,7 +207,12 @@ def build_payload(
     }
 
     reasoning_on = reasoning_effort is not None or thinking_budget is not None
-    profile = resolve_param_profile(model) if reasoning_on else "default"
+    if not reasoning_on:
+        profile = "default"
+    elif force_profile is not None:
+        profile = force_profile
+    else:
+        profile = resolve_param_profile(model)
 
     if include_temperature and not reasoning_on:
         payload["temperature"] = 0.3
@@ -192,37 +224,34 @@ def build_payload(
     # Gemini's thinking_level. Falls back to "high" when only thinking_budget was supplied.
     effort = reasoning_effort or "high"
 
-    if profile == "claude_47_adaptive":
-        # Anthropic Claude 4.7+ rejects thinking.type.enabled and any explicit reasoning_effort
+    if profile == "claude_adaptive":
+        # Modern Claude (4.7+) rejects thinking.type.enabled and any explicit reasoning_effort
         # at the OpenAI-shape layer. Use adaptive thinking + output_config.effort.
         payload["thinking"] = {"type": "adaptive"}
         payload["output_config"] = {"effort": effort}
     elif profile == "gemini_thinking_level":
-        # Gemini 3+: LiteLLM auto-maps reasoning_effort → thinking_level. Sending an additional
+        # Gemini: LiteLLM auto-maps reasoning_effort → thinking_level. Sending an additional
         # `thinking` block triggers "cannot specify both thinking and thinking_level".
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
     elif profile == "openai_reasoning_only":
-        # OpenAI o-series and gpt-5 take reasoning_effort only; no `thinking` block.
+        # OpenAI o-series and gpt-* take reasoning_effort only; no `thinking` block.
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
     elif profile == "claude_legacy_thinking":
-        # Claude 3 and 4.0–4.6 use the legacy thinking shape; no reasoning_effort field.
+        # Opt-in only (via ADVISOR_PROFILE). Claude 3 / 4.0–4.6 legacy thinking shape.
         if thinking_budget is not None:
             payload["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": thinking_budget,
             }
     else:
-        # default / unknown — preserve historical behavior: send both fields, let the
-        # retry safety net in run_advisor() drop whatever upstream rejects.
+        # default / unknown model — send only the OpenAI-shape lowest common denominator.
+        # Modern proxies translate reasoning_effort to provider-specific fields; legacy
+        # providers ignore it. Never send a legacy `thinking.type=enabled` block here:
+        # a wrong default broke modern Claude in v1.3.1.
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
-        if thinking_budget is not None:
-            payload["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": thinking_budget,
-            }
 
     return payload
 
@@ -272,6 +301,12 @@ def looks_like_thinking_budget_conflict(msg: str) -> bool:
     return "thinking_level" in needle or (
         "cannot specify both" in needle and "thinking" in needle
     )
+
+
+def looks_like_anthropic_adaptive_required(msg: str) -> bool:
+    """Anthropic 4.7+ rejected the legacy thinking shape and asked for adaptive + output_config."""
+    needle = msg.lower()
+    return "thinking.type.adaptive" in needle and "output_config" in needle
 
 
 def looks_like_temperature_error(msg: str) -> bool:
@@ -463,6 +498,7 @@ def run_advisor(
 
     current_effort = reasoning_effort
     current_budget = thinking_budget
+    force_profile: str | None = None
 
     resp: dict | None = None
     last_msg: str | None = None
@@ -473,7 +509,14 @@ def run_advisor(
         except RuntimeError as e:
             msg = str(e)
             last_msg = msg
-            if (current_budget is not None) and looks_like_thinking_budget_conflict(msg):
+            if force_profile != "claude_adaptive" and looks_like_anthropic_adaptive_required(msg):
+                print(
+                    f"{log_prefix} upstream required adaptive thinking shape; "
+                    "retrying with claude_adaptive profile",
+                    file=sys.stderr,
+                )
+                force_profile = "claude_adaptive"
+            elif (current_budget is not None) and looks_like_thinking_budget_conflict(msg):
                 print(
                     f"{log_prefix} upstream rejected thinking_budget (uses thinking_level); "
                     "retrying without thinking.budget_tokens, keeping reasoning_effort",
@@ -503,6 +546,7 @@ def run_advisor(
                 reasoning_effort=current_effort,
                 thinking_budget=current_budget,
                 include_temperature=include_temperature,
+                force_profile=force_profile,
             )
     if resp is None:
         raise AdvisorError(f"gave up after retries: {last_msg or 'unknown error'}")

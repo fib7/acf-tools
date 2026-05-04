@@ -85,6 +85,7 @@ All configuration is via environment variables. No config files.
 | Model **or** comma-delimited model pool | `ADVISOR_MODEL` | `OPENAI_MODEL` (no default — error if unset) |
 | Reasoning effort | `ADVISOR_REASONING_EFFORT` | default `high`; values: `low`, `medium`, `high`, `off` |
 | Thinking budget (tokens) | `ADVISOR_THINKING_BUDGET` | default `8000` |
+| Override param-shape profile | `ADVISOR_PROFILE` | one of `claude_adaptive`, `claude_legacy_thinking`, `gemini_thinking_level`, `openai_reasoning_only`, `default`; unset = regex-routed by family name |
 | HTTP timeout (seconds) | `ADVISOR_TIMEOUT` | default `600` (was `180` pre-v1.2.0) |
 | Board: max parallel persona calls | `BOARD_PARALLELISM` | default `5` |
 | Board: total timeout for the whole panel | `BOARD_TOTAL_TIMEOUT_SECONDS` | default `1800` (was `900` pre-v1.2.0) |
@@ -240,11 +241,14 @@ User → Claude → board skill →
 | `persona-design/convergence.md` | STATIC prompt for convergence-checking. Shipped but unused in v1.1.0; reserved for a future revision. |
 | `persona-design/examples/*.md` | Four worked panels (auth-redesign, perf-regression, data-migration, product-prioritization) showing reasoning chains: original prompt → extracted dimensions with reasoning → personas considered AND rejected → final roster → tier choice. Read for the *process*, not as templates. |
 
-**Reasoning fields, both styles:**
-- `reasoning_effort` (string `low`/`medium`/`high`) — OpenAI o-series.
-- `thinking: {type: enabled, budget_tokens: N}` — Anthropic via LiteLLM.
+**Reasoning fields, routed by family (see `MODEL_PARAM_PROFILES` in `lib/advisor.py`):**
+- `claude_adaptive` (any `claude-(opus|sonnet|haiku)`): `thinking: {type: adaptive}` + `output_config: {effort}`.
+- `gemini_thinking_level` (`gemini/gemini*`): `reasoning_effort` only — LiteLLM auto-maps to `thinking_level`.
+- `openai_reasoning_only` (`gpt*`, `o1`, `o3`, …): `reasoning_effort` only.
+- `claude_legacy_thinking` (opt-in via `ADVISOR_PROFILE`): legacy `thinking: {type: enabled, budget_tokens: N}` for Claude 3 / 4.0–4.6.
+- `default` (unknown alias): `reasoning_effort` only — safe lowest-common-denominator. Never sends a legacy `thinking` block.
 
-LiteLLM and most OpenAI-compatible proxies pass through fields they don't recognize. If the upstream rejects them, the script auto-retries once without and warns on stderr.
+If the upstream still rejects fields, the script auto-retries: shape-swap to `claude_adaptive` on the Anthropic adaptive-required 400; otherwise drop reasoning fields and retry with a stderr warning.
 
 ---
 
@@ -333,7 +337,14 @@ Lean, env-var-driven, thinking-on-by-default. Two skills (`advisor` for single s
 
 ### Changelog
 
-- **v1.3.1** — Proactive model-aware param construction. `lib/advisor.py` now resolves a per-call profile from a `MODEL_PARAM_PROFILES` regex registry (matched against the model name from `ADVISOR_MODEL`, family stem only, no version pin) and `build_payload()` dispatches on it instead of always sending both reasoning fields. Profiles: `claude_47_adaptive` (Claude 4.7+ → `thinking.type=adaptive` + `output_config.effort`, omit `reasoning_effort`), `claude_legacy_thinking` (Claude 3 / 4.0–4.6 → legacy `thinking.type=enabled` + `budget_tokens`), `gemini_thinking_level` (Gemini 3+ → `reasoning_effort` only; LiteLLM auto-maps to `thinking_level`), `openai_reasoning_only` (gpt-5 / o-series → `reasoning_effort` only), and `default` (unknown models → both fields, historical behavior). Fixes hard 400s on `gemini/gemini-3.x-*` ("Cannot specify both `thinking` and `thinking_level`") and `claude-opus-4-7` ("`thinking.type.enabled` is not supported … use `thinking.type.adaptive` and `output_config.effort`"). The reactive `looks_like_*` retry detectors are retained as a safety net for unknown models / future API drift. The `[advisor] sending: …` log line gains a `profile=<name>` field for observability.
+- **v1.3.2** — Hardens the v1.3.1 routing so non-canonical aliases stop falling through to the legacy thinking shape:
+  - **Family-only regex, no version pins**. `MODEL_PARAM_PROFILES` matches by provider/family name only (`claude-(opus|sonnet|haiku)`, `gemini`, `gpt|o\d+`); future versions inherit the modern profile. The version-pinned `claude_47_adaptive` profile is renamed `claude_adaptive` to reflect this.
+  - **Safe `default` profile**. Unknown models now send only `reasoning_effort` (the OpenAI-shape lowest common denominator) — never the legacy `thinking.type=enabled, budget_tokens=N` block. That legacy default broke modern Claude when LiteLLM aliases like `proxy/claude-opus-4-7` didn't match the v1.3.1 regex.
+  - **`ADVISOR_PROFILE` env override**. Pin a profile when your gateway uses an alias the regex can't recognise: `ADVISOR_PROFILE=claude_adaptive` (or any of `claude_legacy_thinking`, `gemini_thinking_level`, `openai_reasoning_only`, `default`). Unknown values warn once and fall back to regex routing.
+  - **Shape-swap retry**. New `looks_like_anthropic_adaptive_required()` detector recognises the literal `thinking.type.adaptive` / `output_config` 400 and retries the call pinned to `claude_adaptive` — rescues both alias-vs-regex misses and proxy translation gaps without losing thinking behaviour.
+  - **`claude_legacy_thinking` is opt-in only**. Removed from auto-routing; reachable exclusively via `ADVISOR_PROFILE=claude_legacy_thinking` for users still on Claude 3 / 4.0–4.6.
+  - **`lib/test_advisor.py`**: stdlib unittest covering profile resolution, payload shape per family, override behaviour, and the literal user-reported error string. Run with `uv run python -m unittest discover acf-advisor/lib`.
+- **v1.3.1** — Proactive model-aware param construction. `lib/advisor.py` resolves a per-call profile from a `MODEL_PARAM_PROFILES` regex registry and `build_payload()` dispatches on it instead of always sending both reasoning fields. Profiles: `claude_47_adaptive`, `claude_legacy_thinking`, `gemini_thinking_level`, `openai_reasoning_only`, `default`. Fixes hard 400s on `gemini/gemini-3.x-*` ("Cannot specify both `thinking` and `thinking_level`") and `claude-opus-4-7` ("`thinking.type.enabled` is not supported"). *(Superseded by v1.3.2 — version-pinned regex was incomplete; aliases that didn't match leaked the legacy shape.)*
 - **v1.2.0** — Scope discipline + local-team fallback + provider-compat fixes + higher timeouts:
   - **Local-team fallback**: when no API endpoint is reachable (no key/model after `.env` auto-load + shell), the `board` skill switches to local-team mode — each persona runs as a parallel Claude subagent (`Agent` tool). Synthesis produced by the orchestrator. No external calls. Skill explicitly announces the mode switch. LLM path is unchanged when env IS configured.
   - **New `--check-env` flag** on `advisor.py`: probes env (dotenv + shell) without any HTTP call. Exit 0 if `api_key + model` resolve, 2 if missing. Stderr emits a structured one-liner (`dotenv=… api_key=… model=… ok|missing=…`) used by the board skill to choose the execution path.
