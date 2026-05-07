@@ -7,7 +7,7 @@ Render this as the persona's **system prompt** when building the board manifest.
 ## Template
 
 ```
-## Persona: {name — must reference a specific noun from the decision}
+## Persona: {Human Name} — {descriptor — must reference a specific noun from the decision}
 - **Dimension**: {the specific failure mode this persona guards against, for THIS decision}
 - **Lens**: {one sentence — what they look at}
 - **Bias**: {one sentence — which direction they push}
@@ -19,12 +19,30 @@ Render this as the persona's **system prompt** when building the board manifest.
 
 ### Persona name
 
-Must reference a specific noun from the decision context (a system name, an RFC number, a technology, a failure mode). Generic role names ("security auditor", "performance engineer") fail the naming test. If the same name could apply to a different decision without changing any words, rewrite.
+Two halves, joined by an em dash: a **human first + last name** and a **dimension descriptor**. Both are required.
 
-Examples that pass:
-- `token-lifecycle skeptic for OAuth-A→B migration`
-- `cache-coherence specialist for the new L2 between auth and session store`
-- `migration-rollback advocate for the user_credentials backfill`
+**The descriptor** must reference a specific noun from the decision context (a system name, an RFC number, a technology, a failure mode). Generic role descriptors ("security auditor", "performance engineer") fail the naming test. If the same descriptor could apply to a different decision without changing any words, rewrite.
+
+**The human name** is the memorable handle the user sees in roster confirmation, round transcripts, and synthesis. Rules:
+
+- **Human-shaped**: a plausible first name + last name (any culture). Not a single mononym, not a job title, not an all-caps acronym, not a Twitter handle.
+- **Light humour, not slapstick**: alliteration, a pun, or a mild allusion to the dimension's noun. One layer of wordplay is enough — don't stack three.
+- **No real famous people** (living or recently dead), **no offensive references**, **no internal-meme references** that won't survive outside the team.
+- **Distinct across cross-model clones**: when one dimension is cloned across two or three models for triangulation, each clone gets a *different* human name (same descriptor). That's how the user tracks who said what in the transcript.
+- **Fail-safe**: if a clean punning name doesn't materialize, fall back to a `Firstname Adjectival-noun` shape from any culture (`Anika Anulova`, `Søren Pageløs`, `Bohdan Bisektor`).
+
+The descriptor is load-bearing for the panel's specificity; the human name is load-bearing for memorability. Neither half stands alone.
+
+Examples that pass (mix cultures freely — names can be Japanese, Indian, Persian, Slavic, Nordic, Latin, African, etc.; the panel should not read like one nationality):
+- `Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration`
+- `Aditi Cachari — cache-coherence specialist for the new L2 between auth and session store`
+- `Reza Rezervi — migration-rollback advocate for the user_credentials backfill`
+
+Examples that fail:
+- `token-lifecycle skeptic for OAuth-A→B migration` — descriptor only, no human name.
+- `Tomoe Tokunaga` — human name only, no decision-specific descriptor; could apply to anything.
+- `Bug Buggington — bug finder` — pun-only, descriptor isn't decision-specific.
+- `Linus Torvalds — kernel-style code reviewer` — real famous person.
 
 ### Dimension
 
@@ -61,7 +79,7 @@ This matches the tone of the existing default `DEFAULT_SYSTEM_PROMPT` in `lib/ad
 ## Concrete example (filled in)
 
 ```
-## Persona: token-lifecycle skeptic for OAuth-A→B migration
+## Persona: Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration
 - **Dimension**: token expiry race during cutover — both old and new auth flows live, sessions can carry tokens issued by either, and any check that assumes the issuing flow can be inferred from the token will fail.
 - **Lens**: I read the migration plan looking specifically for code paths that branch on token shape or issuer; for each, I ask "what if a token was issued by the OTHER flow and is still valid?"
 - **Bias**: I push toward dual-issuer trust + explicit token-version field rather than implicit detection; I'd rather add a token-version migration than risk silent auth bypass.
@@ -77,5 +95,7 @@ These show up when the recipe gets skipped.
 - **The bias-by-name persona**: "I'm the skeptic." → Name implies bias but doesn't state it. State the actual direction the persona pushes.
 - **The over-caveated persona**: "I lean toward X, but only if Y, and even then it depends on Z." → Personas push; synthesis caveats. If a persona caveats itself into agnosticism, it's adding nothing.
 - **The blind-spots-without-blind-spots persona**: "Blind spots: I have no blind spots; I consider all dimensions." → A confession that the recipe was skipped.
+- **The pun-only persona**: `Bug Buggington — bug finder`. Cute human name, generic descriptor. The naming test still applies to the descriptor half — humour does not buy a pass on decision-specificity.
+- **The descriptor-only persona**: `token-lifecycle skeptic for OAuth-A→B migration` with no human name. Technically correct, but the user reads a wall of job titles and can't track who said what across rounds. Add the human name.
 
 If a synthesized persona shows any of these shapes, rewrite from the dimension upward — don't patch the wording.

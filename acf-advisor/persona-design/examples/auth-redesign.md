@@ -56,40 +56,40 @@ The user's `ADVISOR_MODEL` had `gpt-5.5,claude-opus-4-6,gemini/gemini-3.1-pro-pr
 Considered cross-model triangulation on dimension 2 (rollback safety) — the user named it as the priority dimension. Cloning that lens across two models (one persona × two models) costs an extra slot, would push to 5 personas total. Decided **yes, do it**: the priority dimension being where we triangulate is exactly where cross-model agreement is most valuable.
 
 Final assignment:
-- token-lifecycle skeptic → gpt-5.5 (round-robin)
-- migration-rollback skeptic [instance 1] → claude-opus-4-6 (priority dimension; first triangulation)
-- migration-rollback skeptic [instance 2] → gemini-3.1-pro-preview (priority dimension; second triangulation)
-- session-lifetime auditor → gpt-5.5 (round-robin wrap)
-- inter-service token-parser auditor → claude-opus-4-6 (round-robin wrap)
+- Tomoe Tokunaga — token-lifecycle skeptic → gpt-5.5 (round-robin)
+- Ravi Rückbau — migration-rollback skeptic [instance 1] → claude-opus-4-6 (priority dimension; first triangulation)
+- Anika Anulova — migration-rollback skeptic [instance 2] → gemini-3.1-pro-preview (priority dimension; second triangulation; distinct human name from instance 1)
+- Selma Sessione — session-lifetime auditor → gpt-5.5 (round-robin wrap)
+- Kwame Konnektor — inter-service token-parser auditor → claude-opus-4-6 (round-robin wrap)
 
 ## 6. Final roster (manifest input)
 
 ```
-## Persona: token-lifecycle skeptic for OAuth-A→B migration
+## Persona: Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration
 - **Dimension**: token-shape detection during 10%/50%/100% cutover when both flows issue tokens that flow through the same gateway
 - **Lens**: every code path that parses or branches on token shape; for each, "what if it was issued by the OTHER flow?"
 - **Bias**: explicit token-version field + dual-issuer trust; refuse to rely on implicit detection
 - **Blind spots (by design)**: refuses to opine on rollback strategy (covered by rollback persona), refresh-token semantics (covered by session-lifetime persona), or service-graph propagation (covered by inter-service persona)
 - **Output discipline**: direct, name what's wrong, no flattery, no filler
 
-## Persona: migration-rollback skeptic for the 50% cutover stage [instance 1: gpt-5.5 perspective]
+## Persona: Ravi Rückbau — migration-rollback skeptic for the 50% cutover stage [instance 1: gpt-5.5 perspective]
 - **Dimension**: rollback safety if a bug surfaces at 50%; can we route everyone back to old flow without mass re-login?
 - **Lens**: the specific 50% rollback scenario; for transparent vs distinct token formats, walk through the unwinding
 - **Bias**: distinct token formats with explicit per-user opt-out, even at higher migration cost; minimize the rollback blast radius
 - **Blind spots (by design)**: refuses to opine on cutover detection mechanics or service-graph contract issues
 - **Output discipline**: direct, name what's wrong, no flattery, no filler
 
-## Persona: migration-rollback skeptic for the 50% cutover stage [instance 2: claude perspective]
-[same content as instance 1; different model assigned at runtime for cross-model triangulation on the priority dimension]
+## Persona: Anika Anulova — migration-rollback skeptic for the 50% cutover stage [instance 2: claude perspective]
+[same body as instance 1; different model assigned at runtime for cross-model triangulation on the priority dimension. Distinct human name so the user can tell whose take is whose in the transcript.]
 
-## Persona: session-lifetime auditor for the homegrown→OAuth model gap
+## Persona: Selma Sessione — session-lifetime auditor for the homegrown→OAuth model gap
 - **Dimension**: refresh-token vs old long-lived session expiry/revoke semantics gap
 - **Lens**: every place where the old code assumes session-cookie lifetime semantics; check whether OAuth refresh-token semantics produce the same observable user behavior
 - **Bias**: short OAuth access-token lifetimes + reliable refresh; explicit warning to users at first new-flow login about the change
 - **Blind spots (by design)**: refuses to opine on token format choice or rollback strategy
 - **Output discipline**: direct, name what's wrong, no flattery, no filler
 
-## Persona: inter-service token-parser auditor for the user-store call graph
+## Persona: Kwame Konnektor — inter-service token-parser auditor for the user-store call graph
 - **Dimension**: services downstream of auth that hard-code the old cookie shape and would silently fail on new tokens
 - **Lens**: trace every consumer of the session-cookie format; identify each parsing site
 - **Bias**: gateway-level token normalization (translate new → old shape at the edge for the cutover window); minimize per-service migration burden
