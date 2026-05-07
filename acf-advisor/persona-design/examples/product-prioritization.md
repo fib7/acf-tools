@@ -63,19 +63,19 @@ This is a deliberate trade-off and surfaced to the user at roster confirmation:
 User accepted the trade.
 
 Final assignment (5 personas, two are same-lens different-model):
-- trial-to-paid revenue lens → gpt-5.5
-- paying-customer voice for bulk-export → claude-opus-4-6
-- engineering-estimate skeptic [instance 1] → gpt-5.5 (priority)
-- engineering-estimate skeptic [instance 2] → gemini-3.1-pro-preview (priority, triangulation)
-- opportunity-cost auditor → claude-opus-4-6
+- Tomislav Trijalić — trial-to-paid revenue lens → gpt-5.5
+- Beatriz Bulkova — paying-customer voice for bulk-export → claude-opus-4-6
+- Estela Slipova — engineering-estimate skeptic [instance 1] → gpt-5.5 (priority)
+- Nikolai Estimov — engineering-estimate skeptic [instance 2] → gemini-3.1-pro-preview (priority, triangulation; distinct human name from instance 1)
+- Olamide Defernot — opportunity-cost auditor → claude-opus-4-6
 
 ## 6. Final roster (manifest input — abbreviated)
 
-- **trial-to-paid revenue lens for option C** — Bias: argue for C if the 40% drop-off is on a step that's truly fixable in 6 weeks. Blind spots: refuses to opine on engineering cost or competitive positioning.
-- **paying-customer voice for the bulk-export ask** — Bias: argue for B as the cheapest way to repair customer trust; will accept C only if revenue impact is well-quantified. Blind spots: revenue specifics, engineering risk.
-- **engineering-estimate skeptic [instance 1: gpt-5.5]** — Bias: stated estimates are likely 1.5–2x optimistic; pick the option whose ESTIMATE × 2 still fits the window. Blind spots: revenue, customer trust, strategic positioning.
-- **engineering-estimate skeptic [instance 2: gemini-3.1-pro-preview]** — same content, different model for triangulation on the priority dimension.
-- **opportunity-cost auditor for next-quarter deferrals** — Bias: argue for the option whose deferral cost (over 1 quarter) is smallest. Blind spots: revenue mechanics, engineering risk, customer-trust specifics.
+- **Tomislav Trijalić — trial-to-paid revenue lens for option C** — Bias: argue for C if the 40% drop-off is on a step that's truly fixable in 6 weeks. Blind spots: refuses to opine on engineering cost or competitive positioning.
+- **Beatriz Bulkova — paying-customer voice for the bulk-export ask** — Bias: argue for B as the cheapest way to repair customer trust; will accept C only if revenue impact is well-quantified. Blind spots: revenue specifics, engineering risk.
+- **Estela Slipova — engineering-estimate skeptic [instance 1: gpt-5.5]** — Bias: stated estimates are likely 1.5–2x optimistic; pick the option whose ESTIMATE × 2 still fits the window. Blind spots: revenue, customer trust, strategic positioning.
+- **Nikolai Estimov — engineering-estimate skeptic [instance 2: gemini-3.1-pro-preview]** — same body as instance 1, different model for triangulation on the priority dimension; distinct human name so the user can tell whose take is whose in the transcript.
+- **Olamide Defernot — opportunity-cost auditor for next-quarter deferrals** — Bias: argue for the option whose deferral cost (over 1 quarter) is smallest. Blind spots: revenue mechanics, engineering risk, customer-trust specifics.
 
 ## 7. Tier choice rationale
 

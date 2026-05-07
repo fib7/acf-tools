@@ -25,7 +25,7 @@ The skill tells you explicitly when this happens:
 
 > No external advisor endpoint configured (no LITELLM_API_KEY/OPENAI_API_KEY in env or project .env). Falling back to local-team mode — each persona will run as a Claude subagent. No external API calls.
 
-The same dimension-extraction → priority pick → roster confirmation steps run as in the LLM path. Cross-model triangulation does not apply (all "models" are Claude). Per-persona output uses `### Advisor (local) — <name> says:` headers; the cost line is `[board:local] mode=local-team personas=N rounds=R subagent_calls=N×R`.
+The same dimension-extraction → priority pick → roster confirmation steps run as in the LLM path. Cross-model triangulation does not apply (all "models" are Claude). Per-persona output uses `### Advisor (local) — <Human Name> (<descriptor>) says:` headers; the cost line is `[board:local] mode=local-team personas=N rounds=R subagent_calls=N×R`.
 
 To force the LLM path again, configure `LITELLM_API_KEY` + `ADVISOR_MODEL` in your project `.env` and re-invoke. The script's `--check-env` flag (also new in 1.2.0) lets you verify the resolution without making any HTTP call:
 
@@ -38,12 +38,12 @@ To force the LLM path again, configure `LITELLM_API_KEY` + `ADVISOR_MODEL` in yo
 
 1. Claude routes to the `board` skill when a decision spans ≥ 2 distinct dimensions of correctness OR is hard-to-reverse OR you explicitly ask for a panel.
 2. **Extracts decision dimensions** as a numbered list and asks you to confirm + pick the most important one (priority dimension). This step is the load-bearing one — by the time the roster is shown, the decision is mostly made.
-3. **Composes personas** — one per confirmed dimension, decision-specific names (e.g. "token-lifecycle skeptic for OAuth-A→B migration", not "security auditor"), each with explicit blind spots.
+3. **Composes personas** — one per confirmed dimension. Each gets a human first+last name with light humour paired with a decision-specific descriptor (e.g. `Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration`, not "security auditor"), plus explicit blind spots. Names mix cultures across the panel; cross-model clones share the descriptor but get distinct human names.
 4. **Picks `R`** by deliberative judgment (default 1; up to 5 when personas trade off, decision is irreversible, etc.). User can override.
 5. **Distributes models** from the pool: round-robin by default, or cross-model triangulation when one specific lens is critical AND the pool offers genuinely different reasoners.
 6. **Confirms the roster with you** (free, no advisor cost) → builds JSON manifest → `board.py` runs personas in parallel via `ThreadPoolExecutor`.
 7. **Synthesizes** all takes into one recommendation, weighted by your priority dimension.
-8. Returns per-persona transcripts (using the same `### Advisor (model) — name says:` idiom as the single advisor) plus the synthesis block.
+8. Returns per-persona transcripts (header form `### Advisor (<model>) — <Human Name> (<descriptor>) says:`) plus the synthesis block.
 
 **Not** for: quick lookups Claude can answer directly, tasks you asked Claude to do, or as a default for trivial second opinions (use the single `advisor` skill).
 
@@ -337,6 +337,12 @@ Lean, env-var-driven, thinking-on-by-default. Two skills (`advisor` for single s
 
 ### Changelog
 
+- **v1.3.3** — Routing-decision parity with the LLM-path call. Fixes a silent misroute to local-team mode when the plugin is installed in projects that configure `LITELLM_API_KEY` / `ADVISOR_MODEL` via a project `.env`:
+  - **Root cause**: the `board` skill's pre-flight read `${ADVISOR_MODEL}` / `${LITELLM_API_KEY}` directly from bash — but Claude Code's Bash tool inherits the orchestrator process env, **not** the project `.env`. The skill therefore always saw missing env and chose local-team mode, even though the per-persona `advisor.py` invocation would have loaded the same `.env` and dispatched LLM calls. `--check-env` was designed for this exact routing decision in v1.2.0; the skill text in the same release contradictorily forbade its use ("no `--check-env`"). Both branches of v1.3.x inherited the bug.
+  - **`board/SKILL.md` pre-flight rewrite**: the routing decision now goes through `"$ADVISOR_BIN" --check-env`. Exit 0 → LLM path, parse the structured one-liner for the model pool. Exit 2 → local-team. Wrapped in `bash -c` for array-syntax independence (Claude Code's interactive shell is often zsh). Pool iteration uses `tr ',' '\n' | while read -r` instead of `IFS=',' read -ra`, since zsh does not word-split parameter expansions on `IFS` by default.
+  - **`lib/advisor.py::check_env()`**: emits new `models=<csv>` field with the full comma-delimited pool from `parse_model_list()`. Existing `model=<first>` field unchanged for backward-compat. Skill prefers `models=` and falls back to `model=` when running against an older `advisor.py`.
+  - **Critical-rules update**: explicit "do not read `${ADVISOR_MODEL}` / `${LITELLM_API_KEY}` directly from bash — those reads silently misroute to local-team mode." The "do not probe env" rule still holds for the per-persona invocation; only the routing oracle is allowed to ask Python.
+  - **Tests**: 3 new `CheckEnvTests` cases lock the `models=` field, pool-order preservation, and the exit-2 / no-`models=` shape on missing env.
 - **v1.3.2** — Hardens the v1.3.1 routing so non-canonical aliases stop falling through to the legacy thinking shape:
   - **Family-only regex, no version pins**. `MODEL_PARAM_PROFILES` matches by provider/family name only (`claude-(opus|sonnet|haiku)`, `gemini`, `gpt|o\d+`); future versions inherit the modern profile. The version-pinned `claude_47_adaptive` profile is renamed `claude_adaptive` to reflect this.
   - **Safe `default` profile**. Unknown models now send only `reasoning_effort` (the OpenAI-shape lowest common denominator) — never the legacy `thinking.type=enabled, budget_tokens=N` block. That legacy default broke modern Claude when LiteLLM aliases like `proxy/claude-opus-4-7` didn't match the v1.3.1 regex.

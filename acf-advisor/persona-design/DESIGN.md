@@ -52,7 +52,9 @@ For each dimension on the confirmed list, write one persona using `persona-templ
 - **Output discipline**: direct, name what's wrong, no flattery, no filler
 ```
 
-**Naming test**: if the persona name could apply to a different decision without changing any words, it is too generic. Rewrite. ("security skeptic" fails the test; "token-lifecycle skeptic for OAuth-A→B migration" passes.)
+**Naming test**: if the persona descriptor could apply to a different decision without changing any words, it is too generic. Rewrite. ("security skeptic" fails the test; "token-lifecycle skeptic for OAuth-A→B migration" passes.)
+
+Each persona also gets a **human first + last name** with light humour, paired with the descriptor by an em dash: `Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration`. Mix cultures across the panel (Japanese, Indian, Persian, Slavic, Nordic, Latin, African, etc.) — a board of five Anglo names reads like a stock photo. The descriptor stays load-bearing for specificity; the human name is the memorable handle the user sees in roster confirmation, transcripts, and synthesis. Cross-model clones share the descriptor but get distinct human names. See `persona-template.md` "Persona name" section for the full rules.
 
 **Blind-spots field is non-negotiable.** A persona that opines on everything has no useful bias; it's just a generalist. Each persona must explicitly refuse to weigh in on dimensions outside its lens — that's what makes synthesis cleanly weight the takes later.
 
@@ -99,6 +101,13 @@ These are warning signs. If your synthesized persona maps 1:1 to one of the left
 | `contrarian` | Disagreement-as-a-job is performative, not informative | `single-tenant-fan in a multi-tenant proposal — argue the simpler architecture if tenant isolation isn't actually a requirement yet` |
 
 The transformation pattern: generic role → **lens × decision-specific noun × failure mode**.
+
+With human names attached, those right-hand entries become memorable handles:
+
+- `pragmatist` → `Yui Yagni — YAGNI advocate for OAuth flow swap`
+- `skeptic` → `Reza Rezervi — migration-rollback skeptic for the user_credentials backfill`
+- `security auditor` → `Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration`
+- `performance engineer` → `Aditi Cachari — cache-coherence specialist for the new L2 between auth and session store`
 
 ---
 

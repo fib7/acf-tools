@@ -51,21 +51,21 @@ Wait — that's a recipe violation. Each persona must cover one dimension. Dropp
 This rejection itself is informative — it shows the cap-at-5 + cross-model-clone trade-off, and how to back out when they conflict.
 
 Final assignment:
-- contract-compliance auditor → gpt-5.5
-- dual-write divergence skeptic → claude-opus-4-6
-- cutover-moment correctness auditor → gemini-3.1-pro-preview
-- migration-rollback skeptic → gpt-5.5 (wrap)
-- MySQL→Postgres schema-difference auditor → claude-opus-4-6 (wrap)
+- Hina Slasaki — contract-compliance auditor → gpt-5.5
+- Dragan Driftović — dual-write divergence skeptic → claude-opus-4-6
+- Camille Coupure — cutover-moment correctness auditor → gemini-3.1-pro-preview
+- Reza Rezervi — migration-rollback skeptic → gpt-5.5 (wrap)
+- Sanjay Schemavarna — MySQL→Postgres schema-difference auditor → claude-opus-4-6 (wrap)
 
 ## 6. Final roster (manifest input — abbreviated)
 
 Each persona follows `persona-template.md` with: dimension, lens, bias, ≥2 named blind spots, output discipline.
 
-- **contract-compliance auditor for the 2h maintenance SLA** — Bias: any plan that requires >2h is a non-starter; argue for Strategy A or a sub-2h variant of B. Blind spots: refuses to opine on consistency or rollback mechanics.
-- **dual-write divergence skeptic for the 6-week window** — Bias: argue for compensating reads (read-from-old, async write to new) over true dual-write to limit divergence surface. Blind spots: SLA, schema mapping.
-- **cutover-moment correctness auditor** — Bias: dark-launch reads from new for 1 week before flipping; refuse to flip until a delta-check job reports zero diff. Blind spots: SLA, rollback.
-- **migration-rollback skeptic** — Bias: every step must be reversible WITHOUT data loss; if a step isn't, design a forward-recovery plan instead. Blind spots: SLA, schema mapping.
-- **MySQL→Postgres schema-difference auditor for user_profiles** — Bias: explicit casting + integrity checks at the boundary; refuse implicit conversions for nullables, timestamps, and charsets. Blind spots: SLA, dual-write mechanics.
+- **Hina Slasaki — contract-compliance auditor for the 2h maintenance SLA** — Bias: any plan that requires >2h is a non-starter; argue for Strategy A or a sub-2h variant of B. Blind spots: refuses to opine on consistency or rollback mechanics.
+- **Dragan Driftović — dual-write divergence skeptic for the 6-week window** — Bias: argue for compensating reads (read-from-old, async write to new) over true dual-write to limit divergence surface. Blind spots: SLA, schema mapping.
+- **Camille Coupure — cutover-moment correctness auditor** — Bias: dark-launch reads from new for 1 week before flipping; refuse to flip until a delta-check job reports zero diff. Blind spots: SLA, rollback.
+- **Reza Rezervi — migration-rollback skeptic** — Bias: every step must be reversible WITHOUT data loss; if a step isn't, design a forward-recovery plan instead. Blind spots: SLA, schema mapping.
+- **Sanjay Schemavarna — MySQL→Postgres schema-difference auditor for user_profiles** — Bias: explicit casting + integrity checks at the boundary; refuse implicit conversions for nullables, timestamps, and charsets. Blind spots: SLA, dual-write mechanics.
 
 ## 7. Tier choice rationale
 

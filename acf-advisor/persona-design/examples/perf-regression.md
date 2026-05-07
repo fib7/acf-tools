@@ -45,17 +45,17 @@ Pool: `gpt-5.5,claude-opus-4-6`. Two models, four personas. Round-robin gives on
 
 Considered cross-model triangulation on dimension 2 (priority) but at four personas already, cloning would push to 5 and the lens isn't one where I expect models to disagree (oncall ergonomics is about pragmatism, not deep reasoning). **Skipped triangulation.** Round-robin assignment:
 
-- bench/prod parity skeptic → gpt-5.5
-- oncall ergonomics advocate → claude-opus-4-6
-- bisect-cost auditor → gpt-5.5 (wrap)
-- prod-telemetry skeptic → claude-opus-4-6 (wrap)
+- Priya Parithi — bench/prod parity skeptic → gpt-5.5
+- Søren Pageløs — oncall ergonomics advocate → claude-opus-4-6
+- Bohdan Bisektor — bisect-cost auditor → gpt-5.5 (wrap)
+- Tomás Telémaco — prod-telemetry skeptic → claude-opus-4-6 (wrap)
 
 ## 6. Final roster (manifest input — abbreviated; same template as auth example)
 
-- **bench/prod parity skeptic for the search benchmark suite** — Dimension: CI bench passing while prod regresses; Lens: every difference between bench setup and prod (cache state, query mix, concurrency, data shape); Bias: argue the bench is wrong before assuming the code is wrong; Blind spots: refuses to opine on which commit, on rollback, or on observability gaps.
-- **oncall ergonomics advocate** — Dimension: minimizing user-pain window; Lens: every option's "time until pages stop"; Bias: rollback now, root-cause later, even if it loses unrelated fixes; Blind spots: refuses to opine on bench accuracy or which commit caused it.
-- **bisect-cost auditor for the 47-commit release** — Dimension: bisect economics in this specific release; Lens: per-iteration cost × iterations; what subset of files most-likely contains the regression; Bias: targeted instrumentation > blind bisection if the file count can be narrowed; Blind spots: refuses to opine on rollback or oncall pain.
-- **prod-telemetry skeptic for the search endpoint** — Dimension: what telemetry exists vs what's needed; Lens: every metric/trace/log in the call graph from edge to result-merger; Bias: 30 minutes of new instrumentation can save 6 hours of bisection; Blind spots: refuses to opine on rollback or bench design.
+- **Priya Parithi — bench/prod parity skeptic for the search benchmark suite** — Dimension: CI bench passing while prod regresses; Lens: every difference between bench setup and prod (cache state, query mix, concurrency, data shape); Bias: argue the bench is wrong before assuming the code is wrong; Blind spots: refuses to opine on which commit, on rollback, or on observability gaps.
+- **Søren Pageløs — oncall ergonomics advocate** — Dimension: minimizing user-pain window; Lens: every option's "time until pages stop"; Bias: rollback now, root-cause later, even if it loses unrelated fixes; Blind spots: refuses to opine on bench accuracy or which commit caused it.
+- **Bohdan Bisektor — bisect-cost auditor for the 47-commit release** — Dimension: bisect economics in this specific release; Lens: per-iteration cost × iterations; what subset of files most-likely contains the regression; Bias: targeted instrumentation > blind bisection if the file count can be narrowed; Blind spots: refuses to opine on rollback or oncall pain.
+- **Tomás Telémaco — prod-telemetry skeptic for the search endpoint** — Dimension: what telemetry exists vs what's needed; Lens: every metric/trace/log in the call graph from edge to result-merger; Bias: 30 minutes of new instrumentation can save 6 hours of bisection; Blind spots: refuses to opine on rollback or bench design.
 
 ## 7. Tier choice rationale
 
