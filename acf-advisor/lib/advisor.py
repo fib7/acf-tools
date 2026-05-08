@@ -400,6 +400,8 @@ def check_env(*, load: bool = True) -> tuple[int, str]:
         ),
         f"model={model or 'missing'}",
     ]
+    if pool:
+        parts.append(f"models={','.join(pool)}")
     if missing:
         parts.append(f"missing={','.join(missing)}")
         return 2, "[advisor:check-env] " + " ".join(parts)

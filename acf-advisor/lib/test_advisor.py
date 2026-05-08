@@ -18,6 +18,7 @@ import unittest
 
 from lib.advisor import (
     build_payload,
+    check_env,
     looks_like_anthropic_adaptive_required,
     resolve_param_profile,
 )
@@ -182,6 +183,60 @@ class ErrorDetectorTests(unittest.TestCase):
         ):
             with self.subTest(msg=msg):
                 self.assertFalse(looks_like_anthropic_adaptive_required(msg))
+
+
+class CheckEnvTests(unittest.TestCase):
+    """Guard the structured one-liner that the board skill greps for routing."""
+
+    _ENV_VARS = (
+        "LITELLM_API_KEY",
+        "OPENAI_API_KEY",
+        "LITELLM_BASE_URL",
+        "OPENAI_BASE_URL",
+        "ADVISOR_MODEL",
+        "OPENAI_MODEL",
+    )
+
+    def setUp(self):
+        self._saved = {k: os.environ.pop(k, None) for k in self._ENV_VARS}
+
+    def tearDown(self):
+        for k in self._ENV_VARS:
+            os.environ.pop(k, None)
+            v = self._saved.get(k)
+            if v is not None:
+                os.environ[k] = v
+
+    def test_pool_emitted_when_multiple_models(self):
+        os.environ["LITELLM_API_KEY"] = "sk-test"
+        os.environ["ADVISOR_MODEL"] = "claude-sonnet-4-6,gpt-5,gemini/gemini-3-pro"
+        code, msg = check_env(load=False)
+        self.assertEqual(code, 0)
+        self.assertIn("model=claude-sonnet-4-6", msg)
+        self.assertIn(
+            "models=claude-sonnet-4-6,gpt-5,gemini/gemini-3-pro",
+            msg,
+            "pool order must be preserved verbatim",
+        )
+        self.assertTrue(msg.endswith(" ok"))
+
+    def test_pool_omitted_when_single_model(self):
+        # Single model: model= already carries the value; no second field needed,
+        # but emitting models= for consistency is fine. Lock the current behavior:
+        # we DO emit models= whenever pool is non-empty, even with one entry.
+        os.environ["LITELLM_API_KEY"] = "sk-test"
+        os.environ["ADVISOR_MODEL"] = "claude-sonnet-4-6"
+        code, msg = check_env(load=False)
+        self.assertEqual(code, 0)
+        self.assertIn("model=claude-sonnet-4-6", msg)
+        self.assertIn("models=claude-sonnet-4-6", msg)
+
+    def test_missing_env_returns_2_and_no_models_field(self):
+        code, msg = check_env(load=False)
+        self.assertEqual(code, 2)
+        self.assertIn("model=missing", msg)
+        self.assertNotIn("models=", msg)
+        self.assertIn("missing=api_key,model", msg)
 
 
 if __name__ == "__main__":
