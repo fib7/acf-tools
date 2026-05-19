@@ -1,7 +1,7 @@
 {
   "name": "acf-advisor",
-  "version": "1.3.4",
-  "description": "Two skills for second opinions: `advisor` consults another LLM (thinking on by default) for one focused take; `board` convenes a multi-persona panel hypertailored to the decision, dispatched as parallel Claude subagents and synthesized by the orchestrator with weighting on the user-chosen priority dimension. Calls any OpenAI-compatible endpoint; comma-delimited ADVISOR_MODEL declares a multi-model pool for round-robin or cross-model triangulation. Per-family param-shape routing (Claude adaptive, Gemini thinking_level, OpenAI reasoning_effort) with ADVISOR_PROFILE override and shape-swap retry. Falls back to a local-team mode (Claude subagents roleplay personas) when no endpoint is configured.",
+  "version": "1.3.6",
+  "description": "Two skills for second opinions: `advisor` consults another LLM (thinking on by default) for one focused take; `board` convenes a multi-persona panel hypertailored to the decision, run as parallel advisor.py calls and synthesized by the orchestrator with weighting on the user-chosen priority dimension. Calls any OpenAI-compatible endpoint; comma-delimited ADVISOR_MODEL declares a multi-model pool for round-robin or cross-model triangulation. Per-family param-shape routing (Claude adaptive, Gemini thinking_level, OpenAI reasoning_effort) with ADVISOR_PROFILE override and shape-swap retry. Falls back to a local-team mode (Claude subagents roleplay personas) when no endpoint is configured.",
   "author": {
     "name": "ACF Tools",
     "email": "acf@fib7.ai"
