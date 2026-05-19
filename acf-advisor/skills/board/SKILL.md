@@ -1,6 +1,6 @@
 ---
 name: board
-description: Convene a board of advisors — multi-persona panel synthesized per call, hypertailored to the decision. Use when the user asks for a "panel", "board of advisors", "multi-perspective analysis", or when a non-trivial decision spans 2+ dimensions and is hard to reverse. Composes 1–5 decision-specific personas (using persona-design/DESIGN.md), confirms them with the user, then dispatches each persona as a parallel Claude Agent subagent that calls advisor.py against the configured LLM pool. Synthesis is the orchestrator's own turn, weighted by the user-chosen priority dimension.
+description: Convene a board of advisors — multi-persona panel synthesized per call, hypertailored to the decision. Use when the user asks for a "panel", "board of advisors", "multi-perspective analysis", or when a non-trivial decision spans 2+ dimensions and is hard to reverse. Composes 1–5 decision-specific personas (using persona-design/DESIGN.md), confirms them with the user, then runs each persona — in LLM mode as a parallel advisor.py call against the configured LLM pool, in local-team mode as a parallel Claude Agent subagent. Synthesis is the orchestrator's own turn, weighted by the user-chosen priority dimension.
 allowed-tools:
   - Bash
   - Read
@@ -31,8 +31,10 @@ The board skill is a pure orchestrator. After the user approves the roster, the 
 
 1. Writes each persona's system prompt to a tempfile.
 2. Writes the shared user prompt (built per the context-building protocol below) to a tempfile.
-3. Dispatches **N parallel `Agent` tool calls in ONE message** — one per persona. Each subagent shells out to `advisor.py` with that persona's system + assigned model and returns the reply verbatim.
-4. Collects subagent returns; for multi-round panels, repeats the dispatch with prior-round transcripts appended.
+3. Runs each persona — **N parallel calls in ONE orchestrator message**, one per persona:
+   - **LLM mode**: N parallel `Bash` calls, each running `advisor.py` with that persona's system + assigned model. The orchestrator runs the commands itself and captures stdout/stderr directly — no subagent relay.
+   - **Local-team mode**: N parallel `Agent` subagents, each roleplaying a persona (no external API). This is the only path that uses subagents.
+4. Collects results; for multi-round panels, repeats with prior-round transcripts appended.
 5. Produces synthesis as the orchestrator's own next turn (no subagent).
 
 There is **no Python orchestrator** (no `board.py`). All orchestration is markdown + Claude tool calls. Parallelism is visible and cancellable in the UI.
@@ -43,10 +45,10 @@ Refer to `../advisor/SKILL.md`:
 
 - **Context-building protocol — the load-bearing step.** Same checklist + bloat audit applies to the user prompt the board sends to every persona.
 - The `### Advisor (<model>) — … says:` rendering header.
-- Stderr observability lines (`[advisor] sending: …`, `[advisor] model=…`, the zero-reasoning notice). Each subagent will report these in its return; surface them aggregated.
+- Stderr observability lines (`[advisor] sending: …`, `[advisor] model=…`, the zero-reasoning notice). Each `advisor.py` call's stderr carries these `[advisor]` lines; surface them aggregated.
 - The failure-mode table for upstream HTTP errors.
 
-The advisor skill's "do not probe env" rule applies to the **per-persona** invocation (each subagent just shells out). The board skill's **routing decision** is different — it must call `advisor.py --check-env` first to see the project's `.env`. See "Pre-flight" below.
+The advisor skill's "do not probe env" rule applies to the **per-persona** invocation (each `advisor.py` call resolves its own env). The board skill's **routing decision** is different — it must call `advisor.py --check-env` first to see the project's `.env`. See "Pre-flight" below.
 
 If you find yourself about to write a context-building checklist, an upstream-error table, or stderr observability conventions in this file — STOP. Cross-reference instead.
 
@@ -151,6 +153,8 @@ For each persona, one line:
 
 Plus the chosen `R` with a one-line justification. If you used cross-model cloning, name it explicitly — and confirm each clone has a distinct human name.
 
+**Output discipline for this turn.** Emit ONLY the per-persona lines above plus the chosen `R` justification. Do NOT add `Cultures: …`, `Model split: 2x foo, 1x bar`, persona-count tallies, dimension recaps, or any other derived/decorative summary. Model and descriptor are already inline in each persona line; culture mix is a composition heuristic for you, not content for the user.
+
 Wait for user approve/edit/veto. **This step is free of advisor cost.**
 
 ### 7. Build the per-persona user prompt
@@ -177,35 +181,19 @@ Apply the **Context-building protocol** from `../advisor/SKILL.md` (mandatory ch
 
 Write the assembled prompt to `/tmp/board-user-r1.txt`. Write each persona's system prompt to `/tmp/board-<persona-id>.sys`.
 
-### 8. Dispatch — N parallel Agent subagents in ONE message
+### 8. Run advisor.py — N parallel Bash calls in ONE message
 
-Issue **a single orchestrator message containing N parallel `Agent` tool calls** (one per persona). Each call:
+Issue **a single orchestrator message containing N parallel `Bash` tool calls** (one per persona). There is no subagent and no relay — you wrote the persona/prompt tempfiles in step 7, you run the commands, you render the results in step 11.
 
-- `subagent_type: "general-purpose"`
-- `description`: `Advisor: <Human Name>` (≤ 5 words)
-- `prompt`: the deterministic instruction below. The subagent's only job is to shell out and return the result. **No env probing, no synthesis, no opinion of its own.**
+Each call runs:
 
-  > You are a mechanical wrapper. Execute exactly the bash command below, capture stdout and stderr, and return them verbatim. Do not summarize, do not paraphrase, do not add commentary. Do not probe env. Do not read shell rc files. Do not run any other tool.
-  >
-  > Return your result in this exact format:
-  >
-  > ```
-  > ### Advisor (<model>) — <Human Name> (<descriptor>) says:
-  >
-  > <stdout verbatim>
-  >
-  > <stderr filtered to [advisor] lines, verbatim>
-  > ```
-  >
-  > If the command exits non-zero, return the exit code, stdout, and stderr verbatim under the same header with `[FAILED rc=N]` prepended.
-  >
-  > The bash command:
-  >
-  > ```bash
-  > "$ADVISOR_BIN" --system-file /tmp/board-<persona-id>.sys --model <model> < /tmp/board-user-r1.txt
-  > ```
-  >
-  > (Substitute the literal `$ADVISOR_BIN` path resolved by the orchestrator, the actual persona-id, and the assigned model.)
+```bash
+"$ADVISOR_BIN" --system-file /tmp/board-<persona-id>.sys --model <model> < /tmp/board-user-r1.txt
+```
+
+Substitute the literal `$ADVISOR_BIN` path resolved in pre-flight, the actual persona-id, and the assigned model. The calls run concurrently. `advisor.py` prints the advisor reply to **stdout** and `[advisor]` observability lines to **stderr** — keep the two separate when you render.
+
+If a call exits non-zero, note the exit code; its slot is rendered with `[FAILED rc=N]` and its stderr (see Failure handling).
 
 ### 9. Multi-round (R ≥ 2)
 
@@ -223,7 +211,7 @@ After collecting round-1 returns, build the round-2 user prompt by appending pri
 …
 ```
 
-Write to `/tmp/board-user-r2.txt`. Dispatch another N parallel `Agent` calls in ONE message, same pattern, pointing at the new prompt file. Each persona only sees prior-round (not mid-round) takes. Repeat for each round up to `R`.
+Write to `/tmp/board-user-r2.txt`. Issue another N parallel `Bash` calls in ONE message, same pattern, pointing at the new prompt file. Each persona only sees prior-round (not mid-round) takes. Repeat for each round up to `R`.
 
 If a per-persona transcript is large, truncate to `~20000 / N` chars per persona to keep the round-2 prompt within size discipline.
 
@@ -231,10 +219,12 @@ If a per-persona transcript is large, truncate to `~20000 / N` chars per persona
 
 After all rounds complete, **you (the orchestrator) produce the synthesis directly** as your own next turn. Use `persona-design/synthesizer.md` as your meta-prompt. Rules:
 
-- Weight by the user's priority dimension.
-- Name disagreement explicitly (don't paper over it — disagreement is signal).
-- No flattery, no filler.
-- End with a concrete recommendation or, if the panel is genuinely split, a named tradeoff for the user to choose.
+- Weight by the user's priority dimension; the persona whose lens covers it gets the most weight on that dimension specifically.
+- Name disagreement explicitly — disagreement is signal, not a wording problem to paper over. Convergence across distinct lenses is the strongest signal; convergence within one lens (cross-model triangulation) is the next strongest.
+- Calibrate confidence to convergence. Speak plainly where personas agreed; name uncertainty where they didn't.
+- Before issuing the recommendation, name the strongest argument against it in one sentence (drawing from a dissenting persona where possible). If none of the personas surfaced one, say so explicitly — that itself is a flag.
+- Escalate, don't soften. If a persona named a fallacy or specification gap in the asker's framing, carry it into the synthesis verbatim. "Mostly working" stays "broken"; "just needs X" stays "incomplete".
+- End with a concrete recommendation, or — if the panel genuinely doesn't converge — a named tradeoff: the two paths and what each commits to. Do not split the difference into a vague middle.
 
 The synthesizer is always Claude — not the advisor LLM. Diversity comes from the personas; integration comes from you.
 
@@ -243,10 +233,10 @@ The synthesizer is always Claude — not the advisor LLM. Diversity comes from t
 ```
 ## Round 1
 ### Advisor (<model>) — <Human Name 1> (<descriptor 1>) says:
-<verbatim subagent reply>
+<advisor reply — stdout, verbatim>
 
 ### Advisor (<model>) — <Human Name 2> (<descriptor 2>) says:
-<verbatim subagent reply>
+<advisor reply — stdout, verbatim>
 …
 
 ## Round 2 (if R ≥ 2)
@@ -260,6 +250,8 @@ The synthesizer is always Claude — not the advisor LLM. Diversity comes from t
 
 [board] mode=<llm|local-team> personas=N rounds=R
 ```
+
+**Strict template.** The output ends at the `[board]` line. No `Cultures:`, no `Model split:`, no persona-count tally, no parameter dump, no "Personas used:" recap. The `[board]` line is the only trailing metadata permitted. If you feel the urge to add a roster diagnostic, that's the urge to suppress.
 
 ## Local-team mode
 
@@ -275,7 +267,7 @@ No external API calls.
 
 ### Step 8 (local-team)
 
-Dispatch N parallel `Agent` calls. Each subagent's prompt is the persona's full system text (Dimension / Lens / Bias / Blind spots / Output discipline) + this marker line + the user prompt:
+Local-team mode is the **only** path that uses `Agent` subagents — there is no external endpoint, so each persona must be a Claude instance roleplaying. Dispatch N parallel `Agent` calls. Each subagent's prompt is the persona's full system text (Dimension / Lens / Bias / Blind spots / Output discipline) + this marker line + the user prompt:
 
 > You are roleplaying as the advisor described above. Respond ONLY in that voice. Output discipline applies. Do not ask follow-up questions; if information is missing, name what's missing and proceed with stated assumptions.
 
@@ -289,10 +281,11 @@ Render with `(local)` instead of `(<model>)` in the headers. Cross-model triangu
 - **`R` is fixed at roster-confirmation time.** No autonomous mid-run extension. Disagreement after `R` rounds IS the signal.
 - **Default `R = 1`** unless a specific signal in the criteria table warrants more. Justify the choice in one line.
 - **If your synthesized roster maps 1:1 to a worked example in `persona-design/examples/`, you skipped dimension extraction.** Redo from step 2.
+- **No roster meta-summary in user-facing output.** Culture mix and model-pool composition are *inputs to your composition decision*, not outputs. Never emit `Cultures: …`, `Model split: …`, persona-count tallies, or similar decorative summaries. The trailing `[board]` line is the only summary metadata permitted.
 
 ## Failure handling
 
-Per-persona failures are isolated by design: if one subagent's `advisor.py` invocation fails, that persona's slot is rendered with `[FAILED rc=N]` and stderr; synthesis runs over the remaining N-1 takes. Don't retry the whole board for a single failure. If ALL personas fail, surface the common error and stop — likely an env or endpoint issue.
+Per-persona failures are isolated by design: if one `advisor.py` call fails, that persona's slot is rendered with `[FAILED rc=N]` and stderr; synthesis runs over the remaining N-1 takes. Don't retry the whole board for a single failure. If ALL personas fail, surface the common error and stop — likely an env or endpoint issue.
 
 For specific upstream errors (HTTP 401, 404, rate limits, etc.), see the failure-modes table in `../advisor/SKILL.md`.
 
@@ -303,5 +296,5 @@ For specific upstream errors (HTTP 401, 404, rate limits, etc.), see the failure
 - **Synthesize personas per call** — never reuse a roster from a worked example. Examples teach the *reasoning chain*, not the output.
 - **Surface dimensions to the user BEFORE composing personas.** The roster confirmation later is a backup, not the main lever.
 - **Cap at 5 personas. Default `R = 1`.** Both bumps require an explicit justification visible to the user.
-- **N parallel subagents in ONE orchestrator message.** Sequential dispatch defeats the architecture.
+- **N parallel calls in ONE orchestrator message** — `Bash` calls in LLM mode, `Agent` subagents in local-team mode. Sequential dispatch defeats the architecture.
 - **Synthesis is YOUR turn, not a subagent call.** Avoids the synthesizer adopting a persona of its own.
