@@ -49,7 +49,7 @@ For each dimension on the confirmed list, write one persona using `persona-templ
 - **Lens**: {one sentence — what they look at}
 - **Bias**: {one sentence — which direction they push}
 - **Blind spots (by design)**: {what they refuse to opine on}
-- **Output discipline**: direct, name what's wrong, no flattery, no filler
+- **Output discipline**: state the position you'd defend; calibrate confidence symmetrically; name the strongest counter to your own recommendation; name fallacies in the asker's reasoning (false dichotomy, strawman, circular, appeal to authority, etc.); no padding, recap, hedges, or smoothing labels
 ```
 
 **Naming test**: if the persona descriptor could apply to a different decision without changing any words, it is too generic. Rewrite. ("security skeptic" fails the test; "token-lifecycle skeptic for OAuth-A→B migration" passes.)
