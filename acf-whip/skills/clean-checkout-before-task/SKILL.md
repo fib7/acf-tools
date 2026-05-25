@@ -135,8 +135,10 @@ fi
 
 Picks up any sibling worktrees' commits already integrated into the local trunk by `/go`'s integration step. Fast-forward only; never rebases or merges in this skill (rebase + intelligent conflict resolution belong to the `integrate-worktree` skill at integration time, not here).
 
+**Shell-safety note**: this block contains a `:` immediately after a parameter expansion in the refspec (`"$TRUNK_BRANCH:refs/..."`). zsh applies `:r`/`:e`/`:h` modifiers to such constructs even inside double quotes and silently corrupts the refspec. Execute under `bash`, not `zsh`. The brace form below also defeats zsh's modifier parser.
+
 ```bash
-git_with_lock_backoff -C "$WORKTREE_PATH" fetch "$REPO_ROOT" "$TRUNK_BRANCH:refs/acfw/trunk-snapshot" --quiet
+git_with_lock_backoff -C "$WORKTREE_PATH" fetch "$REPO_ROOT" "${TRUNK_BRANCH}:refs/acfw/trunk-snapshot" --quiet
 if ! git_with_lock_backoff -C "$WORKTREE_PATH" merge --ff-only refs/acfw/trunk-snapshot; then
   echo "WARN: cannot fast-forward $BRANCH to $TRUNK_BRANCH. Branch has diverged." >&2
   echo "Continue with caution; integrate-worktree will rebase + resolve at integration time." >&2
