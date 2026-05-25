@@ -79,12 +79,20 @@ WORKTREE="$ACFW_TRUNK_ROOT/.worktree/$SLUG"
 BRANCH="worktree/$SLUG"
 ```
 
+### Shell-safety preamble (MANDATORY)
+
+**All script blocks in this skill MUST execute under `bash`, never `zsh`.** Refspecs like `"$BRANCH:refs/acfw/$SLUG"` place a `:` immediately after a parameter expansion; zsh applies modifiers (`:r`, `:e`, `:h`, etc.) to such constructs even inside double quotes, silently corrupting the refspec (e.g. `"$BRANCH:refs/..."` becomes `"$BRANCHefs/..."` because `:r` strips the leading `r` as the "no-extension" modifier). bash has no modifier syntax.
+
+Either invoke the protocol via `bash -c '...'` from the calling tool, or wrap each block as `bash <<'EOF' ... EOF`. As belt-and-suspenders, all parameter expansions adjacent to `:` use brace form `"${VAR}:..."` below; the braces also defeat the zsh modifier parser.
+
+Step 3 additionally verifies post-fetch that `refs/acfw/<slug>` exists and post-FF that HEAD actually advanced, so a silently-corrupted refspec aborts the integration instead of writing an "integrated" marker on top of unchanged trunk (which would orphan the worktree's code commits).
+
 ### Step 2: Fetch the worktree branch into trunk's refs
 
 Cheap; no working-tree change in trunk.
 
 ```bash
-if ! git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" fetch . "$BRANCH:refs/acfw/$SLUG" --quiet; then
+if ! git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" fetch . "${BRANCH}:refs/acfw/${SLUG}" --quiet; then
   rc=$?
   echo "WARN: fetch $BRANCH failed (exit $rc); will retry next iteration" >&2
   exit 10  # transient; orchestrator leaves task accepted, retries next iter
@@ -95,24 +103,41 @@ fi
 
 ```bash
 TRUNK_SHA_BEFORE=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
-if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/$SLUG"; then
+
+# Pre-flight: refs/acfw/<slug> MUST exist after Step 2's fetch. If it doesn't,
+# the fetch silently corrupted the refspec (historical zsh `:r` bug) and we
+# would otherwise commit an "integrated" marker on top of unchanged trunk —
+# orphaning the worktree's code commits. Abort hard.
+if ! git -C "$ACFW_TRUNK_ROOT" rev-parse --verify "refs/acfw/${SLUG}" >/dev/null 2>&1; then
+  echo "FATAL: refs/acfw/${SLUG} does not exist after fetch; aborting integration to prevent silent orphaning of worktree commits" >&2
+  exit 10
+fi
+
+if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/${SLUG}"; then
   TRUNK_SHA_AFTER=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
+  # Post-flight: if HEAD did not advance, the FF was a no-op (worktree branch
+  # was already an ancestor — task should not have been in accepted-but-
+  # unintegrated state). Treat as protocol violation.
+  if [ "$TRUNK_SHA_AFTER" = "$TRUNK_SHA_BEFORE" ]; then
+    echo "FATAL: FF reported success but HEAD did not advance ($TRUNK_SHA_BEFORE); refs/acfw/${SLUG} = $(git -C "$ACFW_TRUNK_ROOT" rev-parse refs/acfw/${SLUG})" >&2
+    exit 10
+  fi
   goto_success
 fi
 ```
 
-If the merge succeeded → goto Step 7 (success). Otherwise fall through to rebase.
+If the merge succeeded AND HEAD advanced → goto Step 7 (success). Otherwise fall through to rebase.
 
 ### Step 4: Rebase the worktree onto current trunk
 
 The rebase happens inside the worktree, never on trunk.
 
 ```bash
-git_with_lock_backoff -C "$WORKTREE" fetch "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH:refs/acfw/trunk-snapshot" --quiet
+git_with_lock_backoff -C "$WORKTREE" fetch "$ACFW_TRUNK_ROOT" "${ACFW_TRUNK_BRANCH}:refs/acfw/trunk-snapshot" --quiet
 if git_with_lock_backoff -C "$WORKTREE" rebase refs/acfw/trunk-snapshot; then
   # Clean rebase. Refresh refs/acfw/<slug> and retry FF.
-  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" fetch . "$BRANCH:refs/acfw/$SLUG" --quiet --force
-  if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/$SLUG"; then
+  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" fetch . "${BRANCH}:refs/acfw/${SLUG}" --quiet --force
+  if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/${SLUG}"; then
     TRUNK_SHA_AFTER=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
     goto_success
   fi
@@ -194,8 +219,8 @@ if grep -qE '^\| .* FATAL:' "$TASK_FILE"; then
 fi
 
 # Refresh and retry FF.
-git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" fetch . "$BRANCH:refs/acfw/$SLUG" --quiet --force
-if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/$SLUG"; then
+git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" fetch . "${BRANCH}:refs/acfw/${SLUG}" --quiet --force
+if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/${SLUG}"; then
   TRUNK_SHA_AFTER=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
   goto_success
 fi
