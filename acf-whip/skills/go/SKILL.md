@@ -7,6 +7,7 @@ allowed-tools:
   - Read
   - TodoWrite
   - Task
+  - Workflow
 ---
 
 # /go - Continuous Backlog Execution
@@ -47,6 +48,51 @@ Execute backlog continuously:
 The orchestrator decides which mode to use by reading project instructions (already loaded into Claude's context); no plugin code special-cases the override.
 
 ---
+
+## Execution: workflow-first, legacy fallback
+
+acf-whip ships a **dynamic-workflow orchestrator** (`workflows/whip-go.workflow.js`) that runs the
+entire loop — scan, slug partition, dependency gate, topological integration, stall/terminal
+bookkeeping — inside a deterministic script. The intermediate state lives in script variables, so
+**your context stays flat across iterations** (this is the fix for the context-bloat problem the
+legacy loop has). Prefer it.
+
+**If the `Workflow` tool is available to you** (dynamic workflows enabled, Claude Code ≥ 2.1.154):
+
+1. Decide the integration mode by reading the project's `CLAUDE.md`/`AGENTS.md` (already in your
+   context): `override` if they direct PR-per-group / non-local-merge integration, otherwise
+   `default` (auto-merge into local trunk).
+2. Resolve the environment with one bash call. **Refuse on detached HEAD** (empty branch):
+   ```bash
+   echo "PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT"
+   echo "TRUNK_ROOT=$(git rev-parse --show-toplevel)"
+   echo "TRUNK_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)"
+   ```
+   If `TRUNK_BRANCH` is empty, STOP — `/go` requires a branch checked out at the repo root.
+3. Launch the orchestrator (it runs in the background; bootstrap runs a doctor `--fix` hard gate and
+   the loop re-checks integrity every iteration):
+   ```
+   Workflow({
+     scriptPath: "<PLUGIN_ROOT>/workflows/whip-go.workflow.js",
+     args: { pluginRoot: "<PLUGIN_ROOT>", trunkRoot: "<TRUNK_ROOT>", trunkBranch: "<TRUNK_BRANCH>", mode: "default" | "override" }
+   })
+   ```
+4. When it completes, report the returned `RunReport` (completed?, iterations, finalCounts,
+   integrated[], stopReason). If it returns `aborted: true` (detached HEAD or an unrepairable FATAL),
+   surface the reason + fatals and STOP. Re-running `/go` is the documented resume — git + `.backlog/`
+   are the only durable state.
+5. Do **not** also run the legacy loop below — the workflow replaces it.
+
+**Only if the `Workflow` tool is NOT available** (dynamic workflows disabled, or older Claude Code):
+run the legacy single-context loop below. It enforces the same doctor gate and slug rules, but the
+loop lives in your context (and grows it).
+
+---
+
+# Legacy fallback loop (no dynamic workflows)
+
+> Everything below runs only when the `Workflow` tool is unavailable. It is the byte-compatible
+> Claude-as-orchestrator implementation of the same `.backlog/` state machine.
 
 ## Continuous Execution Loop
 

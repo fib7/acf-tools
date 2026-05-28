@@ -11,7 +11,7 @@
 **Purpose**: Plugin distribution for ACF cognitive modes and workflow tools
 
 **What this repository IS**:
-- Distribution package for 6 ACF plugins
+- Distribution package for 7 ACF plugins
 - Self-contained plugin implementations ready for installation
 - Marketplace registry for Claude Code plugin ecosystem
 
@@ -28,17 +28,17 @@
 
 | Plugin | Type | Purpose | Files |
 |--------|------|---------|-------|
-| **acf-challenger-mode** | Cognitive | Logic validation enforcer | 5 |
-| **acf-arazor-mode** | Cognitive | Production verification enforcer | 5 |
-| **acf-nitro** | Cognitive | Parallel execution enforcer | 5 |
-| **acf-mission-control** | Functional | Status line HUD | 5 |
-| **acf-librarian** | Functional | Convention enforcement | 5 |
-| **acf-whip** | Functional | Backlog workflow automation (concurrency-safe) | 36 |
-| **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 5 |
+| **acf-challenger-mode** | Cognitive | Logic validation enforcer | 6 |
+| **acf-arazor-mode** | Cognitive | Production verification enforcer | 6 |
+| **acf-nitro** | Cognitive | Parallel execution enforcer | 6 |
+| **acf-mission-control** | Functional | Status line HUD | 6 |
+| **acf-librarian** | Functional | Convention enforcement | 9 |
+| **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe) | 58 |
+| **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 17 |
 
-**Total**: 66 plugin files + 3 project files + marketplace.json = 70 files
+**Total**: 108 plugin files + 10 project/docs files = 118 tracked files.
 
-**acf-whip 1.2.0** introduces the `clean-checkout-before-task` skill, which uses git's worktree branch registry as the lock primitive for parallel agent execution. Tasks declare `Worktree:` and `PR Group:` slugs; `/go` partitions on `Worktree:` and dispatches at most one specialist per slug. See `acf-whip/content/backlog/workflow.md`.
+**acf-whip 2.0.0** makes `/task` and `/go` **workflow-native**: they run as dynamic workflows (`workflows/whip-task.workflow.js`, `workflows/whip-go.workflow.js`) whose loop, slug partition, dependency gate, and topological integration live in a deterministic script — so Claude's context stays flat across iterations — with the legacy single-context loop as the automatic fallback when dynamic workflows are unavailable. Worktree slugs are enforced in three layers: schema-required at decomposition → JS validation gate (kebab-case, acyclic deps, unique ids) → doctor FATAL at dispatch. `/whip-doctor` is the integrity battery and runs as a startup + per-iteration gate; `scan-backlog.sh` emits the read-only snapshot the scheduler runs on; `.worktreeinclude` hydrates git-ignored config into fresh worktrees. The git-worktree branch registry remains the parallelism lock (one specialist per `Worktree:` slug). See `acf-whip/content/backlog/workflow.md`.
 
 **Plugin architecture**: Each plugin is fully self-contained with no cross-dependencies. Users can install any combination.
 
@@ -52,14 +52,14 @@ acf-tools/
 ├── README.md                        # User-facing documentation
 ├── CLAUDE.md                        # This file (AI instructions)
 ├── .claude-plugin/
-│   └── marketplace.json             # Plugin registry (6 plugins)
-├── acf-challenger-mode/             # Logic validation (5 files)
-├── acf-arazor-mode/                 # Production verification (5 files)
-├── acf-nitro/                       # Parallel enforcement (5 files)
-├── acf-mission-control/             # Status HUD (5 files)
-├── acf-librarian/                   # Convention enforcement (5 files)
-├── acf-whip/                        # Workflow automation (35 files)
-└── acf-advisor/                     # Second-opinion LLM client (5 files)
+│   └── marketplace.json             # Plugin registry (7 plugins)
+├── acf-challenger-mode/             # Logic validation (6 files)
+├── acf-arazor-mode/                 # Production verification (6 files)
+├── acf-nitro/                       # Parallel enforcement (6 files)
+├── acf-mission-control/             # Status HUD (6 files)
+├── acf-librarian/                   # Convention enforcement (9 files)
+├── acf-whip/                        # Workflow automation, workflow-native (58 files; skills/ + workflows/)
+└── acf-advisor/                     # Second-opinion LLM client (17 files)
 ```
 
 ---
@@ -107,7 +107,7 @@ chore: update marketplace.json with v1.1.0 versions
 - marketplace.json stays synchronized with plugin versions
 
 **Distribution quality gates**:
-- All 6 plugins install without errors
+- All 7 plugins install without errors
 - Hook handlers execute cleanly (bash/python syntax valid)
 - Content files are well-formed markdown
 - Plugin.json manifests are valid JSON
@@ -352,6 +352,6 @@ The plugins themselves CREATE documentation when installed in user projects:
 ---
 
 **Repository Version**: v1.0
-**Last Updated**: 2026-04-28
-**Marketplace Plugins**: 6
-**Total Files**: 65
+**Last Updated**: 2026-05-28
+**Marketplace Plugins**: 7
+**Total Files**: 118 (tracked)
