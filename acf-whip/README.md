@@ -38,14 +38,33 @@ review → binary accept/reject (no partial credit)
 
 **Violations = Immediate rejection**
 
+### ⚡ Workflow-native orchestration (2.0.0)
+
+When dynamic workflows are available (Claude Code ≥ 2.1.154), `/task` and `/go` run as **dynamic workflows** (`workflows/whip-task.workflow.js`, `workflows/whip-go.workflow.js`):
+
+- **Flat context**: the loop, slug partition, dependency gate, and topological integration order run inside a deterministic script — intermediate state lives in script variables, not Claude's context — so context stays flat no matter how many tasks/iterations. (This is the fix for the old "stop work to dump history" problem.)
+- **Schema-enforced worktree slugs**: `/task`'s planner cannot omit a slug; a JS validation gate (kebab-case, slug ≠ id, acyclic deps, unique ids) runs before any file is written; the doctor FATALs on a missing slug at dispatch.
+- **Integrity-gated**: the doctor runs as a hard gate at startup and a recheck every iteration.
+- **Automatic fallback**: if dynamic workflows are off, both commands fall back to the legacy single-context loop (same behavior, byte-compatible).
+
 ### 🔄 Continuous Backlog Execution
 
-`/go` command loops until 100% complete:
+`/go` loops until 100% complete:
 - Processes ALL state transitions each iteration
 - Quality gate auto-fix before processing
-- Parallel agent spawning for independent tasks
+- Parallel agent spawning for independent tasks (one specialist per worktree slug)
+- Dependency-gated dispatch (same-slug needs accepted; cross-slug needs integrated)
+- Autonomous integration into local trunk with specialist-driven conflict resolution
 - Exits only when all tasks in terminal states (accepted/blocked)
 - No manual intervention needed
+
+### 🩺 Backlog Integrity Doctor
+
+`/whip-doctor [--fix]` is the integrity battery (~18 invariants across FATAL/REPAIRABLE/WARN): status-vs-folder mismatch, missing/empty worktree slug, unknown agent, dangling/cyclic deps, cross-slug dependent dispatched before integration, orphaned worktrees, stale in-progress, and more. It runs automatically as a `/go` startup gate and per-iteration recheck, and at `/task` create-time.
+
+### 📦 Worktree Env Hydration
+
+A committed `.worktreeinclude` manifest lists git-ignored files (`.env`, `node_modules`, `.venv`, local config) to copy/symlink into each fresh `.worktree/<slug>` so specialists run a full dev/test sandbox. Allowlist-only with a hard secret denylist (refuses to symlink `.env*`/`*.pem`/`*.key`/`id_*`/`credentials*`/`*.p12`, requires every entry to be git-ignored, treats a tracked path as an error).
 
 ### 🤖 Agent + Manifest Generator
 
@@ -378,6 +397,8 @@ Next step: Run /go
 
 **Purpose**: Decompose scope into atomic tasks (NEVER implements)
 
+**Execution**: runs as the `whip-task` dynamic workflow when available (schema-enforced slugs + JS validation gate + create-time doctor, before any file is written); otherwise the legacy single-context decomposition.
+
 **Usage**:
 ```bash
 /task "Scope description"
@@ -407,6 +428,8 @@ Next step: Run /go
 
 **Purpose**: Execute entire backlog until 100% complete
 
+**Execution**: runs as the `whip-go` dynamic workflow when available (the loop/partition/dependency-gate/integration live in a script, so Claude's context stays flat across iterations); otherwise the legacy single-context loop. Both refuse to dispatch against a FATAL-failing backlog (doctor startup gate).
+
 **Usage**:
 ```bash
 /go
@@ -430,6 +453,22 @@ Next step: Run /go
 - `in-progress` → `blocked` (timeout 48h)
 
 **Output**: Continuous progress until completion
+
+---
+
+### /whip-doctor - Backlog Integrity
+
+**Purpose**: Diagnose (and optionally repair) backlog + worktree health
+
+**Usage**:
+```bash
+/whip-doctor          # report only
+/whip-doctor --fix    # apply the REPAIRABLE class, then re-scan
+```
+
+**Checks** (FATAL / REPAIRABLE / WARN): status-vs-folder mismatch, missing/empty worktree slug on a code task, unknown Assigned Agent, duplicate IDs, dangling/cyclic dependencies, cross-slug dependent dispatched before integration, worktree on the wrong branch, detached HEAD; stray `Integrated-At`, out-of-range Rejection Count, dup-folder, orphaned worktree; missing clean-checkout token, lingering in-review, stale in-progress, cross-slug glob overlap.
+
+**Output**: `SEVERITY|CODE|TASK_ID|DETAIL` lines + a `SUMMARY|fatal=N|repairable=N|warn=N|ok=…` line; exit 0 iff no FATAL. Runs automatically as a `/go` startup gate and per-iteration recheck.
 
 ---
 

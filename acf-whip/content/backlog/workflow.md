@@ -8,6 +8,14 @@ pending → in-progress → completed → in-review → [accepted|rejected]
          blocked                                    rejected → pending (retry)
 ```
 
+## Execution paths: workflow-native (default) and legacy fallback
+
+`/task` and `/go` run as **dynamic workflows** (`workflows/whip-task.workflow.js`, `workflows/whip-go.workflow.js`) when the host supports them. The loop, the slug partition, the dependency gate, the topological integration order, and the stall/terminal bookkeeping run inside a deterministic JavaScript script; **intermediate state lives in script variables, not Claude's context**, so context stays flat across iterations no matter how large the backlog. Every filesystem/git action is delegated to a narrow agent: a read-only scanner (`scan-backlog.sh`), a single sequential writer (`apply-transition.sh`), parallel specialists/reviewers isolated by worktree slug, and a sequential integrator (`integrate-worktree.sh`) with conflict-resolver dispatch hoisted into the script.
+
+When dynamic workflows are unavailable (disabled, or older Claude Code), both commands fall back to the **legacy single-context loop** documented below — byte-compatible behavior over the same `.backlog/` state machine, but the loop lives in (and grows) Claude's context. The capability check is simply whether the `Workflow` tool is present; no plugin code special-cases it.
+
+Both paths enforce the same invariants: the doctor integrity gate, the single-writer rule, worktree-slug partitioning, and the dependency gate.
+
 ## State Transition Authority
 
 All `.backlog/` state moves happen at the **repo root** (`$ACFW_TRUNK_ROOT`) on the **trunk branch**. The orchestrator (`/go`) is the single writer of `.backlog/` files; specialists and quality-reviewer signal their decisions via the `ACFW-RESULT` marker in their Task() return, and the orchestrator performs the corresponding move + commit on trunk.
@@ -42,8 +50,11 @@ Every git command issued by acf-whip skills (orchestrator commits, worktree crea
 
 **Parallel across worktrees, sequential within a worktree.** Every code-mutating task declares two front-matter fields, set by `task-engineer` at decomposition time:
 
-- `Worktree: <slug>` (kebab-case identifier; required for code-mutating tasks)
+- `Worktree: <slug>` (kebab-case identifier; required for code-mutating tasks; `none` only for research/docs-only tasks; empty on a code task is a FATAL doctor violation)
 - `PR Group: <slug>` (defaults to the same slug; sibling tasks ship together)
+- `Touches Globs: <comma-separated globs>` (the files the task modifies, or `none`; the doctor WARNs when two different-slug pending tasks declare overlapping globs — a mis-partition signal)
+
+Slug enforcement is layered: schema-required at decomposition (the workflow planner cannot omit it), a JS validation gate (kebab-case, never equal to the task id, acyclic deps, unique ids) before any file is written, and a doctor FATAL at dispatch time.
 
 The orchestrator (`/go`) groups pending tasks by `Worktree:` and dispatches at most one specialist per worktree-group. Tasks sharing a slug execute strictly sequentially. Tasks with different slugs execute in parallel.
 
@@ -103,6 +114,22 @@ Every completed task MUST provide:
 In default (auto-merge) mode, every accepted task MUST additionally have:
 5. `Integrated-At: <sha>` populated by the orchestrator's `integrate-worktree` step, plus a transition-log line `accepted | accepted | integrate-worktree | <slug> | <sha> | integrated`.
 
+## Backlog integrity (`/whip-doctor`)
+
+`doctor.sh` is the integrity battery. It runs at three points: as a **hard gate** at `/go` startup (it applies the REPAIRABLE class with `--fix`, then re-scans and refuses to dispatch if any FATAL remains), as a **per-iteration recheck** inside the loop (a mid-run FATAL — e.g. a cycle introduced by a retry — aborts before the next dispatch), and at **`/task` create-time**. `/whip-doctor [--fix]` runs it on demand. Findings are `SEVERITY|CODE|TASK_ID|DETAIL` lines followed by `SUMMARY|fatal=N|repairable=N|warn=N|ok=true|false`. FATAL examples: status-vs-folder mismatch, missing/empty worktree slug on a code task, unknown Assigned Agent, dangling/cyclic deps, cross-slug dependent dispatched before its dep is integrated, worktree on the wrong branch, detached HEAD at trunk. REPAIRABLE (auto-fixed): stray `Integrated-At` on a non-accepted task, out-of-range Rejection Count, a task present in two folders, an orphaned `.worktree/<slug>`.
+
+## Worktree environment hydration (`.worktreeinclude`)
+
+A committed root manifest lists the git-ignored files a fresh `.worktree/<slug>` needs to run a full dev/test sandbox (`.env`, local config, `node_modules`, `.venv`). `clean-checkout-before-task` calls `hydrate-worktree.sh` right after creating a worktree. Lines are glob-capable; default action is **copy**, with `link:`, `copy:`, and `secret:` (copy + `0600`) prefixes. Secret-safety is allowlist-only: nothing is materialized unless listed, a denylist (`.env*`, `*.pem`, `*.key`, `id_*`, `credentials*`, `*.p12`, anything under `.git/`) is refused for symlink and forced to copy, every entry must already be git-ignored (`git check-ignore`), and a tracked path is a hard error — so hydration can never stage a secret.
+
+## In-progress timeout (operator-configurable)
+
+`.backlog/.acfw-config` sets `ACFW_INPROGRESS_TIMEOUT_HOURS` (default **8**; env var overrides). The doctor WARNs on in-progress tasks older than the threshold. `whip-init` scaffolds the config.
+
+## Run & resume model
+
+git plus `.backlog/` are the only durable state — **re-running `/go` is the resume**. A fresh run re-scans from disk and reconstructs the identical plan; the only loss across a Claude Code restart is the in-session agent cache and any in-flight worktree edit, which surfaces as a stale in-progress task that clean-checkout's stash and the timeout recover. The workflow path also writes a gitignored `.backlog/.acfw-run.json` heartbeat each iteration for observability; the design does not depend on it.
+
 ---
 
-**Last Updated**: 2026-04-28
+**Last Updated**: 2026-05-28

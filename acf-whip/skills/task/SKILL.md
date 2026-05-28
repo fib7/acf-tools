@@ -6,8 +6,10 @@ allowed-tools:
   - Read
   - Grep
   - Glob
+  - Bash
   - TodoWrite
   - Task
+  - Workflow
   - mcp__perplexity__perplexity_search_web
   - mcp__context7__resolve-library-id
   - mcp__context7__get-library-docs
@@ -19,6 +21,48 @@ allowed-tools:
 **CRITICAL**: This command ONLY orchestrates. It NEVER implements anything.
 
 Pure delegation tool that decomposes complex scope into independent atomic tasks for parallel execution.
+
+---
+
+## Execution: workflow-first, legacy fallback
+
+acf-whip ships a deterministic decomposition **workflow** that enforces worktree slugs and an
+acyclic dependency graph **before any task file is written** (schema-required slugs → a JS
+validation gate → a create-time doctor). Prefer it: the loop and the intermediate plan live in a
+script, not in your context.
+
+**If the `Workflow` tool is available to you** (dynamic workflows enabled, Claude Code ≥ 2.1.154):
+
+1. Resolve the environment with one bash call at the repo root:
+   ```bash
+   echo "PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT"
+   echo "TRUNK_ROOT=$(git rev-parse --show-toplevel)"
+   echo "TRUNK_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)"
+   ```
+2. Launch the workflow (runs in the background; intermediate state never enters your context):
+   ```
+   Workflow({
+     scriptPath: "<PLUGIN_ROOT>/workflows/whip-task.workflow.js",
+     args: {
+       scope: "<the full /task argument text, verbatim>",
+       pluginRoot: "<PLUGIN_ROOT>",
+       trunkRoot: "<TRUNK_ROOT>",
+       trunkBranch: "<TRUNK_BRANCH>"
+     }
+   })
+   ```
+3. When it completes, report the returned summary: created task ids + slugs + dependencies, the
+   commit sha, and the doctor verdict. If it returns `aborted: true`, surface the `defects` list and
+   **STOP** — do NOT hand-write task files to route around the validation gate. If it returns
+   `error`, fall back to the legacy path below.
+4. Do **not** also run the legacy steps — the workflow replaces them.
+
+**Only if the `Workflow` tool is NOT available** (dynamic workflows disabled, or older Claude Code):
+run the legacy decomposition loop below (Steps 1–8). It produces the same task files — including the
+mandatory `Worktree:` / `PR Group:` / `Touches Globs:` slug fields — but as a single-context
+orchestration.
+
+---
 
 ## 🔥 MANDATORY: Style Enforcement
 
@@ -256,6 +300,11 @@ Task 4: task-engineer for Dependency Verification
 - Set priority: {priority-level}
 - Assign to: {specialist-agent}
 - Identify dependencies: {task-ids or "none"}
+- **Worktree**: {kebab-case-slug} — REQUIRED for code-mutating tasks; tasks touching the same
+  surface SHARE a slug; use literal "none" ONLY for research/docs-only tasks. An empty `Worktree:`
+  on a code task is a FATAL doctor violation that blocks `/go`. NEVER use one-slug-per-task.
+- **PR Group**: {kebab-case-slug} — defaults to the same value as Worktree
+- **Touches Globs**: {comma-separated file globs} or "none" — the files this task modifies
 - File naming: {category}-{XXX}-{descriptive-name}.md
 - Create in: .backlog/pending/
 - Commit: task: create {category}-{id}-{name}
@@ -265,6 +314,7 @@ Task 4: task-engineer for Dependency Verification
 - Task size: ≤8 hours (split if larger)
 - Tech stack: Specify clearly
 - "Out of Scope": Mandatory section present
+- Worktree/PR Group/Touches Globs present (code tasks) or all "none" (non-code)
 
 **Deliverable**:
 Task file in .backlog/pending/ following all requirements.
@@ -285,6 +335,9 @@ After all task-engineer agents complete, spawn ONE MORE agent to verify:
 - Check dependencies are valid (no circular deps)
 - Confirm no duplicate work
 - Validate file naming conventions
+- **Verify every code-mutating task has a kebab-case `Worktree:` slug (never empty, never equal to
+  the task id), a `PR Group:`, and `Touches Globs:`; non-code tasks must use `Worktree: none` and
+  `Touches Globs: none`. Run the doctor as the final check: `bash ${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh "$(git rev-parse --show-toplevel)"` — fix any FATAL before exit.**
 
 **Deliverable**:
 Validation report confirming tasks are ready for execution.

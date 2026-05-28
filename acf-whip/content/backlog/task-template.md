@@ -11,7 +11,7 @@
 - **Status**: pending
 - **Priority**: [blocker|critical|high|medium|low]
 - **Estimated Hours**: [realistic estimate]
-- **Assigned Agent**: [go-engineer|python-ml-engineer|data-engineer|temporal-engineer|ml-ops-engineer|k8s-engineer|event-engineer|react-engineer|database-engineer|devops|test-engineer|quality-reviewer|task-engineer|retro|precommit|lean-architect]
+- **Assigned Agent**: [one of the project's INSTALLED agents — check `ls .claude/agents/*.md` (whip-init generates e.g. go-engineer, python-engineer, nodejs-engineer, nextjs-engineer, react-engineer, vue-engineer, infrastructure-engineer, quality-reviewer, task-engineer, research-agent). Must resolve to `.claude/agents/<name>.md`, else the doctor flags FATAL unknown-agent.]
 - **Worktree**: [kebab-case-slug] (REQUIRED for code-mutating tasks; use "none" ONLY for research/docs-only tasks. Orchestrator dispatches one specialist per worktree-slug; tasks sharing a slug run strictly sequentially. An empty slug on a code task is a FATAL doctor violation and blocks `/go`.)
 - **PR Group**: [kebab-case-slug] (defaults to the same value as Worktree; sibling tasks ship together as one PR)
 - **Touches Globs**: [comma-separated file globs this task will modify, e.g. `services/user-api/**, go.mod`] or "none" (used by the doctor to WARN when two different-slug pending tasks overlap — a mis-partition signal)
