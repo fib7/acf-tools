@@ -127,25 +127,35 @@ Every task description MUST:
 
 ## 🔁 Concurrency Metadata (MANDATORY for code-mutating tasks)
 
-Every task you create that mutates code MUST declare two front-matter fields:
+Every task you create that mutates code MUST declare these front-matter fields:
 
-- `Worktree: <slug>` (kebab-case)
-- `PR Group: <slug>` (defaults to the same slug)
+- `Worktree: <slug>` (kebab-case) — **NEVER leave this empty.** An empty `Worktree:` on a
+  code-mutating task is a **FATAL** integrity violation that hard-stops `/go`. For a task
+  that genuinely mutates no code (research-only, or docs-only outside the codebase) set the
+  literal `Worktree: none` — that routes it to the no-worktree direct-dispatch lane. The
+  distinction between "intentionally slugless" (`none`) and "forgotten" (empty) is what the
+  doctor enforces; do not rely on omission.
+- `PR Group: <slug>` (defaults to the same slug).
+- `Touches Globs: <comma-separated file globs>` — the files/paths this task will modify
+  (e.g. `services/user-api/**, go.mod`), or `none` for non-code tasks. The doctor WARNs when
+  two different-slug pending tasks declare overlapping globs (a mis-partition signal), so be
+  honest and specific.
 
 **The slug rule**: one slug per disjoint surface area. Tasks that touch the same files or the same module share a slug; tasks that touch independent surfaces get different slugs.
 
-**Why this matters**: the orchestrator (`/go`) groups pending tasks by `Worktree:` and dispatches at most one specialist per slug. Tasks sharing a slug run strictly sequentially. Tasks with different slugs run in parallel. Wrong slugs cause either (a) collisions if you put truly overlapping tasks in different slugs, or (b) lost parallelism if you put truly independent tasks in the same slug. Be honest about scope.
+**Why this matters**: the orchestrator (`/go`) groups pending tasks by `Worktree:` and dispatches at most one specialist per slug. Tasks sharing a slug run strictly sequentially. Tasks with different slugs run in parallel. Wrong slugs cause either (a) collisions if you put truly overlapping tasks in different slugs, or (b) lost parallelism if you put truly independent tasks in the same slug. Be honest about scope — and let `Touches Globs` reflect the real surface so the doctor can catch a dishonest partition.
 
 **Heuristic**:
 
 - One feature touching one module → one slug, possibly multiple sibling tasks (same `PR Group:`).
-- Two features touching independent modules → two slugs.
+- Two features touching independent modules → two slugs (and non-overlapping `Touches Globs`).
 - Cross-cutting refactor → one slug for the whole refactor; serialize.
-- Task is research-only or doc-only outside `docs/` is not mutated → `Worktree:` may be omitted; the agent will not invoke `clean-checkout-before-task`.
+- Research-only or docs-only task → `Worktree: none`, `Touches Globs: none`. The agent will not invoke `clean-checkout-before-task`.
 
 **Banned patterns**:
 
 - `Worktree: feature-NNN-task-name` (one slug per task) - defeats the purpose; siblings should share a slug.
+- Empty `Worktree:` on a code task - FATAL; use `none` only when truly no code is touched.
 - Free-form names with spaces or slashes - kebab-case only.
 - Slug not matching any actual code-touching scope - if in doubt, ask the operator.
 
@@ -160,7 +170,7 @@ The orchestrator derives the worktree path as `.worktree/<slug>` (singular, dot-
 - Create task files in `.backlog/pending/` at the **repo root** (`$ACFW_TRUNK_ROOT`)
 - Assign tasks to agents
 - Set priorities and dependencies
-- Set `Worktree:` and `PR Group:` (mandatory for code-mutating tasks)
+- Set `Worktree:`, `PR Group:`, and `Touches Globs:` (mandatory for code-mutating tasks; `none` for non-code tasks)
 - Write acceptance criteria **following style guide**
 - Commit task files to git on the **trunk branch** at the repo root
 - Move tasks between `.backlog/<state>/` folders at the repo root for: retry (rejected→pending), unblock (blocked→pending), redesign (rejected→blocked at >5 rejections)
@@ -232,7 +242,7 @@ Follow structure from `docs/acf/backlog/task-template.md`:
 - **Tech stack specified**: Agent knows what tools to use
 - **"Out of Scope" present**: What NOT to do (mandatory)
 - **Documentation references exist**: All listed docs exist
-- **`Worktree:` and `PR Group:` present** for code-mutating tasks (kebab-case slug; siblings share)
+- **`Worktree:`, `PR Group:`, and `Touches Globs:` present** for code-mutating tasks (kebab-case slug; siblings share; `none` only for genuine non-code tasks — empty `Worktree:` is FATAL)
 
 ### Step 6: Create Task File
 - Create in `.backlog/pending/` with filename: `[category]-[XXX]-[descriptive-name].md`

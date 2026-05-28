@@ -92,30 +92,80 @@ echo "✓ .backlog/ structure verified:"
 ls -1 .backlog/ | grep -v README.md | xargs -I {} echo "  - {}"
 ```
 
-### Step 3.5: Configure Worktree Concurrency
+### Step 3.5: Configure Worktree Concurrency, Env Hydration, and Doctor Config
 
-Add `.worktree/` to `.gitignore` so per-task isolated worktrees do not pollute `main`. This is mandatory for the concurrency model documented in `docs/acf/backlog/workflow.md`.
+**3.5a — gitignore entries.** Add `.worktree/` (per-task isolated worktrees) and
+`.backlog/.acfw-run.json` (the `/go` run heartbeat) to `.gitignore`.
 
 ```bash
-if [ -f .gitignore ]; then
-  if ! grep -qxF '.worktree/' .gitignore; then
-    printf '\n# ACF Whip per-task worktrees (created by clean-checkout-before-task skill)\n.worktree/\n' >> .gitignore
-    echo "✓ Added .worktree/ to .gitignore"
-  else
-    echo "✓ .gitignore already contains .worktree/"
-  fi
+ensure_gitignore() { # <pattern> <comment>
+  if [ -f .gitignore ] && grep -qxF "$1" .gitignore; then return; fi
+  printf '\n# %s\n%s\n' "$2" "$1" >> .gitignore
+  echo "✓ Added $1 to .gitignore"
+}
+ensure_gitignore '.worktree/' 'ACF Whip per-task worktrees (clean-checkout-before-task)'
+ensure_gitignore '.backlog/.acfw-run.json' 'ACF Whip /go run heartbeat'
+```
+
+**3.5b — `.worktreeinclude` manifest.** Scaffold a starter manifest (if missing) listing
+untracked dev files to copy/symlink into each fresh worktree so specialists can run a full
+dev sandbox. Default mode is **copy**; `link:` symlinks; `secret:` copies with stripped
+perms. Every listed path MUST be git-ignored (a tracked path is a hard error). Large dep
+trees default to **copy** (isolated, race-free) — switch a line to `link:` only if tasks
+never run installs inside the worktree.
+
+```bash
+if [ ! -f .worktreeinclude ]; then
+  cat > .worktreeinclude <<'EOF'
+# .worktreeinclude — untracked files to hydrate into each fresh .worktree/<slug>.
+# Honored by clean-checkout-before-task. Default mode: copy. Modes: copy: / link: / secret:.
+# Every path MUST be git-ignored. Globs allowed. Edit to match your project.
+#
+# Local environment (copied so a worktree owns its own and edits don't leak across slugs):
+# .env
+# .env.local
+#
+# Dependency trees (COPY = isolated & safe; switch to `link:` only if no in-worktree installs):
+# node_modules
+# .venv
+#
+# Symlink large read-only caches to save disk:
+# link: .cache
+#
+# Secrets are copied with stripped perms and NEVER symlinked:
+# secret: .secrets/local.key
+EOF
+  echo "✓ Created starter .worktreeinclude (edit to match your project)"
 else
-  printf '# ACF Whip per-task worktrees (created by clean-checkout-before-task skill)\n.worktree/\n' > .gitignore
-  echo "✓ Created .gitignore with .worktree/ entry"
+  echo "✓ .worktreeinclude already present"
 fi
 ```
 
-The `clean-checkout-before-task` skill (shipped with this plugin at `${CLAUDE_PLUGIN_ROOT}/skills/clean-checkout-before-task/SKILL.md`) is auto-discovered by Claude Code; no copy step required. Specialists invoke it via the `Skill` tool. Verify availability:
+**3.5c — doctor config.** Scaffold `.backlog/.acfw-config` with the operator-tunable
+in-progress timeout (default 8h; lower it for overnight runs so an agent killed mid-edit
+frees its slug sooner). Read by `doctor.sh` and `/go`.
 
 ```bash
-if [ ! -f "${CLAUDE_PLUGIN_ROOT}/skills/clean-checkout-before-task/SKILL.md" ]; then
-  echo "WARN: clean-checkout-before-task skill missing from plugin install. Concurrency model will not work." >&2
+if [ ! -f .backlog/.acfw-config ]; then
+  cat > .backlog/.acfw-config <<'EOF'
+# ACF Whip runtime config (sourced by doctor.sh and /go).
+# Hours before an in-progress task is flagged stale / timed out to blocked.
+ACFW_INPROGRESS_TIMEOUT_HOURS=8
+EOF
+  echo "✓ Created .backlog/.acfw-config (ACFW_INPROGRESS_TIMEOUT_HOURS=8)"
 fi
+```
+
+**3.5d — verify shipped scripts.** The worktree/integrity scripts ship in the plugin and
+are invoked by both the legacy and workflow paths. Verify availability:
+
+```bash
+for s in skills/clean-checkout-before-task/bin/clean-checkout.sh \
+         skills/integrate-worktree/bin/integrate-worktree.sh \
+         skills/whip-doctor/bin/doctor.sh \
+         skills/lib/acfw-git.sh; do
+  [ -f "${CLAUDE_PLUGIN_ROOT}/$s" ] || echo "WARN: missing ${CLAUDE_PLUGIN_ROOT}/$s — concurrency/integrity will not work." >&2
+done
 ```
 
 ### Step 4: Install Quality Gate Configuration
@@ -531,7 +581,7 @@ fi
 
 ACF Whip active. State machine: `pending → in-progress → completed → in-review → [accepted|rejected]` (blocked/retry paths exist).
 
-**Commands**: `/task` (decompose), `/go` (execute all), `/retro` (improvement), `/whip-add-agents` (create specialists)
+**Commands**: `/task` (decompose), `/go` (execute all), `/whip-doctor` (backlog integrity check; `--fix` auto-repairs), `/retro` (improvement), `/whip-add-agents` (create specialists)
 
 **Core Docs**: `docs/acf/backlog/workflow.md`, `docs/acf/backlog/task-template.md`, `docs/acf/style/task-descriptions.md`, `.backlog/README.md`
 

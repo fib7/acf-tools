@@ -12,8 +12,9 @@
 - **Priority**: [blocker|critical|high|medium|low]
 - **Estimated Hours**: [realistic estimate]
 - **Assigned Agent**: [go-engineer|python-ml-engineer|data-engineer|temporal-engineer|ml-ops-engineer|k8s-engineer|event-engineer|react-engineer|database-engineer|devops|test-engineer|quality-reviewer|task-engineer|retro|precommit|lean-architect]
-- **Worktree**: [kebab-case-slug] (required for code-mutating tasks; orchestrator dispatches one specialist per worktree-slug; tasks sharing a slug run strictly sequentially)
+- **Worktree**: [kebab-case-slug] (REQUIRED for code-mutating tasks; use "none" ONLY for research/docs-only tasks. Orchestrator dispatches one specialist per worktree-slug; tasks sharing a slug run strictly sequentially. An empty slug on a code task is a FATAL doctor violation and blocks `/go`.)
 - **PR Group**: [kebab-case-slug] (defaults to the same value as Worktree; sibling tasks ship together as one PR)
+- **Touches Globs**: [comma-separated file globs this task will modify, e.g. `services/user-api/**, go.mod`] or "none" (used by the doctor to WARN when two different-slug pending tasks overlap — a mis-partition signal)
 - **Dependencies**: [task-id-1, task-id-2] or "none"
 - **Integrated-At**: (left blank by task-engineer; written by `integrate-worktree` after a successful merge into the local trunk; format: trunk SHA after merge)
 - **Rejection Count**: 0 (max 5; quality-reviewer increments on reject; after 5th rejection, task-engineer redesigns)

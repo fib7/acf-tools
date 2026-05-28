@@ -82,6 +82,24 @@ fi
 echo "🌳 Trunk: $ACFW_TRUNK_BRANCH @ $ACFW_TRUNK_SHA_AT_START"
 ```
 
+## Pre-Loop: Backlog Integrity Gate (doctor)
+
+Before the loop, run the integrity doctor as a **HARD GATE**. `/go` MUST NOT dispatch against an inconsistent backlog (the cause of "executing inconsistent state"). Auto-repair the REPAIRABLE class, then re-scan; if any FATAL remains, abort and print the report for the operator.
+
+```bash
+DOCTOR="${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh"
+bash "$DOCTOR" --fix "$ACFW_TRUNK_ROOT" >/dev/null 2>&1 || true   # apply repairables first
+if ! REPORT=$(bash "$DOCTOR" "$ACFW_TRUNK_ROOT"); then
+  echo "❌ FATAL: backlog integrity gate failed. /go will not dispatch against an inconsistent backlog." >&2
+  echo "$REPORT" | grep '^FATAL' >&2
+  echo "Fix the FATAL findings (most are task-engineer errors: missing slug, dangling/cyclic deps) and re-run /go." >&2
+  exit 1
+fi
+echo "$REPORT" | grep -E '^(REPAIRABLE|WARN)' || true   # surface non-blocking findings
+```
+
+The same doctor runs once per iteration (lite recheck, Step 0 below); a FATAL introduced mid-run also aborts the loop.
+
 ## Backlog state lives at root (single writer)
 
 The orchestrator (this skill, running as the parent agent at `$ACFW_TRUNK_ROOT` on the trunk branch) is the **only writer of `.backlog/` files**. Specialists and quality-reviewer **do not** move task files between state folders; they signal their decision via the `ACFW-RESULT` marker (defined below) on Task() return. The orchestrator parses the marker, performs the file move + `git mv` + commit on the trunk branch, then continues.
@@ -110,44 +128,26 @@ ACFW-RESULT:
 
 If the marker is missing or malformed, the orchestrator treats the dispatch as a transient failure (leave task in current state, retry next iteration).
 
-### Lock-file backoff helper
+### Lock-file backoff helper (shared, extracted)
 
-Used for the orchestrator's own `git mv`/`git commit` operations on trunk:
+`git_with_lock_backoff` is defined once in `${CLAUDE_PLUGIN_ROOT}/skills/lib/acfw-git.sh` — the single source of truth for all acf-whip git logic. Source it before any orchestrator git operation:
 
 ```bash
-git_with_lock_backoff() {
-  local attempt=0 max=3 delay=1 rc
-  while [ $attempt -lt $max ]; do
-    if git "$@" 2>/tmp/acfw-git-err; then
-      return 0
-    fi
-    rc=$?
-    if grep -qE 'index\.lock|Unable to create.*lock' /tmp/acfw-git-err; then
-      attempt=$((attempt + 1))
-      [ $attempt -ge $max ] && break
-      sleep $delay
-      delay=$((delay * 2))
-      continue
-    fi
-    cat /tmp/acfw-git-err >&2
-    return $rc
-  done
-  echo "FATAL: git lock contention persisted; another process holds .git/index.lock" >&2
-  cat /tmp/acfw-git-err >&2
-  return 99
-}
+. "${CLAUDE_PLUGIN_ROOT}/skills/lib/acfw-git.sh"
 ```
 
-Backoff: 1s → 2s → 4s. Never `rm` the lock; let the holding process finish.
+Backoff: 1s → 2s → 4s. Never `rm` the lock; let the holding process finish. (The shared helper captures git's exit status directly and uses a per-invocation temp error file, so it never masks a real failure as success and never clobbers a concurrent agent's error capture.)
 
 ### Orchestrator move primitive
 
 After every Task() return, parse the marker and perform the move at root:
 
 ```bash
+# Parses the ACFW-RESULT marker, then delegates the move + transition-log + commit to the
+# shared apply-transition.sh primitive (idempotent; single source of truth; safe on resume).
 acfw_apply_result() {
   local task_file="$1" from_state="$2" result="$3"
-  local transition reject_inc notes new_state
+  local transition reject_inc notes new_state inc=0
   transition=$(echo "$result" | sed -nE 's/^[[:space:]]*transition:[[:space:]]*([a-z]+).*/\1/p')
   reject_inc=$(echo "$result" | sed -nE 's/^[[:space:]]*rejection_increment:[[:space:]]*([0-9]+).*/\1/p')
   notes=$(echo "$result" | sed -nE 's/^[[:space:]]*notes:[[:space:]]*(.*)/\1/p')
@@ -158,17 +158,9 @@ acfw_apply_result() {
     rejected)  new_state=rejected  ;;
     *) echo "WARN: missing/invalid ACFW-RESULT for $(basename "$task_file"); transient retry next iter" >&2; return 1 ;;
   esac
-  local fname=$(basename "$task_file")
-  local TS=$(date -u +"%Y-%m-%d %H:%M:%S")
-  if [ "$reject_inc" = "1" ] && [ "$transition" = "rejected" ]; then
-    local rc=$(grep -E '^- \*\*Rejection Count\*\*:' "$task_file" | sed -E 's/.*Rejection Count\*\*:[[:space:]]*([0-9]+).*/\1/')
-    rc=${rc:-0}
-    sed -i.bak -E "s/^- \*\*Rejection Count\*\*:.*/- **Rejection Count**: $((rc + 1))/" "$task_file" && rm -f "$task_file.bak"
-  fi
-  printf '| %s | %s | %s | %s | %s |\n' "$TS" "$from_state" "$new_state" "${ASSIGNED_AGENT:-orchestrator}" "$notes" >> "$task_file"
-  mv "$task_file" "$ACFW_TRUNK_ROOT/.backlog/$new_state/$fname"
-  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" add ".backlog/$from_state/$fname" ".backlog/$new_state/$fname"
-  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" commit -m "task: $fname $from_state -> $new_state" --quiet
+  [ "$reject_inc" = "1" ] && [ "$transition" = "rejected" ] && inc=1
+  bash "${CLAUDE_PLUGIN_ROOT}/skills/go/bin/apply-transition.sh" \
+    "$task_file" "$new_state" "${ASSIGNED_AGENT:-orchestrator}" "$notes" "$inc"
 }
 ```
 
@@ -228,6 +220,18 @@ done
 ```
 
 ---
+
+## Step 0: Per-Iteration Integrity Recheck (doctor-lite)
+
+At the top of each iteration, re-run the doctor (report only — repairs were applied at the pre-loop gate). A FATAL introduced mid-run (e.g. a task-engineer retry that produced a cycle, or a half-applied transition after a crash) aborts the loop rather than dispatching against inconsistent state.
+
+```bash
+if ! REPORT=$(bash "${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh" "$ACFW_TRUNK_ROOT"); then
+  echo "❌ FATAL: integrity violation detected mid-run. Aborting before dispatch." >&2
+  echo "$REPORT" | grep '^FATAL' >&2
+  exit 1
+fi
+```
 
 ## Step 1: Quality Gate Auto-Fix (PRE-PROCESSING)
 
@@ -447,7 +451,14 @@ declare -a DISPATCH_QUEUE
 declare -A SEEN_SLUGS
 for f in $(ls -1 .backlog/pending/*.md 2>/dev/null | sort); do
   slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
-  [ -z "$slug" ] && continue   # research/docs-only tasks; dispatch directly without partitioning
+  if [ "$slug" = "none" ]; then DIRECT_DISPATCH+=("$f"); continue; fi   # research/docs-only: dispatch directly, no worktree, no clean-checkout
+  if [ -z "$slug" ]; then
+    # An empty slug on a code task is a FATAL doctor violation that already aborted the run
+    # at the integrity gate. If we somehow reach here, do NOT silently skip into limbo —
+    # surface it and leave the task pending for the operator.
+    echo "WARN: $(basename "$f") has an empty Worktree: slug. Run /whip-doctor; this is a FATAL integrity violation." >&2
+    continue
+  fi
   [ -n "${IN_PROGRESS_SLUGS[$slug]:-}" ] && continue   # group already busy
   [ -n "${SEEN_SLUGS[$slug]:-}" ] && continue   # already picked one task from this group this iteration
   # Apply dependency-gating rule (see Step 3): skip if any dep unsatisfied.
@@ -567,23 +578,28 @@ done
 ### Step 4.5b: Integrate sequentially
 
 ```bash
+IW="${CLAUDE_PLUGIN_ROOT}/skills/integrate-worktree/bin/integrate-worktree.sh"
 for task_file in "${SORTED_QUEUE[@]}"; do
-  if Skill integrate-worktree "$task_file"; then
-    echo "✓ integrated: $(basename "$task_file" .md)"
-  else
-    rc=$?
-    if [ $rc -eq 6 ]; then
-      echo "✗ resolver failed: $(basename "$task_file" .md) → rejected/, will retry next iteration"
-    elif [ $rc -eq 10 ]; then
-      echo "↻ transient: $(basename "$task_file" .md) → leave accepted, retry next iteration"
-    else
-      echo "⚠ integrate-worktree exit $rc on $(basename "$task_file" .md)"
-    fi
+  OUT=$(bash "$IW" "$task_file"); rc=$?
+  if [ $rc -eq 7 ]; then
+    # resolver-needed. OUT carries: worktree, branch, assigned_agent, conflicting_commits,
+    # source_tasks, conflicted_files. Dispatch the task's assigned_agent as a conflict resolver
+    # INSIDE that worktree via the Task tool (see the integrate-worktree skill "Resolver dispatch"
+    # contract): resolve conflicts preserving both intents, run quality gates, then
+    # `git rebase --continue` — or `git rebase --abort` + append `FATAL: <reason>` if irreconcilable.
+    # After the resolver returns, validate + retry the fast-forward:
+    bash "$IW" --post-resolver "$task_file"; rc=$?
   fi
+  case $rc in
+    0)     echo "✓ integrated: $(basename "$task_file" .md)" ;;
+    6)     echo "✗ resolver failed: $(basename "$task_file" .md) → rejected/, retry next iteration" ;;
+    10|99) echo "↻ transient: $(basename "$task_file" .md) → leave accepted, retry next iteration" ;;
+    *)     echo "⚠ integrate-worktree exit $rc on $(basename "$task_file" .md)" ;;
+  esac
 done
 ```
 
-The orchestrator invokes the `integrate-worktree` skill once per task. The skill itself owns the FF → rebase → resolver-dispatch ladder, the cleanup of empty worktrees, and writing `Integrated-At:` on success.
+The orchestrator drives `integrate-worktree.sh` per task via the two-call protocol (initial attempt → on exit 7 dispatch the resolver → `--post-resolver`). The script owns the FF → rebase ladder, the exit-10 anti-orphan guards, the cleanup of empty worktrees, and writing `Integrated-At:` on success; resolver dispatch is hoisted to the orchestrator (bash cannot spawn a subagent).
 
 ---
 
@@ -669,10 +685,13 @@ Defensive: in case the last iteration accepted tasks but exited the loop before 
 
 ```bash
 if [ "$ACFW_INTEGRATION_OVERRIDE" != "1" ]; then
+  IW="${CLAUDE_PLUGIN_ROOT}/skills/integrate-worktree/bin/integrate-worktree.sh"
   for f in .backlog/accepted/*.md; do
     [ -f "$f" ] || continue
     integrated=$(grep -E '^- \*\*Integrated-At\*\*:' "$f" | sed -E 's/.*Integrated-At\*\*:[[:space:]]*//' | tr -d '[:space:]')
-    [ -z "$integrated" ] && Skill integrate-worktree "$f"
+    # Defensive drain. An exit 7 (resolver-needed) here is left for the next /go run rather
+    # than dispatching a resolver post-loop.
+    [ -z "$integrated" ] && bash "$IW" "$f" >/dev/null 2>&1 || true
   done
 fi
 ```
