@@ -38,7 +38,7 @@ fi
 SLUG=$(grep -E '^- \*\*Worktree\*\*:' "$TASK_FILE" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
 
 if [ -z "$SLUG" ]; then
-  echo "FATAL: task $TASK_FILE has no Worktree: field. task-engineer must set it." >&2
+  echo "FATAL: task $TASK_FILE has no Worktree: field. Run '/whip-doctor --fix' to derive and backfill the slug (or have task-engineer set it)." >&2
   exit 1
 fi
 

@@ -61,8 +61,9 @@ mktask pending cyc-b cb pending go-engineer "cyc-a" "" 0
 git add -A; git commit -qm badtasks
 OUT=$(bash "$DOC" "$REPO"); RC=$?
 check "doctor exits 1 when FATAL present" "[ $RC -eq 1 ]"
-check "status-folder-mismatch" "echo \"$OUT\" | grep -q '^FATAL|status-folder-mismatch|bad-status'"
-check "missing-worktree-slug" "echo \"$OUT\" | grep -q '^FATAL|missing-worktree-slug|bad-slug'"
+check "status-folder-mismatch (active=FATAL)" "echo \"$OUT\" | grep -q '^FATAL|status-folder-mismatch|bad-status'"
+check "missing-worktree-slug (active=REPAIRABLE, not FATAL)" "echo \"$OUT\" | grep -q '^REPAIRABLE|missing-worktree-slug|bad-slug'"
+check "missing-worktree-slug active NOT FATAL" "! echo \"$OUT\" | grep -q '^FATAL|missing-worktree-slug|bad-slug'"
 check "explicit none is NOT flagged" "! echo \"$OUT\" | grep -q 'missing-worktree-slug|ok-noslug'"
 check "unknown-agent" "echo \"$OUT\" | grep -q '^FATAL|unknown-agent|bad-agent'"
 check "dangling-dep" "echo \"$OUT\" | grep -q '^FATAL|dangling-dep|dangle'"
@@ -142,6 +143,67 @@ echo "untracked-not-ignored" > "$HR/loose.txt"
 printf 'loose.txt\n' > "$HR/.worktreeinclude"
 bash "$HYD" "$HR" "$WT3" >/dev/null 2>&1; RC=$?
 check "non-ignored path -> exit 3" "[ $RC -eq 3 ]"
+
+cd "$REPO"
+SCAN="$ACF_WHIP/skills/go/bin/scan-backlog.sh"
+
+echo "== missing slug on ACTIVE task: REPAIRABLE, derived + written by --fix =="
+mktask pending bug-201-make-thing "" pending go-engineer none "" 0 "src/c/**"
+git add -A; git commit -qm slugderive
+OUT=$(bash "$DOC" "$REPO")
+check "active missing-slug REPAIRABLE" "echo \"\$OUT\" | grep -q '^REPAIRABLE|missing-worktree-slug|bug-201-make-thing'"
+check "active missing-slug NOT FATAL" "! echo \"\$OUT\" | grep -q '^FATAL|missing-worktree-slug|bug-201-make-thing'"
+bash "$DOC" --fix "$REPO" >/dev/null
+check "slug derived (make-thing) + written by --fix" "grep -qE '^- \*\*Worktree\*\*: make-thing\$' '$REPO/.backlog/pending/bug-201-make-thing.md'"
+rm -f .backlog/pending/bug-201-make-thing.md; git add -A; git commit -qm cleanup-slugderive
+
+echo "== ACCEPTED tasks: structural defects are advisory (WARN), never FATAL =="
+mktask accepted hist-noslug "" rejected ghost-engineer none "" 0   # empty slug + status!=folder + unknown agent, all on accepted
+git add -A; git commit -qm histaccepted
+OUT=$(bash "$DOC" "$REPO")
+check "accepted missing-slug -> WARN" "echo \"\$OUT\" | grep -q '^WARN|missing-worktree-slug|hist-noslug'"
+check "accepted status-mismatch -> WARN" "echo \"\$OUT\" | grep -q '^WARN|status-folder-mismatch|hist-noslug'"
+check "accepted unknown-agent -> WARN" "echo \"\$OUT\" | grep -q '^WARN|unknown-agent|hist-noslug'"
+check "accepted defects add NO FATAL" "! echo \"\$OUT\" | grep -qE '^FATAL\\|(missing-worktree-slug|status-folder-mismatch|unknown-agent)\\|hist-noslug'"
+check "gate passes (ok=true) with only accepted advisories" "echo \"\$OUT\" | grep -q 'SUMMARY|.*|ok=true'"
+check "BREAKDOWN line emitted" "echo \"\$OUT\" | grep -q '^BREAKDOWN|'"
+rm -f .backlog/accepted/hist-noslug.md; git add -A; git commit -qm cleanup-histaccepted
+
+echo "== branch-aware cross-slug dep: branchless historical accepted dep is satisfied =="
+mktask accepted dep-201-base depslug accepted go-engineer none "" 0 "src/base/**"
+mktask in-progress use-201-feat featslug in-progress go-engineer "dep-201-base" "" 0 "src/feat/**"
+git add -A; git commit -qm crossslug
+OUT=$(bash "$DOC" "$REPO")
+check "cross-slug dep on branchless accepted: NOT FATAL" "! echo \"\$OUT\" | grep -q '^FATAL|cross-slug-dep-not-integrated|use-201-feat'"
+git -C "$REPO" worktree add -q "$REPO/.worktree/depslug" -b worktree/depslug trunk 2>/dev/null
+OUT=$(bash "$DOC" "$REPO")
+check "cross-slug dep with live branch + no integ: FATAL" "echo \"\$OUT\" | grep -q '^FATAL|cross-slug-dep-not-integrated|use-201-feat'"
+git -C "$REPO" worktree remove --force "$REPO/.worktree/depslug" 2>/dev/null
+git -C "$REPO" branch -D worktree/depslug >/dev/null 2>&1
+rm -f .backlog/accepted/dep-201-base.md .backlog/in-progress/use-201-feat.md; git add -A; git commit -qm cleanup-crossslug
+
+echo "== accepted-only dangling/cyclic deps are WARN (not FATAL) =="
+mktask accepted acc-dangle adslug accepted go-engineer "ghost-dep-xyz" "" 0 "src/d/**"
+mktask accepted acc-cyc-a aca accepted go-engineer "acc-cyc-b" "" 0 "src/e/**"
+mktask accepted acc-cyc-b acb accepted go-engineer "acc-cyc-a" "" 0 "src/f/**"
+git add -A; git commit -qm accdeps
+OUT=$(bash "$DOC" "$REPO")
+check "accepted dangling-dep -> WARN" "echo \"\$OUT\" | grep -q '^WARN|dangling-dep|acc-dangle'"
+check "accepted cyclic-deps -> WARN" "echo \"\$OUT\" | grep -qE '^WARN\\|cyclic-deps\\|acc-cyc-[ab]'"
+check "accepted-only graph defects keep ok=true" "echo \"\$OUT\" | grep -q 'SUMMARY|.*|ok=true'"
+rm -f .backlog/accepted/acc-dangle.md .backlog/accepted/acc-cyc-*.md; git add -A; git commit -qm cleanup-accdeps
+
+echo "== scan-backlog emits hasWorktreeBranch =="
+mktask accepted sc-201-live livenow accepted go-engineer none "" 0 "src/live/**"
+git add -A; git commit -qm scanlive
+SNAP=$(bash "$SCAN" "$REPO")
+check "hasWorktreeBranch false before branch exists" "echo \"\$SNAP\" | grep -qE '\"stem\":\"sc-201-live\"[^}]*\"hasWorktreeBranch\":false'"
+git -C "$REPO" worktree add -q "$REPO/.worktree/livenow" -b worktree/livenow trunk 2>/dev/null
+SNAP=$(bash "$SCAN" "$REPO")
+check "hasWorktreeBranch true after branch exists" "echo \"\$SNAP\" | grep -qE '\"stem\":\"sc-201-live\"[^}]*\"hasWorktreeBranch\":true'"
+git -C "$REPO" worktree remove --force "$REPO/.worktree/livenow" 2>/dev/null
+git -C "$REPO" branch -D worktree/livenow >/dev/null 2>&1
+rm -f .backlog/accepted/sc-201-live.md; git add -A; git commit -qm cleanup-scanlive
 
 echo ""
 echo "==================================================="

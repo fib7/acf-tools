@@ -40,6 +40,41 @@ commit_fix() { # <path-rel> <msg>
   git_with_lock_backoff -C "$REPO_ROOT" commit -m "$2" --quiet >/dev/null 2>&1 || true
 }
 
+# Existing worktree-branch slugs (ONE git call). Used to tell a live, integratable accepted
+# task (its worktree/<slug> branch exists) from a historical/pre-2.0.0 one (no branch — already
+# on trunk the old way, nothing to integrate, terminal). Membership is a fixed-string whole-line
+# compare so a metachar slug never matches the wrong entry.
+EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' refs/heads/worktree/ 2>/dev/null | sed 's#^worktree/##')
+has_branch() { printf '%s\n' "$EXISTING_WT_SLUGS" | grep -qxF "$1"; }
+
+# Derive a kebab-case worktree slug from a task id: drop the "<category>-<NNN>-" prefix and keep
+# the descriptive tail (already kebab-case); fall back to "<category>-<NNN>" if the tail is empty
+# or invalid. A DISTINCT per-task slug is intentional — one worktree branch per task maximizes
+# parallel dispatch. Tasks that genuinely share a file surface are surfaced by the separate
+# cross-slug-glob-overlap WARN, not silently serialized here.
+derive_slug() { # <id>
+  local id="$1" tail head
+  tail=$(printf '%s' "$id" | sed -E 's/^(feature|bug|infra|test|docs|refactor|data|ml)-[0-9]{1,4}-//')
+  if [ "$tail" != "$id" ] && printf '%s' "$tail" | grep -qE '^[a-z0-9]+(-[a-z0-9]+)*$'; then
+    printf '%s' "$tail"; return
+  fi
+  head=$(printf '%s' "$id" | sed -E 's/^((feature|bug|infra|test|docs|refactor|data|ml)-[0-9]{1,4}).*/\1/')
+  if [ -n "$head" ] && [ "$head" != "$id" ]; then printf '%s' "$head"; else printf '%s' "$id"; fi
+}
+
+# Write a derived slug into the task file: replace an empty "- **Worktree**:" line if one exists,
+# else insert the field right after the always-present "- **Status**:" line. Then commit.
+write_slug() { # <file> <folder> <stem> <slug>
+  local f="$1" folder="$2" stem="$3" slug="$4"
+  if grep -qE '^- \*\*Worktree\*\*:' "$f"; then
+    sed -i.bak -E "s|^- \*\*Worktree\*\*:.*|- **Worktree**: $slug|" "$f" && rm -f "$f.bak"
+  else
+    sed -i.bak -E "/^- \*\*Status\*\*:/a\\
+- **Worktree**: $slug" "$f" && rm -f "$f.bak"
+  fi
+  commit_fix ".backlog/$folder/$stem.md" "doctor: derive Worktree slug '$slug' on $stem"
+}
+
 # ---- FATAL: detached HEAD at trunk root ----
 if ! git -C "$REPO_ROOT" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
   emit FATAL detached-head "(repo)" "HEAD is detached at $REPO_ROOT; /go requires a branch checked out at the repo root"
@@ -58,13 +93,35 @@ for st in $ACTIVE; do
     hasTok=0; grep -qE '\| clean-checkout \| ok \|' "$f" && hasTok=1
     agentOk=1; { [ -n "$agent" ] && [ "$agent" != "none" ] && [ ! -f "$REPO_ROOT/.claude/agents/$agent.md" ]; } && agentOk=0
 
+    # Severity tier: a task in accepted/ is terminal (out of the dispatch path), so its
+    # structural defects are advisory (WARN), never blocking. Active folders keep FATAL.
+    sev_struct=FATAL; [ "$folder" = "accepted" ] && sev_struct=WARN
+
     if [ -z "$id" ] || [ -z "$status" ]; then
-      emit FATAL unparseable-frontmatter "$stem" "missing ID and/or Status field"
+      emit "$sev_struct" unparseable-frontmatter "$stem" "missing ID and/or Status field"
     else
-      [ "$status" != "$folder" ] && emit FATAL status-folder-mismatch "$stem" "Status: '$status' but file is in .backlog/$folder/"
+      [ "$status" != "$folder" ] && emit "$sev_struct" status-folder-mismatch "$stem" "Status: '$status' but file is in .backlog/$folder/"
     fi
-    [ -z "$slug" ] && emit FATAL missing-worktree-slug "$stem" "code-mutating task has no Worktree: slug (set a slug, or 'none' for research/docs-only)"
-    [ "$agentOk" = "0" ] && emit FATAL unknown-agent "$stem" "Assigned Agent '$agent' has no .claude/agents/$agent.md"
+    # Missing Worktree slug: advisory on terminal (accepted) tasks; on active tasks it is a
+    # REPAIRABLE that --fix self-heals by deriving a slug from the id and writing it in — so a
+    # pre-2.0.0 backlog dispatches instead of hard-failing the gate.
+    if [ -z "$slug" ]; then
+      if [ "$folder" = "accepted" ]; then
+        emit WARN missing-worktree-slug "$stem" "accepted task has no Worktree: slug (historical; advisory)"
+      elif [ -n "$id" ]; then
+        derived=$(derive_slug "$id")
+        if [ "$FIX" = "1" ]; then
+          write_slug "$f" "$folder" "$stem" "$derived"
+          slug="$derived"   # use the derived slug for this task's remaining checks (TSV, registry)
+          emit REPAIRABLE missing-worktree-slug "$stem" "derived '$derived' from id and wrote it into the task"
+        else
+          emit REPAIRABLE missing-worktree-slug "$stem" "no Worktree slug; --fix will derive '$derived' from the id"
+        fi
+      else
+        emit "$sev_struct" missing-worktree-slug "$stem" "no Worktree slug and no id to derive one from"
+      fi
+    fi
+    [ "$agentOk" = "0" ] && emit "$sev_struct" unknown-agent "$stem" "Assigned Agent '$agent' has no .claude/agents/$agent.md"
 
     if [ -n "$integ" ] && [ "$folder" != "accepted" ]; then
       if [ "$FIX" = "1" ]; then
@@ -90,8 +147,10 @@ for st in $ACTIVE; do
     [ "$folder" = "accepted" ] && [ "$hasTok" = "0" ] && emit WARN missing-clean-checkout-token "$stem" "accepted without a 'clean-checkout | ok' token"
     [ "$folder" = "in-review" ] && emit WARN lingering-in-review "$stem" "stuck in in-review/ (quality-reviewer must terminate it)"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$stem" "$folder" "$id" "$status" "$slug" "$agent" "${deps:-none}" "$integ" "${globs}" "$rc" >> "$TSV"
+    # hasBranch: does a real worktree/<slug> branch exist? (col 11; consumed by the awk graph pass)
+    hasBranch=0; [ -n "$slug" ] && [ "$slug" != "none" ] && has_branch "$slug" && hasBranch=1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$stem" "$folder" "$id" "$status" "$slug" "$agent" "${deps:-none}" "$integ" "${globs}" "$rc" "$hasBranch" >> "$TSV"
   done
 done
 
@@ -99,8 +158,8 @@ done
 awk -F'\t' '
 function resolve(d,   s){ if(d in stems) return d; for(s in stems){ if(index(s,d)==1) return s } return "" }
 {
-  stem=$1; folder=$2; id=$3; slug=$5; deps=$7; integ=$8; globs=$9;
-  stems[stem]=1; state[stem]=folder; slugOf[stem]=slug; integOf[stem]=integ; depsOf[stem]=deps; globsOf[stem]=globs;
+  stem=$1; folder=$2; id=$3; slug=$5; deps=$7; integ=$8; globs=$9; hasBranch=$11;
+  stems[stem]=1; state[stem]=folder; slugOf[stem]=slug; integOf[stem]=integ; depsOf[stem]=deps; globsOf[stem]=globs; hasBranchOf[stem]=hasBranch;
   if(id!=""){ idcount[id]++ }
   foldcount[stem]++; foldlist[stem]=foldlist[stem]" "folder;
   if(folder=="pending"){ pend[stem]=1 }
@@ -114,10 +173,13 @@ END{
     for(k=1;k<=n;k++){ d=da[k]; gsub(/[ \t]/,"",d);
       if(d=="" || d=="none") continue;
       r=resolve(d);
-      if(r==""){ print "FATAL|dangling-dep|" s "|depends on " d " which has no task file"; continue }
+      if(r==""){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|dangling-dep|" s "|depends on " d " which has no task file"; continue }
       adj[s]=adj[s]" "r; indeg[r]++;
+      # Branch-aware: a cross-slug dep that is accepted-but-unintegrated only blocks when it still
+      # has a live worktree branch (genuinely pending integration). A branchless historical accepted
+      # dep is already on trunk -> satisfied (matches the workflow runtime-terminal model).
       if((state[s]=="in-progress"||state[s]=="completed"||state[s]=="in-review") && slugOf[s]!="" && slugOf[r]!=slugOf[s])
-        if(state[r]!="accepted" || integOf[r]=="")
+        if(state[r]!="accepted" || (integOf[r]=="" && hasBranchOf[r]=="1"))
           print "FATAL|cross-slug-dep-not-integrated|" s "|dispatched (" state[s] ") but cross-slug dep " r " is not accepted+integrated";
     }
   }
@@ -126,7 +188,7 @@ END{
     for(s in stems){ if(removed[s]) continue;
       if((s in indeg ? indeg[s] : 0) <= 0){ removed[s]=1; changed=1;
         m=split(adj[s], aa, " "); for(k=1;k<=m;k++){ t=aa[k]; if(t!="") indeg[t]-- } } } }
-  for(s in stems) if(!removed[s]) print "FATAL|cyclic-deps|" s "|participates in a dependency cycle";
+  for(s in stems) if(!removed[s]){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|cyclic-deps|" s "|participates in a dependency cycle"; }
 
   np=0; for(s in pend){ np++; parr[np]=s }
   for(a=1;a<=np;a++) for(b=a+1;b<=np;b++){ sa=parr[a]; sb=parr[b];
@@ -191,6 +253,12 @@ sort -t'|' -k1,1 "$FINDINGS" 2>/dev/null || cat "$FINDINGS"
 nFATAL=$(grep -c '^FATAL|' "$FINDINGS" 2>/dev/null); nFATAL=${nFATAL:-0}
 nREP=$(grep -c '^REPAIRABLE|' "$FINDINGS" 2>/dev/null); nREP=${nREP:-0}
 nWARN=$(grep -c '^WARN|' "$FINDINGS" 2>/dev/null); nWARN=${nWARN:-0}
+# Grouped breakdown (one line per non-empty severity) so callers can show "N historical
+# advisories" instead of dumping every finding. Output-only; never affects ok.
+for sev in FATAL REPAIRABLE WARN; do
+  grp=$(awk -F'|' -v S="$sev" '$1==S{c[$2]++} END{f=1; for(k in c){ printf "%s%s=%d", (f?"":","), k, c[k]; f=0 }}' "$FINDINGS")
+  [ -n "$grp" ] && printf 'BREAKDOWN|%s|%s\n' "$sev" "$grp"
+done
 ok=true; [ "$nFATAL" -gt 0 ] && ok=false
 printf 'SUMMARY|fatal=%d|repairable=%d|warn=%d|ok=%s\n' "$nFATAL" "$nREP" "$nWARN" "$ok"
 [ "$ok" = "true" ]

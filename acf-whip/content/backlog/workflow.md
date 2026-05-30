@@ -50,13 +50,13 @@ Every git command issued by acf-whip skills (orchestrator commits, worktree crea
 
 **Parallel across worktrees, sequential within a worktree.** Every code-mutating task declares two front-matter fields, set by `task-engineer` at decomposition time:
 
-- `Worktree: <slug>` (kebab-case identifier; required for code-mutating tasks; `none` only for research/docs-only tasks; empty on a code task is a FATAL doctor violation)
+- `Worktree: <slug>` (kebab-case identifier; required for code-mutating tasks; `none` only for research/docs-only tasks). A missing slug on an **active** code task is self-healed: the doctor derives one from the task id and writes it in (`--fix`) rather than hard-failing. A missing slug on an **accepted** (terminal) task is advisory only.
 - `PR Group: <slug>` (defaults to the same slug; sibling tasks ship together)
 - `Touches Globs: <comma-separated globs>` (the files the task modifies, or `none`; the doctor WARNs when two different-slug pending tasks declare overlapping globs — a mis-partition signal)
 
-Slug enforcement is layered: schema-required at decomposition (the workflow planner cannot omit it), a JS validation gate (kebab-case, never equal to the task id, acyclic deps, unique ids) before any file is written, and a doctor FATAL at dispatch time.
+Slug enforcement is layered: schema-required at decomposition (the workflow planner cannot omit it), a JS validation gate (kebab-case, never equal to the task id, acyclic deps, unique ids) before any file is written, and at dispatch the doctor self-heals a missing slug on an active task (derives + writes it).
 
-The orchestrator (`/go`) groups pending tasks by `Worktree:` and dispatches at most one specialist per worktree-group. Tasks sharing a slug execute strictly sequentially. Tasks with different slugs execute in parallel.
+**Parallelism is the default.** The slug is the partition: the orchestrator (`/go`) groups pending tasks by `Worktree:` and dispatches at most one specialist per worktree-group — tasks with different slugs run **in parallel**, tasks sharing a slug run strictly sequentially. Decomposition is therefore biased toward maximum parallelism: every independent file surface gets its own slug (concurrent), a slug is shared only when tasks write the **same** files, and a dependency is declared only when a task genuinely consumes another's output. Over-sharing slugs and adding unnecessary dependencies are the two ways to needlessly serialize work — both are avoided by default.
 
 The lock is git itself: `git worktree add <repo>/.worktree/<slug> -b worktree/<slug>` fails when the branch is already checked out elsewhere. No custom lock files, daemons, or schedulers.
 
@@ -80,6 +80,8 @@ All subsequent state moves, edits, and commits happen inside the worktree on `wo
 
 **Override**: if the project's `CLAUDE.md` (or any other persistent agent instructions) directs a different integration strategy — for example "open a PR per `PR Group:` via `gh pr create` instead of merging locally" — `/go` follows those instructions and skips auto-integration, per Claude's instruction-priority hierarchy. In that mode the operator is responsible for integration; `Integrated-At:` stays empty and the loop's terminal check falls back to `accepted ∪ blocked`.
 
+**Terminal in default mode**: an accepted task is terminal once nothing remains to fold into trunk — it carries `Integrated-At:`, **or** it is non-code (`Worktree: none`), **or** it has no `worktree/<slug>` branch (a historical/pre-2.0.0 task already merged the old way). Branchless historical accepted tasks are never enqueued for integration (integrate-worktree exits 4, "nothing to fold"), so a lived-in backlog reaches 100% instead of looping on phantom branches.
+
 ## Priority Levels
 
 | Priority | SLA (deadline) | Cycle Time Target (stretch goal) |
@@ -100,7 +102,7 @@ Priority orders within a worktree partition. It does not authorize parallelism a
 4. Blocker tasks within a group still take precedence; they just do not break the per-group serialization.
 5. **Dependency gating**: a task may dispatch only from a codebase that already contains all its dependencies.
    - **Same-slug dep** (dep's `Worktree:` equals this task's `Worktree:`): satisfied as soon as the dep is in `.backlog/accepted/`. The dep's commits already live on the shared `worktree/<slug>` branch.
-   - **Cross-slug dep**: dep must be `accepted/` AND have a non-empty `Integrated-At:` (i.e. merged into the local trunk). Acceptance alone is insufficient because the dependent's worktree only sees cross-slug commits after `clean-checkout-before-task` Step 5 fast-forwards from the now-advanced trunk.
+   - **Cross-slug dep**: dep's commits must already be on the local trunk. It blocks only while genuinely pending integration — `accepted/`, a live `worktree/<slug>` branch, and no `Integrated-At:` yet. A non-empty `Integrated-At:` satisfies it; so does a **branchless historical/pre-2.0.0** accepted dep (no worktree branch = already on trunk the old way). A non-code (`none`) dep is satisfied on acceptance.
    - In override (PR) mode, where `Integrated-At:` is never written, acceptance is sufficient for cross-slug deps; the operator is responsible for ordering.
 
 ## Evidence Requirements
@@ -116,7 +118,9 @@ In default (auto-merge) mode, every accepted task MUST additionally have:
 
 ## Backlog integrity (`/whip-doctor`)
 
-`doctor.sh` is the integrity battery. It runs at three points: as a **hard gate** at `/go` startup (it applies the REPAIRABLE class with `--fix`, then re-scans and refuses to dispatch if any FATAL remains), as a **per-iteration recheck** inside the loop (a mid-run FATAL — e.g. a cycle introduced by a retry — aborts before the next dispatch), and at **`/task` create-time**. `/whip-doctor [--fix]` runs it on demand. Findings are `SEVERITY|CODE|TASK_ID|DETAIL` lines followed by `SUMMARY|fatal=N|repairable=N|warn=N|ok=true|false`. FATAL examples: status-vs-folder mismatch, missing/empty worktree slug on a code task, unknown Assigned Agent, dangling/cyclic deps, cross-slug dependent dispatched before its dep is integrated, worktree on the wrong branch, detached HEAD at trunk. REPAIRABLE (auto-fixed): stray `Integrated-At` on a non-accepted task, out-of-range Rejection Count, a task present in two folders, an orphaned `.worktree/<slug>`.
+`doctor.sh` is the integrity battery. It runs at three points: as a **hard gate** at `/go` startup (it applies the REPAIRABLE class with `--fix`, then re-scans and refuses to dispatch if any FATAL remains), as a **per-iteration recheck** inside the loop (a mid-run FATAL — e.g. a cycle introduced by a retry — aborts before the next dispatch), and at **`/task` create-time**. `/whip-doctor [--fix]` runs it on demand. Findings are `SEVERITY|CODE|TASK_ID|DETAIL` lines, then a grouped `BREAKDOWN|<SEV>|code=count,…` line per severity (so callers summarize instead of dumping every line), then `SUMMARY|fatal=N|repairable=N|warn=N|ok=true|false`.
+
+**Severity is scoped to the dispatch path.** A task in `accepted/` is terminal/out-of-scope, so its structural defects are **advisory (WARN), never blocking** — a pre-2.0.0 backlog of historical accepted tasks (missing slugs, stale `Status:`, even dangling/cyclic deps among themselves) does not abort the gate. FATAL is reserved for **active** tasks (pending/in-progress/completed/in-review): status-vs-folder mismatch, unknown Assigned Agent, dangling/cyclic deps, a cross-slug dependent dispatched before its dep is on trunk (branch-aware: a branchless historical dep counts as satisfied), worktree on the wrong branch, detached HEAD at trunk. REPAIRABLE (auto-fixed by `--fix`): **a missing worktree slug on an active code task (derived from the id and written in)**, stray `Integrated-At` on a non-accepted task, out-of-range Rejection Count, a task present in two folders, an orphaned `.worktree/<slug>`.
 
 ## Worktree environment hydration (`.worktreeinclude`)
 
