@@ -135,7 +135,7 @@ Before the loop, run the integrity doctor as a **HARD GATE** over the ACTIVE bac
 ```bash
 DOCTOR="${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh"
 bash "$DOCTOR" --fix "$ACFW_TRUNK_ROOT" >/dev/null 2>&1 || true   # self-heal REPAIRABLE (incl. derive missing slugs)
-if ! REPORT=$(bash "$DOCTOR" "$ACFW_TRUNK_ROOT"); then
+if ! REPORT=$(bash "$DOCTOR" --quiet "$ACFW_TRUNK_ROOT"); then
   echo "❌ FATAL: backlog integrity gate failed. /go will not dispatch against an inconsistent backlog." >&2
   echo "$REPORT" | grep '^FATAL' >&2
   echo "Fix the FATAL findings (active-task errors: dangling/cyclic deps, status-folder mismatch) and re-run /go." >&2
@@ -290,7 +290,7 @@ done
 At the top of each iteration, re-run the doctor (report only — repairs were applied at the pre-loop gate). A FATAL introduced mid-run (e.g. a task-engineer retry that produced a cycle, or a half-applied transition after a crash) aborts the loop rather than dispatching against inconsistent state.
 
 ```bash
-if ! REPORT=$(bash "${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh" "$ACFW_TRUNK_ROOT"); then
+if ! REPORT=$(bash "${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh" --quiet "$ACFW_TRUNK_ROOT"); then
   echo "❌ FATAL: integrity violation detected mid-run. Aborting before dispatch." >&2
   echo "$REPORT" | grep '^FATAL' >&2
   exit 1
