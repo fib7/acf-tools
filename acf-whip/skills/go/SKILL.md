@@ -52,8 +52,9 @@ The orchestrator decides which mode to use by reading project instructions (alre
 ## Execution: workflow-first, legacy fallback
 
 acf-whip ships a **dynamic-workflow orchestrator** (`workflows/whip-go.workflow.js`) that runs the
-entire loop — scan, slug partition, dependency gate, topological integration, stall/terminal
-bookkeeping — inside a deterministic script. The intermediate state lives in script variables, so
+entire loop — scan, slug partition, dependency gate, the full state machine (including
+**blocked→pending unblock** when deps resolve and **in-progress→blocked timeout** past the operator
+threshold), topological integration, stall/terminal bookkeeping — inside a deterministic script. The intermediate state lives in script variables, so
 **your context stays flat across iterations** (this is the fix for the context-bloat problem the
 legacy loop has). Prefer it.
 
@@ -448,15 +449,15 @@ For each task in `.backlog/completed/`:
 }
 ```
 
-#### E. Timeout In-Progress Tasks (48h)
+#### E. Timeout In-Progress Tasks (operator threshold, default 8h)
 
 For each task in `.backlog/in-progress/`:
 1. Read timestamp from transition log
-2. If >48 hours: Timeout (in-progress→blocked)
+2. If older than `ACFW_INPROGRESS_TIMEOUT_HOURS` (env > `.backlog/.acfw-config` > default **8h**): Timeout (in-progress→blocked)
 
 ```javascript
 {
-  content: "Timeout feature-005 (in-progress→blocked, >48h)",
+  content: "Timeout feature-005 (in-progress→blocked, stale)",
   status: "pending",
   activeForm: "Timing out feature-005"
 }
@@ -604,7 +605,7 @@ After all Task() calls return, the orchestrator parses each agent's ACFW-RESULT 
 | completed→in-review | **orchestrator** at root, before reviewer Task() | Pre-move + commit on trunk (mirrors dispatch). |
 | in-review→accepted | **orchestrator** at root, on reviewer's `transition: accepted` signal | acfw_apply_result. |
 | in-review→rejected | **orchestrator** at root, on reviewer's `transition: rejected` signal | acfw_apply_result; increments Rejection Count. |
-| timeout (in-progress→blocked, >48h) | orchestrator at root | Synthesizes a `transition: blocked` with notes "timeout >48h". |
+| timeout (in-progress→blocked, stale past `ACFW_INPROGRESS_TIMEOUT_HOURS`, default 8h) | orchestrator at root | Synthesizes a `transition: blocked` with notes "timeout >=Nh — stale dispatch". |
 
 **The orchestrator is the only writer of `.backlog/` files.** Specialists' worktree-side commits contain code only. task-engineer transitions execute serially at root (no code mutation).
 

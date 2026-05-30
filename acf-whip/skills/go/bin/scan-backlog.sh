@@ -30,6 +30,14 @@ ACTIVE="pending in-progress completed in-review blocked rejected accepted"
 NOW_S=$(date -u +%s)
 GEN_TS=$(date -u +"%Y-%m-%d %H:%M:%S")
 
+# In-progress timeout threshold (hours): env > .backlog/.acfw-config > default 8. Mirrors the
+# precedence in doctor.sh so /go's in-progress->blocked timeout uses the operator's setting. The
+# config is sourced with stdout suppressed so this script's stdout stays a single JSON object.
+ENV_TIMEOUT="${ACFW_INPROGRESS_TIMEOUT_HOURS:-}"
+[ -f "$BL/.acfw-config" ] && . "$BL/.acfw-config" >/dev/null 2>&1
+TIMEOUT_H="${ENV_TIMEOUT:-${ACFW_INPROGRESS_TIMEOUT_HOURS:-8}}"
+printf '%s' "$TIMEOUT_H" | grep -qE '^[0-9]+$' || TIMEOUT_H=8
+
 # ---- JSON helpers ----
 # Escape a single-line string for embedding in JSON (backslash, doublequote;
 # strip stray control chars that should never appear in a frontmatter value).
@@ -177,10 +185,27 @@ EOF
       # (it survives only in the aggregate counts) so the snapshot stays small enough for the workflow
       # agent to echo reliably. Keep it if it is a dependency target — then depsSatisfied/resolve never
       # see a null. Non-accepted folders are always emitted (they drive dispatch).
+      slim=false
       if [ "$st" = "accepted" ]; then
         term_acc=false
         if [ "$hasInteg" = true ] || [ -z "$slug" ] || [ "$slug" = "none" ] || [ "$hasWtBranch" = false ]; then term_acc=true; fi
-        if [ "$term_acc" = true ] && ! is_dep_target "$stem" "$id"; then continue; fi
+        if [ "$term_acc" = true ]; then
+          # terminal accepted: drop entirely unless something depends on it; if it IS a dep target,
+          # keep it but emit a SLIM object (below) instead of the full one.
+          if is_dep_target "$stem" "$id"; then slim=true; else continue; fi
+        fi
+      fi
+
+      # Slim emission for a terminal accepted task retained ONLY as a dependency target. The scheduler
+      # consults it via idx.resolve strictly as a DEP: depsSatisfied reads folder/slug/hasIntegratedAt/
+      # hasWorktreeBranch and never recurses into the dep's own deps, and a terminal task never enters
+      # the integration topo-sort. Dropping the heavy/unused fields shrinks the per-iteration payload
+      # on lived-in backlogs (the full object is ~2-3x larger). deps/touchesGlobs are emitted empty so
+      # any defensive consumer still sees arrays, not undefined.
+      if [ "$slim" = true ]; then
+        if [ "$tfirst" -eq 1 ]; then tfirst=0; else TASKS_JSON="$TASKS_JSON,"; fi
+        TASKS_JSON="$TASKS_JSON{\"stem\":\"$(jesc "$stem")\",\"id\":\"$(jesc "$id")\",\"folder\":\"accepted\",\"slug\":\"$(jesc "$slug")\",\"deps\":[],\"touchesGlobs\":[],\"hasIntegratedAt\":$hasInteg,\"hasWorktreeBranch\":$hasWtBranch,\"rejectionCount\":$rc,\"ageHours\":-1,\"slim\":true}"
+        continue
       fi
 
       last=$(grep -oE '\| [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} \|' "$f" | tail -1 | tr -d '|' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
@@ -250,6 +275,7 @@ printf '"trunkSha":"%s",' "$(jesc "$TRUNK_SHA")"
 printf '"detachedHead":%s,' "$DETACHED"
 printf '"countsOnly":%s,' "$COUNTS_ONLY"
 printf '"generatedAt":"%s",' "$GEN_TS"
+printf '"inProgressTimeoutHours":%d,' "$TIMEOUT_H"
 emit_counts
 printf ',"tasks":[%s]' "$TASKS_JSON"
 printf ',"worktrees":[%s]' "$WT_JSON"
