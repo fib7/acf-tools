@@ -219,6 +219,11 @@ git add -A; git commit -qm deptarget
 SNAP=$(bash "$SCAN" "$REPO")
 check "terminal accepted retained as EXACT dep target" "echo \"\$SNAP\" | grep -qE '\"stem\":\"dep-target-acc\"'"
 check "terminal accepted retained as PREFIX dep target" "echo \"\$SNAP\" | grep -qE '\"stem\":\"prefixacc-full\"'"
+# retained dep targets are SLIM (only the fields depsSatisfied/idx.resolve read): slim:true present,
+# and the heavy full-object fields (status/agent/priority) are dropped — the slim layout puts
+# deps/touchesGlobs immediately after slug, which a full object never does.
+check "dep-target accepted emitted with slim:true" "echo \"\$SNAP\" | grep -qE '\"stem\":\"dep-target-acc\"[^}]*\"slim\":true'"
+check "slim dep-target drops full-only fields (deps right after slug)" "echo \"\$SNAP\" | grep -qE '\"stem\":\"dep-target-acc\",\"id\":\"[^\"]*\",\"folder\":\"accepted\",\"slug\":\"dta\",\"deps\":\[\],\"touchesGlobs\":\[\],\"hasIntegratedAt\":true'"
 rm -f .backlog/accepted/dep-target-acc.md .backlog/accepted/prefixacc-full.md .backlog/pending/dep-consumer.md .backlog/pending/dep-consumer-pfx.md
 git add -A; git commit -qm cleanup-deptarget
 
@@ -255,6 +260,25 @@ check "runtimeTerminalDefault == blocked + accepted (all branchless => terminal)
 check "runtimeTerminalDefault <= runtimeTerminalOverride" "[ \"$RTD\" -le \"$RTO\" ]"
 rm -f .backlog/accepted/rt-hist-1.md .backlog/accepted/rt-integ-1.md .backlog/blocked/rt-blk-1.md .backlog/pending/rt-pend-1.md
 git add -A; git commit -qm cleanup-rtcounts
+
+echo "== scan-backlog: blocked emitted in tasks[] + inProgressTimeoutHours (env > config > 8) =="
+# blocked tasks MUST be in the working set (the workflow now unblocks blocked->pending); the timeout
+# threshold MUST be emitted so /go's in-progress->blocked timeout uses the operator's setting.
+mktask blocked tb-blk tbb blocked go-engineer none "" 0
+mktask in-progress tb-ip tbi in-progress go-engineer none "" 0
+git add -A; git commit -qm tbtimeout
+SNAP=$(bash "$SCAN" "$REPO")
+check "blocked task emitted in tasks[] (drives unblock)" "echo \"\$SNAP\" | grep -qE '\"stem\":\"tb-blk\"[^}]*\"folder\":\"blocked\"'"
+check "in-progress task emitted in tasks[]" "echo \"\$SNAP\" | grep -qE '\"stem\":\"tb-ip\"'"
+check "inProgressTimeoutHours present (default 8)" "echo \"\$SNAP\" | grep -qE '\"inProgressTimeoutHours\":8'"
+SNAP24=$(ACFW_INPROGRESS_TIMEOUT_HOURS=24 bash "$SCAN" "$REPO")
+check "inProgressTimeoutHours honors env override (24)" "echo \"\$SNAP24\" | grep -qE '\"inProgressTimeoutHours\":24'"
+printf 'ACFW_INPROGRESS_TIMEOUT_HOURS=12\n' > .backlog/.acfw-config
+SNAPCFG=$(bash "$SCAN" "$REPO")
+check "inProgressTimeoutHours honors .acfw-config (12)" "echo \"\$SNAPCFG\" | grep -qE '\"inProgressTimeoutHours\":12'"
+check "scan stdout stays single JSON object despite .acfw-config" "echo \"\$SNAPCFG\" | grep -cE '^\\{' | grep -qx 1"
+rm -f .backlog/.acfw-config .backlog/blocked/tb-blk.md .backlog/in-progress/tb-ip.md
+git add -A; git commit -qm cleanup-tbtimeout
 
 echo "== doctor --quiet: only FATAL + BREAKDOWN + SUMMARY =="
 mktask accepted q-adv-1 "" accepted go-engineer none "" 0   # accepted missing slug -> WARN advisory

@@ -131,7 +131,7 @@ for st in $ACTIVE; do
         emit "$sev_struct" missing-worktree-slug "$stem" "no Worktree slug and no id to derive one from"
       fi
     fi
-    [ "$agentOk" = "0" ] && emit "$sev_struct" unknown-agent "$stem" "Assigned Agent '$agent' has no .claude/agents/$agent.md"
+    [ "$agentOk" = "0" ] && emit "$sev_struct" unknown-agent "$stem" "Assigned Agent '$agent' has no .claude/agents/$agent.md — create it or run /whip-add-agents, or reassign the task"
 
     if [ -n "$integ" ] && [ "$folder" != "accepted" ]; then
       if [ "$FIX" = "1" ]; then

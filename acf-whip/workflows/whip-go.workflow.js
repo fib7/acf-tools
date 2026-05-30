@@ -36,7 +36,15 @@ const CLEAN_CHECKOUT = `${pluginRoot}/skills/clean-checkout-before-task/bin/clea
 
 const MAX_ITER = 1000
 const NO_GAIN_LIMIT = 15 // iterations with no terminal gain (perpetual-retry guard); well below MAX_ITER
+
+// <scheduler-pure> ===========================================================================
+// Everything between these markers is PURE (no agent/parallel/phase/log/clock, no closures except
+// the module-level `mode`). tests/phase2-scheduler.test.mjs extracts this block verbatim, injects
+// `mode`, and unit-tests it — so the scheduling/terminal logic (the part the 2.0.x migration broke)
+// is exercised without the Workflow runtime. Keep it pure; if you add a side effect here, the test
+// extraction breaks loudly.
 const MAX_REJECT_RETRY = 3 // rejected with count < this -> retry (rejected->pending); >= this -> blocked
+const DEFAULT_TIMEOUT_H = 8 // in-progress -> blocked fallback when the snapshot omits inProgressTimeoutHours
 const PRIORITY_RANK = { blocker: 0, critical: 1, high: 2, medium: 3, low: 4 }
 const prank = (p) => (p in PRIORITY_RANK ? PRIORITY_RANK[p] : 5)
 const byPriorityThenStem = (a, b) => (prank(a.priority) - prank(b.priority)) || (a.stem < b.stem ? -1 : a.stem > b.stem ? 1 : 0)
@@ -135,7 +143,7 @@ function depsSatisfied(t, idx) {
 // Topological order (Kahn) over cross-slug dependency edges among the integration candidates,
 // so each cross-slug dependency integrates before its dependent. Falls back to input order on cycle
 // (doctor would already FATAL on a real cycle).
-function topoIntegrationOrder(candidates, idx) {
+function topoIntegrationOrder(candidates, idx, onCycle) {
   const set = new Set(candidates.map((t) => t.stem))
   const indeg = new Map(candidates.map((t) => [t.stem, 0]))
   const adj = new Map(candidates.map((t) => [t.stem, []]))
@@ -155,9 +163,44 @@ function topoIntegrationOrder(candidates, idx) {
     const s = q.shift(); order.push(s)
     for (const n of adj.get(s)) { indeg.set(n, indeg.get(n) - 1); if (indeg.get(n) === 0) q.push(n) }
   }
-  if (order.length < candidates.length) return candidates.slice() // cycle guard: keep all, input order
+  if (order.length < candidates.length) { if (onCycle) onCycle(); return candidates.slice() } // cycle guard: keep all, input order
   return order.map((s) => byStem.get(s))
 }
+
+// The two transitions the 2.0.x workflow migration dropped (the legacy markdown loop performed them
+// via task-engineer; see go/SKILL.md Step 3.B/3.E and content/backlog/workflow.md). PURE: returns
+// the single-writer actions plus the in-progress tasks that are still FRESH (must be re-dispatched,
+// NOT timed out this iteration). Both moves land in the pre-move batch, so the moved task dispatches
+// on the NEXT scan (same timing as the rejected->pending self-heal).
+function planUnblockAndTimeout(tasks, idx, opts) {
+  const o = opts || {}
+  const maxReject = (o.maxReject != null) ? o.maxReject : MAX_REJECT_RETRY
+  const timeoutH = (o.timeoutH != null) ? o.timeoutH : DEFAULT_TIMEOUT_H
+  const root = o.trunkRoot || ''
+  const mk = (t, from, toState, notes) => ({ path: `${root}/.backlog/${from}/${t.stem}.md`, toState, agent: 'orchestrator', notes, inc: 0 })
+
+  // blocked -> pending: deps now satisfied AND not a max-rejection "redesign" block (count >= cap).
+  // A specialist-blocked or dep-blocked task re-runs once its deps land; a 3x-rejected task is left
+  // for a human (re-dispatching it just re-rejects). depsSatisfied is the same gate pending uses.
+  const unblockActions = tasks
+    .filter((t) => t.folder === 'blocked')
+    .sort(byPriorityThenStem)
+    .filter((t) => (t.rejectionCount || 0) < maxReject && depsSatisfied(t, idx))
+    .map((t) => mk(t, 'blocked', 'pending', 'dependencies resolved — unblocked'))
+
+  // in-progress -> blocked: stale past the operator timeout (ageHours is computed by scan-backlog;
+  // a negative ageHours means "unknown timestamp" and never times out). A timed-out task must be
+  // excluded from the re-dispatch set, so the caller uses `freshInProgress` to build specialistQ.
+  const stale = tasks
+    .filter((t) => t.folder === 'in-progress' && t.ageHours >= 0 && t.ageHours >= timeoutH)
+    .sort(byPriorityThenStem)
+  const timeoutActions = stale.map((t) => mk(t, 'in-progress', 'blocked', `timeout >=${timeoutH}h — stale dispatch`))
+  const staleStems = new Set(stale.map((t) => t.stem))
+  const freshInProgress = tasks.filter((t) => t.folder === 'in-progress' && !staleStems.has(t.stem))
+
+  return { unblockActions, timeoutActions, freshInProgress }
+}
+// </scheduler-pure> ==========================================================================
 
 // ============================ agent prompt builders ============================
 const NO_BACKLOG_WRITES = 'Do code work ONLY inside the worktree. Do NOT move task files between .backlog/ folders and do NOT commit any .backlog/ change — the orchestrator is the single writer of .backlog/.'
@@ -320,15 +363,13 @@ while (iter < MAX_ITER) {
   iter++
 
   // ---- scan (read-only) + doctor-lite + heartbeat ----
-  const scan = await agent(
-    `${ENV}
+  const scanPrompt = `${ENV}
 Iteration ${iter} of the acf-whip orchestrator. Do three things and return the result:
 1. Read-only snapshot:  bash ${sq(SCAN)} ${sq(trunkRoot)}  — its stdout is a single JSON object. Put that stdout VERBATIM (copy it exactly, add nothing) into snapshotJson.
 2. Integrity recheck (report-only):  bash ${sq(DOCTOR)} --quiet ${sq(trunkRoot)}  — set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (verbatim FATAL| lines).
 3. Heartbeat (best-effort, NOT committed): write a small JSON file at ${sq(`${trunkRoot}/.backlog/.acfw-run.json`)} containing {"iteration":${iter},"mode":"${mode}","ts":"<output of: date -u +%Y-%m-%dT%H:%M:%SZ>"}. If the write fails, ignore it.
-Return the ScanResult.`,
-    { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT },
-  )
+Return the ScanResult.`
+  let scan = await agent(scanPrompt, { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT })
 
   // mid-run FATAL introduced (e.g. a cycle from a retry, a half-applied transition) -> abort before dispatch
   if (!scan.doctorOk) {
@@ -338,8 +379,19 @@ Return the ScanResult.`,
 
   let snap
   try { snap = JSON.parse(scan.snapshotJson) } catch (e) {
-    stopReason = 'snapshot-parse-error'
-    return { aborted: true, reason: 'could not parse backlog snapshot JSON', mode, iteration: iter, raw: scan.snapshotJson.slice(0, 400) }
+    // One re-scan before giving up: the snapshot is relayed by an agent echoing scan-backlog's stdout
+    // verbatim, so a single garbled/truncated echo should not abort a long run. Re-run once; if it is
+    // still unparseable, the snapshot is genuinely malformed -> abort.
+    log(`iter ${iter}: snapshot JSON unparseable — re-scanning once`)
+    scan = await agent(scanPrompt, { label: `scan#${iter}:retry`, phase: 'Iterate', schema: SCAN_RESULT })
+    if (!scan.doctorOk) {
+      stopReason = 'integrity-fatal-midrun'
+      return { aborted: true, reason: 'integrity FATAL detected mid-run (on scan retry); aborting before dispatch', mode, iteration: iter, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
+    }
+    try { snap = JSON.parse(scan.snapshotJson) } catch (e2) {
+      stopReason = 'snapshot-parse-error'
+      return { aborted: true, reason: 'could not parse backlog snapshot JSON after one retry', mode, iteration: iter, raw: (scan.snapshotJson || '').slice(0, 400) }
+    }
   }
   lastSnapshot = snap
   const tasks = snap.tasks || []
@@ -380,6 +432,15 @@ Return the ScanResult.`,
   const directQ = []      // {t, premove} — non-code (slug none), no worktree
   const warnings = []
 
+  // blocked->pending (deps resolved) + in-progress->blocked (stale) — see planUnblockAndTimeout.
+  // These land in the pre-move batch; the moved task dispatches next scan. freshInProgress excludes
+  // any task we just timed out so it is not re-dispatched in the same iteration.
+  const { unblockActions, timeoutActions, freshInProgress } = planUnblockAndTimeout(tasks, idx, {
+    timeoutH: (snap.inProgressTimeoutHours != null ? snap.inProgressTimeoutHours : DEFAULT_TIMEOUT_H),
+    maxReject: MAX_REJECT_RETRY,
+    trunkRoot,
+  })
+
   // reviewers first: completed (premove -> in-review) and lingering in-review (re-review). They claim the slug.
   const inReview = tasks.filter((t) => t.folder === 'in-review').sort(byPriorityThenStem)
   const completed = tasks.filter((t) => t.folder === 'completed').sort(byPriorityThenStem)
@@ -388,10 +449,10 @@ Return the ScanResult.`,
     reviewQ.push({ t, premove: t.folder === 'completed' })
   }
 
-  // then specialists: in-progress (re-dispatch recovery) and pending (start), one per free slug.
-  const inProgress = tasks.filter((t) => t.folder === 'in-progress').sort(byPriorityThenStem)
+  // then specialists: in-progress (re-dispatch recovery — FRESH only; stale ones were timed out
+  // above) and pending (start), one per free slug.
   const pending = tasks.filter((t) => t.folder === 'pending').sort(byPriorityThenStem)
-  for (const t of [...inProgress, ...pending]) {
+  for (const t of [...freshInProgress.slice().sort(byPriorityThenStem), ...pending]) {
     if (t.slug === 'none') {
       if (t.folder === 'pending' && !depsSatisfied(t, idx)) continue
       directQ.push({ t, premove: t.folder === 'pending' })
@@ -414,7 +475,10 @@ Return the ScanResult.`,
   if (warnings.length) for (const w of warnings) log(`WARN ${w}`)
 
   // ---- pre-move (single writer, sequential) ----
+  // Unblock + timeout first (they change what is dispatchable next iteration), then dispatch pre-moves.
   const preActions = [
+    ...unblockActions,
+    ...timeoutActions,
     ...reviewQ.filter((x) => x.premove).map((x) => ({ path: `${trunkRoot}/.backlog/completed/${x.t.stem}.md`, toState: 'in-review', agent: 'orchestrator', notes: 'review-dispatch', inc: 0 })),
     ...specialistQ.filter((x) => x.premove).map((x) => ({ path: `${trunkRoot}/.backlog/pending/${x.t.stem}.md`, toState: 'in-progress', agent: 'orchestrator', notes: 'dispatch', inc: 0 })),
     ...directQ.filter((x) => x.premove).map((x) => ({ path: `${trunkRoot}/.backlog/pending/${x.t.stem}.md`, toState: 'in-progress', agent: 'orchestrator', notes: 'dispatch', inc: 0 })),
@@ -430,6 +494,7 @@ Return the ScanResult.`,
     ...reviewQ.map((x) => ({ kind: 'review', t: x.t, from: 'in-review' })),
   ]
   const justAcceptedTasks = [] // tasks accepted THIS iteration -> integrate in the same iteration (legacy timing)
+  let productiveDispatch = false // at least one dispatch returned a real (non-'none') transition
   if (dispatch.length) {
     const results = await parallel(dispatch.map((d) => () => {
       const prompt = d.kind === 'review'
@@ -463,6 +528,7 @@ Return the ScanResult.`,
         inc: (toState === 'rejected' && r.rejectionIncrement === 1) ? 1 : 0,
       })
     })
+    productiveDispatch = postActions.length > 0 // a real transition was applied (not just a transient/mismatched marker)
     if (postActions.length) await applyTransitions(postActions, `postmove#${iter}`)
   }
 
@@ -478,7 +544,7 @@ Return the ScanResult.`,
       if (seenC.has(t.stem)) continue
       seenC.add(t.stem); candidates.push(t)
     }
-    const ordered = topoIntegrationOrder(candidates, idx)
+    const ordered = topoIntegrationOrder(candidates, idx, () => log('WARN integrate: dependency cycle among integration candidates — using input order; run /whip-doctor'))
     for (const t of ordered) {
       let r = await agent(integratePrompt(t, false), { label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT })
       if (r && r.outcome === 'resolver-needed') {
@@ -497,7 +563,11 @@ Return the ScanResult.`,
   }
 
   // ---- progress accounting (computed from THIS iteration's work) ----
-  const didWork = preActions.length > 0 || dispatch.length > 0 || integratedThisIter > 0
+  // didWork drives the idle guard (break at 3). A pre-move (unblock/timeout/dispatch/reject), an
+  // integration, or a dispatch that returned a REAL transition all count. A dispatch that returns
+  // only 'none' (transient) does NOT — otherwise a task that re-dispatches and keeps failing would
+  // hold idle at 0 forever and only the looser noGain guard (15) would catch it.
+  const didWork = preActions.length > 0 || integratedThisIter > 0 || productiveDispatch
   idle = didWork ? 0 : idle + 1
   noGain = terminal > prevTerminal ? 0 : noGain + 1
   prevTerminal = terminal

@@ -130,7 +130,7 @@ A committed root manifest lists the git-ignored files a fresh `.worktree/<slug>`
 
 ## In-progress timeout (operator-configurable)
 
-`.backlog/.acfw-config` sets `ACFW_INPROGRESS_TIMEOUT_HOURS` (default **8**; env var overrides). The doctor WARNs on in-progress tasks older than the threshold. `whip-init` scaffolds the config.
+`.backlog/.acfw-config` sets `ACFW_INPROGRESS_TIMEOUT_HOURS` (default **8**; env var overrides). `scan-backlog.sh` resolves the threshold (env > config > 8) and emits it in the snapshot; the doctor WARNs on in-progress tasks older than it, and `/go` moves them **in-progress → blocked** (`timeout >=Nh — stale dispatch`) so a crashed/hung dispatch becomes terminal instead of re-dispatching indefinitely. `whip-init` scaffolds the config.
 
 ## Run & resume model
 
@@ -138,4 +138,4 @@ git plus `.backlog/` are the only durable state — **re-running `/go` is the re
 
 ---
 
-**Last Updated**: 2026-05-28
+**Last Updated**: 2026-05-30

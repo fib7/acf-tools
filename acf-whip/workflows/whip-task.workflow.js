@@ -155,6 +155,18 @@ Return the basenames (no .md extension, no directory path) as agents[]. If the d
   { label: 'discover-agents', phase: 'Decompose', schema: REGISTRY },
 )
 const registeredAgents = (reg && Array.isArray(reg.agents)) ? reg.agents : []
+// Empty registry: abort before writing any files. validatePlan can only check assignedAgent against
+// installed agents; with none installed it would pass ANY name, and /go's doctor then FATALs every
+// task (unknown-agent) at the bootstrap gate — a backlog that /task accepted but /go can never
+// dispatch. Fail loudly here with the fix (run /whip-init) instead of producing a stuck backlog.
+if (!registeredAgents.length) {
+  return {
+    phase: 'decompose',
+    aborted: true,
+    reason: 'no specialist agents installed (.claude/agents/ is empty) — /go cannot dispatch to agents that do not exist',
+    nextStep: 'Run /whip-init (and /whip-add-agents) to scaffold specialist agents, then re-run /task.',
+  }
+}
 const agentLine = registeredAgents.length
   ? `assignedAgent MUST be one of this project's installed agents: ${registeredAgents.join(', ')}.`
   : `assignedAgent should name an installed specialist agent (run /whip-init to generate them); no registry was found at .claude/agents/, so choose a sensible specialist name.`

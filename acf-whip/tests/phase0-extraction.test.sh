@@ -104,6 +104,15 @@ check "Integrated-At written" "grep -qE '^- \*\*Integrated-At\*\*: [0-9a-f]{7,}'
 check "ff.txt present on trunk" "[ -f '$REPO/ff.txt' ]"
 check "worktree removed (no siblings)" "[ ! -d '$REPO/.worktree/ff' ]"
 
+echo "== integrate-worktree.sh: no branch -> exit 4 (historical/pre-2.0.0) =="
+# accepted task whose worktree/<slug> branch does NOT exist -> nothing to fold; terminal; caller
+# must NOT retry (the workflow maps exit 4 -> outcome 'skipped'). Guards against a phantom-fetch loop.
+mktask accepted feat-hist histslug
+bash "$IW" "$REPO/.backlog/accepted/feat-hist.md" >/dev/null 2>&1; RC=$?
+check "no-branch integrate exit 4" "[ $RC -eq 4 ]"
+check "exit-4 leaves task in accepted/ (not rejected)" "[ -f '$REPO/.backlog/accepted/feat-hist.md' ]"
+check "exit-4 writes no Integrated-At" "! grep -qE '^- \*\*Integrated-At\*\*: [0-9a-f]{7,}' '$REPO/.backlog/accepted/feat-hist.md'"
+
 echo "== integrate-worktree.sh: resolver-needed (conflict) + post-resolver reject =="
 mktask pending feat-cx cx
 bash "$CC" "$REPO/.backlog/pending/feat-cx.md" >/dev/null
