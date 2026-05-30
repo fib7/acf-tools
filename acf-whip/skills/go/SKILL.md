@@ -130,18 +130,20 @@ echo "🌳 Trunk: $ACFW_TRUNK_BRANCH @ $ACFW_TRUNK_SHA_AT_START"
 
 ## Pre-Loop: Backlog Integrity Gate (doctor)
 
-Before the loop, run the integrity doctor as a **HARD GATE**. `/go` MUST NOT dispatch against an inconsistent backlog (the cause of "executing inconsistent state"). Auto-repair the REPAIRABLE class, then re-scan; if any FATAL remains, abort and print the report for the operator.
+Before the loop, run the integrity doctor as a **HARD GATE** over the ACTIVE backlog. The `--fix` pass self-heals the REPAIRABLE class first — including **deriving a missing `Worktree:` slug** for any active code task, so a pre-2.0.0 backlog dispatches instead of hard-failing. Only a remaining **FATAL** aborts. Findings on `accepted/` tasks are **advisory (WARN), never blocking**: an accepted task is terminal / out of the dispatch path, so a missing slug or stale `Status:` there does not gate the run.
 
 ```bash
 DOCTOR="${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh"
-bash "$DOCTOR" --fix "$ACFW_TRUNK_ROOT" >/dev/null 2>&1 || true   # apply repairables first
+bash "$DOCTOR" --fix "$ACFW_TRUNK_ROOT" >/dev/null 2>&1 || true   # self-heal REPAIRABLE (incl. derive missing slugs)
 if ! REPORT=$(bash "$DOCTOR" "$ACFW_TRUNK_ROOT"); then
   echo "❌ FATAL: backlog integrity gate failed. /go will not dispatch against an inconsistent backlog." >&2
   echo "$REPORT" | grep '^FATAL' >&2
-  echo "Fix the FATAL findings (most are task-engineer errors: missing slug, dangling/cyclic deps) and re-run /go." >&2
+  echo "Fix the FATAL findings (active-task errors: dangling/cyclic deps, status-folder mismatch) and re-run /go." >&2
   exit 1
 fi
-echo "$REPORT" | grep -E '^(REPAIRABLE|WARN)' || true   # surface non-blocking findings
+# Surface non-blocking findings as a compact grouped breakdown — a lived-in backlog can carry
+# hundreds of historical accepted advisories, so never dump them line-by-line.
+echo "$REPORT" | grep '^BREAKDOWN|' || true
 ```
 
 The same doctor runs once per iteration (lite recheck, Step 0 below); a FATAL introduced mid-run also aborts the loop.
@@ -234,16 +236,32 @@ while [ $iteration -lt $max_iterations ]; do
 
   # ... process workflow ...
 
-  # Count terminal tasks. In default (auto-merge) mode, an accepted task is terminal
-  # only if its Integrated-At: is set. In override (PR) mode, accepted alone is terminal.
+  # Count terminal tasks. Override (PR) mode: accepted alone is terminal. Default (auto-merge)
+  # mode: an accepted task is terminal once nothing remains to fold into trunk — it carries
+  # Integrated-At, OR is non-code ("none"), OR has no worktree/<slug> branch (historical/pre-2.0.0,
+  # already on trunk). Equivalently: accepted MINUS the ones still pending integration (a real
+  # branch, not yet integrated). Mirrors the workflow's isTerminal.
+  accepted_count=$(ls -1 .backlog/accepted/*.md 2>/dev/null | wc -l | tr -d ' ')
+  blocked_count=$(ls -1 .backlog/blocked/*.md 2>/dev/null | wc -l | tr -d ' ')
   if [ "$ACFW_INTEGRATION_OVERRIDE" = "1" ]; then
-    terminal_count=$(ls -1 .backlog/accepted/*.md .backlog/blocked/*.md 2>/dev/null | wc -l)
+    terminal_count=$((accepted_count + blocked_count))
   else
-    integrated_count=$(grep -lE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' .backlog/accepted/*.md 2>/dev/null | wc -l)
-    blocked_count=$(ls -1 .backlog/blocked/*.md 2>/dev/null | wc -l)
-    terminal_count=$((integrated_count + blocked_count))
+    pending_integration=0
+    for f in .backlog/accepted/*.md; do
+      [ -f "$f" ] || continue
+      slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | head -1 | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+      { [ -z "$slug" ] || [ "$slug" = "none" ]; } && continue
+      grep -qE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' "$f" && continue
+      git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$slug" && pending_integration=$((pending_integration + 1))
+    done
+    terminal_count=$((accepted_count + blocked_count - pending_integration))
   fi
-  total_count=$(find .backlog -name "*.md" ! -path "*/.git/*" ! -name "README.md" ! -name ".gitkeep" | wc -l)
+  # Denominator = the 7 ACTIVE folders only (draft/ and archive/ are excluded from automation and
+  # must never inflate the completion target — matches the workflow's tasks[] population).
+  total_count=$(ls -1 \
+    .backlog/pending/*.md .backlog/in-progress/*.md .backlog/completed/*.md .backlog/in-review/*.md \
+    .backlog/blocked/*.md .backlog/rejected/*.md .backlog/accepted/*.md 2>/dev/null \
+    | grep -vE '/README\.md$' | wc -l | tr -d ' ')
 
   if [ $terminal_count -eq $total_count ] && [ $total_count -gt 0 ]; then
     echo "✅ Backlog 100% complete!"
@@ -403,7 +421,7 @@ For each task in `.backlog/pending/`:
 A task may dispatch only from a codebase that already contains all its dependencies. For each dep:
 
 - **Same-slug dep** (dep's `Worktree:` equals this task's `Worktree:`): satisfied as soon as `dep` is in `.backlog/accepted/`. Its commits already live on the shared `worktree/<slug>` branch and will be present in the worktree when the within-slug serializer picks the next task.
-- **Cross-slug dep** (different `Worktree:` slug): `dep` must be in `.backlog/accepted/` **AND** have a non-empty `Integrated-At:` field, i.e. its commits are on the local trunk. Acceptance alone is not enough — the dependent's worktree only sees cross-slug commits after `clean-checkout-before-task` Step 5 fast-forwards from the now-advanced trunk.
+- **Cross-slug dep** (different `Worktree:` slug): `dep` must be in `.backlog/accepted/` **AND** its commits must already be on the local trunk — i.e. it has a non-empty `Integrated-At:`, **or** it is a historical task with no `worktree/<slug>` branch (already merged the old way; nothing left to integrate). A cross-slug dep blocks only while it is genuinely pending integration (accepted, a live branch, no `Integrated-At:` yet). A non-code (`none`) dep never integrates, so it is satisfied on acceptance.
 
 In override (PR) mode, where there is no `Integrated-At:` field because no auto-merge happens, treat acceptance as sufficient for cross-slug deps too (operator is responsible for ordering).
 
@@ -527,10 +545,14 @@ for dep_id in $(echo "$DEPS" | tr ',' '\n' | tr -d '[:space:]'); do
   dep_file=$(ls .backlog/accepted/${dep_id}*.md 2>/dev/null | head -1)
   [ -z "$dep_file" ] && return 1   # dep not accepted
   dep_slug=$(grep -E '^- \*\*Worktree\*\*:' "$dep_file" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
-  if [ "$dep_slug" != "$THIS_SLUG" ]; then
-    # Cross-slug: require Integrated-At
+  if [ "$dep_slug" != "$THIS_SLUG" ] && [ "$dep_slug" != "none" ]; then
+    # Cross-slug code dep: blocks only while genuinely pending integration — accepted, a live
+    # worktree/<slug> branch, and no Integrated-At yet. A branchless historical dep is already on
+    # trunk (satisfied); a non-code "none" dep never integrates (satisfied).
     integrated=$(grep -E '^- \*\*Integrated-At\*\*:' "$dep_file" | sed -E 's/.*Integrated-At\*\*:[[:space:]]*//' | tr -d '[:space:]')
-    [ -z "$integrated" ] && return 1
+    if [ -z "$integrated" ] && git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$dep_slug"; then
+      return 1
+    fi
   fi
 done
 return 0
@@ -614,7 +636,12 @@ declare -a INTEGRATE_QUEUE
 for f in .backlog/accepted/*.md; do
   [ -f "$f" ] || continue
   integrated=$(grep -E '^- \*\*Integrated-At\*\*:' "$f" | sed -E 's/.*Integrated-At\*\*:[[:space:]]*//' | tr -d '[:space:]')
-  [ -z "$integrated" ] && INTEGRATE_QUEUE+=("$f")
+  [ -n "$integrated" ] && continue
+  slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | head -1 | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+  # Only enqueue tasks with a real worktree branch to fold in. A branchless historical/pre-2.0.0
+  # task is already on trunk (terminal) — skip it, or integrate-worktree would exit 4 every pass.
+  { [ -z "$slug" ] || [ "$slug" = "none" ]; } && continue
+  git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$slug" && INTEGRATE_QUEUE+=("$f")
 done
 
 # Topo-sort INTEGRATE_QUEUE by cross-slug deps (dep first). Implementation: simple
@@ -638,6 +665,7 @@ for task_file in "${SORTED_QUEUE[@]}"; do
   fi
   case $rc in
     0)     echo "✓ integrated: $(basename "$task_file" .md)" ;;
+    4)     echo "↷ skipped (historical; no worktree branch): $(basename "$task_file" .md)" ;;
     6)     echo "✗ resolver failed: $(basename "$task_file" .md) → rejected/, retry next iteration" ;;
     10|99) echo "↻ transient: $(basename "$task_file" .md) → leave accepted, retry next iteration" ;;
     *)     echo "⚠ integrate-worktree exit $rc on $(basename "$task_file" .md)" ;;
@@ -654,19 +682,33 @@ The orchestrator drives `integrate-worktree.sh` per task via the two-call protoc
 After all agents complete in iteration AND Step 4.5 has integrated newly-accepted tasks:
 
 ```bash
-# Count terminal states. Default mode: accepted tasks must have Integrated-At set.
+# Count terminal states. Override mode: accepted alone is terminal. Default mode: an accepted task
+# is terminal once nothing remains to fold into trunk — Integrated-At set, OR non-code ("none"), OR
+# no worktree/<slug> branch (historical, already on trunk). = accepted MINUS those still pending
+# integration (a live branch, not yet integrated). Mirrors the workflow's isTerminal.
+accepted_count=$(ls -1 .backlog/accepted/*.md 2>/dev/null | wc -l | tr -d ' ')
+blocked_count=$(ls -1 .backlog/blocked/*.md 2>/dev/null | wc -l | tr -d ' ')
 if [ "$ACFW_INTEGRATION_OVERRIDE" = "1" ]; then
-  accepted_count=$(ls -1 .backlog/accepted/*.md 2>/dev/null | wc -l)
   integrated_count=$accepted_count   # treat accepted as terminal in override mode
+  terminal_count=$((accepted_count + blocked_count))
 else
-  accepted_count=$(ls -1 .backlog/accepted/*.md 2>/dev/null | wc -l)
-  integrated_count=$(grep -lE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' .backlog/accepted/*.md 2>/dev/null | wc -l)
+  integrated_count=$(grep -lE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' .backlog/accepted/*.md 2>/dev/null | wc -l | tr -d ' ')
+  pending_integration=0
+  for f in .backlog/accepted/*.md; do
+    [ -f "$f" ] || continue
+    slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | head -1 | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+    { [ -z "$slug" ] || [ "$slug" = "none" ]; } && continue
+    grep -qE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' "$f" && continue
+    git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$slug" && pending_integration=$((pending_integration + 1))
+  done
+  terminal_count=$((accepted_count + blocked_count - pending_integration))
 fi
-blocked_count=$(ls -1 .backlog/blocked/*.md 2>/dev/null | wc -l)
-terminal_count=$((integrated_count + blocked_count))
 
-# Count total tasks
-total_count=$(find .backlog -name "*.md" ! -path "*/.git/*" ! -name "README.md" ! -name ".gitkeep" | wc -l)
+# Denominator = the 7 ACTIVE folders only (draft/ and archive/ are excluded from automation).
+total_count=$(ls -1 \
+  .backlog/pending/*.md .backlog/in-progress/*.md .backlog/completed/*.md .backlog/in-review/*.md \
+  .backlog/blocked/*.md .backlog/rejected/*.md .backlog/accepted/*.md 2>/dev/null \
+  | grep -vE '/README\.md$' | wc -l | tr -d ' ')
 
 echo "📊 Progress: $terminal_count / $total_count terminal ($integrated_count integrated, $accepted_count accepted, $blocked_count blocked)"
 ```
@@ -735,9 +777,12 @@ if [ "$ACFW_INTEGRATION_OVERRIDE" != "1" ]; then
   for f in .backlog/accepted/*.md; do
     [ -f "$f" ] || continue
     integrated=$(grep -E '^- \*\*Integrated-At\*\*:' "$f" | sed -E 's/.*Integrated-At\*\*:[[:space:]]*//' | tr -d '[:space:]')
-    # Defensive drain. An exit 7 (resolver-needed) here is left for the next /go run rather
-    # than dispatching a resolver post-loop.
-    [ -z "$integrated" ] && bash "$IW" "$f" >/dev/null 2>&1 || true
+    [ -n "$integrated" ] && continue
+    slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | head -1 | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+    { [ -z "$slug" ] || [ "$slug" = "none" ]; } && continue
+    # Defensive drain. An exit 7 (resolver-needed) here is left for the next /go run rather than
+    # dispatching a resolver post-loop; a branchless historical task has no branch to fold (skip).
+    git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$slug" && bash "$IW" "$f" >/dev/null 2>&1 || true
   done
 fi
 ```

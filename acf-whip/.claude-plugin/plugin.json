@@ -1,7 +1,7 @@
 {
   "name": "acf-whip",
-  "version": "2.0.0",
-  "description": "Hostile workflow enforcer. Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates. /task and /go run as dynamic workflows (deterministic loop, schema-enforced worktree slugs, integrity-gated) when available, with the legacy single-context loop as automatic fallback.",
+  "version": "2.0.1",
+  "description": "Hostile workflow enforcer. Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates. /task and /go run as dynamic workflows (deterministic loop, schema-enforced worktree slugs, integrity-gated) when available, with the legacy single-context loop as automatic fallback. Self-heals pre-2.0.0 backlogs: the doctor derives missing worktree slugs for active tasks and treats accepted/historical tasks as advisory (never blocking); /go counts branchless historical accepted tasks as terminal. Planning and execution default to maximum parallelism of non-conflicting work.",
   "author": {
     "name": "ACF Tools Team",
     "email": "acf@fib7.ai"

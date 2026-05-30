@@ -84,8 +84,8 @@ const INTEGRATE_RESULT = {
   type: 'object', additionalProperties: false,
   required: ['exitCode', 'outcome', 'note', 'resolverWorktree', 'resolverBranch', 'resolverAgent', 'resolverConflictedFiles', 'resolverConflictingCommits'],
   properties: {
-    exitCode: { type: 'integer', description: 'the integrate-worktree.sh exit code (0,6,7,10,99,...)' },
-    outcome: { type: 'string', enum: ['integrated', 'resolver-needed', 'rejected', 'transient', 'error'] },
+    exitCode: { type: 'integer', description: 'the integrate-worktree.sh exit code (0,4,6,7,10,99,...)' },
+    outcome: { type: 'string', enum: ['integrated', 'resolver-needed', 'rejected', 'transient', 'skipped', 'error'] },
     note: { type: 'string' },
     resolverWorktree: { type: 'string', description: 'from the resolver-needed block "worktree:" line, else ""' },
     resolverBranch: { type: 'string', description: 'from "branch:", else ""' },
@@ -111,8 +111,10 @@ function isTerminal(t) {
   if (t.folder === 'blocked') return true
   if (t.folder === 'accepted') {
     if (mode === 'override') return true
-    // default (auto-merge): integrated, or nothing to integrate (non-code slug "none")
-    return t.hasIntegratedAt || t.slug === 'none'
+    // default (auto-merge): terminal when integrated, or when there's nothing to integrate —
+    // a non-code slug ("none"), or a historical/pre-2.0.0 task with no worktree branch (already
+    // on trunk the old way; a phantom branch can never be fetched, so it's as done as it gets).
+    return t.hasIntegratedAt || t.slug === 'none' || !t.hasWorktreeBranch
   }
   return false
 }
@@ -121,8 +123,11 @@ function depsSatisfied(t, idx) {
     const dep = idx.resolve(depTok)
     if (!dep) return false // dangling — doctor would FATAL; be conservative
     if (dep.folder !== 'accepted') return false
+    // A cross-slug code dep blocks only while it is genuinely pending integration: accepted, has a
+    // live worktree branch, and not yet integrated. A branchless historical dep is already on trunk
+    // -> satisfied (mirrors isTerminal + the doctor's branch-aware cross-slug-dep check).
     const crossSlug = dep.slug !== t.slug // includes dep.slug === 'none'
-    if (mode === 'default' && crossSlug && dep.slug !== 'none' && !dep.hasIntegratedAt) return false
+    if (mode === 'default' && crossSlug && dep.slug !== 'none' && dep.hasWorktreeBranch && !dep.hasIntegratedAt) return false
   }
   return true
 }
@@ -238,6 +243,7 @@ Run the acf-whip integrator for one accepted task and report its result. Run EXA
   ${cmd}
 Capture the exit code and stdout. Map exit code -> outcome:
   0  -> integrated      (folded into trunk; Integrated-At written)
+  4  -> skipped         (no worktree/<slug> branch — historical/pre-2.0.0 task already on trunk; nothing to integrate, do NOT retry)
   6  -> rejected        (conflict unresolved; task moved to rejected/)
   7  -> resolver-needed  (rebase conflict; stdout carries a "ACFW-INTEGRATE: resolver-needed" block — DO NOT touch the worktree, just parse and report)
   10 -> transient        (anti-orphan guard; leave accepted, retry later)
@@ -349,6 +355,10 @@ Return the ScanResult.`,
   if (total > 0 && terminal === total) { stopReason = 'complete'; break }
 
   // ---- plan (pure JS): partition by slug, gate deps, build queues ----
+  // PARALLELISM INVARIANT (default): every non-conflicting ready unit dispatches CONCURRENTLY.
+  // The slug is the partition — one agent per distinct ready slug runs in parallel below
+  // (parallel(dispatch...)); only same-slug work (shared file surface) and unmet deps serialize.
+  // Nothing here may serialize work that a distinct slug + satisfied deps would let run in parallel.
   const codeSlug = (t) => t.slug && t.slug !== 'none'
   const seen = new Set()
   // One agent per code slug per iteration. Reviewers claim first, then in-progress (re-dispatch
@@ -453,7 +463,10 @@ Return the ScanResult.`,
   if (mode === 'default') {
     const seenC = new Set()
     const candidates = []
-    for (const t of [...tasks.filter((t) => t.folder === 'accepted' && codeSlug(t) && !t.hasIntegratedAt), ...justAcceptedTasks.filter(codeSlug)]) {
+    // Only enqueue accepted tasks that have a real worktree branch to fold in. A branchless
+    // historical/pre-2.0.0 accepted task is already on trunk (isTerminal treats it terminal) — never
+    // enqueue it, or integrate-worktree would fetch a missing ref and retry forever.
+    for (const t of [...tasks.filter((t) => t.folder === 'accepted' && codeSlug(t) && !t.hasIntegratedAt && t.hasWorktreeBranch), ...justAcceptedTasks.filter(codeSlug)]) {
       if (seenC.has(t.stem)) continue
       seenC.add(t.stem); candidates.push(t)
     }
@@ -470,6 +483,7 @@ Return the ScanResult.`,
       }
       if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); integratedThisIter++; log(`✓ integrated ${t.stem}`) }
       else if (r && r.outcome === 'rejected') { rejectedStems.push(t.stem); log(`✗ integrate rejected ${t.stem} — ${r.note}`) }
+      else if (r && r.outcome === 'skipped') { log(`↷ skipped ${t.stem} — no worktree branch (historical; terminal)`) }
       // transient/error -> leave accepted, retry next iteration
     }
   }
@@ -496,7 +510,7 @@ Final integration drain. Run  bash ${sq(SCAN)} ${sq(trunkRoot)}  and return its 
   try { snap2 = JSON.parse(rescan.snapshotJson) } catch (e) { snap2 = null }
   if (snap2) {
     const idx2 = indexTasks(snap2.tasks || [])
-    const left = topoIntegrationOrder((snap2.tasks || []).filter((t) => t.folder === 'accepted' && t.slug && t.slug !== 'none' && !t.hasIntegratedAt), idx2)
+    const left = topoIntegrationOrder((snap2.tasks || []).filter((t) => t.folder === 'accepted' && t.slug && t.slug !== 'none' && !t.hasIntegratedAt && t.hasWorktreeBranch), idx2)
     for (const t of left) {
       // single defensive pass: an exit-7 here is intentionally left for the next /go run (no resolver post-loop)
       const r = await agent(integratePrompt(t, false), { label: `drain:${t.slug}`, phase: 'Drain', schema: INTEGRATE_RESULT })

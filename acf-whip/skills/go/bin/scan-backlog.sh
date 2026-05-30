@@ -101,6 +101,10 @@ emit_counts() {
 # ---- Per-task objects (skipped in --counts-only) ----
 TASKS_JSON=""
 if [ "$COUNTS_ONLY" = "false" ]; then
+  # Existing worktree-branch slugs (ONE git call). hasWorktreeBranch distinguishes a live,
+  # integratable accepted task (branch exists) from a historical/pre-2.0.0 one (no branch —
+  # already on trunk, terminal). Membership is a fixed-string whole-line compare (metachar-safe).
+  EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' refs/heads/worktree/ 2>/dev/null | sed 's#^worktree/##')
   tfirst=1
   for st in $ACTIVE; do
     d="$BL/$st"; [ -d "$d" ] || continue
@@ -121,6 +125,8 @@ if [ "$COUNTS_ONLY" = "false" ]; then
       hasInteg=false; [ -n "$integ" ] && hasInteg=true
       hasTok=false; grep -qE '\| clean-checkout \| ok \|' "$f" && hasTok=true
       codeMut=true; { [ -z "$slug" ] || [ "$slug" = "none" ]; } && codeMut=false
+      hasWtBranch=false
+      if [ -n "$slug" ] && [ "$slug" != "none" ] && printf '%s\n' "$EXISTING_WT_SLUGS" | grep -qxF "$slug"; then hasWtBranch=true; fi
 
       last=$(grep -oE '\| [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} \|' "$f" | tail -1 | tr -d '|' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
       age=-1; lastTs=""
@@ -145,6 +151,7 @@ if [ "$COUNTS_ONLY" = "false" ]; then
       TASKS_JSON="$TASKS_JSON\"hasIntegratedAt\":$hasInteg,"
       TASKS_JSON="$TASKS_JSON\"hasCleanCheckoutToken\":$hasTok,"
       TASKS_JSON="$TASKS_JSON\"isCodeMutating\":$codeMut,"
+      TASKS_JSON="$TASKS_JSON\"hasWorktreeBranch\":$hasWtBranch,"
       TASKS_JSON="$TASKS_JSON\"rejectionCount\":$rc,"
       TASKS_JSON="$TASKS_JSON\"lastTransitionTs\":\"$(jesc "$lastTs")\","
       TASKS_JSON="$TASKS_JSON\"ageHours\":$age}"

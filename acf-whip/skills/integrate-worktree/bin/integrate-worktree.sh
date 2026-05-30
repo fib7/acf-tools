@@ -19,6 +19,8 @@
 # Exit codes:
 #   0  integrated (Integrated-At written, task remains in accepted/)
 #   1  task missing Worktree: field
+#   4  no worktree/<slug> branch -> historical/pre-2.0.0 task already on trunk; nothing to
+#      integrate (terminal). Caller must NOT retry.
 #   6  conflict unresolved -> task moved to rejected/, Rejection Count incremented
 #   7  resolver-needed -> context printed, worktree left mid-rebase (caller dispatches resolver)
 #  10  transient git error (fetch/refspec) -> leave task accepted, retry next iteration
@@ -52,7 +54,7 @@ ASSIGNED_AGENT=$(grep -E '^- \*\*Assigned Agent\*\*:' "$TASK_FILE" | sed -E 's/.
 TASK_ID=$(basename "$TASK_FILE" .md)
 
 if [ -z "$SLUG" ]; then
-  echo "FATAL: $TASK_FILE has no Worktree: field; cannot integrate." >&2
+  echo "FATAL: $TASK_FILE has no Worktree: field; cannot integrate. Run '/whip-doctor --fix' to backfill the slug." >&2
   exit 1
 fi
 
@@ -170,6 +172,15 @@ if [ "$MODE" = "post-resolver" ]; then
 fi
 
 # ================= initial mode =================
+# ---- Step 2 pre-check: the worktree branch MUST exist. If it doesn't, this is a historical/
+# pre-2.0.0 accepted task already on trunk (or a pruned branch) — nothing to fold in. Report and
+# exit 4 (terminal; caller must NOT retry) instead of fetching a missing ref into an exit-10 retry
+# loop. /go already filters these via hasWorktreeBranch; this keeps the script correct standalone.
+if ! git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  echo "ACFW-INTEGRATE: skipped-historical (no branch $BRANCH; nothing to integrate)"
+  exit 4
+fi
+
 # ---- Step 2: Fetch the worktree branch into trunk's refs ----
 if ! git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" fetch . "${BRANCH}:refs/acfw/${SLUG}" --quiet >&2; then
   rc=$?
