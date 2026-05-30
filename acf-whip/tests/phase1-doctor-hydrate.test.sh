@@ -193,17 +193,78 @@ check "accepted cyclic-deps -> WARN" "echo \"\$OUT\" | grep -qE '^WARN\\|cyclic-
 check "accepted-only graph defects keep ok=true" "echo \"\$OUT\" | grep -q 'SUMMARY|.*|ok=true'"
 rm -f .backlog/accepted/acc-dangle.md .backlog/accepted/acc-cyc-*.md; git add -A; git commit -qm cleanup-accdeps
 
-echo "== scan-backlog emits hasWorktreeBranch =="
+echo "== scan-backlog working-set: branchless accepted collapses, live one is kept =="
 mktask accepted sc-201-live livenow accepted go-engineer none "" 0 "src/live/**"
 git add -A; git commit -qm scanlive
 SNAP=$(bash "$SCAN" "$REPO")
-check "hasWorktreeBranch false before branch exists" "echo \"\$SNAP\" | grep -qE '\"stem\":\"sc-201-live\"[^}]*\"hasWorktreeBranch\":false'"
+# branchless accepted with no dependents = terminal-by-rule -> collapsed out of tasks[] (counted only)
+check "branchless accepted collapsed from tasks[]" "! echo \"\$SNAP\" | grep -qE '\"stem\":\"sc-201-live\"'"
+check "collapsed accepted still counted in runtimeTerminalDefault" "echo \"\$SNAP\" | grep -qE '\"runtimeTerminalDefault\":[1-9]'"
 git -C "$REPO" worktree add -q "$REPO/.worktree/livenow" -b worktree/livenow trunk 2>/dev/null
 SNAP=$(bash "$SCAN" "$REPO")
-check "hasWorktreeBranch true after branch exists" "echo \"\$SNAP\" | grep -qE '\"stem\":\"sc-201-live\"[^}]*\"hasWorktreeBranch\":true'"
+# now it has a live worktree branch -> non-terminal -> emitted with hasWorktreeBranch:true
+check "live accepted kept with hasWorktreeBranch true" "echo \"\$SNAP\" | grep -qE '\"stem\":\"sc-201-live\"[^}]*\"hasWorktreeBranch\":true'"
 git -C "$REPO" worktree remove --force "$REPO/.worktree/livenow" 2>/dev/null
 git -C "$REPO" branch -D worktree/livenow >/dev/null 2>&1
 rm -f .backlog/accepted/sc-201-live.md; git add -A; git commit -qm cleanup-scanlive
+
+echo "== scan-backlog working-set: terminal accepted KEPT when something depends on it (anti-hang) =="
+# integrated (terminal) accepted, referenced by a pending task -> must stay in tasks[] or depsSatisfied hangs
+mktask accepted dep-target-acc dta accepted go-engineer none "abc1234" 0
+mktask pending dep-consumer dcs pending go-engineer "dep-target-acc" "" 0 "src/dc/**"
+# prefix dep: token "dep-target" is a prefix of stem "dep-target-acc" (mirrors indexTasks.resolve)
+mktask accepted prefixacc-full pfa accepted go-engineer none "beef999" 0
+mktask pending dep-consumer-pfx dcp pending go-engineer "prefixacc" "" 0 "src/dp/**"
+git add -A; git commit -qm deptarget
+SNAP=$(bash "$SCAN" "$REPO")
+check "terminal accepted retained as EXACT dep target" "echo \"\$SNAP\" | grep -qE '\"stem\":\"dep-target-acc\"'"
+check "terminal accepted retained as PREFIX dep target" "echo \"\$SNAP\" | grep -qE '\"stem\":\"prefixacc-full\"'"
+rm -f .backlog/accepted/dep-target-acc.md .backlog/accepted/prefixacc-full.md .backlog/pending/dep-consumer.md .backlog/pending/dep-consumer-pfx.md
+git add -A; git commit -qm cleanup-deptarget
+
+echo "== scan-backlog working-set: large historical backlog stays small =="
+i=1; while [ $i -le 200 ]; do mktask accepted "hist-$i" "" accepted go-engineer none "" 0; i=$((i+1)); done
+mktask pending live-1 livea pending go-engineer none "" 0 "src/x/**"
+mktask pending live-2 liveb pending go-engineer none "" 0 "src/y/**"
+git add -A; git commit -qm largebacklog
+SNAP=$(bash "$SCAN" "$REPO")
+NTASKS=$(printf '%s' "$SNAP" | grep -oE '"stem":' | wc -l | tr -d ' ')
+NBYTES=$(printf '%s' "$SNAP" | wc -c | tr -d ' ')
+TOTAL=$(printf '%s' "$SNAP" | grep -oE '"total":[0-9]+' | sed 's/.*://')
+check "working-set tasks[] small (<30, not ~200)" "[ \"$NTASKS\" -lt 30 ]"
+check "counts.total reflects full backlog (>=200)" "[ \"$TOTAL\" -ge 200 ]"
+check "snapshot well under 20KB (was ~138KB)" "[ \"$NBYTES\" -lt 20000 ]"
+i=1; while [ $i -le 200 ]; do rm -f ".backlog/accepted/hist-$i.md"; i=$((i+1)); done
+rm -f .backlog/pending/live-1.md .backlog/pending/live-2.md
+git add -A; git commit -qm cleanup-largebacklog
+
+echo "== scan-backlog runtimeTerminal counts =="
+# no worktree/* branches exist at this point -> every accepted is branchless -> all terminal-by-rule
+mktask accepted rt-hist-1 "" accepted go-engineer none "" 0
+mktask accepted rt-integ-1 rti accepted go-engineer none "deadbee" 0
+mktask blocked rt-blk-1 rtb blocked go-engineer none "" 0
+mktask pending rt-pend-1 rtp pending go-engineer none "" 0 "src/z/**"
+git add -A; git commit -qm rtcounts
+SNAP=$(bash "$SCAN" "$REPO")
+RTD=$(printf '%s' "$SNAP" | grep -oE '"runtimeTerminalDefault":[0-9]+' | sed 's/.*://')
+RTO=$(printf '%s' "$SNAP" | grep -oE '"runtimeTerminalOverride":[0-9]+' | sed 's/.*://')
+BLK=$(printf '%s' "$SNAP" | grep -oE '"blocked":[0-9]+' | sed 's/.*://')
+ACC=$(printf '%s' "$SNAP" | grep -oE '"accepted":[0-9]+' | sed 's/.*://')
+check "runtimeTerminalOverride == blocked + accepted" "[ \"$RTO\" -eq $((BLK + ACC)) ]"
+check "runtimeTerminalDefault == blocked + accepted (all branchless => terminal)" "[ \"$RTD\" -eq $((BLK + ACC)) ]"
+check "runtimeTerminalDefault <= runtimeTerminalOverride" "[ \"$RTD\" -le \"$RTO\" ]"
+rm -f .backlog/accepted/rt-hist-1.md .backlog/accepted/rt-integ-1.md .backlog/blocked/rt-blk-1.md .backlog/pending/rt-pend-1.md
+git add -A; git commit -qm cleanup-rtcounts
+
+echo "== doctor --quiet: only FATAL + BREAKDOWN + SUMMARY =="
+mktask accepted q-adv-1 "" accepted go-engineer none "" 0   # accepted missing slug -> WARN advisory
+git add -A; git commit -qm quietadv
+VERB=$(bash "$DOC" "$REPO"); QUI=$(bash "$DOC" --quiet "$REPO")
+check "quiet SUMMARY identical to verbose" "[ \"\$(echo \"\$QUI\" | grep '^SUMMARY|')\" = \"\$(echo \"\$VERB\" | grep '^SUMMARY|')\" ]"
+check "quiet keeps BREAKDOWN lines" "echo \"\$QUI\" | grep -q '^BREAKDOWN|'"
+check "quiet suppresses per-WARN finding lines" "! echo \"\$QUI\" | grep -q '^WARN|'"
+check "verbose still emits per-WARN finding lines" "echo \"\$VERB\" | grep -q '^WARN|'"
+rm -f .backlog/accepted/q-adv-1.md; git add -A; git commit -qm cleanup-quietadv
 
 echo ""
 echo "==================================================="

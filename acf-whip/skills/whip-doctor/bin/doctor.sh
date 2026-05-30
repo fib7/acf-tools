@@ -2,8 +2,11 @@
 # doctor.sh — backlog integrity battery for acf-whip.
 #
 # Usage:
-#   doctor.sh [--fix] [REPO_ROOT]
+#   doctor.sh [--fix] [--quiet] [REPO_ROOT]
 #     --fix      apply the REPAIRABLE class, then re-scan (default: report only)
+#     --quiet    print only FATAL findings + BREAKDOWN + SUMMARY (suppress the per-finding dump);
+#                bounds output to O(fatals + codes) so hundreds of historical advisories don't have
+#                to flow through the /go scan agent. The interactive /whip-doctor stays verbose.
 #     REPO_ROOT  defaults to $ACFW_TRUNK_ROOT or `git rev-parse --show-toplevel`
 #
 # Output (one line per finding, machine- and human-readable):
@@ -21,7 +24,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/../../lib/acfw-git.sh"
 
 FIX=0
-if [ "${1:-}" = "--fix" ]; then FIX=1; shift; fi
+QUIET=0
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --fix) FIX=1; shift;;
+    --quiet) QUIET=1; shift;;
+    *) break;;
+  esac
+done
 REPO_ROOT="${1:-${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}}"
 BL="$REPO_ROOT/.backlog"
 ACTIVE="pending in-progress completed in-review blocked rejected accepted"
@@ -249,7 +259,14 @@ if [ -d "$BL/in-progress" ]; then
 fi
 
 # ---- Print findings + summary ----
-sort -t'|' -k1,1 "$FINDINGS" 2>/dev/null || cat "$FINDINGS"
+# --quiet: only the FATAL lines (the gate decision) flow through; the per-finding WARN/REPAIRABLE
+# dump (one per historical accepted task on a lived-in backlog) is suppressed. BREAKDOWN + SUMMARY
+# below are always emitted, so the grouped advisory counts and ok flag are unchanged.
+if [ "$QUIET" -eq 1 ]; then
+  grep '^FATAL|' "$FINDINGS" 2>/dev/null || true
+else
+  sort -t'|' -k1,1 "$FINDINGS" 2>/dev/null || cat "$FINDINGS"
+fi
 nFATAL=$(grep -c '^FATAL|' "$FINDINGS" 2>/dev/null); nFATAL=${nFATAL:-0}
 nREP=$(grep -c '^REPAIRABLE|' "$FINDINGS" 2>/dev/null); nREP=${nREP:-0}
 nWARN=$(grep -c '^WARN|' "$FINDINGS" 2>/dev/null); nWARN=${nWARN:-0}

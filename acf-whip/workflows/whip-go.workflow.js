@@ -292,7 +292,7 @@ Bootstrap the acf-whip orchestrator at trunk root ${sq(trunkRoot)}.
 1. Detached HEAD check: run  git -C ${sq(trunkRoot)} symbolic-ref --quiet HEAD  — if it FAILS, set detached true and stop (do not run the doctor).
 2. If a branch is checked out: apply repairable integrity issues, then re-scan:
      bash ${sq(DOCTOR)} --fix ${sq(trunkRoot)} >/dev/null 2>&1 || true
-     bash ${sq(DOCTOR)} ${sq(trunkRoot)}
+     bash ${sq(DOCTOR)} --quiet ${sq(trunkRoot)}
    From the second run capture: doctorOk (SUMMARY ok=true), doctorSummary (the verbatim SUMMARY line), fatals (verbatim FATAL| lines).
 Return the BootstrapResult.`,
   { label: 'bootstrap', phase: 'Bootstrap', schema: BOOTSTRAP },
@@ -324,7 +324,7 @@ while (iter < MAX_ITER) {
     `${ENV}
 Iteration ${iter} of the acf-whip orchestrator. Do three things and return the result:
 1. Read-only snapshot:  bash ${sq(SCAN)} ${sq(trunkRoot)}  — its stdout is a single JSON object. Put that stdout VERBATIM (copy it exactly, add nothing) into snapshotJson.
-2. Integrity recheck (report-only):  bash ${sq(DOCTOR)} ${sq(trunkRoot)}  — set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (verbatim FATAL| lines).
+2. Integrity recheck (report-only):  bash ${sq(DOCTOR)} --quiet ${sq(trunkRoot)}  — set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (verbatim FATAL| lines).
 3. Heartbeat (best-effort, NOT committed): write a small JSON file at ${sq(`${trunkRoot}/.backlog/.acfw-run.json`)} containing {"iteration":${iter},"mode":"${mode}","ts":"<output of: date -u +%Y-%m-%dT%H:%M:%SZ>"}. If the write fails, ignore it.
 Return the ScanResult.`,
     { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT },
@@ -345,13 +345,21 @@ Return the ScanResult.`,
   const tasks = snap.tasks || []
   const idx = indexTasks(tasks)
 
-  // ---- terminal + stall (computed in JS) ----
-  // Completion is measured over the ACTIVE task population (tasks[] from scan-backlog), NOT
-  // counts.total — draft/ and archive/ are excluded from automation, so terminal could never equal
-  // a denominator that counts them.
-  const terminal = tasks.filter(isTerminal).length
-  const total = tasks.length
-  log(`iter ${iter}: ${terminal}/${total} active terminal (integrated=${snap.counts.integrated}, accepted=${snap.counts.accepted}, blocked=${snap.counts.blocked})`)
+  // ---- terminal + stall (computed from scan-backlog's COUNTS, not tasks[]) ----
+  // tasks[] is now the bounded WORKING SET (scan-backlog collapses terminal/historical accepted into
+  // counts so the snapshot stays small enough for the agent to echo reliably). So completion is
+  // measured over counts.total — which is already ACTIVE-only (draft/ and archive/ are excluded at
+  // the scanner) — against the runtime-terminal count, which mirrors isTerminal exactly.
+  // No silent fallback: a snapshot missing these counts means scan/workflow version skew; counting
+  // isTerminal over the collapsed working set would UNDERcount and stall forever as 'no-progress'
+  // instead of 'complete'. Abort loudly instead.
+  if (snap.counts.runtimeTerminalDefault == null || snap.counts.runtimeTerminalOverride == null) {
+    stopReason = 'snapshot-version-skew'
+    return { aborted: true, reason: 'backlog snapshot is missing runtimeTerminal counts — scan-backlog.sh / workflow version skew; reinstall acf-whip so both are 2.0.2+', mode, iteration: iter }
+  }
+  const total = snap.counts.total
+  const terminal = mode === 'override' ? snap.counts.runtimeTerminalOverride : snap.counts.runtimeTerminalDefault
+  log(`iter ${iter}: ${terminal}/${total} active terminal (integrated=${snap.counts.integrated}, accepted=${snap.counts.accepted}, blocked=${snap.counts.blocked}, workingSet=${tasks.length})`)
   if (total > 0 && terminal === total) { stopReason = 'complete'; break }
 
   // ---- plan (pure JS): partition by slug, gate deps, build queues ----

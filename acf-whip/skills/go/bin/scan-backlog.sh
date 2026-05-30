@@ -72,16 +72,36 @@ c_accepted=$(count_md "$BL/accepted")
 # inflate the completion denominator — they are not part of tasks[] either).
 c_total=$((c_pending + c_inprogress + c_completed + c_inreview + c_blocked + c_rejected + c_accepted))
 
-# integrated = accepted tasks carrying a non-empty hex Integrated-At (>=7 chars)
+# Existing worktree-branch slugs (ONE git call), hoisted here so the runtime-terminal accepted count
+# is correct in BOTH full and --counts-only modes. hasWorktreeBranch distinguishes a live,
+# integratable accepted task (branch exists) from a historical/pre-2.0.0 one (no branch — already on
+# trunk, terminal). Membership is a fixed-string whole-line compare (metachar-safe).
+EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' refs/heads/worktree/ 2>/dev/null | sed 's#^worktree/##')
+
+# integrated = accepted tasks carrying a non-empty hex Integrated-At (>=7 chars).
+# c_term_acc = accepted tasks TERMINAL by the default-mode runtime rule (mirrors JS isTerminal for
+# accepted): hasIntegratedAt (non-empty Integrated-At), OR non-code slug ("" / "none"), OR no branch.
 c_integrated=0
+c_term_acc=0
 if [ -d "$BL/accepted" ]; then
   for f in "$BL/accepted"/*.md; do
     [ -f "$f" ] || continue
     grep -qE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' "$f" && c_integrated=$((c_integrated + 1))
+    a_slug=$(field "$f" "Worktree" | tr -d '[:space:]')
+    a_hasInteg=false; [ -n "$(field "$f" "Integrated-At" | tr -d '[:space:]')" ] && a_hasInteg=true
+    a_hasBranch=false
+    if [ -n "$a_slug" ] && [ "$a_slug" != "none" ] && printf '%s\n' "$EXISTING_WT_SLUGS" | grep -qxF "$a_slug"; then a_hasBranch=true; fi
+    if [ "$a_hasInteg" = true ] || [ -z "$a_slug" ] || [ "$a_slug" = "none" ] || [ "$a_hasBranch" = false ]; then
+      c_term_acc=$((c_term_acc + 1))
+    fi
   done
 fi
 c_terminal_default=$((c_integrated + c_blocked))
 c_terminal_override=$((c_accepted + c_blocked))
+# Runtime-terminal counts drive /go completion (terminal===total). Default: blocked + accepted that
+# are terminal-by-rule. Override: blocked + ALL accepted (override treats every accepted as terminal).
+c_runtime_terminal_default=$((c_blocked + c_term_acc))
+c_runtime_terminal_override=$((c_blocked + c_accepted))
 
 emit_counts() {
   printf '"counts":{'
@@ -95,16 +115,41 @@ emit_counts() {
   printf '"integrated":%d,' "$c_integrated"
   printf '"terminalDefault":%d,' "$c_terminal_default"
   printf '"terminalOverride":%d,' "$c_terminal_override"
+  printf '"runtimeTerminalDefault":%d,' "$c_runtime_terminal_default"
+  printf '"runtimeTerminalOverride":%d,' "$c_runtime_terminal_override"
   printf '"total":%d}' "$c_total"
 }
 
 # ---- Per-task objects (skipped in --counts-only) ----
 TASKS_JSON=""
 if [ "$COUNTS_ONLY" = "false" ]; then
-  # Existing worktree-branch slugs (ONE git call). hasWorktreeBranch distinguishes a live,
-  # integratable accepted task (branch exists) from a historical/pre-2.0.0 one (no branch —
-  # already on trunk, terminal). Membership is a fixed-string whole-line compare (metachar-safe).
-  EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' refs/heads/worktree/ 2>/dev/null | sed 's#^worktree/##')
+  # Dep-token set: every Dependencies token referenced by ANY active task, extracted with the SAME
+  # field()+comma-split/trim that emits each task's deps, so the scanner and the JS resolver agree
+  # byte-for-byte. Used by the working-set collapse below: a terminal accepted task is KEPT in tasks[]
+  # when it is a dependency target, so depsSatisfied / indexTasks.resolve never see a null and a
+  # dependent never silently hangs. Over-keeping is harmless; under-keeping is a hang.
+  DEP_TOKENS=$(
+    for st in $ACTIVE; do
+      d="$BL/$st"; [ -d "$d" ] || continue
+      for f in "$d"/*.md; do
+        [ -f "$f" ] || continue
+        field "$f" "Dependencies" | tr ',' '\n'
+      done
+    done | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$' | grep -vxF 'none' | sort -u
+  )
+  # Is an accepted task a dependency target? Mirrors indexTasks.resolve: byId, byStem, then stem-prefix.
+  is_dep_target() { # <stem> <id>
+    local _stem="$1" _id="$2" _tok
+    printf '%s\n' "$DEP_TOKENS" | grep -qxF "$_stem" && return 0
+    [ -n "$_id" ] && printf '%s\n' "$DEP_TOKENS" | grep -qxF "$_id" && return 0
+    while IFS= read -r _tok; do
+      [ -z "$_tok" ] && continue
+      case "$_stem" in "$_tok"*) return 0;; esac
+    done <<EOF
+$DEP_TOKENS
+EOF
+    return 1
+  }
   tfirst=1
   for st in $ACTIVE; do
     d="$BL/$st"; [ -d "$d" ] || continue
@@ -127,6 +172,16 @@ if [ "$COUNTS_ONLY" = "false" ]; then
       codeMut=true; { [ -z "$slug" ] || [ "$slug" = "none" ]; } && codeMut=false
       hasWtBranch=false
       if [ -n "$slug" ] && [ "$slug" != "none" ] && printf '%s\n' "$EXISTING_WT_SLUGS" | grep -qxF "$slug"; then hasWtBranch=true; fi
+
+      # Working-set collapse: a TERMINAL accepted task that nothing depends on is dropped from tasks[]
+      # (it survives only in the aggregate counts) so the snapshot stays small enough for the workflow
+      # agent to echo reliably. Keep it if it is a dependency target — then depsSatisfied/resolve never
+      # see a null. Non-accepted folders are always emitted (they drive dispatch).
+      if [ "$st" = "accepted" ]; then
+        term_acc=false
+        if [ "$hasInteg" = true ] || [ -z "$slug" ] || [ "$slug" = "none" ] || [ "$hasWtBranch" = false ]; then term_acc=true; fi
+        if [ "$term_acc" = true ] && ! is_dep_target "$stem" "$id"; then continue; fi
+      fi
 
       last=$(grep -oE '\| [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} \|' "$f" | tail -1 | tr -d '|' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
       age=-1; lastTs=""
