@@ -27,12 +27,12 @@ All `.backlog/` state moves happen at the **repo root** (`$ACFW_TRUNK_ROOT`) on 
 | N/A | pending | task-engineer (creation, at root, never in a worktree) |
 | pending | in-progress | `/go` orchestrator (pre-move + commit before dispatching specialist) |
 | in-progress | completed | `/go` orchestrator on specialist's `transition: completed` signal |
-| in-progress | blocked | `/go` orchestrator on specialist's `transition: blocked` signal |
+| in-progress | blocked | `/go` orchestrator on specialist's `transition: blocked` signal (increments `Block-Count` — the per-task loop-breaker) |
 | completed | in-review | `/go` orchestrator (pre-move before dispatching quality-reviewer) |
 | in-review | accepted | `/go` orchestrator on reviewer's `transition: accepted` signal |
 | in-review | rejected | `/go` orchestrator on reviewer's `transition: rejected` signal (also increments Rejection Count) |
 | rejected | pending | task-engineer (retry, at root); max 5 attempts |
-| blocked | pending | task-engineer (unblock when deps resolved, at root) |
+| blocked | pending | `/go` orchestrator when deps resolve (gated on `Rejection Count` < cap and `Block-Count` < cap), or task-engineer (unblock, at root) |
 | rejected | blocked | task-engineer (redesign at >5 rejections, at root) |
 
 **task-engineer never enters a worktree.** It never invokes `clean-checkout-before-task`. All its operations are on `.backlog/` at the repo root, committed to the trunk branch.
@@ -41,8 +41,9 @@ All `.backlog/` state moves happen at the **repo root** (`$ACFW_TRUNK_ROOT`) on 
 
 **Retry limit**: Rejected tasks can return to in-progress up to 5 times. After 5th rejection, task-engineer redesigns (rejected → blocked) at root.
 
-**File move + transition log update = ATOMIC** (same commit on trunk).
+**File move + Status rewrite + transition-log update = ATOMIC** (same commit on trunk). The single writer rewrites `- **Status**:` to the destination folder as it moves the file — **the folder is the source of truth and Status always follows it** — so a transition can never leave Status stale (a stale Status used to self-inflict a `status-folder-mismatch` FATAL that aborted `/go` at its first transition).
 **Timestamp command**: `date +"%Y-%m-%d %H:%M:%S"` (never placeholder).
+**Transition rows splice into the `## Transition Log` table and cap** (shared `append_log_row`), so a task file stays well-formed and bounded no matter how many transitions churn — rows never dangle after the last heading.
 
 ## Git lock-file policy
 
@@ -82,7 +83,9 @@ All subsequent state moves, edits, and commits happen inside the worktree on `wo
 
 **Override**: if the project's `CLAUDE.md` (or any other persistent agent instructions) directs a different integration strategy — for example "open a PR per `PR Group:` via `gh pr create` instead of merging locally" — `/go` follows those instructions and skips auto-integration, per Claude's instruction-priority hierarchy. In that mode the operator is responsible for integration; `Integrated-At:` stays empty and the loop's terminal check falls back to `accepted ∪ blocked`.
 
-**Terminal in default mode**: an accepted task is terminal once nothing remains to fold into trunk — it carries `Integrated-At:`, **or** it is non-code (`Worktree: none`), **or** it has no `worktree/<slug>` branch (a historical/pre-2.0.0 task already merged the old way). Branchless historical accepted tasks are never enqueued for integration (integrate-worktree exits 4, "nothing to fold"), so a lived-in backlog reaches 100% instead of looping on phantom branches.
+**Terminal in default mode**: an accepted task is terminal once nothing remains to fold into trunk — it carries `Integrated-At:`, **or** it is non-code (`Worktree: none`), **or** it has no `worktree/<slug>` branch (a historical/pre-2.0.0 task already merged the old way). Branchless historical accepted tasks are never enqueued for integration (integrate-worktree exits 4, "nothing to fold"), so a lived-in backlog reaches 100% instead of looping on phantom branches. A `worktree/<slug>` branch that **exists but has no commits ahead of trunk** (a read-only/gate/verification task that got a slug but produced no code) is also terminal: integrate-worktree marks it `Integrated-At:` and reaps the empty branch instead of retrying a no-op fast-forward forever.
+
+**Completion requires no queued unblock.** The loop declares the backlog complete only when it is 100% terminal **and** no blocked task is about to be unblocked. Otherwise a cross-slug dependency that integrates in the final iteration would hit 100% and exit before the blocked dependent gets its `blocked → pending` pass — so the loop runs one more unblock+dispatch pass first.
 
 ## Priority Levels
 
@@ -122,7 +125,7 @@ In default (auto-merge) mode, every accepted task MUST additionally have:
 
 `doctor.sh` is the integrity battery. It runs at three points: as a **hard gate** at `/go` startup (it applies the REPAIRABLE class with `--fix`, then re-scans and refuses to dispatch if any FATAL remains), as a **per-iteration recheck** inside the loop (a mid-run FATAL — e.g. a cycle introduced by a retry — aborts before the next dispatch), and at **`/task` create-time**. `/whip-doctor [--fix]` runs it on demand. Findings are `SEVERITY|CODE|TASK_ID|DETAIL` lines, then a grouped `BREAKDOWN|<SEV>|code=count,…` line per severity (so callers summarize instead of dumping every line), then `SUMMARY|fatal=N|repairable=N|warn=N|ok=true|false`.
 
-**Severity is scoped to the dispatch path.** A task in `accepted/` is terminal/out-of-scope, so its structural defects are **advisory (WARN), never blocking** — a pre-2.0.0 backlog of historical accepted tasks (missing slugs, stale `Status:`, even dangling/cyclic deps among themselves) does not abort the gate. FATAL is reserved for **active** tasks (pending/in-progress/completed/in-review): status-vs-folder mismatch, unknown Assigned Agent, dangling/cyclic deps, a cross-slug dependent dispatched before its dep is on trunk (branch-aware: a branchless historical dep counts as satisfied), worktree on the wrong branch, detached HEAD at trunk. REPAIRABLE (auto-fixed by `--fix`): **a missing worktree slug on an active code task (derived from the id and written in)**, stray `Integrated-At` on a non-accepted task, out-of-range Rejection Count, a task present in two folders, an orphaned `.worktree/<slug>`.
+**Severity is scoped to the dispatch path.** A task in `accepted/` is terminal/out-of-scope, so its structural defects are **advisory (WARN), never blocking** — a pre-2.0.0 backlog of historical accepted tasks (missing slugs, stale `Status:`, even dangling/cyclic deps among themselves) does not abort the gate. FATAL is reserved for **active** tasks (pending/in-progress/completed/in-review): unknown Assigned Agent, dangling/cyclic deps, a cross-slug dependent dispatched before its dep is on trunk (branch-aware: a branchless historical dep counts as satisfied), worktree on the wrong branch, detached HEAD at trunk. REPAIRABLE (auto-fixed by `--fix`): **a status-vs-folder mismatch on an active task (Status rewritten to match the folder — the folder is the source of truth; this is why a backlog whose mover left Status stale self-heals at the bootstrap gate instead of aborting)**, a missing worktree slug on an active code task (derived from the id and written in), stray `Integrated-At` on a non-accepted task, out-of-range Rejection Count or Block-Count, a task present in two folders, an orphaned `.worktree/<slug>`.
 
 ## Worktree environment hydration (`.worktreeinclude`)
 
@@ -132,10 +135,20 @@ A committed root manifest lists the git-ignored files a fresh `.worktree/<slug>`
 
 `.backlog/.acfw-config` sets `ACFW_INPROGRESS_TIMEOUT_HOURS` (default **8**; env var overrides). `scan-backlog.sh` resolves the threshold (env > config > 8) and emits it in the snapshot; the doctor WARNs on in-progress tasks older than it, and `/go` moves them **in-progress → blocked** (`timeout >=Nh — stale dispatch`) so a crashed/hung dispatch becomes terminal instead of re-dispatching indefinitely. `whip-init` scaffolds the config.
 
+## Per-task loop-breaker (Block-Count)
+
+A specialist is only dispatched on a task whose dependencies are already satisfied, so a specialist that returns `transition: blocked` is signalling that the **real blocker is unmodeled** (e.g. "needs a python-engineer task that does not exist"). Left unguarded, such a task cycles `pending → in-progress → blocked → pending` forever — its declared deps stay accepted, so the unblock pass re-queues it every iteration, and the global no-gain guard never trips because other tasks keep making progress.
+
+`/go` breaks this with a **durable per-task `Block-Count`**: each specialist re-block of a dispatched task increments the counter (timeout and max-rejection redesign blocks do **not** count). Once `Block-Count` reaches the cap (default **3**), the unblock pass stops re-queueing the task — it stays in `blocked/` (terminal) and is surfaced in the run report as `needsOperator`, with its reason, instead of spinning. The count lives in the task front-matter, so it survives a crash/restart. An operator clears `Block-Count` (or models the missing dependency) to re-enable the task.
+
+## Run survival (bounded agent retry)
+
+Every schema-bearing agent call the orchestrator makes — bootstrap, scan, the single writer, integrate, drain — is wrapped in a bounded retry that degrades gracefully on a StructuredOutput non-emit (a subagent that finishes without returning its structured result) instead of letting the exception abort the whole run. A non-emit maps to the safe transient for that step: the writer defers its moves to the next iteration (apply-transition is idempotent), integrate leaves the task accepted to retry, and the scanner re-scans before a clean abort. So a single agent hiccup costs one iteration, not a multi-hour run.
+
 ## Run & resume model
 
-git plus `.backlog/` are the only durable state — **re-running `/go` is the resume**. A fresh run re-scans from disk and reconstructs the identical plan; the only loss across a Claude Code restart is the in-session agent cache and any in-flight worktree edit, which surfaces as a stale in-progress task that clean-checkout's stash and the timeout recover. The workflow path also writes a gitignored `.backlog/.acfw-run.json` heartbeat each iteration for observability; the design does not depend on it.
+git plus `.backlog/` are the only durable state — **re-running `/go` is the resume**. A fresh run re-scans from disk and reconstructs the identical plan; the only loss across a Claude Code restart is the in-session agent cache and any in-flight worktree edit, which surfaces as a stale in-progress task that clean-checkout's stash and the timeout recover. `Block-Count` and `Rejection Count` are front-matter, so the loop-breaker and retry budgets also survive a restart. The workflow path also writes a gitignored `.backlog/.acfw-run.json` heartbeat each iteration for observability; the design does not depend on it.
 
 ---
 
-**Last Updated**: 2026-05-30
+**Last Updated**: 2026-06-01

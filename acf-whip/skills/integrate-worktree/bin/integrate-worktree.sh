@@ -76,8 +76,7 @@ do_success() {
   fi
   rm -f "$TASK_FILE_ON_TRUNK.bak"
 
-  printf '| %s | accepted | accepted | integrate-worktree | %s | %s | integrated |\n' \
-    "$TS" "$SLUG" "$TRUNK_SHA_AFTER" >> "$TASK_FILE_ON_TRUNK"
+  append_log_row "$TASK_FILE_ON_TRUNK" "$(printf '| %s | accepted | accepted | integrate-worktree | %s | %s | integrated |' "$TS" "$SLUG" "$TRUNK_SHA_AFTER")"
 
   git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" add ".backlog/accepted/$(basename "$TASK_FILE")"
   git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" commit -m "integrate: $TASK_ID ($SLUG -> $ACFW_TRUNK_BRANCH)" --quiet
@@ -105,8 +104,10 @@ do_resolver_failure() {
   NEW_RC=$((RC + 1))
   sed -i.bak -E "s/^- \*\*Rejection Count\*\*:.*/- **Rejection Count**: $NEW_RC/" "$TASK_FILE" && rm -f "$TASK_FILE.bak"
 
-  printf '| %s | accepted | rejected | integrate-worktree | %s | %s |\n' "$TS" "$SLUG" "$REASON" >> "$TASK_FILE"
+  append_log_row "$TASK_FILE" "$(printf '| %s | accepted | rejected | integrate-worktree | %s | %s |' "$TS" "$SLUG" "$REASON")"
 
+  # Folder is the source of truth: sync Status to the destination state with the mv (I4).
+  sed -i.bak -E "s/^- \*\*Status\*\*:.*/- **Status**: rejected/" "$TASK_FILE" && rm -f "$TASK_FILE.bak"
   mv "$TASK_FILE" "$ACFW_TRUNK_ROOT/.backlog/rejected/$(basename "$TASK_FILE")"
   git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" add ".backlog/accepted/$(basename "$TASK_FILE")" ".backlog/rejected/$(basename "$TASK_FILE")"
   git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" commit -m "integrate: reject $TASK_ID ($REASON)" --quiet
@@ -179,6 +180,18 @@ fi
 if ! git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
   echo "ACFW-INTEGRATE: skipped-historical (no branch $BRANCH; nothing to integrate)"
   exit 4
+fi
+
+# ---- Step 2 pre-check (I5B): the branch EXISTS but has NO commits ahead of trunk -> nothing to fold
+# in. A read-only / gate / verification task (retro's verification-001) still gets a worktree/<slug>
+# branch from clean-checkout but produces no code commit, so a plain FF would be a no-op that the
+# post-flight guard turns into an exit-10 retry loop. Mark it terminal instead: write Integrated-At
+# (= current trunk) and run the normal success cleanup, so it counts terminal and the worktree is reaped.
+AHEAD=$(git -C "$ACFW_TRUNK_ROOT" rev-list --count "${ACFW_TRUNK_BRANCH}..${BRANCH}" 2>/dev/null || echo "")
+if [ "$AHEAD" = "0" ]; then
+  TRUNK_SHA_AFTER=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
+  echo "ACFW-INTEGRATE: empty-branch (no commits ahead of $ACFW_TRUNK_BRANCH; nothing to integrate, marking terminal)"
+  do_success
 fi
 
 # ---- Step 2: Fetch the worktree branch into trunk's refs ----

@@ -174,6 +174,8 @@ EOF
       integ=$(field "$f" "Integrated-At" | tr -d '[:space:]')
       rc=$(field "$f" "Rejection Count" | tr -d '[:space:]')
       printf '%s' "$rc" | grep -qE '^-?[0-9]+$' || rc=0
+      bc=$(field "$f" "Block-Count" | tr -d '[:space:]')
+      printf '%s' "$bc" | grep -qE '^-?[0-9]+$' || bc=0
 
       hasInteg=false; [ -n "$integ" ] && hasInteg=true
       hasTok=false; grep -qE '\| clean-checkout \| ok \|' "$f" && hasTok=true
@@ -204,7 +206,7 @@ EOF
       # any defensive consumer still sees arrays, not undefined.
       if [ "$slim" = true ]; then
         if [ "$tfirst" -eq 1 ]; then tfirst=0; else TASKS_JSON="$TASKS_JSON,"; fi
-        TASKS_JSON="$TASKS_JSON{\"stem\":\"$(jesc "$stem")\",\"id\":\"$(jesc "$id")\",\"folder\":\"accepted\",\"slug\":\"$(jesc "$slug")\",\"deps\":[],\"touchesGlobs\":[],\"hasIntegratedAt\":$hasInteg,\"hasWorktreeBranch\":$hasWtBranch,\"rejectionCount\":$rc,\"ageHours\":-1,\"slim\":true}"
+        TASKS_JSON="$TASKS_JSON{\"stem\":\"$(jesc "$stem")\",\"id\":\"$(jesc "$id")\",\"folder\":\"accepted\",\"slug\":\"$(jesc "$slug")\",\"deps\":[],\"touchesGlobs\":[],\"hasIntegratedAt\":$hasInteg,\"hasWorktreeBranch\":$hasWtBranch,\"rejectionCount\":$rc,\"blockCount\":$bc,\"ageHours\":-1,\"slim\":true}"
         continue
       fi
 
@@ -233,6 +235,7 @@ EOF
       TASKS_JSON="$TASKS_JSON\"isCodeMutating\":$codeMut,"
       TASKS_JSON="$TASKS_JSON\"hasWorktreeBranch\":$hasWtBranch,"
       TASKS_JSON="$TASKS_JSON\"rejectionCount\":$rc,"
+      TASKS_JSON="$TASKS_JSON\"blockCount\":$bc,"
       TASKS_JSON="$TASKS_JSON\"lastTransitionTs\":\"$(jesc "$lastTs")\","
       TASKS_JSON="$TASKS_JSON\"ageHours\":$age}"
     done

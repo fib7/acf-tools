@@ -44,6 +44,9 @@ const NO_GAIN_LIMIT = 15 // iterations with no terminal gain (perpetual-retry gu
 // is exercised without the Workflow runtime. Keep it pure; if you add a side effect here, the test
 // extraction breaks loudly.
 const MAX_REJECT_RETRY = 3 // rejected with count < this -> retry (rejected->pending); >= this -> blocked
+const MAX_BLOCK_RETRY = 3 // per-task re-block cap (retro I2): a task whose specialist re-blocks it this
+// many times stops being re-unblocked — it stays blocked (terminal) and is surfaced as needsOperator,
+// so a single unmodeled-blocker task can no longer livelock the run (the global noGain guard missed it).
 const DEFAULT_TIMEOUT_H = 8 // in-progress -> blocked fallback when the snapshot omits inProgressTimeoutHours
 const PRIORITY_RANK = { blocker: 0, critical: 1, high: 2, medium: 3, low: 4 }
 const prank = (p) => (p in PRIORITY_RANK ? PRIORITY_RANK[p] : 5)
@@ -175,17 +178,20 @@ function topoIntegrationOrder(candidates, idx, onCycle) {
 function planUnblockAndTimeout(tasks, idx, opts) {
   const o = opts || {}
   const maxReject = (o.maxReject != null) ? o.maxReject : MAX_REJECT_RETRY
+  const maxBlock = (o.maxBlock != null) ? o.maxBlock : MAX_BLOCK_RETRY
   const timeoutH = (o.timeoutH != null) ? o.timeoutH : DEFAULT_TIMEOUT_H
   const root = o.trunkRoot || ''
   const mk = (t, from, toState, notes) => ({ path: `${root}/.backlog/${from}/${t.stem}.md`, toState, agent: 'orchestrator', notes, inc: 0 })
 
-  // blocked -> pending: deps now satisfied AND not a max-rejection "redesign" block (count >= cap).
-  // A specialist-blocked or dep-blocked task re-runs once its deps land; a 3x-rejected task is left
-  // for a human (re-dispatching it just re-rejects). depsSatisfied is the same gate pending uses.
+  // blocked -> pending: deps now satisfied AND not a max-rejection "redesign" block (count >= cap)
+  // AND not a max-re-block "needs operator" task (blockCount >= cap). A specialist-blocked or
+  // dep-blocked task re-runs once its deps land; a 3x-rejected task is left for a human; a task whose
+  // specialist has re-blocked it 3x (its real blocker is unmodeled — retro I2) STOPS being re-queued
+  // so it can no longer livelock the run. It stays blocked (terminal) and surfaces as needsOperator.
   const unblockActions = tasks
     .filter((t) => t.folder === 'blocked')
     .sort(byPriorityThenStem)
-    .filter((t) => (t.rejectionCount || 0) < maxReject && depsSatisfied(t, idx))
+    .filter((t) => (t.rejectionCount || 0) < maxReject && (t.blockCount || 0) < maxBlock && depsSatisfied(t, idx))
     .map((t) => mk(t, 'blocked', 'pending', 'dependencies resolved — unblocked'))
 
   // in-progress -> blocked: stale past the operator timeout (ageHours is computed by scan-backlog;
@@ -310,13 +316,33 @@ Resolve every conflict preserving BOTH intents, run the project's quality gates 
 Do NOT move task files and do NOT commit .backlog/. When done, report what you did in one line.`
 }
 
-// One sequential writer call. actions: [{ path, toState, agent, notes, inc }].
+// Bounded-retry wrapper around a schema agent() call (retro I1). A StructuredOutput non-emit (the
+// subagent finished without calling the tool) THROWS out of a bare `await agent({schema})`; unhandled,
+// it kills the entire run — runs A and D died this way after hours of work. Retry a few times, then
+// degrade gracefully via onGiveUp() (a safe sentinel) instead of propagating. The parallel dispatch
+// path already maps a thrown thunk to null (runtime semantics), so this is only for the bare-await
+// calls: bootstrap, scan, the single writer, integrate, drain.
+async function safeAgent(prompt, opts, onGiveUp) {
+  const tries = 3
+  for (let k = 1; k <= tries; k++) {
+    try {
+      return await agent(prompt, k === 1 ? opts : { ...opts, label: `${opts.label}:retry${k - 1}` })
+    } catch (e) {
+      log(`agent ${opts.label} non-emit/error (attempt ${k}/${tries}): ${String((e && e.message) || e).slice(0, 160)}`)
+    }
+  }
+  return onGiveUp ? onGiveUp() : null
+}
+
+// One sequential writer call. actions: [{ path, toState, agent, notes, inc, binc }].
 async function applyTransitions(actions, label) {
   if (!actions.length) return { applied: [], note: 'nothing to do' }
   const lines = actions.map((a) =>
-    `  bash ${sq(APPLY)} ${sq(a.path)} ${sq(a.toState)} ${sq(a.agent || 'orchestrator')} ${sq(a.notes || '')} ${sq(String(a.inc || 0))}`,
+    `  bash ${sq(APPLY)} ${sq(a.path)} ${sq(a.toState)} ${sq(a.agent || 'orchestrator')} ${sq(a.notes || '')} ${sq(String(a.inc || 0))} ${sq(String(a.binc || 0))}`,
   ).join('\n')
-  return agent(
+  // Non-emit here is non-fatal: the moves are re-planned from the next scan (folder state is the truth)
+  // and apply-transition.sh is idempotent, so deferring a write one iteration is safe.
+  return safeAgent(
     `${ENV}
 You are the SINGLE backlog writer. Run these apply-transition.sh calls IN ORDER, one at a time (never in parallel). Each moves one task file between .backlog/ folders, appends a transition-log row, and commits on trunk. apply-transition.sh is idempotent (no-ops if the file is already in the target folder), so re-running is safe.
 
@@ -324,12 +350,13 @@ ${lines}
 
 Capture each call's stdout (an "ok:" or "noop:" line) into applied[]. If any call errors, record it in applied[] and continue with the rest. Return the WriteResult.`,
     { label, phase: 'Iterate', schema: WRITE_BATCH },
+    () => ({ applied: [], note: 'writer agent non-emit after retries — transitions deferred to next iteration' }),
   )
 }
 
 // ============================ BOOTSTRAP (hard gate) ============================
 phase('Bootstrap')
-const boot = await agent(
+const boot = await safeAgent(
   `${ENV}
 Bootstrap the acf-whip orchestrator at trunk root ${sq(trunkRoot)}.
 1. Detached HEAD check: run  git -C ${sq(trunkRoot)} symbolic-ref --quiet HEAD  — if it FAILS, set detached true and stop (do not run the doctor).
@@ -339,7 +366,11 @@ Bootstrap the acf-whip orchestrator at trunk root ${sq(trunkRoot)}.
    From the second run capture: doctorOk (SUMMARY ok=true), doctorSummary (the verbatim SUMMARY line), fatals (verbatim FATAL| lines).
 Return the BootstrapResult.`,
   { label: 'bootstrap', phase: 'Bootstrap', schema: BOOTSTRAP },
+  () => null,
 )
+if (!boot) {
+  return { aborted: true, reason: 'bootstrap agent never emitted after retries; re-run /go (git + .backlog/ are durable, nothing is lost)', mode }
+}
 if (boot.detached) {
   return { aborted: true, reason: 'detached HEAD at trunk root; /go requires a branch checked out at the repo root', mode }
 }
@@ -369,7 +400,11 @@ Iteration ${iter} of the acf-whip orchestrator. Do three things and return the r
 2. Integrity recheck (report-only):  bash ${sq(DOCTOR)} --quiet ${sq(trunkRoot)}  — set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (verbatim FATAL| lines).
 3. Heartbeat (best-effort, NOT committed): write a small JSON file at ${sq(`${trunkRoot}/.backlog/.acfw-run.json`)} containing {"iteration":${iter},"mode":"${mode}","ts":"<output of: date -u +%Y-%m-%dT%H:%M:%SZ>"}. If the write fails, ignore it.
 Return the ScanResult.`
-  let scan = await agent(scanPrompt, { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT })
+  let scan = await safeAgent(scanPrompt, { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT }, () => null)
+  if (!scan) {
+    stopReason = 'scan-nonemit'
+    return { aborted: true, reason: 'scan agent never emitted after retries; re-run /go (git + .backlog/ are durable, nothing is lost)', mode, iteration: iter }
+  }
 
   // mid-run FATAL introduced (e.g. a cycle from a retry, a half-applied transition) -> abort before dispatch
   if (!scan.doctorOk) {
@@ -383,7 +418,11 @@ Return the ScanResult.`
     // verbatim, so a single garbled/truncated echo should not abort a long run. Re-run once; if it is
     // still unparseable, the snapshot is genuinely malformed -> abort.
     log(`iter ${iter}: snapshot JSON unparseable — re-scanning once`)
-    scan = await agent(scanPrompt, { label: `scan#${iter}:retry`, phase: 'Iterate', schema: SCAN_RESULT })
+    scan = await safeAgent(scanPrompt, { label: `scan#${iter}:retry`, phase: 'Iterate', schema: SCAN_RESULT }, () => null)
+    if (!scan) {
+      stopReason = 'scan-nonemit'
+      return { aborted: true, reason: 'scan agent never emitted after retries (on re-scan); re-run /go (git + .backlog/ are durable)', mode, iteration: iter }
+    }
     if (!scan.doctorOk) {
       stopReason = 'integrity-fatal-midrun'
       return { aborted: true, reason: 'integrity FATAL detected mid-run (on scan retry); aborting before dispatch', mode, iteration: iter, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
@@ -396,6 +435,17 @@ Return the ScanResult.`
   lastSnapshot = snap
   const tasks = snap.tasks || []
   const idx = indexTasks(tasks)
+
+  // Unblock/timeout plan is computed HERE (before the completion check) so completion can require that
+  // no blocked task is about to be unblocked — otherwise a cross-slug dep that integrates in the final
+  // iteration hits 100% terminal and the loop breaks before the blocked dependent gets its unblock pass
+  // (retro I5A). Reused below for the pre-move batch.
+  const { unblockActions, timeoutActions, freshInProgress } = planUnblockAndTimeout(tasks, idx, {
+    timeoutH: (snap.inProgressTimeoutHours != null ? snap.inProgressTimeoutHours : DEFAULT_TIMEOUT_H),
+    maxReject: MAX_REJECT_RETRY,
+    maxBlock: MAX_BLOCK_RETRY,
+    trunkRoot,
+  })
 
   // ---- terminal + stall (computed from scan-backlog's COUNTS, not tasks[]) ----
   // tasks[] is now the bounded WORKING SET (scan-backlog collapses terminal/historical accepted into
@@ -412,7 +462,9 @@ Return the ScanResult.`
   const total = snap.counts.total
   const terminal = mode === 'override' ? snap.counts.runtimeTerminalOverride : snap.counts.runtimeTerminalDefault
   log(`iter ${iter}: ${terminal}/${total} active terminal (integrated=${snap.counts.integrated}, accepted=${snap.counts.accepted}, blocked=${snap.counts.blocked}, workingSet=${tasks.length})`)
-  if (total > 0 && terminal === total) { stopReason = 'complete'; break }
+  // Complete only when 100% terminal AND nothing is queued to unblock — the extra unblock+dispatch
+  // pass (retro I5A) keeps a last-iteration-integrated dependency from stranding its blocked dependent.
+  if (total > 0 && terminal === total && unblockActions.length === 0) { stopReason = 'complete'; break }
 
   // ---- plan (pure JS): partition by slug, gate deps, build queues ----
   // PARALLELISM INVARIANT (default): every non-conflicting ready unit dispatches CONCURRENTLY.
@@ -432,14 +484,7 @@ Return the ScanResult.`
   const directQ = []      // {t, premove} — non-code (slug none), no worktree
   const warnings = []
 
-  // blocked->pending (deps resolved) + in-progress->blocked (stale) — see planUnblockAndTimeout.
-  // These land in the pre-move batch; the moved task dispatches next scan. freshInProgress excludes
-  // any task we just timed out so it is not re-dispatched in the same iteration.
-  const { unblockActions, timeoutActions, freshInProgress } = planUnblockAndTimeout(tasks, idx, {
-    timeoutH: (snap.inProgressTimeoutHours != null ? snap.inProgressTimeoutHours : DEFAULT_TIMEOUT_H),
-    maxReject: MAX_REJECT_RETRY,
-    trunkRoot,
-  })
+  // (unblockActions/timeoutActions/freshInProgress were hoisted above the completion check — retro I5A.)
 
   // reviewers first: completed (premove -> in-review) and lingering in-review (re-review). They claim the slug.
   const inReview = tasks.filter((t) => t.folder === 'in-review').sort(byPriorityThenStem)
@@ -526,6 +571,10 @@ Return the ScanResult.`
         agent: d.t.agent || 'orchestrator',
         notes: (r.notes || '').slice(0, 200),
         inc: (toState === 'rejected' && r.rejectionIncrement === 1) ? 1 : 0,
+        // Bump Block-Count only on a SPECIALIST re-block of a dispatched task (deps were satisfied at
+        // dispatch, so this is the unmodeled-blocker signal — retro I2). Timeout/redesign blocks keep
+        // their own gates and do NOT count here.
+        binc: (toState === 'blocked' && d.from === 'in-progress') ? 1 : 0,
       })
     })
     productiveDispatch = postActions.length > 0 // a real transition was applied (not just a transient/mismatched marker)
@@ -545,15 +594,16 @@ Return the ScanResult.`
       seenC.add(t.stem); candidates.push(t)
     }
     const ordered = topoIntegrationOrder(candidates, idx, () => log('WARN integrate: dependency cycle among integration candidates — using input order; run /whip-doctor'))
+    const integTransient = (note) => () => ({ outcome: 'transient', note })
     for (const t of ordered) {
-      let r = await agent(integratePrompt(t, false), { label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT })
+      let r = await safeAgent(integratePrompt(t, false), { label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT }, integTransient('integrate agent non-emit — left accepted, retry next iteration'))
       if (r && r.outcome === 'resolver-needed') {
         log(`integrate ${t.slug}: conflict — dispatching resolver ${r.resolverAgent || t.agent || '(default)'}`)
         const ropts = { label: `resolve:${t.slug}`, phase: 'Iterate' }
         const ragent = r.resolverAgent || t.agent
         if (ragent && ragent !== 'none') ropts.agentType = ragent
         await agent(resolverPrompt(t, r), ropts)
-        r = await agent(integratePrompt(t, true), { label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT })
+        r = await safeAgent(integratePrompt(t, true), { label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT }, integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
       }
       if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); integratedThisIter++; log(`✓ integrated ${t.stem}`) }
       else if (r && r.outcome === 'rejected') { rejectedStems.push(t.stem); log(`✗ integrate rejected ${t.stem} — ${r.note}`) }
@@ -579,19 +629,20 @@ Return the ScanResult.`
 phase('Drain')
 let drained = 0
 if (mode === 'default' && lastSnapshot) {
-  const rescan = await agent(
+  const rescan = await safeAgent(
     `${ENV}
 Final integration drain. Run  bash ${sq(SCAN)} ${sq(trunkRoot)}  and return its stdout VERBATIM in snapshotJson (set doctorOk true, doctorSummary "drain", doctorFatals []).`,
     { label: 'drain:scan', phase: 'Drain', schema: SCAN_RESULT },
+    () => null,
   )
   let snap2 = null
-  try { snap2 = JSON.parse(rescan.snapshotJson) } catch (e) { snap2 = null }
+  try { snap2 = rescan ? JSON.parse(rescan.snapshotJson) : null } catch (e) { snap2 = null }
   if (snap2) {
     const idx2 = indexTasks(snap2.tasks || [])
     const left = topoIntegrationOrder((snap2.tasks || []).filter((t) => t.folder === 'accepted' && t.slug && t.slug !== 'none' && !t.hasIntegratedAt && t.hasWorktreeBranch), idx2)
     for (const t of left) {
       // single defensive pass: an exit-7 here is intentionally left for the next /go run (no resolver post-loop)
-      const r = await agent(integratePrompt(t, false), { label: `drain:${t.slug}`, phase: 'Drain', schema: INTEGRATE_RESULT })
+      const r = await safeAgent(integratePrompt(t, false), { label: `drain:${t.slug}`, phase: 'Drain', schema: INTEGRATE_RESULT }, () => ({ outcome: 'transient', note: 'drain integrate non-emit' }))
       if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); drained++ }
     }
   }
@@ -599,6 +650,12 @@ Final integration drain. Run  bash ${sq(SCAN)} ${sq(trunkRoot)}  and return its 
 
 // ============================ REPORT ============================
 const finalCounts = lastSnapshot ? lastSnapshot.counts : null
+// Tasks parked for an operator: blocked at the re-block cap (their real blocker is unmodeled — retro
+// I2) or at the max-rejection cap. These are why a "complete" run can still leave blocked tasks: the
+// loop-breaker intentionally stops re-dispatching them instead of livelocking. Surface them explicitly.
+const needsOperator = ((lastSnapshot && lastSnapshot.tasks) || [])
+  .filter((t) => t.folder === 'blocked' && ((t.blockCount || 0) >= MAX_BLOCK_RETRY || (t.rejectionCount || 0) >= MAX_REJECT_RETRY))
+  .map((t) => ({ stem: t.stem, blockCount: t.blockCount || 0, rejectionCount: t.rejectionCount || 0 }))
 return {
   completed: stopReason === 'complete',
   stopReason, // complete | no-progress | max-iterations | (aborts return earlier)
@@ -608,9 +665,11 @@ return {
   integrated: integratedStems,
   rejectedAtIntegration: rejectedStems,
   drainedPostLoop: drained,
-  note: stopReason === 'complete'
+  needsOperator,
+  note: (stopReason === 'complete'
     ? 'Backlog 100% terminal.'
     : stopReason === 'no-progress'
       ? 'No progress for 3 iterations — user intervention needed (check blocked/ and rejected/).'
-      : 'Hit the iteration cap.',
+      : 'Hit the iteration cap.')
+    + (needsOperator.length ? ` ${needsOperator.length} task(s) parked for an operator (re-block/rejection cap reached): ${needsOperator.map((n) => n.stem).join(', ')}.` : ''),
 }

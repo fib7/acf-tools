@@ -61,7 +61,10 @@ mktask pending cyc-b cb pending go-engineer "cyc-a" "" 0
 git add -A; git commit -qm badtasks
 OUT=$(bash "$DOC" "$REPO"); RC=$?
 check "doctor exits 1 when FATAL present" "[ $RC -eq 1 ]"
-check "status-folder-mismatch (active=FATAL)" "echo \"$OUT\" | grep -q '^FATAL|status-folder-mismatch|bad-status'"
+# I4: status-folder-mismatch on an ACTIVE task is REPAIRABLE (folder is source of truth; --fix syncs
+# Status), NOT FATAL — so a stale Status can never abort /go at its first transition.
+check "status-folder-mismatch (active=REPAIRABLE)" "echo \"$OUT\" | grep -q '^REPAIRABLE|status-folder-mismatch|bad-status'"
+check "status-folder-mismatch active NOT FATAL" "! echo \"$OUT\" | grep -q '^FATAL|status-folder-mismatch|bad-status'"
 check "missing-worktree-slug (active=REPAIRABLE, not FATAL)" "echo \"$OUT\" | grep -q '^REPAIRABLE|missing-worktree-slug|bad-slug'"
 check "missing-worktree-slug active NOT FATAL" "! echo \"$OUT\" | grep -q '^FATAL|missing-worktree-slug|bad-slug'"
 check "explicit none is NOT flagged" "! echo \"$OUT\" | grep -q 'missing-worktree-slug|ok-noslug'"
@@ -82,13 +85,17 @@ rm -f .backlog/pending/bad-*.md .backlog/pending/dangle.md .backlog/pending/cyc-
 mktask accepted r-integ alpha accepted go-engineer none "" 0           # we'll add bad integ below in non-accepted
 mktask pending r-stray-integ gg pending go-engineer none "abc1234" 0   # integ on non-accepted -> repairable
 mktask pending r-rc gg2 pending go-engineer none "" 9                  # rc out of range
+mktask in-progress r-status rst completed go-engineer none "" 0        # I4: Status 'completed' but in in-progress/
 git add -A; git commit -qm repairables
 OUT=$(bash "$DOC" "$REPO")
 check "integrated-at-on-non-accepted reported" "echo \"$OUT\" | grep -q '^REPAIRABLE|integrated-at-on-non-accepted|r-stray-integ'"
 check "rejection-count-out-of-range reported" "echo \"$OUT\" | grep -q '^REPAIRABLE|rejection-count-out-of-range|r-rc'"
+check "I4: status-folder-mismatch reported REPAIRABLE" "echo \"$OUT\" | grep -q '^REPAIRABLE|status-folder-mismatch|r-status'"
 bash "$DOC" --fix "$REPO" >/dev/null
 check "stray Integrated-At cleared after --fix" "! grep -qE '^- \*\*Integrated-At\*\*: abc1234' '$REPO/.backlog/pending/r-stray-integ.md'"
 check "Rejection Count clamped to 5 after --fix" "grep -qE '^- \*\*Rejection Count\*\*: 5' '$REPO/.backlog/pending/r-rc.md'"
+check "I4: Status synced to folder after --fix (completed -> in-progress)" "grep -qE '^- \*\*Status\*\*: in-progress\$' '$REPO/.backlog/in-progress/r-status.md'"
+rm -f .backlog/in-progress/r-status.md; git add -A; git commit -qm cleanup-rstatus
 
 echo "== orphaned + wrong-branch worktree =="
 mktask pending wlive wlive pending go-engineer none "" 0; git add -A; git commit -qm wlive
