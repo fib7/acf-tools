@@ -97,9 +97,11 @@ fi
 
 # ---- Step 7: Log the OK token ----
 # Format (machine-greppable): | <UTC ts> | clean-checkout | ok | clean-checkout-before-task | <slug> | <branch> |
+# Spliced into the ## Transition Log table (append_log_row) so it stays in-section and bounded (I3),
+# while remaining greppable anywhere in the file for the reviewer's auto-reject check.
 TS=$(date -u +"%Y-%m-%d %H:%M:%S")
 LINE="| $TS | clean-checkout | ok | $ACFW_AGENT_FIELD | $SLUG | $BRANCH |"
-printf '\n%s\n' "$LINE" >> "$TASK_FILE"
+append_log_row "$TASK_FILE" "$LINE"
 
 # ---- Step 8: Print the worktree path for the caller ----
 echo "$WORKTREE_PATH"

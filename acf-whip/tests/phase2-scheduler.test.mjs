@@ -34,7 +34,7 @@ const block = text.slice(start, end)
 // Build a factory that closes over an injected `mode` and returns the functions.
 function load(mode) {
   // eslint-disable-next-line no-new-func
-  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, byPriorityThenStem, MAX_REJECT_RETRY, DEFAULT_TIMEOUT_H };`)
+  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H };`)
   return factory(mode)
 }
 const Sdef = load('default')
@@ -42,13 +42,14 @@ const Sovr = load('override')
 
 // sanity: constants came from the source, not duplicated here
 check('MAX_REJECT_RETRY extracted from source (=3)', Sdef.MAX_REJECT_RETRY === 3)
+check('MAX_BLOCK_RETRY extracted from source (=3)', Sdef.MAX_BLOCK_RETRY === 3)
 check('DEFAULT_TIMEOUT_H extracted from source (=8)', Sdef.DEFAULT_TIMEOUT_H === 8)
 
 // ---- task factory ----
 const T = (o) => ({
   stem: o.stem, id: o.id ?? o.stem, folder: o.folder, slug: o.slug ?? 'none',
   deps: o.deps ?? [], hasIntegratedAt: !!o.hasIntegratedAt, hasWorktreeBranch: !!o.hasWorktreeBranch,
-  rejectionCount: o.rejectionCount ?? 0, ageHours: o.ageHours ?? -1, priority: o.priority ?? 'medium',
+  rejectionCount: o.rejectionCount ?? 0, blockCount: o.blockCount ?? 0, ageHours: o.ageHours ?? -1, priority: o.priority ?? 'medium',
 })
 
 // ============================ isTerminal ============================
@@ -115,6 +116,27 @@ const T = (o) => ({
     const tasks = [A_live, B]
     const r = planUnblockAndTimeout(tasks, indexTasks(tasks), { trunkRoot: '/r' })
     check('blocked+deps-UNsatisfied -> NOT unblocked', r.unblockActions.length === 0)
+  }
+  // (3b) I2: blocked, deps satisfied, blockCount >= cap -> NOT unblocked (parked for operator)
+  {
+    const B = T({ stem: 'b', folder: 'blocked', slug: 'sb', deps: ['a'], rejectionCount: 0, blockCount: 3 })
+    const tasks = [A, B]
+    const r = planUnblockAndTimeout(tasks, indexTasks(tasks), { trunkRoot: '/r' })
+    check('I2: blocked+deps-satisfied+blockCount>=cap -> NOT unblocked (loop-breaker)', r.unblockActions.length === 0)
+  }
+  // (3c) I2: blocked, deps satisfied, blockCount < cap -> still unblocked (gets another fair shot)
+  {
+    const B = T({ stem: 'b', folder: 'blocked', slug: 'sb', deps: ['a'], rejectionCount: 0, blockCount: 2 })
+    const tasks = [A, B]
+    const r = planUnblockAndTimeout(tasks, indexTasks(tasks), { trunkRoot: '/r' })
+    check('I2: blocked+deps-satisfied+blockCount<cap -> still unblocked', r.unblockActions.length === 1)
+  }
+  // (3d) I2: a custom maxBlock threshold is honored
+  {
+    const B = T({ stem: 'b', folder: 'blocked', slug: 'sb', deps: ['a'], rejectionCount: 0, blockCount: 1 })
+    const tasks = [A, B]
+    const r = planUnblockAndTimeout(tasks, indexTasks(tasks), { trunkRoot: '/r', maxBlock: 1 })
+    check('I2: blockCount 1 >= custom maxBlock 1 -> NOT unblocked', r.unblockActions.length === 0)
   }
   // (4) in-progress stale -> timeout->blocked, excluded from freshInProgress
   {

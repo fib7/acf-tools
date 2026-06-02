@@ -99,6 +99,7 @@ for st in $ACTIVE; do
     id=$(field "$f" "ID"); status=$(field "$f" "Status"); slug=$(field "$f" "Worktree" | tr -d '[:space:]')
     deps=$(field "$f" "Dependencies"); integ=$(field "$f" "Integrated-At" | tr -d '[:space:]')
     agent=$(field "$f" "Assigned Agent" | tr -d '[:space:]'); rc=$(field "$f" "Rejection Count" | tr -d '[:space:]')
+    bc=$(field "$f" "Block-Count" | tr -d '[:space:]')
     globs=$(field "$f" "Touches Globs")
     hasTok=0; grep -qE '\| clean-checkout \| ok \|' "$f" && hasTok=1
     agentOk=1; { [ -n "$agent" ] && [ "$agent" != "none" ] && [ ! -f "$REPO_ROOT/.claude/agents/$agent.md" ]; } && agentOk=0
@@ -109,8 +110,20 @@ for st in $ACTIVE; do
 
     if [ -z "$id" ] || [ -z "$status" ]; then
       emit "$sev_struct" unparseable-frontmatter "$stem" "missing ID and/or Status field"
-    else
-      [ "$status" != "$folder" ] && emit "$sev_struct" status-folder-mismatch "$stem" "Status: '$status' but file is in .backlog/$folder/"
+    elif [ "$status" != "$folder" ]; then
+      # Status-folder mismatch is REPAIRABLE, not FATAL: the folder is the source of truth, so --fix
+      # rewrites Status to match it. This self-heals a backlog whose mover left Status stale (retro I4)
+      # instead of aborting /go at its first transition. Accepted stays advisory (WARN).
+      if [ "$folder" = "accepted" ]; then
+        emit WARN status-folder-mismatch "$stem" "Status: '$status' but file is in .backlog/accepted/ (advisory)"
+      elif [ "$FIX" = "1" ]; then
+        sed -i.bak -E "s/^- \*\*Status\*\*:.*/- **Status**: $folder/" "$f" && rm -f "$f.bak"
+        commit_fix ".backlog/$folder/$stem.md" "doctor: sync Status to folder '$folder' on $stem"
+        emit REPAIRABLE status-folder-mismatch "$stem" "rewrote Status '$status' -> '$folder' (folder is source of truth)"
+        status="$folder"
+      else
+        emit REPAIRABLE status-folder-mismatch "$stem" "Status '$status' != folder '$folder'; --fix rewrites Status to '$folder'"
+      fi
     fi
     # Missing Worktree slug: advisory on terminal (accepted) tasks; on active tasks it is a
     # REPAIRABLE that --fix self-heals by deriving a slug from the id and writing it in — so a
@@ -151,6 +164,21 @@ for st in $ACTIVE; do
           emit REPAIRABLE rejection-count-out-of-range "$stem" "clamped $rc -> $clamped"
         else
           emit REPAIRABLE rejection-count-out-of-range "$stem" "Rejection Count $rc out of [0,5]"
+        fi
+      fi
+    fi
+    # Block-Count (per-task re-block counter, retro I2): clamp a negative/garbage value. A value at or
+    # above the cap is VALID — it means the task is intentionally parked for an operator — so only the
+    # out-of-range low end is repaired (mirrors Rejection Count; upper bound generous to never mask a cap).
+    if [ -n "$bc" ] && printf '%s' "$bc" | grep -qE '^-?[0-9]+$'; then
+      if [ "$bc" -lt 0 ] || [ "$bc" -gt 9 ]; then
+        bclamp=$bc; [ "$bc" -lt 0 ] && bclamp=0; [ "$bc" -gt 9 ] && bclamp=9
+        if [ "$FIX" = "1" ]; then
+          sed -i.bak -E "s/^- \*\*Block-Count\*\*:.*/- **Block-Count**: $bclamp/" "$f" && rm -f "$f.bak"
+          commit_fix ".backlog/$folder/$stem.md" "doctor: clamp Block-Count on $stem to $bclamp"
+          emit REPAIRABLE block-count-out-of-range "$stem" "clamped $bc -> $bclamp"
+        else
+          emit REPAIRABLE block-count-out-of-range "$stem" "Block-Count $bc out of [0,9]"
         fi
       fi
     fi

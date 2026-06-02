@@ -18,6 +18,7 @@
 - **Dependencies**: [task-id-1, task-id-2] or "none"
 - **Integrated-At**: (left blank by task-engineer; written by `integrate-worktree` after a successful merge into the local trunk; format: trunk SHA after merge)
 - **Rejection Count**: 0 (max 5; quality-reviewer increments on reject; after 5th rejection, task-engineer redesigns)
+- **Block-Count**: 0 (per-task re-block counter; `/go` increments when a specialist re-blocks a dispatched task and stops re-dispatching once it reaches the cap, parking the task for an operator)
 - **Created By**: task-engineer
 - **Created At**: $(date +"%Y-%m-%d %H:%M:%S") UTC
 - **Documentation**: [existing docs agent must read first, or "none"]
