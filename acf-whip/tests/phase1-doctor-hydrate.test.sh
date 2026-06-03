@@ -297,6 +297,34 @@ check "quiet suppresses per-WARN finding lines" "! echo \"\$QUI\" | grep -q '^WA
 check "verbose still emits per-WARN finding lines" "echo \"\$VERB\" | grep -q '^WARN|'"
 rm -f .backlog/accepted/q-adv-1.md; git add -A; git commit -qm cleanup-quietadv
 
+echo "== doctor --active-only: same FATAL/ok as full, skips accepted advisories, no false dangling =="
+AOR="$WORK/ao-repo"; git init -q -b trunk "$AOR" >/dev/null; (
+  cd "$AOR"; git config user.email t@t; git config user.name t
+  mkdir -p .backlog/{pending,in-progress,completed,in-review,blocked,rejected,accepted} .claude/agents
+  echo x > .claude/agents/go-engineer.md
+  mkao(){ # <dir> <stem> <slug> <status> <deps> <integ>
+    printf '# Task: %s\n\n## Metadata\n\n- **ID**: %s\n- **Status**: %s\n- **Assigned Agent**: go-engineer\n- **Worktree**: %s\n- **Dependencies**: %s\n- **Integrated-At**: %s\n- **Rejection Count**: 0\n\n## Transition Log\n' "$2" "$2" "$4" "$3" "$5" "$6" > ".backlog/$1/$2.md"
+  }
+  mkao accepted a-term alpha accepted none abc1234def        # terminal accepted (integrated) dep target
+  mkao accepted a-cand charlie accepted none ""              # accepted, has branch, unintegrated (candidate)
+  mkao pending p-deps-term pp pending "a-term" ""            # pending depends on TERMINAL accepted -> NO dangling
+  mkao in-progress ip-fatal india in-progress "a-cand" ""   # cross-slug dep on unintegrated accepted -> FATAL
+  printf '| 2026-06-02 10:00:00 | clean-checkout | ok |\n' >> .backlog/in-progress/ip-fatal.md
+  mkao pending p-dangle echoslug pending "ghost-x" ""        # dangling dep -> FATAL
+  git add -A; git commit -qm aofix >/dev/null
+  git branch worktree/charlie; git branch worktree/india
+)
+AO_FULL=$(bash "$DOC" --quiet "$AOR"); AO_ACT=$(bash "$DOC" --quiet --active-only "$AOR")
+check "active-only FATAL lines identical to full" \
+  "[ \"\$(echo \"\$AO_FULL\"|grep '^FATAL|'|sort)\" = \"\$(echo \"\$AO_ACT\"|grep '^FATAL|'|sort)\" ]"
+check "active-only same ok flag as full" \
+  "[ \"\$(echo \"\$AO_FULL\"|grep -oE 'ok=(true|false)')\" = \"\$(echo \"\$AO_ACT\"|grep -oE 'ok=(true|false)')\" ]"
+check "active-only catches active-folder dangling-dep FATAL" "echo \"\$AO_ACT\" | grep -q '^FATAL|dangling-dep|p-dangle'"
+check "active-only catches cross-slug-dep-not-integrated against accepted dep" "echo \"\$AO_ACT\" | grep -q '^FATAL|cross-slug-dep-not-integrated|ip-fatal'"
+check "active-only: NO false dangling-dep for pending->terminal-accepted" "! echo \"\$AO_ACT\" | grep -q '^FATAL|dangling-dep|p-deps-term'"
+check "active-only suppresses accepted advisory WARNs (fewer warns than full)" \
+  "[ \"\$(echo \"\$AO_ACT\"|sed -nE 's/.*warn=([0-9]+).*/\1/p')\" -lt \"\$(echo \"\$AO_FULL\"|sed -nE 's/.*warn=([0-9]+).*/\1/p')\" ]"
+
 echo ""
 echo "==================================================="
 echo "Phase 1 doctor+hydrate test: $PASS passed, $FAIL failed"

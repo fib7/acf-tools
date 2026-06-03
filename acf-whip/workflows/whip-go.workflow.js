@@ -37,6 +37,15 @@ const CLEAN_CHECKOUT = `${pluginRoot}/skills/clean-checkout-before-task/bin/clea
 const MAX_ITER = 1000
 const NO_GAIN_LIMIT = 15 // iterations with no terminal gain (perpetual-retry guard); well below MAX_ITER
 
+// Model for the DETERMINISTIC shell-runner agents (bootstrap, scan, the single backlog writer,
+// integrate, drain). These agents do ZERO reasoning — they run a fixed bash command and copy its
+// stdout into a schema — so they run on a fast/cheap model instead of the session model (every one
+// inherited Opus before, paying Opus generation cost for a verbatim echo). The specialist/reviewer/
+// direct and conflict-resolver dispatches do REAL work and are deliberately LEFT on the session model
+// + their agentType (see the no-model comments at those call sites). Overridable via args.shellModel
+// (set it to roll back to the session model if a model ever mis-handles the digest echo).
+const SHELL_MODEL = (args && args.shellModel) || 'haiku'
+
 // <scheduler-pure> ===========================================================================
 // Everything between these markers is PURE (no agent/parallel/phase/log/clock, no closures except
 // the module-level `mode`). tests/phase2-scheduler.test.mjs extracts this block verbatim, injects
@@ -107,14 +116,30 @@ const INTEGRATE_RESULT = {
 }
 
 // ============================ pure-JS scheduling helpers ============================
-function indexTasks(tasks) {
+function indexTasks(tasks, satisfiedDeps) {
   const byId = new Map(), byStem = new Map()
   for (const t of tasks) { if (t.id) byId.set(t.id, t); if (t.stem) byStem.set(t.stem, t) }
+  // satisfiedDeps (digest mode): terminal-accepted dependency targets the scanner collapsed into
+  // {stem,id} instead of full task objects. A dep token that resolves ONLY here is a DONE dependency.
+  // Synthesize a terminal accepted object shaped so the EXISTING isTerminal (accepted + hasIntegratedAt
+  // -> terminal) and depsSatisfied (slug 'none' short-circuits the cross-slug gate -> satisfied) treat
+  // it as satisfied with NO edits to those bodies. REAL tasks (byId/byStem) always win first, so a live
+  // integration candidate — a full task object, never in satisfiedDeps — keeps blocking its dependents.
+  const sd = satisfiedDeps || []
+  const satById = new Map(), satByStem = new Map()
+  for (const e of sd) { if (e && e.id) satById.set(e.id, e); if (e && e.stem) satByStem.set(e.stem, e) }
+  const synth = (e) => ({ stem: e.stem || e.id, id: e.id || e.stem, folder: 'accepted', slug: 'none', hasIntegratedAt: true, hasWorktreeBranch: false, deps: [] })
+  const satResolve = (tok) => {
+    if (satById.has(tok)) return synth(satById.get(tok))
+    if (satByStem.has(tok)) return synth(satByStem.get(tok))
+    for (const [stem, e] of satByStem) if (stem.indexOf(tok) === 0) return synth(e) // prefix (mirrors resolve)
+    return null
+  }
   const resolve = (tok) => {
     if (byId.has(tok)) return byId.get(tok)
     if (byStem.has(tok)) return byStem.get(tok)
     for (const [stem, t] of byStem) if (stem.indexOf(tok) === 0) return t // prefix match (mirrors doctor)
-    return null
+    return satResolve(tok)
   }
   return { byId, byStem, resolve }
 }
@@ -349,7 +374,7 @@ You are the SINGLE backlog writer. Run these apply-transition.sh calls IN ORDER,
 ${lines}
 
 Capture each call's stdout (an "ok:" or "noop:" line) into applied[]. If any call errors, record it in applied[] and continue with the rest. Return the WriteResult.`,
-    { label, phase: 'Iterate', schema: WRITE_BATCH },
+    { label, phase: 'Iterate', schema: WRITE_BATCH, model: SHELL_MODEL },
     () => ({ applied: [], note: 'writer agent non-emit after retries — transitions deferred to next iteration' }),
   )
 }
@@ -365,7 +390,7 @@ Bootstrap the acf-whip orchestrator at trunk root ${sq(trunkRoot)}.
      bash ${sq(DOCTOR)} --quiet ${sq(trunkRoot)}
    From the second run capture: doctorOk (SUMMARY ok=true), doctorSummary (the verbatim SUMMARY line), fatals (verbatim FATAL| lines).
 Return the BootstrapResult.`,
-  { label: 'bootstrap', phase: 'Bootstrap', schema: BOOTSTRAP },
+  { label: 'bootstrap', phase: 'Bootstrap', schema: BOOTSTRAP, model: SHELL_MODEL },
   () => null,
 )
 if (!boot) {
@@ -396,11 +421,11 @@ while (iter < MAX_ITER) {
   // ---- scan (read-only) + doctor-lite + heartbeat ----
   const scanPrompt = `${ENV}
 Iteration ${iter} of the acf-whip orchestrator. Do three things and return the result:
-1. Read-only snapshot:  bash ${sq(SCAN)} ${sq(trunkRoot)}  — its stdout is a single JSON object. Put that stdout VERBATIM (copy it exactly, add nothing) into snapshotJson.
-2. Integrity recheck (report-only):  bash ${sq(DOCTOR)} --quiet ${sq(trunkRoot)}  — set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (verbatim FATAL| lines).
+1. Read-only snapshot:  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trunkRoot)}  — its stdout is a single JSON object. Put that stdout VERBATIM (copy it exactly, add nothing) into snapshotJson.
+2. Integrity recheck (report-only):  bash ${sq(DOCTOR)} --quiet --active-only ${sq(trunkRoot)}  — set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (verbatim FATAL| lines).
 3. Heartbeat (best-effort, NOT committed): write a small JSON file at ${sq(`${trunkRoot}/.backlog/.acfw-run.json`)} containing {"iteration":${iter},"mode":"${mode}","ts":"<output of: date -u +%Y-%m-%dT%H:%M:%SZ>"}. If the write fails, ignore it.
 Return the ScanResult.`
-  let scan = await safeAgent(scanPrompt, { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT }, () => null)
+  let scan = await safeAgent(scanPrompt, { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT, model: SHELL_MODEL }, () => null)
   if (!scan) {
     stopReason = 'scan-nonemit'
     return { aborted: true, reason: 'scan agent never emitted after retries; re-run /go (git + .backlog/ are durable, nothing is lost)', mode, iteration: iter }
@@ -418,7 +443,7 @@ Return the ScanResult.`
     // verbatim, so a single garbled/truncated echo should not abort a long run. Re-run once; if it is
     // still unparseable, the snapshot is genuinely malformed -> abort.
     log(`iter ${iter}: snapshot JSON unparseable — re-scanning once`)
-    scan = await safeAgent(scanPrompt, { label: `scan#${iter}:retry`, phase: 'Iterate', schema: SCAN_RESULT }, () => null)
+    scan = await safeAgent(scanPrompt, { label: `scan#${iter}:retry`, phase: 'Iterate', schema: SCAN_RESULT, model: SHELL_MODEL }, () => null)
     if (!scan) {
       stopReason = 'scan-nonemit'
       return { aborted: true, reason: 'scan agent never emitted after retries (on re-scan); re-run /go (git + .backlog/ are durable)', mode, iteration: iter }
@@ -434,7 +459,7 @@ Return the ScanResult.`
   }
   lastSnapshot = snap
   const tasks = snap.tasks || []
-  const idx = indexTasks(tasks)
+  const idx = indexTasks(tasks, snap.satisfiedDeps)
 
   // Unblock/timeout plan is computed HERE (before the completion check) so completion can require that
   // no blocked task is about to be unblocked — otherwise a cross-slug dep that integrates in the final
@@ -545,6 +570,9 @@ Return the ScanResult.`
       const prompt = d.kind === 'review'
         ? (d.t.slug === 'none' ? directReviewPrompt(d.t) : reviewerPrompt(d.t)) // none tasks have no worktree to clean-checkout
         : d.kind === 'direct' ? directPrompt(d.t) : specialistPrompt(d.t)
+      // NO model: here — specialists/direct/reviewers do the REAL implementation/review work and MUST
+      // keep the session model (+ their agentType below). Only the deterministic shell-runners (scan,
+      // writer, integrate, bootstrap, drain) are routed to SHELL_MODEL.
       const opts = { label: `${d.kind}:${d.t.slug === 'none' ? d.t.stem : d.t.slug}`, phase: 'Iterate', schema: ACFW_RESULT }
       // Reviewers ALWAYS run as quality-reviewer (independent review — never the implementer's agent);
       // specialists/direct run as the task's assigned agent (doctor guarantees a set agent exists).
@@ -596,14 +624,15 @@ Return the ScanResult.`
     const ordered = topoIntegrationOrder(candidates, idx, () => log('WARN integrate: dependency cycle among integration candidates — using input order; run /whip-doctor'))
     const integTransient = (note) => () => ({ outcome: 'transient', note })
     for (const t of ordered) {
-      let r = await safeAgent(integratePrompt(t, false), { label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT }, integTransient('integrate agent non-emit — left accepted, retry next iteration'))
+      let r = await safeAgent(integratePrompt(t, false), { label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate agent non-emit — left accepted, retry next iteration'))
       if (r && r.outcome === 'resolver-needed') {
         log(`integrate ${t.slug}: conflict — dispatching resolver ${r.resolverAgent || t.agent || '(default)'}`)
+        // NO model: here — the conflict resolver does REAL merge-conflict reasoning; session model + agentType.
         const ropts = { label: `resolve:${t.slug}`, phase: 'Iterate' }
         const ragent = r.resolverAgent || t.agent
         if (ragent && ragent !== 'none') ropts.agentType = ragent
         await agent(resolverPrompt(t, r), ropts)
-        r = await safeAgent(integratePrompt(t, true), { label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT }, integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
+        r = await safeAgent(integratePrompt(t, true), { label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
       }
       if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); integratedThisIter++; log(`✓ integrated ${t.stem}`) }
       else if (r && r.outcome === 'rejected') { rejectedStems.push(t.stem); log(`✗ integrate rejected ${t.stem} — ${r.note}`) }
@@ -631,18 +660,18 @@ let drained = 0
 if (mode === 'default' && lastSnapshot) {
   const rescan = await safeAgent(
     `${ENV}
-Final integration drain. Run  bash ${sq(SCAN)} ${sq(trunkRoot)}  and return its stdout VERBATIM in snapshotJson (set doctorOk true, doctorSummary "drain", doctorFatals []).`,
-    { label: 'drain:scan', phase: 'Drain', schema: SCAN_RESULT },
+Final integration drain. Run  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trunkRoot)}  and return its stdout VERBATIM in snapshotJson (set doctorOk true, doctorSummary "drain", doctorFatals []).`,
+    { label: 'drain:scan', phase: 'Drain', schema: SCAN_RESULT, model: SHELL_MODEL },
     () => null,
   )
   let snap2 = null
   try { snap2 = rescan ? JSON.parse(rescan.snapshotJson) : null } catch (e) { snap2 = null }
   if (snap2) {
-    const idx2 = indexTasks(snap2.tasks || [])
+    const idx2 = indexTasks(snap2.tasks || [], snap2.satisfiedDeps)
     const left = topoIntegrationOrder((snap2.tasks || []).filter((t) => t.folder === 'accepted' && t.slug && t.slug !== 'none' && !t.hasIntegratedAt && t.hasWorktreeBranch), idx2)
     for (const t of left) {
       // single defensive pass: an exit-7 here is intentionally left for the next /go run (no resolver post-loop)
-      const r = await safeAgent(integratePrompt(t, false), { label: `drain:${t.slug}`, phase: 'Drain', schema: INTEGRATE_RESULT }, () => ({ outcome: 'transient', note: 'drain integrate non-emit' }))
+      const r = await safeAgent(integratePrompt(t, false), { label: `drain:${t.slug}`, phase: 'Drain', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, () => ({ outcome: 'transient', note: 'drain integrate non-emit' }))
       if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); drained++ }
     }
   }

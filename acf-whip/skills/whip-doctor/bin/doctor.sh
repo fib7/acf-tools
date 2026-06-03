@@ -2,11 +2,18 @@
 # doctor.sh — backlog integrity battery for acf-whip.
 #
 # Usage:
-#   doctor.sh [--fix] [--quiet] [REPO_ROOT]
+#   doctor.sh [--fix] [--quiet] [--active-only] [REPO_ROOT]
 #     --fix      apply the REPAIRABLE class, then re-scan (default: report only)
 #     --quiet    print only FATAL findings + BREAKDOWN + SUMMARY (suppress the per-finding dump);
 #                bounds output to O(fatals + codes) so hundreds of historical advisories don't have
 #                to flow through the /go scan agent. The interactive /whip-doctor stays verbose.
+#     --active-only  per-iteration fast path: run the FULL per-file pass only on the non-accepted
+#                active folders (where every mid-run FATAL lives), and feed the cross-task awk graph a
+#                cheap BATCHED stub row per accepted task (stem/id/slug/integ/hasBranch) instead of the
+#                per-file field() extraction (the 240-600x process-spawn hotspot on a lived-in backlog).
+#                Accepted tasks are advisory-only (forced WARN, never a gate FATAL), so the FATAL set
+#                and the ok flag are UNCHANGED — only suppressed accepted advisories (WARN/REPAIRABLE
+#                counts) differ. Never combine with --fix (the startup gate uses the full --fix pass).
 #     REPO_ROOT  defaults to $ACFW_TRUNK_ROOT or `git rev-parse --show-toplevel`
 #
 # Output (one line per finding, machine- and human-readable):
@@ -25,16 +32,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 FIX=0
 QUIET=0
+ACTIVE_ONLY=0
 while [ $# -gt 0 ]; do
   case "${1:-}" in
     --fix) FIX=1; shift;;
     --quiet) QUIET=1; shift;;
+    --active-only) ACTIVE_ONLY=1; shift;;
     *) break;;
   esac
 done
 REPO_ROOT="${1:-${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}}"
 BL="$REPO_ROOT/.backlog"
 ACTIVE="pending in-progress completed in-review blocked rejected accepted"
+# Non-accepted active folders: in --active-only mode the full per-file pass runs only over these
+# (accepted is fed to the awk graph as a cheap batched stub — see emit_accepted_stub_tsv).
+ACTIVE_NONACC="pending in-progress completed in-review blocked rejected"
 # Timeout precedence: env var > .backlog/.acfw-config > default 8h.
 ENV_TIMEOUT="${ACFW_INPROGRESS_TIMEOUT_HOURS:-}"
 [ -f "$BL/.acfw-config" ] && . "$BL/.acfw-config" 2>/dev/null
@@ -56,6 +68,45 @@ commit_fix() { # <path-rel> <msg>
 # compare so a metachar slug never matches the wrong entry.
 EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' refs/heads/worktree/ 2>/dev/null | sed 's#^worktree/##')
 has_branch() { printf '%s\n' "$EXISTING_WT_SLUGS" | grep -qxF "$1"; }
+
+# --active-only: emit a cheap BATCHED TSV stub row per accepted task so the cross-task awk graph keeps
+# every accepted stem as a dep-resolution target (resolve/dangling-dep/cross-slug-dep-not-integrated/
+# duplicate-id/dup-folder stay correct) WITHOUT the per-file field() extraction. ONE find + ONE grep
+# (ID/Worktree/Integrated-At) feed ONE awk. Accepted deps are emitted "none": an accepted task can
+# only ever be the DEPENDED-UPON side of a FATAL (cross-slug-dep-not-integrated fires on the active
+# DEPENDENT), and its own structural defects are advisory (WARN) — so its own deps never gate. id IS
+# emitted (duplicate-id is FATAL across folders). TSV columns mirror the full pass exactly (11 cols).
+emit_accepted_stub_tsv() {
+  [ -d "$BL/accepted" ] || return 0
+  local accf wtf
+  accf=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-acc.XXXXXX")
+  wtf=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-wt.XXXXXX")
+  find "$BL/accepted" -maxdepth 1 -type f -name '*.md' ! -name 'README.md' 2>/dev/null > "$accf"
+  printf '%s\n' "$EXISTING_WT_SLUGS" > "$wtf"
+  grep -HE '^- \*\*(ID|Worktree|Integrated-At)\*\*:' "$BL/accepted/"*.md 2>/dev/null | awk \
+    -v accf="$accf" -v wtf="$wtf" '
+    BEGIN {
+      while ((getline l < wtf) > 0) if (l != "") wt[l]=1
+      while ((getline l < accf) > 0) { if (l=="") continue; files[l]=1; n=split(l,p,"/"); b=p[n]; sub(/\.md$/,"",b); stem[l]=b }
+    }
+    {
+      c=index($0,":"); if (c==0) next
+      f=substr($0,1,c-1); rest=substr($0,c+1)
+      if (!(f in files)) next
+      if (match(rest,/\*\*ID\*\*:[ \t]*/))            { v=substr(rest,RSTART+RLENGTH); gsub(/[ \t]+$/,"",v); id[f]=v }
+      else if (match(rest,/\*\*Worktree\*\*:[ \t]*/)) { v=substr(rest,RSTART+RLENGTH); gsub(/[ \t]/,"",v);   slug[f]=v }
+      else if (match(rest,/\*\*Integrated-At\*\*:[ \t]*/)) { v=substr(rest,RSTART+RLENGTH); gsub(/[ \t]/,"",v); integ[f]=v }
+    }
+    END {
+      for (f in files) {
+        s=stem[f]; i=(f in id)?id[f]:""; sl=(f in slug)?slug[f]:""; ig=(f in integ)?integ[f]:""
+        hb=(sl!="" && sl!="none" && (sl in wt))?1:0
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s, "accepted", i, "accepted", sl, "", "none", ig, "", 0, hb
+      }
+    }
+  '
+  rm -f "$accf" "$wtf"
+}
 
 # Derive a kebab-case worktree slug from a task id: drop the "<category>-<NNN>-" prefix and keep
 # the descriptive tail (already kebab-case); fall back to "<category>-<NNN>" if the tail is empty
@@ -91,7 +142,11 @@ if ! git -C "$REPO_ROOT" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
 fi
 
 # ---- Per-file pass: emit independent findings, apply per-file repairs, build TSV ----
-for st in $ACTIVE; do
+# --active-only restricts the full per-file pass to the non-accepted folders (accepted is fed to the
+# awk graph as a cheap batched stub appended below); full/--fix runs always cover every active folder.
+LOOP_FOLDERS="$ACTIVE"
+[ "$ACTIVE_ONLY" = "1" ] && LOOP_FOLDERS="$ACTIVE_NONACC"
+for st in $LOOP_FOLDERS; do
   d="$BL/$st"; [ -d "$d" ] || continue
   for f in "$d"/*.md; do
     [ -f "$f" ] || continue
@@ -191,6 +246,10 @@ for st in $ACTIVE; do
       "$stem" "$folder" "$id" "$status" "$slug" "$agent" "${deps:-none}" "$integ" "${globs}" "$rc" "$hasBranch" >> "$TSV"
   done
 done
+
+# --active-only: append the cheap batched accepted stub rows so the awk graph below resolves every
+# cross-task dependency that points at an accepted task (without the per-file field() cost on accepted).
+[ "$ACTIVE_ONLY" = "1" ] && emit_accepted_stub_tsv >> "$TSV"
 
 # ---- Cross-task analysis in awk (portable associative arrays) ----
 awk -F'\t' '

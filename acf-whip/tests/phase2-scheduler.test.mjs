@@ -90,6 +90,54 @@ const T = (o) => ({
   })())
 }
 
+// ============================ satisfiedDeps (F1 digest collapse) ============================
+// The digest scanner collapses terminal-accepted dependency targets into a flat satisfiedDeps[] of
+// {stem,id} instead of full task objects. indexTasks(tasks, satisfiedDeps) must synthesize a terminal
+// accepted dep for a token that resolves ONLY there, so depsSatisfied treats it as satisfied — while a
+// REAL integration candidate (a full task object, never in satisfiedDeps) still blocks.
+{
+  const { indexTasks, depsSatisfied } = Sdef
+  const P = (deps) => T({ stem: 't', folder: 'pending', slug: 'st', deps })
+  // (1) token resolves only via satisfiedDeps -> satisfied (default)
+  {
+    const t = P(['a'])
+    check('digest: dep in satisfiedDeps -> satisfied (default)', depsSatisfied(t, indexTasks([t], [{ stem: 'a', id: 'a' }])) === true)
+  }
+  // (2) same in override
+  {
+    const t = P(['a'])
+    check('digest: dep in satisfiedDeps -> satisfied (override)', Sovr.depsSatisfied(t, Sovr.indexTasks([t], [{ stem: 'a', id: 'a' }])) === true)
+  }
+  // (3) a REAL integration candidate (live branch, unintegrated, cross-slug) still BLOCKS even if a
+  //     same-named entry were (wrongly) in satisfiedDeps — real byStem wins first.
+  {
+    const cand = T({ stem: 'a', folder: 'accepted', slug: 'sa', hasWorktreeBranch: true, hasIntegratedAt: false })
+    const t = T({ stem: 't', folder: 'pending', slug: 'sb', deps: ['a'] })
+    check('digest: real integration candidate wins over satisfiedDeps -> blocks', depsSatisfied(t, indexTasks([cand, t], [{ stem: 'a', id: 'a' }])) === false)
+  }
+  // (4) id-based match (dep token is the id, stem differs)
+  {
+    const t = P(['feature-9-foo'])
+    check('digest: satisfiedDeps id match -> satisfied', depsSatisfied(t, indexTasks([t], [{ stem: 'f9', id: 'feature-9-foo' }])) === true)
+  }
+  // (5) stem-prefix match (dep token is a prefix of a satisfiedDeps stem; mirrors resolve())
+  {
+    const t = P(['feature-9'])
+    check('digest: satisfiedDeps stem-prefix match -> satisfied', depsSatisfied(t, indexTasks([t], [{ stem: 'feature-9-foo', id: 'feature-9-foo' }])) === true)
+  }
+  // (6) token absent from both tasks[] and satisfiedDeps -> dangling -> NOT satisfied (no silent pass)
+  {
+    const t = P(['ghost'])
+    check('digest: token in neither -> dangling -> NOT satisfied', depsSatisfied(t, indexTasks([t], [{ stem: 'a', id: 'a' }])) === false)
+  }
+  // (7) version-skew: indexTasks called with NO satisfiedDeps arg behaves as before (full snapshot)
+  {
+    const A = T({ stem: 'a', folder: 'accepted', slug: 'none' })
+    const t = T({ stem: 't', folder: 'pending', slug: 'sb', deps: ['a'] })
+    check('digest: indexTasks without satisfiedDeps arg still resolves real tasks', depsSatisfied(t, indexTasks([A, t])) === true)
+  }
+}
+
 // ============================ planUnblockAndTimeout ============================
 {
   const { indexTasks, planUnblockAndTimeout } = Sdef
