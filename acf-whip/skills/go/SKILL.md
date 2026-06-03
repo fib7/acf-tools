@@ -78,6 +78,13 @@ legacy loop has). Prefer it.
      args: { pluginRoot: "<PLUGIN_ROOT>", trunkRoot: "<TRUNK_ROOT>", trunkBranch: "<TRUNK_BRANCH>", mode: "default" | "override" }
    })
    ```
+   The per-iteration scan runs `scan-backlog.sh --digest` (a small scheduling snapshot — counts +
+   actionable tasks + a compact `satisfiedDeps` list, with terminal-accepted tasks collapsed) and
+   `whip-doctor --active-only` (full integrity over active folders; accepted fed as cheap stubs), so a
+   lived-in backlog scans in seconds instead of tens of seconds. The deterministic shell-runner agents
+   (scan, the single writer, integrate, bootstrap, drain) run on a fast model; pass an optional
+   `shellModel` arg to override it (e.g. pin to the session model for rollback). Specialists, reviewers,
+   and conflict-resolvers always run on the session model.
 4. When it completes, report the returned `RunReport` (completed?, iterations, finalCounts,
    integrated[], stopReason). If it returns `aborted: true` (detached HEAD or an unrepairable FATAL),
    surface the reason + fatals and STOP. Re-running `/go` is the documented resume — git + `.backlog/`
