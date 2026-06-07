@@ -92,12 +92,17 @@ const WRITE_BATCH = {
 }
 const ACFW_RESULT = {
   type: 'object', additionalProperties: false,
+  // Only the original four are REQUIRED — keeping the emit surface small protects against the
+  // StructuredOutput non-emit that BUG-1 hardens against. blockedReason/needsTask are OPTIONAL signals
+  // (BUG-2) a specialist sets ONLY when it blocks on unmodeled work; absent, behaviour is unchanged.
   required: ['transition', 'commitSha', 'rejectionIncrement', 'notes'],
   properties: {
     transition: { type: 'string', enum: ['completed', 'blocked', 'accepted', 'rejected', 'none'], description: 'the transition from your ACFW-RESULT marker; "none" if you could not complete (transient — orchestrator retries next iteration)' },
     commitSha: { type: 'string', description: 'commit sha on worktree/<slug>, or "n/a"' },
     rejectionIncrement: { type: 'integer', enum: [0, 1] },
     notes: { type: 'string', description: 'one-line reason' },
+    blockedReason: { type: 'string', enum: ['dependency-missing', 'environment', 'unrecoverable', 'none'], description: 'ONLY meaningful when transition=blocked. "dependency-missing" = the REAL blocker is unmodeled work that should be its own task (name it in needsTask) — the orchestrator then PARKS this task for an operator instead of re-dispatching it (re-running /go will not help). Omit or "none" for an ordinary block.' },
+    needsTask: { type: 'string', description: 'when blockedReason=dependency-missing: a one-line description of the missing task an operator should create; else "".' },
   },
 }
 const INTEGRATE_RESULT = {
@@ -206,6 +211,10 @@ function planUnblockAndTimeout(tasks, idx, opts) {
   const maxBlock = (o.maxBlock != null) ? o.maxBlock : MAX_BLOCK_RETRY
   const timeoutH = (o.timeoutH != null) ? o.timeoutH : DEFAULT_TIMEOUT_H
   const root = o.trunkRoot || ''
+  // parked (BUG-2): stems a specialist blocked on with blocked_reason=dependency-missing this run. Their
+  // DECLARED deps are satisfied (the real blocker is unmodeled), so without this they would be re-unblocked
+  // and re-dispatched on a tight loop until Block-Count hit its cap. Parking stops the re-queue immediately.
+  const parked = (o.parked instanceof Set) ? o.parked : new Set(o.parked || [])
   const mk = (t, from, toState, notes) => ({ path: `${root}/.backlog/${from}/${t.stem}.md`, toState, agent: 'orchestrator', notes, inc: 0 })
 
   // blocked -> pending: deps now satisfied AND not a max-rejection "redesign" block (count >= cap)
@@ -216,7 +225,7 @@ function planUnblockAndTimeout(tasks, idx, opts) {
   const unblockActions = tasks
     .filter((t) => t.folder === 'blocked')
     .sort(byPriorityThenStem)
-    .filter((t) => (t.rejectionCount || 0) < maxReject && (t.blockCount || 0) < maxBlock && depsSatisfied(t, idx))
+    .filter((t) => (t.rejectionCount || 0) < maxReject && (t.blockCount || 0) < maxBlock && !parked.has(t.stem) && depsSatisfied(t, idx))
     .map((t) => mk(t, 'blocked', 'pending', 'dependencies resolved — unblocked'))
 
   // in-progress -> blocked: stale past the operator timeout (ageHours is computed by scan-backlog;
@@ -230,6 +239,17 @@ function planUnblockAndTimeout(tasks, idx, opts) {
   const freshInProgress = tasks.filter((t) => t.folder === 'in-progress' && !staleStems.has(t.stem))
 
   return { unblockActions, timeoutActions, freshInProgress }
+}
+
+// Map a dispatched unit's CURRENT folder + the specialist/reviewer's reported transition to the next
+// folder, or null for "no legal move this iteration" (transient — leave the task where it is and retry).
+// Extracted pure so the streaming lifecycle (BUG-3) and its unit tests share one source of truth.
+function resultToState(from, transition) {
+  if (from === 'in-progress' && transition === 'completed') return 'completed'
+  if (from === 'in-progress' && transition === 'blocked') return 'blocked'
+  if (from === 'in-review' && transition === 'accepted') return 'accepted'
+  if (from === 'in-review' && transition === 'rejected') return 'rejected'
+  return null
 }
 // </scheduler-pure> ==========================================================================
 
@@ -251,9 +271,11 @@ Then: read the task at ${sq(rootPath)} (the ROOT path — read it there). Do the
     commit_sha: <sha on worktree/${t.slug}, or n/a>
     rejection_increment: 0
     notes: <one line>
-Use transition "completed" when the work is done and quality gates pass; "blocked" if you hit an unresolvable blocker. ${NO_BACKLOG_WRITES}
+    blocked_reason: <only if blocked: dependency-missing | environment | unrecoverable | none>
+    needs_task: <only if blocked_reason=dependency-missing: the missing task to create, else n/a>
+Use transition "completed" when the work is done and quality gates pass; "blocked" if you hit an unresolvable blocker. If the real blocker is WORK THAT SHOULD BE ITS OWN TASK and does not exist yet (not one of your declared Dependencies), set blocked_reason "dependency-missing" and describe that task in needs_task — the orchestrator parks this task for an operator instead of looping on it. ${NO_BACKLOG_WRITES}
 
-Finally return the structured ACFWResult matching your marker (transition, commitSha, rejectionIncrement 0, notes).`
+Finally return the structured ACFWResult matching your marker (transition, commitSha, rejectionIncrement 0, notes; plus blockedReason/needsTask if you blocked on a missing dependency).`
 }
 
 function reviewerPrompt(t) {
@@ -303,8 +325,11 @@ Read the task at ${sq(rootPath)}, do the work, and write the deliverable/evidenc
     commit_sha: n/a
     rejection_increment: 0
     notes: <one line>
+    blocked_reason: <only if blocked: dependency-missing | environment | unrecoverable | none>
+    needs_task: <only if blocked_reason=dependency-missing: the missing task to create, else n/a>
+If you block because of unmodeled work that should be its own task, set blocked_reason "dependency-missing" and name that task in needs_task so the orchestrator parks this for an operator.
 
-Return the structured ACFWResult matching your marker.`
+Return the structured ACFWResult matching your marker (plus blockedReason/needsTask if you blocked on a missing dependency).`
 }
 
 function integratePrompt(t, postResolver) {
@@ -357,6 +382,37 @@ async function safeAgent(prompt, opts, onGiveUp) {
     }
   }
   return onGiveUp ? onGiveUp() : null
+}
+
+// BUG-1 parse-fallback: pull a JSON object out of a free-text agent message. The scan's failure mode
+// is "the model ran the command and answered, but did not call StructuredOutput", so the JSON it
+// printed is recoverable from the text. Prefer a fenced ```json block; else take the outermost {...}.
+function extractJson(text) {
+  if (!text) return null
+  const t = String(text)
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  const candidate = fence ? fence[1] : t
+  const a = candidate.indexOf('{'), b = candidate.lastIndexOf('}')
+  if (a < 0 || b < 0 || b <= a) return null
+  try { return JSON.parse(candidate.slice(a, b + 1)) } catch (e) { return null }
+}
+
+// BUG-1: schema-LESS scan fallback. When the schema-forced scan agent exhausts its retries without
+// emitting StructuredOutput, run scan-backlog.sh through a plain (no-schema) agent that returns its
+// final text, and parse the snapshot JSON out of that text directly. The per-iteration doctor recheck
+// is advisory mid-run (bootstrap already gated, the next clean scan rechecks), so this path skips it.
+async function textScanFallback(label) {
+  let txt = null
+  try {
+    txt = await agent(
+      `${ENV}
+Run EXACTLY:  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trunkRoot)}
+Output its stdout — a single JSON object — as your ENTIRE final message. No prose, no markdown fences, nothing else.`,
+      { label, phase: 'Iterate', model: SHELL_MODEL },
+    )
+  } catch (e) { return null }
+  const snap = extractJson(txt)
+  return snap && snap.counts ? snap : null
 }
 
 // One sequential writer call. actions: [{ path, toState, agent, notes, inc, binc }].
@@ -412,6 +468,8 @@ let noGain = 0 // consecutive iterations with no terminal gain (perpetual futile
 let prevTerminal = -1
 const integratedStems = []
 const rejectedStems = []
+const parkedThisRun = new Set() // stems a specialist blocked on with dependency-missing (BUG-2) — not re-dispatched
+const parkedNeeds = new Map() // stem -> needs_task text (for the final operator report)
 let lastSnapshot = null
 let stopReason = 'max-iterations'
 
@@ -426,36 +484,44 @@ Iteration ${iter} of the acf-whip orchestrator. Do three things and return the r
 3. Heartbeat (best-effort, NOT committed): write a small JSON file at ${sq(`${trunkRoot}/.backlog/.acfw-run.json`)} containing {"iteration":${iter},"mode":"${mode}","ts":"<output of: date -u +%Y-%m-%dT%H:%M:%SZ>"}. If the write fails, ignore it.
 Return the ScanResult.`
   let scan = await safeAgent(scanPrompt, { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT, model: SHELL_MODEL }, () => null)
-  if (!scan) {
-    stopReason = 'scan-nonemit'
-    return { aborted: true, reason: 'scan agent never emitted after retries; re-run /go (git + .backlog/ are durable, nothing is lost)', mode, iteration: iter }
-  }
 
-  // mid-run FATAL introduced (e.g. a cycle from a retry, a half-applied transition) -> abort before dispatch
-  if (!scan.doctorOk) {
+  // mid-run FATAL introduced (e.g. a cycle from a retry, a half-applied transition) is a GENUINE stop
+  // (unrepairable integrity) -> abort before dispatch. A non-emit/garbled echo is NOT genuine and is
+  // handled below by parse-fallback + degrade (BUG-1), never by aborting the whole run.
+  if (scan && !scan.doctorOk) {
     stopReason = 'integrity-fatal-midrun'
     return { aborted: true, reason: 'integrity FATAL detected mid-run; aborting before dispatch', mode, iteration: iter, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
   }
 
-  let snap
-  try { snap = JSON.parse(scan.snapshotJson) } catch (e) {
-    // One re-scan before giving up: the snapshot is relayed by an agent echoing scan-backlog's stdout
-    // verbatim, so a single garbled/truncated echo should not abort a long run. Re-run once; if it is
-    // still unparseable, the snapshot is genuinely malformed -> abort.
+  let snap = null
+  if (scan) { try { snap = JSON.parse(scan.snapshotJson) } catch (e) { snap = null } }
+  if (scan && !snap) {
+    // One schema re-scan on a garbled/truncated echo before falling back: the snapshot is relayed by an
+    // agent echoing scan-backlog's stdout verbatim, so a single bad echo should not derail a long run.
     log(`iter ${iter}: snapshot JSON unparseable — re-scanning once`)
     scan = await safeAgent(scanPrompt, { label: `scan#${iter}:retry`, phase: 'Iterate', schema: SCAN_RESULT, model: SHELL_MODEL }, () => null)
-    if (!scan) {
-      stopReason = 'scan-nonemit'
-      return { aborted: true, reason: 'scan agent never emitted after retries (on re-scan); re-run /go (git + .backlog/ are durable)', mode, iteration: iter }
-    }
-    if (!scan.doctorOk) {
+    if (scan && !scan.doctorOk) {
       stopReason = 'integrity-fatal-midrun'
       return { aborted: true, reason: 'integrity FATAL detected mid-run (on scan retry); aborting before dispatch', mode, iteration: iter, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
     }
-    try { snap = JSON.parse(scan.snapshotJson) } catch (e2) {
-      stopReason = 'snapshot-parse-error'
-      return { aborted: true, reason: 'could not parse backlog snapshot JSON after one retry', mode, iteration: iter, raw: (scan.snapshotJson || '').slice(0, 400) }
-    }
+    if (scan) { try { snap = JSON.parse(scan.snapshotJson) } catch (e) { snap = null } }
+  }
+  if (!snap) {
+    // Schema path exhausted (StructuredOutput non-emit, or unparseable twice). The model likely ran the
+    // command and answered without calling the tool — try a schema-LESS text scan and parse the JSON it
+    // printed (BUG-1 parse-fallback). The scan is read-only bookkeeping, not judgement.
+    log(`iter ${iter}: scan schema path failed — trying schema-less text scan`)
+    const fb = await textScanFallback(`scan#${iter}:text`)
+    if (fb) { snap = fb; log(`iter ${iter}: recovered snapshot via text fallback (doctor recheck skipped this iteration)`) }
+  }
+  if (!snap) {
+    // Even the text fallback failed. A read-only scan is bookkeeping, not judgement — do NOT abort the
+    // whole run (and discard hours of healthy iterations) over a transient helper-emit failure (BUG-1).
+    // Stop the loop gracefully and fall through to the defensive Drain, which integrates any remaining
+    // accepted work off the last good snapshot. git + .backlog/ are durable; re-run /go to continue.
+    stopReason = 'scan-degraded'
+    log(`iter ${iter}: scan produced no snapshot after retries + text fallback — stopping loop, draining, then return (re-run /go to continue)`)
+    break
   }
   lastSnapshot = snap
   const tasks = snap.tasks || []
@@ -469,6 +535,7 @@ Return the ScanResult.`
     timeoutH: (snap.inProgressTimeoutHours != null ? snap.inProgressTimeoutHours : DEFAULT_TIMEOUT_H),
     maxReject: MAX_REJECT_RETRY,
     maxBlock: MAX_BLOCK_RETRY,
+    parked: parkedThisRun,
     trunkRoot,
   })
 
@@ -556,90 +623,125 @@ Return the ScanResult.`
   ]
   if (preActions.length) await applyTransitions(preActions, `premove#${iter}`)
 
-  // ---- execute (parallel; one agent per claimed slug + all direct tasks) ----
-  // Build a flat dispatch list; results map back by position.
-  const dispatch = [
-    ...specialistQ.map((x) => ({ kind: 'specialist', t: x.t, from: 'in-progress' })),
-    ...directQ.map((x) => ({ kind: 'direct', t: x.t, from: 'in-progress' })),
-    ...reviewQ.map((x) => ({ kind: 'review', t: x.t, from: 'in-review' })),
-  ]
-  const justAcceptedTasks = [] // tasks accepted THIS iteration -> integrate in the same iteration (legacy timing)
-  let productiveDispatch = false // at least one dispatch returned a real (non-'none') transition
-  if (dispatch.length) {
-    const results = await parallel(dispatch.map((d) => () => {
-      const prompt = d.kind === 'review'
-        ? (d.t.slug === 'none' ? directReviewPrompt(d.t) : reviewerPrompt(d.t)) // none tasks have no worktree to clean-checkout
-        : d.kind === 'direct' ? directPrompt(d.t) : specialistPrompt(d.t)
-      // NO model: here — specialists/direct/reviewers do the REAL implementation/review work and MUST
-      // keep the session model (+ their agentType below). Only the deterministic shell-runners (scan,
-      // writer, integrate, bootstrap, drain) are routed to SHELL_MODEL.
-      const opts = { label: `${d.kind}:${d.t.slug === 'none' ? d.t.stem : d.t.slug}`, phase: 'Iterate', schema: ACFW_RESULT }
-      // Reviewers ALWAYS run as quality-reviewer (independent review — never the implementer's agent);
-      // specialists/direct run as the task's assigned agent (doctor guarantees a set agent exists).
-      const at = d.kind === 'review' ? 'quality-reviewer' : d.t.agent
-      if (at && at !== 'none') opts.agentType = at
-      return agent(prompt, opts)
-    }))
+  // ---- execute: STREAMING lifecycle per dispatched unit (BUG-3) ----
+  // Replaces the old "parallel(all) -> barrier -> batch post-move -> integrate" with a per-unit pipeline:
+  // each specialist/direct, on completion, flows through review and (default mode) integration WITHOUT
+  // waiting for the slowest unit in the wave — so a doc task done in minutes is reviewed+accepted (and
+  // a code task integrated) in minutes even while a multi-hour task in the same wave is still running.
+  // Two invariants are preserved by EXPLICIT serialization, not by the iteration barrier:
+  //   • single writer — every .backlog/ transition runs through serializeWrite (a promise chain), so
+  //                     apply-transition.sh calls never overlap even when units finish concurrently.
+  //   • integration   — serializeIntegrate serializes the git folds onto trunk. Cross-slug dependents are
+  //                     already gated at DISPATCH (depsSatisfied requires the dep accepted+integrated), so
+  //                     units accepted in the SAME wave are mutually dependency-independent and need only
+  //                     serialization, not ordering. Pre-existing accepted leftovers (which CAN be
+  //                     interdependent) integrate first, in one topo-ordered, lock-held pass.
+  let productiveDispatch = false // at least one dispatch produced a real (non-'none') transition
+  let integratedThisIter = 0
+  let writeTail = Promise.resolve()
+  const serializeWrite = (fn) => { const r = writeTail.then(() => fn()); writeTail = r.then(() => {}, () => {}); return r }
+  let integrateTail = Promise.resolve()
+  const serializeIntegrate = (fn) => { const r = integrateTail.then(() => fn()); integrateTail = r.then(() => {}, () => {}); return r }
+  const streamWrite = (actions, label) => serializeWrite(() => applyTransitions(actions, label))
+  const integTransient = (note) => () => ({ outcome: 'transient', note })
 
-    // ---- post-move (single writer, sequential) — map each ACFW-RESULT to a transition ----
-    const postActions = []
-    results.forEach((r, i) => {
-      if (!r || r.transition === 'none') return // transient: leave task where it is, retry next iteration
-      const d = dispatch[i]
-      let toState = null
-      if (d.from === 'in-progress' && r.transition === 'completed') toState = 'completed'
-      else if (d.from === 'in-progress' && r.transition === 'blocked') toState = 'blocked'
-      else if (d.from === 'in-review' && r.transition === 'accepted') toState = 'accepted'
-      else if (d.from === 'in-review' && r.transition === 'rejected') toState = 'rejected'
-      if (!toState) return // mismatched marker -> transient
-      if (toState === 'accepted') justAcceptedTasks.push(d.t)
-      postActions.push({
-        path: `${trunkRoot}/.backlog/${d.from}/${d.t.stem}.md`,
-        toState,
-        agent: d.t.agent || 'orchestrator',
-        notes: (r.notes || '').slice(0, 200),
-        inc: (toState === 'rejected' && r.rejectionIncrement === 1) ? 1 : 0,
-        // Bump Block-Count only on a SPECIALIST re-block of a dispatched task (deps were satisfied at
-        // dispatch, so this is the unmodeled-blocker signal — retro I2). Timeout/redesign blocks keep
-        // their own gates and do NOT count here.
-        binc: (toState === 'blocked' && d.from === 'in-progress') ? 1 : 0,
-      })
-    })
-    productiveDispatch = postActions.length > 0 // a real transition was applied (not just a transient/mismatched marker)
-    if (postActions.length) await applyTransitions(postActions, `postmove#${iter}`)
+  // Fold ONE accepted task's worktree branch into trunk (resolver hoisted). Updates integration tallies.
+  async function integrateOne(t) {
+    let r = await safeAgent(integratePrompt(t, false), { label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate agent non-emit — left accepted, retry next iteration'))
+    if (r && r.outcome === 'resolver-needed') {
+      log(`integrate ${t.slug}: conflict — dispatching resolver ${r.resolverAgent || t.agent || '(default)'}`)
+      // NO model: here — the conflict resolver does REAL merge-conflict reasoning; session model + agentType.
+      const ropts = { label: `resolve:${t.slug}`, phase: 'Iterate' }
+      const ragent = r.resolverAgent || t.agent
+      if (ragent && ragent !== 'none') ropts.agentType = ragent
+      await agent(resolverPrompt(t, r), ropts)
+      r = await safeAgent(integratePrompt(t, true), { label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
+    }
+    if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); integratedThisIter++; log(`✓ integrated ${t.stem}`) }
+    else if (r && r.outcome === 'rejected') { rejectedStems.push(t.stem); log(`✗ integrate rejected ${t.stem} — ${r.note}`) }
+    else if (r && r.outcome === 'skipped') { log(`↷ skipped ${t.stem} — no worktree branch (historical; terminal)`) }
+    // transient/error -> leave accepted, retry next iteration
   }
 
-  // ---- integrate (default mode only; sequential, topo order; resolver hoisted) ----
-  let integratedThisIter = 0
+  // Review one task that is NOW in in-review/ (moved there by premove for reviewQ, or inline below for a
+  // freshly-completed specialist), then integrate on accept. A reviewer non-emit throws out of the unit
+  // thunk -> parallel maps it to null; the task is left committed in in-review/ and re-reviewed next scan.
+  async function runReviewAndIntegrate(t) {
+    const isNone = t.slug === 'none'
+    const rprompt = isNone ? directReviewPrompt(t) : reviewerPrompt(t)
+    // Reviewers ALWAYS run as quality-reviewer (independent review — never the implementer's agent).
+    const rr = await agent(rprompt, { label: `review:${isNone ? t.stem : t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' })
+    const toState = resultToState('in-review', rr && rr.transition)
+    if (!toState) return // none/mismatched -> transient, leave in in-review/
+    await streamWrite([{ path: `${trunkRoot}/.backlog/in-review/${t.stem}.md`, toState, agent: t.agent || 'orchestrator', notes: (rr.notes || '').slice(0, 200), inc: (toState === 'rejected' && rr.rejectionIncrement === 1) ? 1 : 0 }], `review#${iter}:${t.stem}`)
+    productiveDispatch = true
+    if (toState === 'accepted' && mode === 'default' && codeSlug(t)) await serializeIntegrate(() => integrateOne(t))
+  }
+
+  // Run one specialist/direct unit, then stream it through review (+integration) on completion.
+  async function processUnit(d) {
+    if (d.kind === 'review') return runReviewAndIntegrate(d.t) // already in in-review/ (premove)
+    const prompt = d.kind === 'direct' ? directPrompt(d.t) : specialistPrompt(d.t)
+    // NO model: specialists/direct do REAL work — keep the session model (+ agentType). Only the
+    // deterministic shell-runners (scan, writer, integrate, bootstrap, drain) use SHELL_MODEL.
+    const opts = { label: `${d.kind}:${d.t.slug === 'none' ? d.t.stem : d.t.slug}`, phase: 'Iterate', schema: ACFW_RESULT }
+    const at = d.t.agent
+    if (at && at !== 'none') opts.agentType = at
+    const r = await agent(prompt, opts) // throws on non-emit -> parallel thunk -> null (transient)
+    const toState = resultToState('in-progress', r && r.transition)
+    if (!toState) return // none/mismatched -> leave in in-progress/, retry next iteration
+    if (toState === 'blocked') {
+      // BUG-2: dependency-missing -> park for an operator now (stop re-queueing) + actionable message.
+      if (r.blockedReason === 'dependency-missing') {
+        parkedThisRun.add(d.t.stem)
+        const need = (r.needsTask || '').trim()
+        if (need) parkedNeeds.set(d.t.stem, need.slice(0, 200))
+        log(`⚑ ${d.t.stem}: blocked on unmodeled work — create a task: ${need || '(unspecified — see task notes)'} — parked, not re-dispatching this run`)
+      }
+      // binc:1 — a specialist re-block of a dispatched task is the unmodeled-blocker signal (retro I2).
+      await streamWrite([{ path: `${trunkRoot}/.backlog/in-progress/${d.t.stem}.md`, toState: 'blocked', agent: d.t.agent || 'orchestrator', notes: (r.notes || '').slice(0, 200), inc: 0, binc: 1 }], `block#${iter}:${d.t.stem}`)
+      productiveDispatch = true
+      return
+    }
+    // completed: move in-progress -> completed -> in-review (one writer call), then review+integrate inline.
+    await streamWrite([
+      { path: `${trunkRoot}/.backlog/in-progress/${d.t.stem}.md`, toState: 'completed', agent: d.t.agent || 'orchestrator', notes: (r.notes || '').slice(0, 200), inc: 0 },
+      { path: `${trunkRoot}/.backlog/completed/${d.t.stem}.md`, toState: 'in-review', agent: 'orchestrator', notes: 'review-dispatch', inc: 0 },
+    ], `done#${iter}:${d.t.stem}`)
+    productiveDispatch = true
+    await runReviewAndIntegrate(d.t)
+  }
+
+  // Pre-existing accepted leftovers (from the scan) CAN be interdependent — integrate them in one
+  // topo-ordered, lock-held pass that runs concurrently with the dispatch wave below. A branchless
+  // historical/pre-2.0.0 accepted task is already on trunk (isTerminal treats it terminal) — never
+  // enqueue it, or integrate-worktree would fetch a missing ref and retry forever.
+  let priorIntegratePass = Promise.resolve()
   if (mode === 'default') {
     const seenC = new Set()
     const candidates = []
-    // Only enqueue accepted tasks that have a real worktree branch to fold in. A branchless
-    // historical/pre-2.0.0 accepted task is already on trunk (isTerminal treats it terminal) — never
-    // enqueue it, or integrate-worktree would fetch a missing ref and retry forever.
-    for (const t of [...tasks.filter((t) => t.folder === 'accepted' && codeSlug(t) && !t.hasIntegratedAt && t.hasWorktreeBranch), ...justAcceptedTasks.filter(codeSlug)]) {
+    for (const t of tasks.filter((t) => t.folder === 'accepted' && codeSlug(t) && !t.hasIntegratedAt && t.hasWorktreeBranch)) {
       if (seenC.has(t.stem)) continue
       seenC.add(t.stem); candidates.push(t)
     }
-    const ordered = topoIntegrationOrder(candidates, idx, () => log('WARN integrate: dependency cycle among integration candidates — using input order; run /whip-doctor'))
-    const integTransient = (note) => () => ({ outcome: 'transient', note })
-    for (const t of ordered) {
-      let r = await safeAgent(integratePrompt(t, false), { label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate agent non-emit — left accepted, retry next iteration'))
-      if (r && r.outcome === 'resolver-needed') {
-        log(`integrate ${t.slug}: conflict — dispatching resolver ${r.resolverAgent || t.agent || '(default)'}`)
-        // NO model: here — the conflict resolver does REAL merge-conflict reasoning; session model + agentType.
-        const ropts = { label: `resolve:${t.slug}`, phase: 'Iterate' }
-        const ragent = r.resolverAgent || t.agent
-        if (ragent && ragent !== 'none') ropts.agentType = ragent
-        await agent(resolverPrompt(t, r), ropts)
-        r = await safeAgent(integratePrompt(t, true), { label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
-      }
-      if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); integratedThisIter++; log(`✓ integrated ${t.stem}`) }
-      else if (r && r.outcome === 'rejected') { rejectedStems.push(t.stem); log(`✗ integrate rejected ${t.stem} — ${r.note}`) }
-      else if (r && r.outcome === 'skipped') { log(`↷ skipped ${t.stem} — no worktree branch (historical; terminal)`) }
-      // transient/error -> leave accepted, retry next iteration
+    if (candidates.length) {
+      const ordered = topoIntegrationOrder(candidates, idx, () => log('WARN integrate: dependency cycle among integration candidates — using input order; run /whip-doctor'))
+      priorIntegratePass = serializeIntegrate(async () => { for (const t of ordered) await integrateOne(t) })
     }
   }
+
+  // ---- dispatch the wave; each unit streams its own lifecycle (BUG-3) ----
+  const dispatch = [
+    ...specialistQ.map((x) => ({ kind: 'specialist', t: x.t })),
+    ...directQ.map((x) => ({ kind: 'direct', t: x.t })),
+    ...reviewQ.map((x) => ({ kind: 'review', t: x.t })),
+  ]
+  if (dispatch.length) {
+    // BUG-5: name what this wave is running so a supervisor can see WHAT is in flight without polling.
+    log(`iter ${iter}: dispatching ${specialistQ.length} specialist + ${directQ.length} direct + ${reviewQ.length} review — ${dispatch.map((d) => `${d.kind}:${d.t.slug === 'none' ? d.t.stem : d.t.slug}`).join(', ')}`)
+    await parallel(dispatch.map((d) => () => processUnit(d)))
+  }
+  await priorIntegratePass // ensure leftover integration finished before progress accounting
 
   // ---- progress accounting (computed from THIS iteration's work) ----
   // didWork drives the idle guard (break at 3). A pre-move (unblock/timeout/dispatch/reject), an
@@ -666,9 +768,15 @@ Final integration drain. Run  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trun
   )
   let snap2 = null
   try { snap2 = rescan ? JSON.parse(rescan.snapshotJson) : null } catch (e) { snap2 = null }
+  // BUG-6a: if the drain scan itself can't emit (it routes through the same schema-forced agent as the
+  // main scan), drain off the last good in-memory snapshot instead of skipping integration entirely. A
+  // stale snapshot may list a just-integrated task as still-accepted, so exclude stems already integrated
+  // this run; integrate-worktree treats an already-folded (empty) branch as terminal, so it is a no-op
+  // even if one slips through.
+  if (!snap2) snap2 = lastSnapshot
   if (snap2) {
     const idx2 = indexTasks(snap2.tasks || [], snap2.satisfiedDeps)
-    const left = topoIntegrationOrder((snap2.tasks || []).filter((t) => t.folder === 'accepted' && t.slug && t.slug !== 'none' && !t.hasIntegratedAt && t.hasWorktreeBranch), idx2)
+    const left = topoIntegrationOrder((snap2.tasks || []).filter((t) => t.folder === 'accepted' && t.slug && t.slug !== 'none' && !t.hasIntegratedAt && t.hasWorktreeBranch && !integratedStems.includes(t.stem)), idx2)
     for (const t of left) {
       // single defensive pass: an exit-7 here is intentionally left for the next /go run (no resolver post-loop)
       const r = await safeAgent(integratePrompt(t, false), { label: `drain:${t.slug}`, phase: 'Drain', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, () => ({ outcome: 'transient', note: 'drain integrate non-emit' }))
@@ -680,14 +788,19 @@ Final integration drain. Run  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trun
 // ============================ REPORT ============================
 const finalCounts = lastSnapshot ? lastSnapshot.counts : null
 // Tasks parked for an operator: blocked at the re-block cap (their real blocker is unmodeled — retro
-// I2) or at the max-rejection cap. These are why a "complete" run can still leave blocked tasks: the
-// loop-breaker intentionally stops re-dispatching them instead of livelocking. Surface them explicitly.
-const needsOperator = ((lastSnapshot && lastSnapshot.tasks) || [])
+// I2) or at the max-rejection cap, OR explicitly parked this run on a dependency-missing signal (BUG-2,
+// possibly before reaching the cap). These are why a "complete" run can still leave blocked tasks: the
+// loop-breaker intentionally stops re-dispatching them instead of livelocking. Surface them explicitly,
+// with the missing-task hint when the specialist provided one.
+const capParked = ((lastSnapshot && lastSnapshot.tasks) || [])
   .filter((t) => t.folder === 'blocked' && ((t.blockCount || 0) >= MAX_BLOCK_RETRY || (t.rejectionCount || 0) >= MAX_REJECT_RETRY))
-  .map((t) => ({ stem: t.stem, blockCount: t.blockCount || 0, rejectionCount: t.rejectionCount || 0 }))
+  .map((t) => ({ stem: t.stem, blockCount: t.blockCount || 0, rejectionCount: t.rejectionCount || 0, needsTask: parkedNeeds.get(t.stem) || '' }))
+const capParkedStems = new Set(capParked.map((n) => n.stem))
+const depParked = [...parkedThisRun].filter((s) => !capParkedStems.has(s)).map((s) => ({ stem: s, blockCount: 0, rejectionCount: 0, needsTask: parkedNeeds.get(s) || '' }))
+const needsOperator = [...capParked, ...depParked]
 return {
   completed: stopReason === 'complete',
-  stopReason, // complete | no-progress | max-iterations | (aborts return earlier)
+  stopReason, // complete | no-progress | max-iterations | scan-degraded | (aborts return earlier)
   mode,
   iterations: iter,
   finalCounts,
@@ -699,6 +812,8 @@ return {
     ? 'Backlog 100% terminal.'
     : stopReason === 'no-progress'
       ? 'No progress for 3 iterations — user intervention needed (check blocked/ and rejected/).'
-      : 'Hit the iteration cap.')
+      : stopReason === 'scan-degraded'
+        ? 'Scan could not emit a snapshot after retries + schema-less text fallback; stopped the loop and drained integratable work. Nothing lost (git + .backlog/ are durable) — re-run /go to continue.'
+        : 'Hit the iteration cap.')
     + (needsOperator.length ? ` ${needsOperator.length} task(s) parked for an operator (re-block/rejection cap reached): ${needsOperator.map((n) => n.stem).join(', ')}.` : ''),
 }
