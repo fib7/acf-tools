@@ -34,7 +34,7 @@ const block = text.slice(start, end)
 // Build a factory that closes over an injected `mode` and returns the functions.
 function load(mode) {
   // eslint-disable-next-line no-new-func
-  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H };`)
+  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, resultToState, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H };`)
   return factory(mode)
 }
 const Sdef = load('default')
@@ -186,6 +186,19 @@ const T = (o) => ({
     const r = planUnblockAndTimeout(tasks, indexTasks(tasks), { trunkRoot: '/r', maxBlock: 1 })
     check('I2: blockCount 1 >= custom maxBlock 1 -> NOT unblocked', r.unblockActions.length === 0)
   }
+  // (3e) BUG-2: blocked, deps satisfied, blockCount < cap, but stem is PARKED (dependency-missing) -> NOT unblocked
+  {
+    const B = T({ stem: 'b', folder: 'blocked', slug: 'sb', deps: ['a'], rejectionCount: 0, blockCount: 0 })
+    const tasks = [A, B]
+    const parkedOff = planUnblockAndTimeout(tasks, indexTasks(tasks), { trunkRoot: '/r' })
+    check('BUG-2: not parked -> unblocked (baseline)', parkedOff.unblockActions.length === 1)
+    const parkedOnSet = planUnblockAndTimeout(tasks, indexTasks(tasks), { trunkRoot: '/r', parked: new Set(['b']) })
+    check('BUG-2: parked stem (Set) -> NOT unblocked even below the cap', parkedOnSet.unblockActions.length === 0)
+    const parkedOnArr = planUnblockAndTimeout(tasks, indexTasks(tasks), { trunkRoot: '/r', parked: ['b'] })
+    check('BUG-2: parked accepts an array too', parkedOnArr.unblockActions.length === 0)
+    const parkedOther = planUnblockAndTimeout(tasks, indexTasks(tasks), { trunkRoot: '/r', parked: new Set(['z']) })
+    check('BUG-2: parking an unrelated stem does not suppress this one', parkedOther.unblockActions.length === 1)
+  }
   // (4) in-progress stale -> timeout->blocked, excluded from freshInProgress
   {
     const IP = T({ stem: 'ip', folder: 'in-progress', slug: 'si', ageHours: 20 })
@@ -245,6 +258,19 @@ const T = (o) => ({
   const ord2 = topoIntegrationOrder([X, Y], indexTasks([X, Y]), () => { cycled = true })
   check('topo: cycle triggers onCycle callback', cycled === true)
   check('topo: cycle falls back to input order (all kept)', ord2.length === 2)
+}
+
+// ============================ resultToState (BUG-3 streaming lifecycle) ============================
+{
+  const { resultToState } = Sdef
+  check('in-progress + completed -> completed', resultToState('in-progress', 'completed') === 'completed')
+  check('in-progress + blocked -> blocked', resultToState('in-progress', 'blocked') === 'blocked')
+  check('in-review + accepted -> accepted', resultToState('in-review', 'accepted') === 'accepted')
+  check('in-review + rejected -> rejected', resultToState('in-review', 'rejected') === 'rejected')
+  check('in-progress + accepted -> null (illegal jump)', resultToState('in-progress', 'accepted') === null)
+  check('in-review + completed -> null (illegal jump)', resultToState('in-review', 'completed') === null)
+  check('any + none -> null (transient)', resultToState('in-progress', 'none') === null && resultToState('in-review', 'none') === null)
+  check('any + undefined -> null (non-emit)', resultToState('in-progress', undefined) === null)
 }
 
 console.log(`\nphase2-scheduler: ${PASS} passed, ${FAIL} failed`)
