@@ -38,6 +38,9 @@
 
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/../../lib/acfw-git.sh"
+
 COUNTS_ONLY=false
 DIGEST=false
 MODE_ARG=default
@@ -66,6 +69,10 @@ ENV_TIMEOUT="${ACFW_INPROGRESS_TIMEOUT_HOURS:-}"
 [ -f "$BL/.acfw-config" ] && . "$BL/.acfw-config" >/dev/null 2>&1
 TIMEOUT_H="${ENV_TIMEOUT:-${ACFW_INPROGRESS_TIMEOUT_HOURS:-8}}"
 printf '%s' "$TIMEOUT_H" | grep -qE '^[0-9]+$' || TIMEOUT_H=8
+
+# Worktree ownership namespace (env > .acfw-config > default). Emitted in the snapshot so the
+# workflow's prompt strings reference the configured branch prefix, not a hardcoded one.
+acfw_load_namespace "$REPO_ROOT"
 
 # ---- JSON helpers ----
 # Escape a single-line string for embedding in JSON (backslash, doublequote;
@@ -168,7 +175,7 @@ c_total=$((c_pending + c_inprogress + c_completed + c_inreview + c_blocked + c_r
 # is correct in BOTH full and --counts-only modes. hasWorktreeBranch distinguishes a live,
 # integratable accepted task (branch exists) from a historical/pre-2.0.0 one (no branch — already
 # on trunk, terminal). Membership is a fixed-string whole-line compare (metachar-safe).
-EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' refs/heads/worktree/ 2>/dev/null | sed 's#^worktree/##')
+EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' "refs/heads/$ACFW_BRANCH_PREFIX/" 2>/dev/null | sed "s#^${ACFW_BRANCH_PREFIX}/##")
 
 # Dep-token set for the digest satisfiedDeps filter: the Dependencies tokens referenced by
 # NON-ACCEPTED active tasks (pending/in-progress/completed/in-review/blocked/rejected) — extracted
@@ -431,11 +438,11 @@ if [ "$COUNTS_ONLY" = "false" ] && [ "$DIGEST" = false ] && [ -d "$REPO_ROOT/.wo
     [ -z "$wt" ] && continue
     slug=$(basename "$wt")
     actual=$(git -C "$wt" branch --show-current 2>/dev/null || true)
-    onExpected=false; [ "$actual" = "worktree/$slug" ] && onExpected=true
+    onExpected=false; [ "$actual" = "$ACFW_BRANCH_PREFIX/$slug" ] && onExpected=true
     isLive=false; printf '%s\n' "$LIVE_SLUGS" | grep -qxF "$slug" && isLive=true
     if [ "$wfirst" -eq 1 ]; then wfirst=0; else WT_JSON="$WT_JSON,"; fi
     WT_JSON="$WT_JSON{\"slug\":\"$(jesc "$slug")\",\"branch\":\"$(jesc "$actual")\",\"onExpectedBranch\":$onExpected,\"isLive\":$isLive}"
-  done < <(find "$REPO_ROOT/.worktree" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+  done < <(find "$REPO_ROOT/$ACFW_WORKTREE_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
 fi
 
 # ---- Assemble ----
@@ -449,6 +456,8 @@ printf '"digest":%s,' "$DIGEST"
 printf '"mode":"%s",' "$MODE_ARG"
 printf '"generatedAt":"%s",' "$GEN_TS"
 printf '"inProgressTimeoutHours":%d,' "$TIMEOUT_H"
+printf '"branchPrefix":"%s",' "$(jesc "$ACFW_BRANCH_PREFIX")"
+printf '"worktreeDir":"%s",' "$(jesc "$ACFW_WORKTREE_DIR")"
 emit_counts
 printf ',"tasks":[%s]' "$TASKS_JSON"
 printf ',"satisfiedDeps":[%s]' "$DIGEST_SAT_JSON"

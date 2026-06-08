@@ -94,3 +94,30 @@ append_log_row() {
   fi
   rm -f "$tmp"
 }
+
+# acfw_load_namespace <repo-root> — resolve the worktree DIRECTORY and BRANCH PREFIX
+# that acf-whip owns. Sets two globals:
+#   ACFW_WORKTREE_DIR    per-task worktree dir, relative to repo root (default ".worktree")
+#   ACFW_BRANCH_PREFIX   branch namespace acf-whip owns; trees live on <prefix>/<slug> (default "worktree")
+#
+# Why this matters: acf-whip must only ever create/remove/inspect worktrees inside its OWN
+# namespace. A user may keep unrelated research/benchmark worktrees in the same repo (even under
+# .worktree/) — those must be invisible to the doctor's orphan reaper. The branch prefix is the
+# ownership signal; the dir is where new trees are placed.
+#
+# Precedence: .backlog/.acfw-config > inherited env var > built-in default. The committed config is
+# the source of truth (sourcing it overwrites any inherited env value); an env var only fills in a
+# key the config does not pin. This is order-independent — safe to call before OR after another code
+# path has already sourced .acfw-config (e.g. the timeout block in doctor.sh / scan-backlog.sh).
+# Idempotent.
+acfw_load_namespace() { # <repo-root>
+  [ -n "${1:-}" ] && [ -f "$1/.backlog/.acfw-config" ] && . "$1/.backlog/.acfw-config" >/dev/null 2>&1
+  ACFW_WORKTREE_DIR="${ACFW_WORKTREE_DIR:-.worktree}"
+  ACFW_BRANCH_PREFIX="${ACFW_BRANCH_PREFIX:-worktree}"
+  # Strip any stray leading "./" or trailing "/" on the dir, and a trailing "/" on the prefix,
+  # so downstream "$DIR/$SLUG" and "$PREFIX/$SLUG" concatenations are well-formed.
+  ACFW_WORKTREE_DIR="${ACFW_WORKTREE_DIR#./}"; ACFW_WORKTREE_DIR="${ACFW_WORKTREE_DIR%/}"
+  ACFW_BRANCH_PREFIX="${ACFW_BRANCH_PREFIX%/}"
+  [ -z "$ACFW_WORKTREE_DIR" ] && ACFW_WORKTREE_DIR=".worktree"
+  [ -z "$ACFW_BRANCH_PREFIX" ] && ACFW_BRANCH_PREFIX="worktree"
+}

@@ -45,8 +45,9 @@ fi
 # ---- Step 2: Derive paths and resolve trunk ----
 REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}"
 TRUNK_BRANCH="${ACFW_TRUNK_BRANCH:-$(git -C "$REPO_ROOT" symbolic-ref --short HEAD 2>/dev/null)}"
-WORKTREE_PATH="$REPO_ROOT/.worktree/$SLUG"
-BRANCH="worktree/$SLUG"
+acfw_load_namespace "$REPO_ROOT"   # sets ACFW_WORKTREE_DIR / ACFW_BRANCH_PREFIX
+WORKTREE_PATH="$REPO_ROOT/$ACFW_WORKTREE_DIR/$SLUG"
+BRANCH="$ACFW_BRANCH_PREFIX/$SLUG"
 
 if [ -z "$TRUNK_BRANCH" ]; then
   echo "FATAL: cannot resolve trunk branch (HEAD detached?). Refuse to create worktree." >&2

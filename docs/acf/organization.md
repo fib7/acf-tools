@@ -17,6 +17,7 @@
 project-root/
 ├── docs/                        # ALL documentation (MANDATORY)
 ├── .backlog/                   # Task state machine (if using ACF workflow)
+├── .worktree/                  # Per-task git worktrees (if using ACF workflow; gitignored, ephemeral)
 ├── .claude/                    # Claude configuration
 └── [source code directories]   # src/, cmd/, app/, etc.
 ```
@@ -57,6 +58,22 @@ docs/
 ├── .metrics/
 └── README.md
 ```
+
+### Per-Task Worktree Directory (if using ACF workflow)
+
+Git worktrees for parallel task execution MUST live at the repo root in `.worktree/`.
+
+**Location**:
+- ✅ `<repo-root>/.worktree/<slug>` (dot-prefixed, at repo root)
+- ❌ `.claude/.worktree/` (wrong location)
+- ❌ `../<repo>-<branch>/` (sibling/external paths)
+- ❌ `worktrees/` or `worktree/` (wrong name / missing dot)
+
+**Rules**:
+- **Ephemeral**: created on demand by `clean-checkout-before-task`, removed after integration. Never commit worktree contents.
+- **Gitignored**: `.worktree/` MUST be in `.gitignore` (added by `/whip-init`).
+- **Branch namespace**: each worktree is checked out on `worktree/<slug>`. acf-whip manages **only** worktrees on this branch namespace — any other worktree you park under `.worktree/` (e.g. research/benchmarking) is left untouched.
+- **Configurable**: the directory and branch prefix are overridable via `.backlog/.acfw-config` (`ACFW_WORKTREE_DIR`, `ACFW_BRANCH_PREFIX`) — set them only on a fresh backlog.
 
 ---
 

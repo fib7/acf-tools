@@ -38,6 +38,8 @@ The orchestrator (`/go`) groups pending tasks by `Worktree:` and dispatches at m
 
 The lock is git itself: `git worktree add <repo>/.worktree/<slug> -b worktree/<slug>` fails when the branch is already checked out elsewhere. No custom lock files, daemons, or schedulers.
 
+**Ownership scope.** acf-whip owns exactly one branch namespace — `worktree/<slug>` — and only ever creates, inspects, or removes worktrees on it. The doctor's orphan reaper and wrong-branch check are scoped to that namespace, so the `/go` bootstrap `--fix` never touches a worktree you keep in the same repo for your own research/benchmarking, even one parked under `.worktree/`. The directory and branch prefix are configurable per project via `.backlog/.acfw-config` (`ACFW_WORKTREE_DIR`, `ACFW_BRANCH_PREFIX`); change them only on a fresh backlog.
+
 ### Step 0: clean-checkout-before-task
 
 Every implementer specialist and `quality-reviewer` invokes the `clean-checkout-before-task` skill as Step 0, before reading the task body. The skill:
