@@ -58,8 +58,9 @@ if [ -z "$SLUG" ]; then
   exit 1
 fi
 
-WORKTREE="$ACFW_TRUNK_ROOT/.worktree/$SLUG"
-BRANCH="worktree/$SLUG"
+acfw_load_namespace "$ACFW_TRUNK_ROOT"   # sets ACFW_WORKTREE_DIR / ACFW_BRANCH_PREFIX
+WORKTREE="$ACFW_TRUNK_ROOT/$ACFW_WORKTREE_DIR/$SLUG"
+BRANCH="$ACFW_BRANCH_PREFIX/$SLUG"
 TRUNK_SHA_AFTER=""  # set before do_success
 
 # ---- Step 7: Success path ----

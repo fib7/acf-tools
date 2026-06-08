@@ -108,6 +108,58 @@ check "live worktree NOT flagged orphan" "! echo \"$OUT\" | grep -q 'orphaned-wo
 bash "$DOC" --fix "$REPO" >/dev/null
 check "orphan worktree removed after --fix" "[ ! -d '$REPO/.worktree/ghost' ]"
 
+echo "== ownership scoping: foreign worktrees under .worktree/ are left alone =="
+# A user's own research/benchmark worktree parked under .worktree/, on a NON-namespace branch.
+# acf-whip owns only the <prefix>/<slug> branch namespace, so this must be invisible to the
+# doctor: no orphaned-worktree, no wrong-branch FATAL, and NOT removed by --fix.
+git -C "$REPO" worktree add -q "$REPO/.worktree/research" -b bench/research trunk 2>/dev/null
+mkdir -p "$REPO/.worktree/scratch"   # a plain (non-worktree) dir — also not ours
+OUT=$(bash "$DOC" "$REPO")
+check "foreign worktree NOT flagged orphan" "! echo \"$OUT\" | grep -q 'orphaned-worktree|research'"
+check "foreign worktree NOT flagged wrong-branch" "! echo \"$OUT\" | grep -q 'worktree-wrong-branch|research'"
+check "plain dir under .worktree NOT flagged" "! echo \"$OUT\" | grep -q 'scratch'"
+bash "$DOC" --fix "$REPO" >/dev/null 2>&1
+check "foreign worktree SURVIVES --fix" "[ -d '$REPO/.worktree/research' ]"
+check "foreign branch SURVIVES --fix" "git -C '$REPO' show-ref --verify --quiet refs/heads/bench/research"
+check "plain dir SURVIVES --fix" "[ -d '$REPO/.worktree/scratch' ]"
+git -C "$REPO" worktree remove --force "$REPO/.worktree/research" 2>/dev/null
+git -C "$REPO" branch -D bench/research >/dev/null 2>&1
+rm -rf "$REPO/.worktree/scratch"
+
+echo "== configurable namespace (.acfw-config ACFW_WORKTREE_DIR / ACFW_BRANCH_PREFIX) =="
+CN="$WORK/cnrepo"; git init -q -b main "$CN"
+git -C "$CN" config user.email t@t; git -C "$CN" config user.name t
+mkdir -p "$CN/.backlog"/{pending,in-progress,completed,in-review,blocked,rejected,accepted}
+mkdir -p "$CN/.claude/agents"; echo x > "$CN/.claude/agents/go-engineer.md"
+printf 'ACFW_WORKTREE_DIR=.wt\nACFW_BRANCH_PREFIX=wtx\n' > "$CN/.backlog/.acfw-config"
+echo seed > "$CN/seed"; git -C "$CN" add -A; git -C "$CN" commit -qm seed
+cat > "$CN/.backlog/pending/c1.md" <<EOF
+# Task: c1
+
+## Metadata
+
+- **ID**: c1
+- **Status**: pending
+- **Assigned Agent**: go-engineer
+- **Worktree**: cslug
+- **PR Group**: cslug
+- **Dependencies**: none
+- **Integrated-At**:
+- **Rejection Count**: 0
+- **Touches Globs**:
+
+## Transition Log
+EOF
+git -C "$CN" add -A; git -C "$CN" commit -qm c1
+OUT=$(ACFW_TRUNK_ROOT="$CN" ACFW_TRUNK_BRANCH=main bash "$CC" "$CN/.backlog/pending/c1.md" 2>/dev/null)
+check "clean-checkout prints custom worktree path" "[ \"$OUT\" = '$CN/.wt/cslug' ]"
+check "worktree created at custom dir .wt/cslug" "[ -d '$CN/.wt/cslug' ]"
+check "branch created in custom namespace wtx/cslug" "git -C '$CN' show-ref --verify --quiet refs/heads/wtx/cslug"
+check "default .worktree/ NOT created under custom namespace" "[ ! -d '$CN/.worktree' ]"
+OUT=$(ACFW_TRUNK_ROOT="$CN" ACFW_TRUNK_BRANCH=main bash "$DOC" "$CN")
+check "doctor ok under custom namespace" "echo \"$OUT\" | grep -q 'SUMMARY|.*|ok=true'"
+check "live custom-namespace worktree NOT flagged orphan" "! echo \"$OUT\" | grep -q 'orphaned-worktree|cslug'"
+
 echo "== WARN: lingering in-review =="
 mktask in-review wr wr in-review go-engineer none "" 0; git add -A; git commit -qm wr
 OUT=$(bash "$DOC" "$REPO")

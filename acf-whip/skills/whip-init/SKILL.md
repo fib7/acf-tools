@@ -94,16 +94,19 @@ ls -1 .backlog/ | grep -v README.md | xargs -I {} echo "  - {}"
 
 ### Step 3.5: Configure Worktree Concurrency, Env Hydration, and Doctor Config
 
-**3.5a — gitignore entries.** Add `.worktree/` (per-task isolated worktrees) and
-`.backlog/.acfw-run.json` (the `/go` run heartbeat) to `.gitignore`.
+**3.5a — gitignore entries.** Add the per-task worktree dir (default `.worktree/`, or the
+`ACFW_WORKTREE_DIR` you set in 3.5c) and `.backlog/.acfw-run.json` (the `/go` run heartbeat)
+to `.gitignore`. ACF convention: per-task worktrees live at `<repo-root>/.worktree/` and are
+gitignored (see `docs/acf/organization.md` → "Per-Task Worktree Directory").
 
 ```bash
+WT_DIR="${ACFW_WORKTREE_DIR:-.worktree}"   # honor a custom dir if .acfw-config sets one
 ensure_gitignore() { # <pattern> <comment>
   if [ -f .gitignore ] && grep -qxF "$1" .gitignore; then return; fi
   printf '\n# %s\n%s\n' "$2" "$1" >> .gitignore
   echo "✓ Added $1 to .gitignore"
 }
-ensure_gitignore '.worktree/' 'ACF Whip per-task worktrees (clean-checkout-before-task)'
+ensure_gitignore "${WT_DIR%/}/" 'ACF Whip per-task worktrees (clean-checkout-before-task)'
 ensure_gitignore '.backlog/.acfw-run.json' 'ACF Whip /go run heartbeat'
 ```
 
@@ -143,16 +146,26 @@ fi
 
 **3.5c — doctor config.** Scaffold `.backlog/.acfw-config` with the operator-tunable
 in-progress timeout (default 8h; lower it for overnight runs so an agent killed mid-edit
-frees its slug sooner). Read by `doctor.sh` and `/go`.
+frees its slug sooner) and the worktree namespace acf-whip owns. Read by `doctor.sh`,
+`scan-backlog.sh`, `clean-checkout.sh`, `integrate-worktree.sh`, and `/go`.
 
 ```bash
 if [ ! -f .backlog/.acfw-config ]; then
   cat > .backlog/.acfw-config <<'EOF'
-# ACF Whip runtime config (sourced by doctor.sh and /go).
+# ACF Whip runtime config (sourced by doctor.sh, scan-backlog.sh, clean-checkout.sh,
+# integrate-worktree.sh, and /go).
+
 # Hours before an in-progress task is flagged stale / timed out to blocked.
 ACFW_INPROGRESS_TIMEOUT_HOURS=8
+
+# Worktree namespace acf-whip OWNS and may create/remove. acf-whip only ever touches
+# worktrees on the <ACFW_BRANCH_PREFIX>/<slug> branch — any other worktree (including one
+# you park under ACFW_WORKTREE_DIR for your own research/benchmarking) is left untouched.
+# Change these ONLY on a fresh backlog: existing worktrees are pinned to the old namespace.
+ACFW_WORKTREE_DIR=.worktree
+ACFW_BRANCH_PREFIX=worktree
 EOF
-  echo "✓ Created .backlog/.acfw-config (ACFW_INPROGRESS_TIMEOUT_HOURS=8)"
+  echo "✓ Created .backlog/.acfw-config (timeout=8h, worktree namespace .worktree / worktree)"
 fi
 ```
 
