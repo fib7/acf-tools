@@ -43,6 +43,7 @@ while [ $# -gt 0 ]; do
 done
 REPO_ROOT="${1:-${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}}"
 BL="$REPO_ROOT/.backlog"
+acfw_load_namespace "$REPO_ROOT"   # sets ACFW_WORKTREE_DIR / ACFW_BRANCH_PREFIX (worktree ownership)
 ACTIVE="pending in-progress completed in-review blocked rejected accepted"
 # Non-accepted active folders: in --active-only mode the full per-file pass runs only over these
 # (accepted is fed to the awk graph as a cheap batched stub — see emit_accepted_stub_tsv).
@@ -66,7 +67,7 @@ commit_fix() { # <path-rel> <msg>
 # task (its worktree/<slug> branch exists) from a historical/pre-2.0.0 one (no branch — already
 # on trunk the old way, nothing to integrate, terminal). Membership is a fixed-string whole-line
 # compare so a metachar slug never matches the wrong entry.
-EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' refs/heads/worktree/ 2>/dev/null | sed 's#^worktree/##')
+EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' "refs/heads/$ACFW_BRANCH_PREFIX/" 2>/dev/null | sed "s#^${ACFW_BRANCH_PREFIX}/##")
 has_branch() { printf '%s\n' "$EXISTING_WT_SLUGS" | grep -qxF "$1"; }
 
 # --active-only: emit a cheap BATCHED TSV stub row per accepted task so the cross-task awk graph keeps
@@ -313,22 +314,31 @@ fi
 
 # ---- Worktree registry checks ----
 LIVE_SLUGS=$(awk -F'\t' '$2=="pending"||$2=="in-progress"||$2=="completed"||$2=="in-review"{print $5}' "$TSV" | sort -u)
-if [ -d "$REPO_ROOT/.worktree" ]; then
+if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
   while IFS= read -r wt; do
     [ -z "$wt" ] && continue
     slug=$(basename "$wt")
     actual=$(git -C "$wt" branch --show-current 2>/dev/null || true)
-    [ "$actual" != "worktree/$slug" ] && emit FATAL worktree-wrong-branch "$slug" ".worktree/$slug is on '$actual', expected 'worktree/$slug'"
+    # OWNERSHIP GUARD: acf-whip only manages worktrees on its OWN branch namespace
+    # (<prefix>/<slug>). A dir under $ACFW_WORKTREE_DIR that is on a foreign branch, detached
+    # (e.g. mid-rebase), or not a registered worktree at all belongs to the user's own parallel
+    # work — leave it completely alone (no FATAL, no removal). This is what keeps /go's startup
+    # doctor --fix from reaping unrelated research/benchmark worktrees parked in the same dir.
+    case "$actual" in
+      "$ACFW_BRANCH_PREFIX"/*) ;;   # acf-whip-owned — proceed to checks below
+      *) continue ;;                # foreign / detached / plain dir — not ours
+    esac
+    [ "$actual" != "$ACFW_BRANCH_PREFIX/$slug" ] && emit FATAL worktree-wrong-branch "$slug" "$ACFW_WORKTREE_DIR/$slug is on '$actual', expected '$ACFW_BRANCH_PREFIX/$slug'"
     if ! printf '%s\n' "$LIVE_SLUGS" | grep -qx "$slug"; then
       if [ "$FIX" = "1" ]; then
         git_with_lock_backoff -C "$REPO_ROOT" worktree remove --force "$wt" >/dev/null 2>&1 || true
-        git_with_lock_backoff -C "$REPO_ROOT" branch -D "worktree/$slug" >/dev/null 2>&1 || true
+        git_with_lock_backoff -C "$REPO_ROOT" branch -D "$ACFW_BRANCH_PREFIX/$slug" >/dev/null 2>&1 || true
         emit REPAIRABLE orphaned-worktree "$slug" "removed (no live task on slug)"
       else
-        emit REPAIRABLE orphaned-worktree "$slug" ".worktree/$slug has no pending/in-progress/completed/in-review task"
+        emit REPAIRABLE orphaned-worktree "$slug" "$ACFW_WORKTREE_DIR/$slug has no pending/in-progress/completed/in-review task"
       fi
     fi
-  done < <(find "$REPO_ROOT/.worktree" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+  done < <(find "$REPO_ROOT/$ACFW_WORKTREE_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
 fi
 
 # ---- WARN: stale in-progress (older than timeout) ----
