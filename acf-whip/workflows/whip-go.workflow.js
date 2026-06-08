@@ -14,6 +14,11 @@ const pluginRoot = (args && args.pluginRoot) || ''
 const trunkRoot = (args && args.trunkRoot) || ''
 const trunkBranch = (args && args.trunkBranch) || ''
 const mode = (args && args.mode === 'override') ? 'override' : 'default'
+// Worktree branch namespace acf-whip owns (<prefix>/<slug>). Defaults to 'worktree'; updated from
+// each scan snapshot's branchPrefix so prompt text matches a custom ACFW_BRANCH_PREFIX in .acfw-config.
+// Prompts are informational only — the agent always uses the path clean-checkout.sh prints — so a
+// stale default here is cosmetic, but keeping it in sync avoids confusing the specialist.
+let branchPrefix = (args && args.branchPrefix) || 'worktree'
 if (!pluginRoot || !trunkRoot) {
   return { error: 'whip-go.workflow.js requires args.pluginRoot and args.trunkRoot', got: { pluginRoot, trunkRoot } }
 }
@@ -263,12 +268,12 @@ You are the ${t.agent || 'assigned'} specialist executing one acf-whip backlog t
 
 STEP 0 (mandatory concurrency primitive): run
   bash ${sq(CLEAN_CHECKOUT)} ${sq(rootPath)}
-Its stdout is the absolute worktree path (branch worktree/${t.slug}). If it exits non-zero, do NOT proceed: return transition "none" with the exit code in notes (the orchestrator retries next iteration).
+Its stdout is the absolute worktree path (branch ${branchPrefix}/${t.slug}). If it exits non-zero, do NOT proceed: return transition "none" with the exit code in notes (the orchestrator retries next iteration).
 
-Then: read the task at ${sq(rootPath)} (the ROOT path — read it there). Do the implementation INSIDE the worktree printed by Step 0, on branch worktree/${t.slug}. Run the project's quality gates. Commit your CODE to the worktree branch. Write evidence-of-completion back into the ROOT task file at ${sq(rootPath)} (append to its sections), then end your response with the ACFW-RESULT marker:
+Then: read the task at ${sq(rootPath)} (the ROOT path — read it there). Do the implementation INSIDE the worktree printed by Step 0, on branch ${branchPrefix}/${t.slug}. Run the project's quality gates. Commit your CODE to the worktree branch. Write evidence-of-completion back into the ROOT task file at ${sq(rootPath)} (append to its sections), then end your response with the ACFW-RESULT marker:
   ACFW-RESULT:
     transition: completed | blocked
-    commit_sha: <sha on worktree/${t.slug}, or n/a>
+    commit_sha: <sha on ${branchPrefix}/${t.slug}, or n/a>
     rejection_increment: 0
     notes: <one line>
     blocked_reason: <only if blocked: dependency-missing | environment | unrecoverable | none>
@@ -283,7 +288,7 @@ function reviewerPrompt(t) {
   return `${ENV}
 You are quality-reviewer reviewing one acf-whip task that an implementer marked completed.
 
-STEP 0: run  bash ${sq(CLEAN_CHECKOUT)} ${sq(rootPath)}  to attach to the task's worktree (branch worktree/${t.slug}) and validate it. If it exits non-zero, return transition "none" with the exit code in notes.
+STEP 0: run  bash ${sq(CLEAN_CHECKOUT)} ${sq(rootPath)}  to attach to the task's worktree (branch ${branchPrefix}/${t.slug}) and validate it. If it exits non-zero, return transition "none" with the exit code in notes.
 
 Then review the implementation against the task's Acceptance Criteria and quality gates, working in the worktree.
 AUTO-REJECT rule: if the task's Transition Log lacks a "| clean-checkout | ok |" token, reject.
@@ -524,6 +529,7 @@ Return the ScanResult.`
     break
   }
   lastSnapshot = snap
+  if (snap.branchPrefix) branchPrefix = snap.branchPrefix
   const tasks = snap.tasks || []
   const idx = indexTasks(tasks, snap.satisfiedDeps)
 

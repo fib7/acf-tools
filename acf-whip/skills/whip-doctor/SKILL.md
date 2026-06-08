@@ -33,13 +33,21 @@ Exit 0 when `ok=true` (no FATAL), exit 1 otherwise.
 
 - **FATAL** — corruption that MUST block execution: status-vs-folder mismatch,
   duplicate ID across files, dangling or cyclic dependencies, a code-mutating task with
-  no `Worktree:` slug, an `Assigned Agent` with no agent file, a worktree on the wrong
-  branch, a dispatched task whose cross-slug dependency is not yet integrated, detached
+  no `Worktree:` slug, an `Assigned Agent` with no agent file, an acf-whip worktree on the
+  wrong branch, a dispatched task whose cross-slug dependency is not yet integrated, detached
   HEAD at the repo root, unparseable frontmatter.
 - **REPAIRABLE** — safe to auto-fix with `--fix`, then re-scan to confirm: stray
   `Integrated-At` on a non-accepted task (cleared), `Rejection Count` out of `[0,5]`
   (clamped), the same task present in two folders (kept the one matching its `Status`),
   an orphaned `.worktree/<slug>` with no live task (removed).
+
+**Ownership scope (worktree checks).** The doctor manages **only** worktrees on the
+namespace it owns — `<ACFW_BRANCH_PREFIX>/<slug>` (default `worktree/<slug>`), configurable in
+`.backlog/.acfw-config`. A directory under `.worktree/` on any other branch, detached (e.g.
+mid-rebase), or that is not a registered worktree is treated as **foreign** — your own
+parallel research/benchmark work — and is left completely alone: no `orphaned-worktree`, no
+`worktree-wrong-branch`, and never removed by `--fix`. Both the wrong-branch FATAL and the
+orphan reaper apply only to worktrees in acf-whip's branch namespace.
 - **WARN** — surfaced, never blocks: accepted task missing the `clean-checkout | ok`
   token, a task lingering in `in-review/`, an in-progress task past the configurable
   timeout (`ACFW_INPROGRESS_TIMEOUT_HOURS`, default 8h), two pending tasks in different
