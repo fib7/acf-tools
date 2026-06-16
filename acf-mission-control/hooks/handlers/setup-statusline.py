@@ -1,99 +1,167 @@
 #!/usr/bin/env python3
-"""ACF Mission Control - Auto-Setup Hook
+"""ACF Mission Control - Self-Upgrading Installer
 
-Automatically configures Mission Control status line in project settings on first run.
+Runs on every SessionStart. Keeps the repo-local
+`.claude/scripts/status-line.py` in sync with the version shipped by the plugin:
 
-Runs on: SessionStart (startup, resume, clear)
-Effect:
-1. Creates .claude/scripts/ directory if missing
-2. Copies status-line.py from plugin to .claude/scripts/ if not present
-3. Makes script executable
-4. Adds statusLine configuration to .claude/settings.json pointing to local copy
+1. Creates `.claude/scripts/` if missing.
+2. Compares the `# mission-control-version:` marker in the plugin source vs the
+   local copy (semver tuple compare).
+   - No local copy            -> install.
+   - plugin version > local   -> back up local to `status-line.py.bak`, overwrite.
+   - plugin version <= local  -> leave the local copy alone (no downgrade).
+3. Ensures `.claude/settings.json` points statusLine at the local copy and, when
+   the cache-warmth segment is in play, injects `refreshInterval` so the
+   indicator stays live while the session is idle.
+
+Non-blocking: any failure exits 0 so a bad upgrade never breaks the session.
 """
 
 import json
-import sys
 import os
 import shutil
 import stat
+import sys
 from pathlib import Path
 
-# Read hook input
-hook_input = json.load(sys.stdin)
+REFRESH_INTERVAL = 30  # seconds; keeps the cache-warmth indicator current when idle
 
-# Get project directory from hook input
-project_dir = hook_input.get("cwd", ".")
-claude_dir = Path(project_dir) / ".claude"
-scripts_dir = claude_dir / "scripts"
-settings_path = claude_dir / "settings.json"
-local_script_path = scripts_dir / "status-line.py"
 
-# Create .claude directory if it doesn't exist
-claude_dir.mkdir(exist_ok=True)
+def parse_version(text):
+    """Extract '# mission-control-version: X.Y.Z' as an int tuple.
 
-# Create .claude/scripts directory if it doesn't exist
-scripts_dir.mkdir(exist_ok=True)
+    Missing/garbled marker -> (0, 0, 0) so it counts as 'ancient' (upgradeable).
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("# mission-control-version:"):
+            raw = line.split(":", 1)[1].strip()
+            parts = raw.split(".")
+            out = []
+            for part in parts[:3]:
+                try:
+                    out.append(int(part))
+                except ValueError:
+                    out.append(0)
+            while len(out) < 3:
+                out.append(0)
+            return tuple(out)
+    return (0, 0, 0)
 
-# Get plugin root from environment
-plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
-if not plugin_root:
-    # Can't determine plugin location - skip setup
-    sys.exit(0)
 
-source_script = Path(plugin_root) / "hooks" / "handlers" / "status-line.py"
-
-# Copy status-line.py from plugin to .claude/scripts/ if not present
-if not local_script_path.exists():
+def read_text(path):
     try:
-        shutil.copy2(source_script, local_script_path)
+        return path.read_text()
+    except OSError:
+        return ""
 
-        # Make script executable (chmod +x)
-        current_permissions = local_script_path.stat().st_mode
-        local_script_path.chmod(current_permissions | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    except Exception as e:
-        print(f"Failed to copy status line script: {e}", file=sys.stderr)
-        sys.exit(1)
-
-# Read existing settings or create new
-if settings_path.exists():
+def main():
     try:
-        with open(settings_path, "r") as f:
-            settings = json.load(f)
-    except json.JSONDecodeError:
-        settings = {}
-else:
+        hook_input = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        hook_input = {}
+
+    project_dir = hook_input.get("cwd", ".")
+    claude_dir = Path(project_dir) / ".claude"
+    scripts_dir = claude_dir / "scripts"
+    settings_path = claude_dir / "settings.json"
+    local_script = scripts_dir / "status-line.py"
+    backup_script = scripts_dir / "status-line.py.bak"
+
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if not plugin_root:
+        sys.exit(0)
+    source_script = Path(plugin_root) / "hooks" / "handlers" / "status-line.py"
+
+    try:
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        sys.exit(0)
+
+    source_text = read_text(source_script)
+    if not source_text:
+        sys.exit(0)
+    src_version = parse_version(source_text)
+
+    action = None  # "installed" | (old, new) upgrade tuple | None
+
+    if not local_script.exists():
+        action = "installed"
+    else:
+        local_version = parse_version(read_text(local_script))
+        if src_version > local_version:
+            action = (local_version, src_version)
+
+    if action is not None:
+        try:
+            if action != "installed":
+                # Preserve the prior (possibly customized) copy before overwriting.
+                shutil.copy2(local_script, backup_script)
+            shutil.copy2(source_script, local_script)
+            mode = local_script.stat().st_mode
+            local_script.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        except Exception as exc:  # noqa: BLE001 - non-blocking
+            print("Mission Control upgrade failed: {}".format(exc), file=sys.stderr)
+            sys.exit(0)
+
+    # ---- settings.json: ensure statusLine + refreshInterval ----------------
     settings = {}
+    if settings_path.exists():
+        try:
+            with open(settings_path) as fh:
+                settings = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            settings = {}
 
-# Check if statusLine already configured
-if "statusLine" in settings:
-    # Already configured - nothing to do
+    sl = settings.get("statusLine")
+    settings_changed = False
+    if not isinstance(sl, dict):
+        sl = {
+            "type": "command",
+            "command": ".claude/scripts/status-line.py",
+            "padding": 0,
+            "refreshInterval": REFRESH_INTERVAL,
+        }
+        settings["statusLine"] = sl
+        settings_changed = True
+    else:
+        # Add refreshInterval if absent; never clobber a user's custom value.
+        if "refreshInterval" not in sl:
+            sl["refreshInterval"] = REFRESH_INTERVAL
+            settings_changed = True
+
+    if settings_changed:
+        try:
+            with open(settings_path, "w") as fh:
+                json.dump(settings, fh, indent=2)
+        except OSError as exc:
+            print("Mission Control settings write failed: {}".format(exc), file=sys.stderr)
+            sys.exit(0)
+
+    # ---- report ------------------------------------------------------------
+    msg = None
+    if action == "installed":
+        msg = "🚀 Mission Control activated — status line installed to .claude/scripts/"
+    elif isinstance(action, tuple):
+        old, new = action
+        msg = (
+            "🚀 Mission Control upgraded v{}→v{} "
+            "(previous saved to status-line.py.bak)".format(
+                ".".join(map(str, old)), ".".join(map(str, new))
+            )
+        )
+
+    if msg:
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": msg,
+            }
+        }))
+
     sys.exit(0)
 
-# Add Mission Control status line configuration (pointing to LOCAL copy via relative path)
-settings["statusLine"] = {
-    "type": "command",
-    "command": ".claude/scripts/status-line.py",
-    "padding": 0
-}
 
-# Write updated settings
-try:
-    with open(settings_path, "w") as f:
-        json.dump(settings, f, indent=2)
-
-    # Output success message (will be added to context via SessionStart hook)
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": "🚀 Mission Control activated - Status line script copied to .claude/scripts/, configured in .claude/settings.json"
-        }
-    }
-    print(json.dumps(output))
-
-except Exception as e:
-    # Setup failed - report to user via stderr (non-blocking error)
-    print(f"Mission Control setup failed: {e}", file=sys.stderr)
-    sys.exit(1)
-
-sys.exit(0)
+if __name__ == "__main__":
+    main()

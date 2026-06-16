@@ -31,7 +31,7 @@
 | **acf-challenger-mode** | Cognitive | Logic validation enforcer | 6 |
 | **acf-arazor-mode** | Cognitive | Production verification enforcer | 6 |
 | **acf-nitro** | Cognitive | Parallel execution enforcer | 6 |
-| **acf-mission-control** | Functional | Status line HUD | 6 |
+| **acf-mission-control** | Functional | Two-line status line HUD (1M-aware fuel gauge, cost, rate limits, cache warmth); self-upgrading | 6 |
 | **acf-librarian** | Functional | Convention enforcement | 9 |
 | **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe) | 65 |
 | **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 17 |
