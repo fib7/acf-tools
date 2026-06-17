@@ -49,8 +49,8 @@
     },
     {
       "name": "acf-whip",
-      "description": "Continuous backlog automation with aggressive quality gates. /task decomposes a scope into atomic, dependency-aware tasks; /go orchestrates them to completion — dispatching parallel specialists in isolated git worktrees (one per task slug), running quality review, and integrating accepted branches into the trunk, looping until every task is accepted or blocked. Concurrency-safe (the git-worktree branch registry is the lock), self-healing via /whip-doctor, and run as deterministic dynamic workflows so Claude's context stays flat across long runs.",
-      "version": "2.4.0",
+      "description": "Workflow-native backlog automation. /task decomposes a scope into atomic, dependency-aware tasks; /go runs parallel specialists in isolated git worktrees (one per slug), reviews their work, and integrates accepted branches into the trunk — looping until every task is accepted or blocked. Concurrency-safe and self-healing via /whip-doctor.",
+      "version": "2.4.1",
       "author": {
         "name": "ACF Tools Team",
         "email": "acf@fib7.ai"
