@@ -23,6 +23,8 @@
 #      integrate (terminal). Caller must NOT retry.
 #   6  conflict unresolved -> task moved to rejected/, Rejection Count incremented
 #   7  resolver-needed -> context printed, worktree left mid-rebase (caller dispatches resolver)
+#   8  contaminated -> branch carries .backlog/ commits not on trunk; refused (no FF/rebase). Context
+#      printed; caller PARKS the task for an operator (manual recovery). Caller must NOT retry/reject.
 #  10  transient git error (fetch/refspec) -> leave task accepted, retry next iteration
 #  99  lock contention persisted past backoff -> transient, retry next iteration
 
@@ -82,6 +84,10 @@ do_success() {
   git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" add ".backlog/accepted/$(basename "$TASK_FILE")"
   git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" commit -m "integrate: $TASK_ID ($SLUG -> $ACFW_TRUNK_BRANCH)" --quiet
 
+  # A reused slug forks its next task from the trunk we just advanced to: re-point the fork base
+  # so the branch stays code-only on the next clean-checkout re-align.
+  git -C "$ACFW_TRUNK_ROOT" update-ref "refs/acfw/forkbase/$SLUG" "$TRUNK_SHA_AFTER" 2>/dev/null || true
+
   # Cleanup: remove worktree iff no more pending/in-progress tasks share the slug.
   REMAINING=$(grep -lE "^- \*\*Worktree\*\*:[[:space:]]*${SLUG}[[:space:]]*\$" \
     "$ACFW_TRUNK_ROOT/.backlog/pending/"*.md \
@@ -89,6 +95,7 @@ do_success() {
   if [ "$REMAINING" -eq 0 ]; then
     git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" worktree remove --force "$WORKTREE" 2>/dev/null || true
     git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" branch -d "$BRANCH" 2>/dev/null || true
+    git -C "$ACFW_TRUNK_ROOT" update-ref -d "refs/acfw/forkbase/$SLUG" 2>/dev/null || true
   fi
   exit 0
 }
@@ -113,6 +120,34 @@ do_resolver_failure() {
   git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" add ".backlog/accepted/$(basename "$TASK_FILE")" ".backlog/rejected/$(basename "$TASK_FILE")"
   git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" commit -m "integrate: reject $TASK_ID ($REASON)" --quiet
   exit 6
+}
+
+# fork_base — resolve the trunk SHA the branch's code commits sit on. Prefer the recorded
+# per-slug fork-base ref (written by clean-checkout / do_success); fall back to the merge-base
+# with the trunk snapshot for pre-2.4.1 branches. Echoes the SHA (empty if unresolvable).
+fork_base() {
+  local b
+  b=$(git -C "$WORKTREE" rev-parse --verify "refs/acfw/forkbase/$SLUG" 2>/dev/null || true)
+  [ -z "$b" ] && b=$(git -C "$WORKTREE" merge-base HEAD refs/acfw/trunk-snapshot 2>/dev/null || true)
+  echo "$b"
+}
+
+# A worktree/<slug> branch is code-only by construction. If it carries ANY commit touching
+# .backlog/ that is not on trunk, it was contaminated (a pre-2.4.1 branch that imported trunk's
+# task-transition history). Rebasing such a branch replays the whole phantom range and produces
+# spurious conflicts -> the integrate reject-loop. Refuse it: print context, exit 8. The orchestrator
+# parks the task for an operator (manual recovery: cherry-pick the tip code commit onto trunk).
+emit_contaminated() {
+  local POISON
+  POISON=$(git -C "$ACFW_TRUNK_ROOT" log --oneline "${ACFW_TRUNK_BRANCH}..refs/acfw/${SLUG}" -- .backlog/ 2>/dev/null || true)
+  echo "ACFW-INTEGRATE: contaminated"
+  echo "worktree: $WORKTREE"
+  echo "branch: $BRANCH"
+  echo "task_file: $TASK_FILE"
+  echo "backlog_commits_on_branch:"
+  echo "$POISON"
+  echo "recovery: cherry-pick the branch's tip code commit(s) onto $ACFW_TRUNK_BRANCH, stamp Integrated-At, then remove the worktree + branch."
+  exit 8
 }
 
 # Emit conflict context for the caller, then exit 7. Worktree is left mid-rebase.
@@ -213,6 +248,14 @@ if ! git -C "$ACFW_TRUNK_ROOT" rev-parse --verify "refs/acfw/${SLUG}" >/dev/null
   exit 10
 fi
 
+# ---- Step 3 pre-check: branches are code-only. A branch carrying .backlog/ commits not on trunk is
+# contaminated (pre-2.4.1 import of trunk's task-transition history). Never FF or rebase it — that
+# replays the phantom range and produces the spurious conflicts behind the reject-loop. Refuse and
+# hand back to the orchestrator to park for an operator.
+if [ -n "$(git -C "$ACFW_TRUNK_ROOT" log --oneline "${ACFW_TRUNK_BRANCH}..refs/acfw/${SLUG}" -- .backlog/ 2>/dev/null)" ]; then
+  emit_contaminated
+fi
+
 if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/${SLUG}" >&2; then
   TRUNK_SHA_AFTER=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
   # Post-flight: HEAD must have advanced. A no-op FF means the branch was already an
@@ -224,9 +267,14 @@ if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/${SLUG
   do_success
 fi
 
-# ---- Step 4: Rebase the worktree onto current trunk, then retry FF ----
+# ---- Step 4: Replay the branch's OWN commits onto current trunk, then retry FF ----
+# Rebase --onto with an explicit fork base so ONLY base..HEAD (the branch's code commits) replay.
+# A bare `rebase refs/acfw/trunk-snapshot` replays merge-base..HEAD instead — with a stale base that
+# is the whole imported .backlog + duplicated-trunk range, the original cause of the phantom-conflict
+# reject-loop. The Step-3 guard already refused any branch carrying .backlog/, so base..HEAD is code-only.
 git_with_lock_backoff -C "$WORKTREE" fetch "$ACFW_TRUNK_ROOT" "${ACFW_TRUNK_BRANCH}:refs/acfw/trunk-snapshot" --quiet >&2
-if git_with_lock_backoff -C "$WORKTREE" rebase refs/acfw/trunk-snapshot >&2; then
+BASE=$(fork_base)
+if [ -n "$BASE" ] && git_with_lock_backoff -C "$WORKTREE" rebase --onto refs/acfw/trunk-snapshot "$BASE" "$BRANCH" >&2; then
   if retry_ff; then
     do_success
   fi

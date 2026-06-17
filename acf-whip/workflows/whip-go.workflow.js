@@ -114,8 +114,8 @@ const INTEGRATE_RESULT = {
   type: 'object', additionalProperties: false,
   required: ['exitCode', 'outcome', 'note', 'resolverWorktree', 'resolverBranch', 'resolverAgent', 'resolverConflictedFiles', 'resolverConflictingCommits'],
   properties: {
-    exitCode: { type: 'integer', description: 'the integrate-worktree.sh exit code (0,4,6,7,10,99,...)' },
-    outcome: { type: 'string', enum: ['integrated', 'resolver-needed', 'rejected', 'transient', 'skipped', 'error'] },
+    exitCode: { type: 'integer', description: 'the integrate-worktree.sh exit code (0,4,6,7,8,10,99,...)' },
+    outcome: { type: 'string', enum: ['integrated', 'resolver-needed', 'rejected', 'transient', 'skipped', 'contaminated', 'error'] },
     note: { type: 'string' },
     resolverWorktree: { type: 'string', description: 'from the resolver-needed block "worktree:" line, else ""' },
     resolverBranch: { type: 'string', description: 'from "branch:", else ""' },
@@ -350,6 +350,7 @@ Capture the exit code and stdout. Map exit code -> outcome:
   4  -> skipped         (no worktree/<slug> branch — historical/pre-2.0.0 task already on trunk; nothing to integrate, do NOT retry)
   6  -> rejected        (conflict unresolved; task moved to rejected/)
   7  -> resolver-needed  (rebase conflict; stdout carries a "ACFW-INTEGRATE: resolver-needed" block — DO NOT touch the worktree, just parse and report)
+  8  -> contaminated     (branch carries .backlog/ commits not on trunk; stdout carries an "ACFW-INTEGRATE: contaminated" block — DO NOT touch the worktree. Put the "recovery:" line (and the offending commits) into note. The orchestrator parks this task for an operator; do NOT retry/reject.)
   10 -> transient        (anti-orphan guard; leave accepted, retry later)
   99 -> transient        (git lock contention)
   other -> error
@@ -666,6 +667,13 @@ Return the ScanResult.`
     if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); integratedThisIter++; log(`✓ integrated ${t.stem}`) }
     else if (r && r.outcome === 'rejected') { rejectedStems.push(t.stem); log(`✗ integrate rejected ${t.stem} — ${r.note}`) }
     else if (r && r.outcome === 'skipped') { log(`↷ skipped ${t.stem} — no worktree branch (historical; terminal)`) }
+    else if (r && r.outcome === 'contaminated') {
+      // The branch carries trunk .backlog/ commits (pre-2.4.1 import) — rebasing it produces phantom
+      // conflicts. Park for an operator instead of rejecting/re-running (a re-run re-contaminates).
+      parkedThisRun.add(t.stem)
+      parkedNeeds.set(t.stem, (r.note || `contaminated branch — cherry-pick the tip code commit of ${t.slug} onto trunk, then remove the worktree+branch`).slice(0, 200))
+      log(`⚑ ${t.stem}: contaminated worktree branch (${t.slug}) — parked for operator, manual recovery required`)
+    }
     // transient/error -> leave accepted, retry next iteration
   }
 
@@ -726,7 +734,7 @@ Return the ScanResult.`
   if (mode === 'default') {
     const seenC = new Set()
     const candidates = []
-    for (const t of tasks.filter((t) => t.folder === 'accepted' && codeSlug(t) && !t.hasIntegratedAt && t.hasWorktreeBranch)) {
+    for (const t of tasks.filter((t) => t.folder === 'accepted' && codeSlug(t) && !t.hasIntegratedAt && t.hasWorktreeBranch && !parkedThisRun.has(t.stem))) {
       if (seenC.has(t.stem)) continue
       seenC.add(t.stem); candidates.push(t)
     }

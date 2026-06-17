@@ -5,8 +5,9 @@
 #   TASK_FILE: absolute path to the task markdown (in .backlog/pending/ or in-progress/).
 #
 # Resolves the task's Worktree slug, lazy-creates an isolated git worktree on
-# worktree/<slug>, validates the branch, fast-forwards from local trunk, stashes
-# unrelated changes, logs the clean-checkout OK token, and prints the worktree path.
+# worktree/<slug>, validates the branch, re-aligns the branch's own commits onto local trunk
+# (code-only, never importing .backlog history), stashes unrelated changes, logs the
+# clean-checkout OK token, and prints the worktree path.
 # The lock is git itself: `git worktree add -b <branch>` fails when the branch is
 # already checked out elsewhere — that failure is the mutual-exclusion primitive.
 #
@@ -64,6 +65,10 @@ if [ ! -d "$WORKTREE_PATH" ]; then
     exit 2
   fi
   WORKTREE_WAS_CREATED=1
+  # Record the fork base: the branch's code commits sit on top of this trunk SHA. Both the
+  # code-only re-sync (Step 5) and integrate-worktree replay ONLY base..HEAD, never merging trunk's
+  # .backlog history into the branch — so the branch stays code-only by construction.
+  git -C "$REPO_ROOT" update-ref "refs/acfw/forkbase/$SLUG" "$(git -C "$REPO_ROOT" rev-parse "$TRUNK_BRANCH")" 2>/dev/null || true
 fi
 
 # ---- Step 3.5: Worktree env hydration (.worktreeinclude) ----
@@ -83,11 +88,30 @@ if [ "$ACTUAL_BRANCH" != "$BRANCH" ]; then
   exit 3
 fi
 
-# ---- Step 5: Sync to local trunk (fast-forward only) ----
+# ---- Step 5: Re-align the slug branch onto current trunk — CODE-ONLY ----
+# NEVER merge trunk's .backlog history into the branch (the historical `merge --ff-only` did exactly
+# that whenever the branch had no code commit yet, then drifted on a stale base once it did — the
+# root cause of the integrate reject-loop). Instead replay ONLY the branch's own commits (base..HEAD)
+# onto a fresh trunk snapshot via `rebase --onto`, so the branch is code-only by construction. On any
+# conflict (or a dirty tree) abort and leave the branch on its existing code-only state; integrate-
+# worktree rebases + resolves at integration time.
+BASE_REF="refs/acfw/forkbase/$SLUG"
 git_with_lock_backoff -C "$WORKTREE_PATH" fetch "$REPO_ROOT" "${TRUNK_BRANCH}:refs/acfw/trunk-snapshot" --quiet >&2
-if ! git_with_lock_backoff -C "$WORKTREE_PATH" merge --ff-only refs/acfw/trunk-snapshot >&2; then
-  echo "WARN: cannot fast-forward $BRANCH to $TRUNK_BRANCH. Branch has diverged." >&2
-  echo "Continue with caution; integrate-worktree will rebase + resolve at integration time." >&2
+BASE=$(git -C "$WORKTREE_PATH" rev-parse --verify "$BASE_REF" 2>/dev/null || true)
+if [ -z "$BASE" ]; then
+  # pre-2.4.1 branch with no recorded base: fall back to the merge-base with the snapshot.
+  BASE=$(git -C "$WORKTREE_PATH" merge-base "$BRANCH" refs/acfw/trunk-snapshot 2>/dev/null || true)
+fi
+if [ -n "$(git -C "$WORKTREE_PATH" status --porcelain)" ]; then
+  echo "WARN: $SLUG worktree has uncommitted changes; skipping trunk re-align (defer to integrate)." >&2
+elif [ -z "$BASE" ]; then
+  echo "WARN: cannot determine fork base for $SLUG; skipping trunk re-align (defer to integrate)." >&2
+elif git_with_lock_backoff -C "$WORKTREE_PATH" rebase --onto refs/acfw/trunk-snapshot "$BASE" "$BRANCH" >&2; then
+  git -C "$WORKTREE_PATH" update-ref "$BASE_REF" "$(git -C "$WORKTREE_PATH" rev-parse refs/acfw/trunk-snapshot)" 2>/dev/null || true
+else
+  git -C "$WORKTREE_PATH" rebase --abort 2>/dev/null || true
+  echo "WARN: cannot re-align $BRANCH onto $TRUNK_BRANCH (code-only rebase hit conflicts)." >&2
+  echo "Continue on existing code-only state; integrate-worktree will rebase + resolve at integration time." >&2
 fi
 
 # ---- Step 6: Stash unrelated working-tree changes ----
