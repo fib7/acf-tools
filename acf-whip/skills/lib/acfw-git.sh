@@ -95,6 +95,36 @@ append_log_row() {
   rm -f "$tmp"
 }
 
+# acfw_pending_code_commits <C> <upstream-ref> <branch-ref> — print the branch's GENUINE,
+# not-yet-on-trunk code commits, oldest-first (apply order), one SHA per line.
+#
+# "Genuine code" = a commit that (a) is NOT already present on <upstream> by patch-id, AND
+# (b) touches at least one path OUTSIDE .backlog/. This is the 2.5.0 primitive that makes
+# integration patch-id-aware:
+#   • EMPTY output  -> every code change on the branch is already on trunk (or the branch carries
+#                      only .backlog phantom commits). The branch is done-modulo-stamp: the caller
+#                      stamps Integrated-At and reaps, with NO rebase and NO conflict. This is the
+#                      cure for the phantom-conflict reject-loop and the "done but not integrated"
+#                      stall on long-lived repos.
+#   • NON-empty     -> exactly the commits the caller must replay onto fresh trunk (cherry-pick),
+#                      dropping the interleaved .backlog phantom commits that caused false conflicts.
+#
+# `git cherry <upstream> <branch>` marks each commit '-' (already upstream by patch-id) or '+'
+# (new), oldest-first. We keep '+' commits that touch a non-.backlog path. A merge commit shows no
+# diff-tree paths here and is skipped (code-only branches are linear; replaying a merge via
+# cherry-pick would need -m anyway). Output order is git cherry's native apply order.
+acfw_pending_code_commits() { # <C> <upstream-ref> <branch-ref>
+  local C="$1" upstream="$2" branch="$3" mark sha names
+  git -C "$C" cherry "$upstream" "$branch" 2>/dev/null | while read -r mark sha; do
+    [ "$mark" = "+" ] || continue
+    names=$(git -C "$C" diff-tree --no-commit-id --name-only -r "$sha" 2>/dev/null)
+    [ -n "$names" ] || continue
+    if printf '%s\n' "$names" | grep -qv '^\.backlog/'; then
+      printf '%s\n' "$sha"
+    fi
+  done
+}
+
 # acfw_load_namespace <repo-root> — resolve the worktree DIRECTORY and BRANCH PREFIX
 # that acf-whip owns. Sets two globals:
 #   ACFW_WORKTREE_DIR    per-task worktree dir, relative to repo root (default ".worktree")

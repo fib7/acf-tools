@@ -34,7 +34,7 @@ const block = text.slice(start, end)
 // Build a factory that closes over an injected `mode` and returns the functions.
 function load(mode) {
   // eslint-disable-next-line no-new-func
-  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, resultToState, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H };`)
+  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, resultToState, reconcileIntegrationTallies, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H };`)
   return factory(mode)
 }
 const Sdef = load('default')
@@ -271,6 +271,48 @@ const T = (o) => ({
   check('in-review + completed -> null (illegal jump)', resultToState('in-review', 'completed') === null)
   check('any + none -> null (transient)', resultToState('in-progress', 'none') === null && resultToState('in-review', 'none') === null)
   check('any + undefined -> null (non-emit)', resultToState('in-progress', undefined) === null)
+}
+
+// ============================ reconcileIntegrationTallies (WS5 / retro #9) ============================
+{
+  const { reconcileIntegrationTallies } = Sdef
+  const snap = (tasks) => ({ tasks })
+
+  // Baseline: accumulators agree with disk (integrated tasks collapsed out of the digest) -> unchanged.
+  {
+    const r = reconcileIntegrationTallies(['a', 'b'], [], new Set(['a', 'b']), snap([]))
+    check('recon: clean run keeps integrated as-is', JSON.stringify(r.integrated) === JSON.stringify(['a', 'b']))
+    check('recon: clean run has no rejections', r.rejectedAtIntegration.length === 0)
+    check('recon: clean run not flagged reconciled', r.reconciled === false)
+  }
+
+  // The #9 case: a post-resolver agent NON-EMIT — integrate-worktree moved the task to rejected/ on
+  // disk (exit 6) but no accumulator caught it. attemptedIntegrate + the rejected/ folder recover it.
+  {
+    const r = reconcileIntegrationTallies([], [], new Set(['x']), snap([{ stem: 'x', folder: 'rejected' }]))
+    check('recon: missed integration-rejection recovered from disk', JSON.stringify(r.rejectedAtIntegration) === JSON.stringify(['x']))
+    check('recon: flagged reconciled when a rejection was recovered', r.reconciled === true)
+  }
+
+  // A stem the loop OPTIMISTICALLY counted integrated but disk shows in rejected/ -> demoted.
+  {
+    const r = reconcileIntegrationTallies(['y'], [], new Set(['y']), snap([{ stem: 'y', folder: 'rejected' }]))
+    check('recon: false-positive integrated demoted out of integrated', r.integrated.length === 0)
+    check('recon: false-positive integrated added to rejectedAtIntegration', JSON.stringify(r.rejectedAtIntegration) === JSON.stringify(['y']))
+    check('recon: demotion flags reconciled', r.reconciled === true)
+  }
+
+  // Dedup: a stem in BOTH rejectedStems and the disk-derived set appears once.
+  {
+    const r = reconcileIntegrationTallies([], ['z'], new Set(['z']), snap([{ stem: 'z', folder: 'rejected' }]))
+    check('recon: rejection not double-counted', JSON.stringify(r.rejectedAtIntegration) === JSON.stringify(['z']))
+  }
+
+  // An accepted-but-not-yet-integrated stem present in the snapshot is NOT a rejection.
+  {
+    const r = reconcileIntegrationTallies(['k'], [], new Set(['k']), snap([{ stem: 'k', folder: 'accepted' }]))
+    check('recon: accepted-in-snapshot stem stays integrated (not demoted)', JSON.stringify(r.integrated) === JSON.stringify(['k']))
+  }
 }
 
 console.log(`\nphase2-scheduler: ${PASS} passed, ${FAIL} failed`)

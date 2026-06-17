@@ -1,6 +1,6 @@
 {
   "name": "acf-whip",
-  "version": "2.4.1",
+  "version": "2.5.0",
   "description": "Workflow-native backlog automation. /task decomposes a scope into atomic, dependency-aware tasks; /go runs parallel specialists in isolated git worktrees (one per slug), reviews their work, and integrates accepted branches into the trunk — looping until every task is accepted or blocked. Concurrency-safe and self-healing via /whip-doctor.",
   "author": {
     "name": "ACF Tools Team",

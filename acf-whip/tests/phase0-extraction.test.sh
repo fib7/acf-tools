@@ -127,8 +127,8 @@ OUT=$(bash "$IW" "$REPO/.backlog/accepted/feat-cx.md" 2>/dev/null); RC=$?
 check "conflict -> exit 7 (resolver-needed)" "[ $RC -eq 7 ]"
 check "emits resolver-needed marker" "echo \"$OUT\" | grep -q 'ACFW-INTEGRATE: resolver-needed'"
 check "emits worktree + conflicted file" "echo \"$OUT\" | grep -q 'conflict.txt'"
-check "worktree left mid-rebase" "git -C '$REPO/.worktree/cx' status | grep -qiE 'rebas'"
-# Simulate a resolver that gave up: call --post-resolver while still mid-rebase -> reject.
+check "worktree left mid-cherry-pick" "git -C '$REPO/.worktree/cx' rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null"
+# Simulate a resolver that gave up: call --post-resolver while still mid-cherry-pick -> reject.
 bash "$IW" --post-resolver "$REPO/.backlog/accepted/feat-cx.md" >/dev/null 2>&1; RC=$?
 check "post-resolver (gave up) -> exit 6" "[ $RC -eq 6 ]"
 check "task moved to rejected/" "[ -f '$REPO/.backlog/rejected/feat-cx.md' ]"
@@ -144,10 +144,10 @@ git -C "$REPO" add shared.txt && git -C "$REPO" commit -q -m "trunk edit shared"
 git -C "$REPO" mv ".backlog/pending/feat-ok.md" ".backlog/accepted/feat-ok.md" && git -C "$REPO" commit -q -m "accept feat-ok"
 bash "$IW" "$REPO/.backlog/accepted/feat-ok.md" >/dev/null 2>&1; RC=$?
 check "conflict again -> exit 7" "[ $RC -eq 7 ]"
-# Resolve the conflict the way a resolver would, then continue the rebase.
+# Resolve the conflict the way a resolver would, then continue the cherry-pick.
 echo "resolved" > "$REPO/.worktree/ok/shared.txt"
 git -C "$REPO/.worktree/ok" add shared.txt
-GIT_EDITOR=true git -C "$REPO/.worktree/ok" rebase --continue >/dev/null 2>&1
+GIT_EDITOR=true git -C "$REPO/.worktree/ok" cherry-pick --continue >/dev/null 2>&1
 bash "$IW" --post-resolver "$REPO/.backlog/accepted/feat-ok.md" >/dev/null 2>&1; RC=$?
 check "post-resolver success -> exit 0" "[ $RC -eq 0 ]"
 check "Integrated-At written for feat-ok" "grep -qE '^- \*\*Integrated-At\*\*: [0-9a-f]{7,}' '$REPO/.backlog/accepted/feat-ok.md'"
