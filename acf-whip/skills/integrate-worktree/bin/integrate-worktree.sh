@@ -9,23 +9,34 @@
 #   ACFW_TRUNK_ROOT   absolute path to the repo-root checkout (trunk)
 #   ACFW_TRUNK_BRANCH the branch checked out at ACFW_TRUNK_ROOT
 #
-# Resolver dispatch is HOISTED OUT of this script: a workflow subagent / the
-# orchestrator cannot reliably spawn another subagent from inside bash. On rebase
-# conflict the script assembles full conflict context, prints an "ACFW-INTEGRATE:
-# resolver-needed" block on stdout, leaves the worktree mid-rebase, and exits 7. The
-# caller dispatches the task's assigned_agent into the worktree, then re-invokes this
-# script with --post-resolver to validate + retry the fast-forward.
+# 2.5.0 integration is PATCH-ID AWARE. The branch's genuine code commits not yet on trunk are
+# computed by patch-id (acfw_pending_code_commits): if EMPTY, every code change is already on trunk
+# (or the branch carries only .backlog phantoms) and the task is stamped terminal with no rebase and
+# no conflict. Otherwise exactly those commits are replayed onto fresh trunk via cherry-pick (clean
+# code-only branches FF first), dropping interleaved .backlog phantom commits — so a long-lived
+# pre-2.4.1 branch with ~1000 phantom commits replays its ONE real commit, not the whole range.
+#
+# Resolver dispatch is HOISTED OUT of this script: a workflow subagent / the orchestrator cannot
+# reliably spawn another subagent from inside bash. On a cherry-pick conflict the script assembles
+# full conflict context, prints an "ACFW-INTEGRATE: resolver-needed" block on stdout, leaves the
+# worktree mid-cherry-pick on the branch, and exits 7. The caller dispatches the task's
+# assigned_agent into the worktree, then re-invokes this script with --post-resolver to validate +
+# retry the fast-forward. Before any branch mutation the script records refs/acfw/preintegrate/<slug>
+# (the pre-integration branch tip) so a botched fold is always recoverable; a resolver failure
+# restores the branch from it.
 #
 # Exit codes:
-#   0  integrated (Integrated-At written, task remains in accepted/)
+#   0  integrated (Integrated-At written, task remains in accepted/). Includes the patch-id
+#      short-circuit: code already on trunk -> stamped terminal, no rebase.
 #   1  task missing Worktree: field
 #   4  no worktree/<slug> branch -> historical/pre-2.0.0 task already on trunk; nothing to
 #      integrate (terminal). Caller must NOT retry.
-#   6  conflict unresolved -> task moved to rejected/, Rejection Count incremented
-#   7  resolver-needed -> context printed, worktree left mid-rebase (caller dispatches resolver)
-#   8  contaminated -> branch carries .backlog/ commits not on trunk; refused (no FF/rebase). Context
-#      printed; caller PARKS the task for an operator (manual recovery). Caller must NOT retry/reject.
-#  10  transient git error (fetch/refspec) -> leave task accepted, retry next iteration
+#   6  conflict unresolved -> task moved to rejected/, Rejection Count incremented (branch restored
+#      from refs/acfw/preintegrate/<slug> so the code survives)
+#   7  resolver-needed -> context printed, worktree left mid-cherry-pick (caller dispatches resolver)
+#   8  (retired in 2.5.0) formerly "contaminated"; .backlog-carrying branches now self-salvage in-path
+#      via the patch-id replay, so this is no longer emitted.
+#  10  transient git error (fetch/refspec/dirty worktree) -> leave task accepted, retry next iteration
 #  99  lock contention persisted past backoff -> transient, retry next iteration
 
 set -u
@@ -87,6 +98,8 @@ do_success() {
   # A reused slug forks its next task from the trunk we just advanced to: re-point the fork base
   # so the branch stays code-only on the next clean-checkout re-align.
   git -C "$ACFW_TRUNK_ROOT" update-ref "refs/acfw/forkbase/$SLUG" "$TRUNK_SHA_AFTER" 2>/dev/null || true
+  # Integration succeeded — the pre-integration backup is no longer needed (WS3).
+  git -C "$ACFW_TRUNK_ROOT" update-ref -d "refs/acfw/preintegrate/$SLUG" 2>/dev/null || true
 
   # Cleanup: remove worktree iff no more pending/in-progress tasks share the slug.
   REMAINING=$(grep -lE "^- \*\*Worktree\*\*:[[:space:]]*${SLUG}[[:space:]]*\$" \
@@ -103,7 +116,15 @@ do_success() {
 # ---- Step 6: Resolver failure path ----
 do_resolver_failure() {
   local TS REASON RC NEW_RC
+  # Abort whichever sequencer is mid-flight (2.5.0 replays via cherry-pick; older runs via rebase).
+  git -C "$WORKTREE" cherry-pick --abort 2>/dev/null || true
   git -C "$WORKTREE" rebase --abort 2>/dev/null || true
+  # WS3: restore the branch to its pre-integration tip so the task's CODE survives the failed fold
+  # (the reconstruction reset the branch to trunk before replaying). Recoverable, never destroyed.
+  if git -C "$WORKTREE" rev-parse --verify "refs/acfw/preintegrate/$SLUG" >/dev/null 2>&1; then
+    git -C "$WORKTREE" reset --hard "refs/acfw/preintegrate/$SLUG" 2>/dev/null || true
+    git -C "$ACFW_TRUNK_ROOT" update-ref -d "refs/acfw/preintegrate/$SLUG" 2>/dev/null || true
+  fi
   TS=$(date -u +"%Y-%m-%d %H:%M:%S")
   REASON="conflict-unresolved by $ASSIGNED_AGENT"
 
@@ -122,35 +143,8 @@ do_resolver_failure() {
   exit 6
 }
 
-# fork_base — resolve the trunk SHA the branch's code commits sit on. Prefer the recorded
-# per-slug fork-base ref (written by clean-checkout / do_success); fall back to the merge-base
-# with the trunk snapshot for pre-2.4.1 branches. Echoes the SHA (empty if unresolvable).
-fork_base() {
-  local b
-  b=$(git -C "$WORKTREE" rev-parse --verify "refs/acfw/forkbase/$SLUG" 2>/dev/null || true)
-  [ -z "$b" ] && b=$(git -C "$WORKTREE" merge-base HEAD refs/acfw/trunk-snapshot 2>/dev/null || true)
-  echo "$b"
-}
-
-# A worktree/<slug> branch is code-only by construction. If it carries ANY commit touching
-# .backlog/ that is not on trunk, it was contaminated (a pre-2.4.1 branch that imported trunk's
-# task-transition history). Rebasing such a branch replays the whole phantom range and produces
-# spurious conflicts -> the integrate reject-loop. Refuse it: print context, exit 8. The orchestrator
-# parks the task for an operator (manual recovery: cherry-pick the tip code commit onto trunk).
-emit_contaminated() {
-  local POISON
-  POISON=$(git -C "$ACFW_TRUNK_ROOT" log --oneline "${ACFW_TRUNK_BRANCH}..refs/acfw/${SLUG}" -- .backlog/ 2>/dev/null || true)
-  echo "ACFW-INTEGRATE: contaminated"
-  echo "worktree: $WORKTREE"
-  echo "branch: $BRANCH"
-  echo "task_file: $TASK_FILE"
-  echo "backlog_commits_on_branch:"
-  echo "$POISON"
-  echo "recovery: cherry-pick the branch's tip code commit(s) onto $ACFW_TRUNK_BRANCH, stamp Integrated-At, then remove the worktree + branch."
-  exit 8
-}
-
-# Emit conflict context for the caller, then exit 7. Worktree is left mid-rebase.
+# Emit conflict context for the caller, then exit 7. Worktree is left mid-cherry-pick on $BRANCH
+# (2.5.0 replays the branch's pending code commits via cherry-pick; the resolver continues it).
 emit_resolver_needed() {
   local MERGE_BASE CONFLICTING_COMMITS SOURCE_TASKS CONFLICTED_FILES
   MERGE_BASE=$(git -C "$WORKTREE" merge-base HEAD refs/acfw/trunk-snapshot 2>/dev/null || true)
@@ -163,6 +157,7 @@ emit_resolver_needed() {
   echo "branch: $BRANCH"
   echo "task_file: $TASK_FILE"
   echo "assigned_agent: $ASSIGNED_AGENT"
+  echo "sequencer: cherry-pick"
   echo "conflicting_commits:"
   echo "$CONFLICTING_COMMITS"
   echo "source_tasks:"
@@ -172,13 +167,15 @@ emit_resolver_needed() {
   exit 7
 }
 
-# Returns 0 if a rebase is in progress in the worktree (robust for linked worktrees,
-# where $WORKTREE/.git is a file, not a directory).
-rebase_in_progress() {
-  local rb rba
+# Returns 0 if a rebase OR cherry-pick sequence is in progress in the worktree (robust for linked
+# worktrees, where $WORKTREE/.git is a file, not a directory). A resolver that finished cleanly
+# leaves neither; one that gave up mid-conflict leaves the sequencer state behind.
+sequencer_in_progress() {
+  local rb rba cp
   rb=$(git -C "$WORKTREE" rev-parse --git-path rebase-merge 2>/dev/null || true)
   rba=$(git -C "$WORKTREE" rev-parse --git-path rebase-apply 2>/dev/null || true)
-  { [ -n "$rb" ] && [ -d "$rb" ]; } || { [ -n "$rba" ] && [ -d "$rba" ]; }
+  cp=$(git -C "$WORKTREE" rev-parse --git-path CHERRY_PICK_HEAD 2>/dev/null || true)
+  { [ -n "$rb" ] && [ -d "$rb" ]; } || { [ -n "$rba" ] && [ -d "$rba" ]; } || { [ -n "$cp" ] && [ -f "$cp" ]; }
 }
 
 # Refresh refs/acfw/<slug> from the (possibly rebased) worktree branch and retry FF.
@@ -193,8 +190,8 @@ retry_ff() {
 
 # ================= post-resolver mode =================
 if [ "$MODE" = "post-resolver" ]; then
-  if rebase_in_progress; then
-    do_resolver_failure   # resolver gave up or crashed mid-rebase
+  if sequencer_in_progress; then
+    do_resolver_failure   # resolver gave up or crashed mid-cherry-pick/rebase
   fi
   if [ -n "$(git -C "$WORKTREE" status --porcelain)" ]; then
     do_resolver_failure   # working tree dirty: resolver did not finish cleanly
@@ -248,37 +245,65 @@ if ! git -C "$ACFW_TRUNK_ROOT" rev-parse --verify "refs/acfw/${SLUG}" >/dev/null
   exit 10
 fi
 
-# ---- Step 3 pre-check: branches are code-only. A branch carrying .backlog/ commits not on trunk is
-# contaminated (pre-2.4.1 import of trunk's task-transition history). Never FF or rebase it — that
-# replays the phantom range and produces the spurious conflicts behind the reject-loop. Refuse and
-# hand back to the orchestrator to park for an operator.
-if [ -n "$(git -C "$ACFW_TRUNK_ROOT" log --oneline "${ACFW_TRUNK_BRANCH}..refs/acfw/${SLUG}" -- .backlog/ 2>/dev/null)" ]; then
-  emit_contaminated
-fi
+# ---- Step 3 (2.5.0): patch-id awareness ----
+# PENDING = the branch's genuine code commits not yet on trunk by patch-id, oldest-first, with
+# .backlog phantom commits and already-applied commits dropped (see acfw_pending_code_commits).
+PENDING=$(acfw_pending_code_commits "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH" "refs/acfw/${SLUG}")
+# Does the branch carry .backlog/ commits not on trunk? Such a branch must NEVER fast-forward (that
+# would re-add trunk's task-transition phantoms onto trunk); it is reconstructed code-only below.
+HAS_BACKLOG=0
+[ -n "$(git -C "$ACFW_TRUNK_ROOT" log --oneline "${ACFW_TRUNK_BRANCH}..refs/acfw/${SLUG}" -- .backlog/ 2>/dev/null)" ] && HAS_BACKLOG=1
 
-if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/${SLUG}" >&2; then
+# WS1 short-circuit: every code change on the branch is already on trunk by patch-id (or the branch
+# carries only .backlog phantoms). Nothing to fold in — stamp Integrated-At at current trunk and reap.
+# NO rebase, NO conflict. Cures the phantom-conflict reject-loop AND the done-modulo-integration stall
+# (accepted-but-unintegrated tasks whose equivalent code is already on trunk), and stops re-rejecting
+# already-integrated work on re-runs.
+if [ -z "$PENDING" ]; then
   TRUNK_SHA_AFTER=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
-  # Post-flight: HEAD must have advanced. A no-op FF means the branch was already an
-  # ancestor — the task should not have been accepted-but-unintegrated.
-  if [ "$TRUNK_SHA_AFTER" = "$TRUNK_SHA_BEFORE" ]; then
-    echo "FATAL: FF reported success but HEAD did not advance ($TRUNK_SHA_BEFORE); refs/acfw/${SLUG} = $(git -C "$ACFW_TRUNK_ROOT" rev-parse refs/acfw/${SLUG})" >&2
-    exit 10
-  fi
+  echo "ACFW-INTEGRATE: already-integrated ($SLUG code already on $ACFW_TRUNK_BRANCH by patch-id; marking terminal)"
   do_success
 fi
 
-# ---- Step 4: Replay the branch's OWN commits onto current trunk, then retry FF ----
-# Rebase --onto with an explicit fork base so ONLY base..HEAD (the branch's code commits) replay.
-# A bare `rebase refs/acfw/trunk-snapshot` replays merge-base..HEAD instead — with a stale base that
-# is the whole imported .backlog + duplicated-trunk range, the original cause of the phantom-conflict
-# reject-loop. The Step-3 guard already refused any branch carrying .backlog/, so base..HEAD is code-only.
-git_with_lock_backoff -C "$WORKTREE" fetch "$ACFW_TRUNK_ROOT" "${ACFW_TRUNK_BRANCH}:refs/acfw/trunk-snapshot" --quiet >&2
-BASE=$(fork_base)
-if [ -n "$BASE" ] && git_with_lock_backoff -C "$WORKTREE" rebase --onto refs/acfw/trunk-snapshot "$BASE" "$BRANCH" >&2; then
-  if retry_ff; then
+[ "$HAS_BACKLOG" = "1" ] && echo "ACFW-INTEGRATE: salvaging contaminated branch ($SLUG carries .backlog phantom commits; replaying code-only)" >&2
+
+# ---- Step 4: fast path — a clean code-only branch that is a linear descendant FFs straight in ----
+if [ "$HAS_BACKLOG" = "0" ]; then
+  if git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" merge --ff-only "refs/acfw/${SLUG}" >&2; then
+    TRUNK_SHA_AFTER=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
+    # Post-flight: HEAD must have advanced. PENDING was non-empty, so a no-op FF is a contradiction.
+    if [ "$TRUNK_SHA_AFTER" = "$TRUNK_SHA_BEFORE" ]; then
+      echo "FATAL: FF reported success but HEAD did not advance ($TRUNK_SHA_BEFORE); refs/acfw/${SLUG} = $(git -C "$ACFW_TRUNK_ROOT" rev-parse refs/acfw/${SLUG})" >&2
+      exit 10
+    fi
     do_success
   fi
 fi
 
-# ---- Step 5: Conflict — assemble context and hand back to the caller ----
+# ---- Step 5: reconstruct a clean code-only tip — replay ONLY the pending code commits onto fresh
+# trunk via cherry-pick (drops .backlog phantoms + already-applied commits), then FF. ----
+git_with_lock_backoff -C "$WORKTREE" fetch "$ACFW_TRUNK_ROOT" "${ACFW_TRUNK_BRANCH}:refs/acfw/trunk-snapshot" --quiet >&2
+# A dirty worktree at integrate time is anomalous (the specialist is done, the reviewer accepted).
+# Never reset --hard over uncommitted work — defer and retry instead.
+if [ -n "$(git -C "$WORKTREE" status --porcelain)" ]; then
+  echo "WARN: $SLUG worktree has uncommitted changes at integrate time; deferring (retry next iteration)." >&2
+  exit 10
+fi
+# WS3: back up the branch tip BEFORE mutating it, so a botched replay or a resolver that clobbers the
+# branch is one `git branch <name> refs/acfw/preintegrate/<slug>` away — never reflog-archaeology.
+git -C "$ACFW_TRUNK_ROOT" update-ref "refs/acfw/preintegrate/$SLUG" "$(git -C "$WORKTREE" rev-parse "$BRANCH")" 2>/dev/null || true
+echo "ACFW-INTEGRATE: recovery ref refs/acfw/preintegrate/$SLUG = $(git -C "$WORKTREE" rev-parse "$BRANCH") (pre-integration $BRANCH tip)" >&2
+# Move the branch to fresh trunk and replay its code commits on top. cherry-pick advances $BRANCH
+# (the checked-out ref), so a conflict leaves the worktree mid-cherry-pick ON the branch — exactly
+# what the resolver + post-resolver retry_ff expect.
+git_with_lock_backoff -C "$WORKTREE" checkout "$BRANCH" >&2 2>/dev/null || true
+git_with_lock_backoff -C "$WORKTREE" reset --hard refs/acfw/trunk-snapshot >&2
+if ! git_with_lock_backoff -C "$WORKTREE" cherry-pick $PENDING >&2; then
+  emit_resolver_needed   # conflict — worktree left mid-cherry-pick on $BRANCH
+fi
+if retry_ff; then
+  do_success
+fi
+
+# ---- Step 6: clean replay but FF still failed (trunk advanced under us) — hand back to the caller ----
 emit_resolver_needed

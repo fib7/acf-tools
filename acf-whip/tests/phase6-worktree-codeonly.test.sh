@@ -10,7 +10,8 @@
 #   A  clean-checkout re-sync replays ONLY the branch's own code commits (no .backlog import), even
 #      after trunk accrues new .backlog commits -> `git log trunk..branch -- .backlog/` stays EMPTY.
 #   B  integrate folds exactly the branch's code commit (branch is 1 ahead, not 367) and stamps Integrated-At.
-#   C  a contaminated branch (carries a .backlog/ commit) is REFUSED with exit 8 / "contaminated"; trunk unchanged.
+#   C  a contaminated branch (carries a .backlog/ commit) is SALVAGED in-path (2.5.0): the patch-id
+#      replay folds the real code commit and DROPS the .backlog phantom, exit 0, trunk gets the code only.
 #   D  the per-slug fork-base ref is created on worktree add and deleted on full reap.
 # Run: bash acf-whip/tests/phase6-worktree-codeonly.test.sh
 
@@ -108,22 +109,44 @@ check "B6: worktree branch reaped (no more tasks share the slug)" "! git -C '$RE
 check "D2: fork-base ref deleted on full reap" "! git -C '$REPO' rev-parse --verify -q refs/acfw/forkbase/fix-a >/dev/null"
 rm -f /tmp/p6-integ.out
 
-echo "== Scenario C: a contaminated branch is REFUSED (exit 8), trunk untouched =="
+echo "== Scenario C: a contaminated branch is SALVAGED in-path (2.5.0: code folded, .backlog dropped) =="
 mktask accepted bug-2 fix-b accepted
 git add -A; git commit -qm "add bug-2"
 git -C "$REPO" worktree add -q "$REPO/.worktree/fix-b" -b worktree/fix-b trunk
 WT2="$REPO/.worktree/fix-b"
+mkdir -p "$WT2/.backlog/pending"
 # Poison the branch: a .backlog/ commit that is NOT on trunk (mimics a pre-2.4.1 imported transition).
 echo poison > "$WT2/.backlog/pending/poison.md"; git -C "$WT2" add -A; git -C "$WT2" commit -qm "task: poison pending -> done"
 echo "real fix" > "$WT2/src-fix-b.txt"; git -C "$WT2" add -A; git -C "$WT2" commit -qm "fix: bug-2 code"
+# Advance trunk so the branch diverges (forces the patch-id reconstruction path, not a plain FF).
+trunk_backlog_commit churn-c
 TRUNK_BEFORE_C=$(git -C "$REPO" rev-parse trunk)
-bash "$INTEGRATE" "$REPO/.backlog/accepted/bug-2.md" >/tmp/p6-cont.out 2>/dev/null; RC=$?
-check "C1: integrate refuses with exit 8" "[ $RC -eq 8 ]"
-check "C2: 'contaminated' block emitted on stdout" "grep -q 'ACFW-INTEGRATE: contaminated' /tmp/p6-cont.out"
-check "C3: recovery hint emitted" "grep -q '^recovery:' /tmp/p6-cont.out"
-check "C4: trunk HEAD unchanged (nothing folded)" "[ \"\$(git -C '$REPO' rev-parse trunk)\" = \"$TRUNK_BEFORE_C\" ]"
-check "C5: task stays in accepted/ (not rejected)" "[ -f '$REPO/.backlog/accepted/bug-2.md' ] && [ ! -f '$REPO/.backlog/rejected/bug-2.md' ]"
-rm -f /tmp/p6-cont.out
+bash "$INTEGRATE" "$REPO/.backlog/accepted/bug-2.md" >"$WORK/cont.out" 2>&1; RC=$?
+check "C1: integrate salvages with exit 0" "[ $RC -eq 0 ]"
+check "C2: 'salvaging contaminated branch' emitted" "grep -q 'ACFW-INTEGRATE: salvaging contaminated branch' '$WORK/cont.out'"
+check "C3: the real code commit landed on trunk" "git -C '$REPO' cat-file -e trunk:src-fix-b.txt 2>/dev/null"
+check "C4: the .backlog phantom was DROPPED (not on trunk)" "! git -C '$REPO' cat-file -e trunk:.backlog/pending/poison.md 2>/dev/null"
+check "C5: Integrated-At stamped, task stays accepted (not rejected)" \
+  "grep -qE '^- \*\*Integrated-At\*\*: [0-9a-f]{7,}' '$REPO/.backlog/accepted/bug-2.md' && [ ! -f '$REPO/.backlog/rejected/bug-2.md' ]"
+check "C6: pre-integration backup ref cleaned up on success" "! git -C '$REPO' rev-parse -q --verify refs/acfw/preintegrate/fix-b >/dev/null"
+
+echo "== Scenario E: clean-checkout HEALS a legacy no-forkbase branch (patch-id, not far-back merge-base) =="
+mktask in-progress bug-5 fix-e in-progress
+git add -A; git commit -qm "add bug-5"
+# Legacy shape: a worktree created directly (NO forkbase ref), carrying a .backlog phantom + code.
+git -C "$REPO" worktree add -q "$REPO/.worktree/fix-e" -b worktree/fix-e trunk
+WT5="$REPO/.worktree/fix-e"
+mkdir -p "$WT5/.backlog/pending"
+echo poison > "$WT5/.backlog/pending/phantom-e.md"; git -C "$WT5" add -A; git -C "$WT5" commit -qm "task: phantom-e pending -> done"
+echo "code-e" > "$WT5/code-e.txt"; git -C "$WT5" add -A; git -C "$WT5" commit -qm "feat: bug-5 code"
+git -C "$REPO" update-ref -d refs/acfw/forkbase/fix-e 2>/dev/null || true   # ensure legacy (no base)
+check "E0: branch carries a .backlog phantom pre-heal" "[ -n \"\$(git -C '$REPO' log --oneline trunk..worktree/fix-e -- .backlog/)\" ]"
+trunk_backlog_commit churn-e1; trunk_backlog_commit churn-e2   # trunk advances
+bash "$CC" "$REPO/.backlog/in-progress/bug-5.md" >/dev/null 2>&1
+check "E1: branch is now code-only (phantom dropped by patch-id heal)" "[ -z \"\$(git -C '$REPO' log --oneline trunk..worktree/fix-e -- .backlog/)\" ]"
+check "E2: the code commit survived the heal" "git -C '$WT5' cat-file -e worktree/fix-e:code-e.txt 2>/dev/null"
+check "E3: branch re-based onto current trunk tip" "[ \"\$(git -C '$REPO' merge-base trunk worktree/fix-e)\" = \"\$(git -C '$REPO' rev-parse trunk)\" ]"
+check "E4: fork-base ref now recorded (branch healed for future runs)" "git -C '$REPO' rev-parse --verify -q refs/acfw/forkbase/fix-e >/dev/null"
 
 echo ""
 echo "==================================================="

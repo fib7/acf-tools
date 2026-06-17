@@ -256,6 +256,29 @@ function resultToState(from, transition) {
   if (from === 'in-review' && transition === 'rejected') return 'rejected'
   return null
 }
+
+// reconcileIntegrationTallies — WS5 / retro #9: the in-loop integrate accumulators are optimistic. A
+// post-resolver integrate agent that fails to emit returns 'transient', so the rejection that
+// integrate-worktree ALREADY wrote to disk (task moved to rejected/, exit 6) is recorded nowhere — the
+// report would claim rejectedAtIntegration:[] while the folder says otherwise, and could even list a
+// stem under `integrated` that is actually in rejected/. The fix trusts the final on-disk snapshot:
+//   • integratedStems  — stems the loop THOUGHT it integrated (optimistic positives)
+//   • rejectedStems    — stems the loop SAW rejected at integration
+//   • attemptedIntegrate — every stem handed to the integrator (the authoritative "we tried" set)
+//   • finalSnap.tasks  — folder truth; a terminal-integrated task is COLLAPSED out of the digest, so
+//     absent ⇒ integrated-or-unknown (NOT rejected). Only an explicit rejected/ entry demotes a stem.
+// Returns { integrated, rejectedAtIntegration, reconciled } — deduped, disk-consistent.
+function reconcileIntegrationTallies(integratedStems, rejectedStems, attemptedIntegrate, finalSnap) {
+  const finalByStem = new Map(((finalSnap && finalSnap.tasks) || []).map((t) => [t.stem, t]))
+  const rejectedOnDisk = (stem) => { const t = finalByStem.get(stem); return !!(t && t.folder === 'rejected') }
+  const integrated = [...new Set(integratedStems)].filter((s) => !rejectedOnDisk(s))
+  const rejectedAtIntegration = [...new Set([
+    ...rejectedStems,
+    ...[...attemptedIntegrate].filter(rejectedOnDisk),
+  ])]
+  const reconciled = integrated.length !== new Set(integratedStems).size || rejectedAtIntegration.length !== new Set(rejectedStems).size
+  return { integrated, rejectedAtIntegration, reconciled }
+}
 // </scheduler-pure> ==========================================================================
 
 // ============================ agent prompt builders ============================
@@ -349,8 +372,8 @@ Capture the exit code and stdout. Map exit code -> outcome:
   0  -> integrated      (folded into trunk; Integrated-At written)
   4  -> skipped         (no worktree/<slug> branch — historical/pre-2.0.0 task already on trunk; nothing to integrate, do NOT retry)
   6  -> rejected        (conflict unresolved; task moved to rejected/)
-  7  -> resolver-needed  (rebase conflict; stdout carries a "ACFW-INTEGRATE: resolver-needed" block — DO NOT touch the worktree, just parse and report)
-  8  -> contaminated     (branch carries .backlog/ commits not on trunk; stdout carries an "ACFW-INTEGRATE: contaminated" block — DO NOT touch the worktree. Put the "recovery:" line (and the offending commits) into note. The orchestrator parks this task for an operator; do NOT retry/reject.)
+  7  -> resolver-needed  (cherry-pick conflict; stdout carries a "ACFW-INTEGRATE: resolver-needed" block — DO NOT touch the worktree, just parse and report)
+  8  -> contaminated     (retired in 2.5.0 — .backlog-carrying branches now self-salvage in-path; not emitted. Kept for back-compat: if seen, treat like resolver-needed/transient and report note.)
   10 -> transient        (anti-orphan guard; leave accepted, retry later)
   99 -> transient        (git lock contention)
   other -> error
@@ -361,15 +384,21 @@ Return the structured IntegrateResult. Do NOT dispatch a resolver yourself; the 
 function resolverPrompt(t, r) {
   return `${ENV}
 You are the conflict resolver (${r.resolverAgent || t.agent || 'assigned specialist'}) for an acf-whip integration.
-The worktree at ${sq(r.resolverWorktree)} (branch ${r.resolverBranch}) is MID-REBASE onto trunk with conflicts. Do NOT abort the rebase unless the conflict is irreconcilable.
+The worktree at ${sq(r.resolverWorktree)} (branch ${r.resolverBranch}) is MID-CHERRY-PICK onto trunk with conflicts. Do NOT abort unless the conflict is irreconcilable.
 
 Conflicted files:
 ${r.resolverConflictedFiles || '(none reported)'}
 
+FORBIDDEN — these DESTROY the task's accepted work or corrupt the fold (the orchestrator will reject the integration if it detects them):
+  - git reset (any form), git checkout/switch to another branch, git branch -D/-f, git stash drop, deleting the worktree.
+  - Moving the worktree off branch ${r.resolverBranch}. Stay on this branch the entire time.
+  - Editing or committing anything under .backlog/ (task state lives on trunk only).
+ALLOWED — only: edit the conflicted files in place, git -C ${sq(r.resolverWorktree)} add <file>, and git -C ${sq(r.resolverWorktree)} cherry-pick --continue / --abort.
+
 Resolve every conflict preserving BOTH intents, run the project's quality gates inside the worktree, then:
-  - if resolved cleanly:  git -C ${sq(r.resolverWorktree)} rebase --continue   (continue until the rebase finishes)
-  - if irreconcilable:    git -C ${sq(r.resolverWorktree)} rebase --abort   AND append a line "| <date> | FATAL: <reason> |" to the task file ${sq(`${trunkRoot}/.backlog/accepted/${t.stem}.md`)}
-Do NOT move task files and do NOT commit .backlog/. When done, report what you did in one line.`
+  - if resolved cleanly:  git -C ${sq(r.resolverWorktree)} cherry-pick --continue   (continue until the cherry-pick sequence finishes; HEAD must stay on ${r.resolverBranch})
+  - if irreconcilable:    git -C ${sq(r.resolverWorktree)} cherry-pick --abort   AND append a line "| <date> | FATAL: <reason> |" to the task file ${sq(`${trunkRoot}/.backlog/accepted/${t.stem}.md`)}
+Do NOT move task files. When done, report what you did in one line.`
 }
 
 // Bounded-retry wrapper around a schema agent() call (retro I1). A StructuredOutput non-emit (the
@@ -474,6 +503,9 @@ let noGain = 0 // consecutive iterations with no terminal gain (perpetual futile
 let prevTerminal = -1
 const integratedStems = []
 const rejectedStems = []
+const attemptedIntegrate = new Set() // every stem handed to integrateOne — used to reconcile the report
+                                     // against disk (WS5 / retro #9): an attempted stem now in rejected/
+                                     // was rejected at integration even if the agent failed to emit it.
 const parkedThisRun = new Set() // stems a specialist blocked on with dependency-missing (BUG-2) — not re-dispatched
 const parkedNeeds = new Map() // stem -> needs_task text (for the final operator report)
 let lastSnapshot = null
@@ -654,6 +686,7 @@ Return the ScanResult.`
 
   // Fold ONE accepted task's worktree branch into trunk (resolver hoisted). Updates integration tallies.
   async function integrateOne(t) {
+    attemptedIntegrate.add(t.stem)
     let r = await safeAgent(integratePrompt(t, false), { label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate agent non-emit — left accepted, retry next iteration'))
     if (r && r.outcome === 'resolver-needed') {
       log(`integrate ${t.slug}: conflict — dispatching resolver ${r.resolverAgent || t.agent || '(default)'}`)
@@ -773,6 +806,9 @@ Return the ScanResult.`
 // ============================ DRAIN (defensive, default mode) ============================
 phase('Drain')
 let drained = 0
+// finalSnap = the freshest authoritative snapshot used to RECONCILE the run report (WS5 / retro #9).
+// Defaults to the last good loop snapshot; the drain rescan below upgrades it when it succeeds.
+let finalSnap = lastSnapshot
 if (mode === 'default' && lastSnapshot) {
   const rescan = await safeAgent(
     `${ENV}
@@ -788,11 +824,13 @@ Final integration drain. Run  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trun
   // this run; integrate-worktree treats an already-folded (empty) branch as terminal, so it is a no-op
   // even if one slips through.
   if (!snap2) snap2 = lastSnapshot
+  finalSnap = snap2 || lastSnapshot
   if (snap2) {
     const idx2 = indexTasks(snap2.tasks || [], snap2.satisfiedDeps)
     const left = topoIntegrationOrder((snap2.tasks || []).filter((t) => t.folder === 'accepted' && t.slug && t.slug !== 'none' && !t.hasIntegratedAt && t.hasWorktreeBranch && !integratedStems.includes(t.stem)), idx2)
     for (const t of left) {
       // single defensive pass: an exit-7 here is intentionally left for the next /go run (no resolver post-loop)
+      attemptedIntegrate.add(t.stem)
       const r = await safeAgent(integratePrompt(t, false), { label: `drain:${t.slug}`, phase: 'Drain', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, () => ({ outcome: 'transient', note: 'drain integrate non-emit' }))
       if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); drained++ }
     }
@@ -800,13 +838,19 @@ Final integration drain. Run  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trun
 }
 
 // ============================ REPORT ============================
-const finalCounts = lastSnapshot ? lastSnapshot.counts : null
+// WS5 / retro #9: RECONCILE the run tallies against the freshest on-disk snapshot (finalSnap). The
+// in-loop accumulators are optimistic — a post-resolver integrate agent that fails to emit returns
+// 'transient' while integrate-worktree already moved the task to rejected/ on disk, so a naive report
+// can claim a task integrated (or silently omit a rejection) that the folder state contradicts. The
+// disk (folder + Integrated-At) is the source of truth; the accumulators only name what we attempted.
+const finalCounts = finalSnap ? finalSnap.counts : null
+const { integrated, rejectedAtIntegration, reconciled } = reconcileIntegrationTallies(integratedStems, rejectedStems, attemptedIntegrate, finalSnap)
 // Tasks parked for an operator: blocked at the re-block cap (their real blocker is unmodeled — retro
 // I2) or at the max-rejection cap, OR explicitly parked this run on a dependency-missing signal (BUG-2,
 // possibly before reaching the cap). These are why a "complete" run can still leave blocked tasks: the
 // loop-breaker intentionally stops re-dispatching them instead of livelocking. Surface them explicitly,
 // with the missing-task hint when the specialist provided one.
-const capParked = ((lastSnapshot && lastSnapshot.tasks) || [])
+const capParked = ((finalSnap && finalSnap.tasks) || [])
   .filter((t) => t.folder === 'blocked' && ((t.blockCount || 0) >= MAX_BLOCK_RETRY || (t.rejectionCount || 0) >= MAX_REJECT_RETRY))
   .map((t) => ({ stem: t.stem, blockCount: t.blockCount || 0, rejectionCount: t.rejectionCount || 0, needsTask: parkedNeeds.get(t.stem) || '' }))
 const capParkedStems = new Set(capParked.map((n) => n.stem))
@@ -818,8 +862,8 @@ return {
   mode,
   iterations: iter,
   finalCounts,
-  integrated: integratedStems,
-  rejectedAtIntegration: rejectedStems,
+  integrated,
+  rejectedAtIntegration,
   drainedPostLoop: drained,
   needsOperator,
   note: (stopReason === 'complete'
@@ -829,5 +873,6 @@ return {
       : stopReason === 'scan-degraded'
         ? 'Scan could not emit a snapshot after retries + schema-less text fallback; stopped the loop and drained integratable work. Nothing lost (git + .backlog/ are durable) — re-run /go to continue.'
         : 'Hit the iteration cap.')
-    + (needsOperator.length ? ` ${needsOperator.length} task(s) parked for an operator (re-block/rejection cap reached): ${needsOperator.map((n) => n.stem).join(', ')}.` : ''),
+    + (needsOperator.length ? ` ${needsOperator.length} task(s) parked for an operator (re-block/rejection cap reached): ${needsOperator.map((n) => n.stem).join(', ')}.` : '')
+    + (reconciled ? ' (integration tallies reconciled against final on-disk state).' : ''),
 }
