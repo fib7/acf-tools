@@ -31,12 +31,16 @@ files, daemons, or schedulers.
 
 1. Resolve `Worktree:` slug from the task front-matter (missing → exit 1 for code tasks).
 2. Resolve trunk from `$ACFW_TRUNK_ROOT` / `$ACFW_TRUNK_BRANCH` (set by `/go`), else `git rev-parse`.
-3. Lazy-create `.worktree/<slug>` on `worktree/<slug>` from the local trunk.
+3. Lazy-create `.worktree/<slug>` on `worktree/<slug>` from the local trunk, recording the fork
+   base (`refs/acfw/forkbase/<slug>` = the trunk SHA the branch's code sits on).
 4. **Hydrate** the worktree from `.worktreeinclude` (Step 3.5; copies/symlinks untracked
    dev files like `.env`, `node_modules` so the worktree runs a full sandbox). No-op when
    the manifest is absent. See `hydrate-worktree.sh`.
 5. Validate the worktree is on `worktree/<slug>` (drift → exit 3).
-6. Fast-forward only from local trunk (picks up sibling worktrees' integrated commits).
+6. Re-align the branch's own commits onto local trunk — **code-only** — via
+   `rebase --onto <trunk-snapshot> <fork-base>` (picks up sibling worktrees' integrated commits
+   without ever merging trunk's `.backlog` history into the branch). On conflict it aborts and
+   defers to integrate time, leaving the branch on its existing code-only state.
 7. Stash unrelated working-tree changes.
 8. Append the OK token; print the worktree path.
 

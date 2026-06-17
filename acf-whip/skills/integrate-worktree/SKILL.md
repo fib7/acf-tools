@@ -18,6 +18,13 @@ order. Specialists never call this — they never write to trunk's `.git/index`.
 lock-backoff in `skills/lib/acfw-git.sh`). This skill is a thin wrapper so the legacy and
 workflow paths run the *same* implementation.
 
+**Branches are code-only.** The rebase replays ONLY the branch's own commits onto trunk via
+`rebase --onto <trunk-snapshot> <fork-base>` (the fork base is the per-slug ref
+`refs/acfw/forkbase/<slug>`, recorded at worktree creation and re-pointed after each integration).
+A bare whole-branch rebase would replay the stale `merge-base..HEAD` range — trunk's `.backlog`
+task-transition history plus duplicated-trunk commits — which is the cause of the 2.4.1 reject-loop.
+Before integrating, a guard refuses any branch carrying `.backlog/` commits not on trunk (exit 8).
+
 ## Two-call protocol (resolver dispatch is hoisted to the caller)
 
 Bash cannot reliably spawn a subagent, so conflict resolution is split across two calls
@@ -36,6 +43,10 @@ bash "${CLAUDE_PLUGIN_ROOT}/skills/integrate-worktree/bin/integrate-worktree.sh"
   source_tasks, conflicted_files) and leaves the worktree mid-rebase. The caller must
   dispatch `assigned_agent` as a conflict resolver **inside that worktree** (see resolver
   contract below), then make Call 2.
+- exit 8 → **contaminated**: the branch carries `.backlog/` commits not on trunk (a pre-2.4.1
+  import). The script prints an `ACFW-INTEGRATE: contaminated` block and refuses (no FF/rebase).
+  The caller **parks the task for an operator** (manual recovery: cherry-pick the tip code commit
+  onto trunk) — do NOT retry or reject.
 - exit 10 / 99 → transient; leave the task in `accepted/`, retry next iteration.
 
 **Call 2 — after the resolver returns:**
@@ -81,6 +92,7 @@ under `#!/usr/bin/env bash`, so the corruption cannot recur regardless of login 
 | 1 | task missing `Worktree:` field | surface to operator (task-engineer bug) |
 | 6 | conflict unresolved | task is in `rejected/`; retry path takes over |
 | 7 | resolver-needed | dispatch resolver, then call with `--post-resolver` |
+| 8 | contaminated (`.backlog/` commits on branch) | park task for an operator; do NOT retry/reject |
 | 10 | transient git error | leave in `accepted/`; retry next iteration |
 | 99 | lock contention past backoff | transient; retry next iteration |
 

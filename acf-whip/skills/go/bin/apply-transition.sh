@@ -26,7 +26,8 @@
 # exists), it no-ops — so a re-applied batch after a workflow resume cannot double-move
 # or double-commit.
 #
-# Exit codes: 0 success or no-op; 2 bad args / file not found; 99 lock contention.
+# Exit codes: 0 success or no-op; 2 bad args / file not found; 3 invoked off-trunk (would
+# poison a code-only branch); 99 lock contention.
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,6 +46,19 @@ if [ -z "$TASK_FILE" ] || [ -z "$TO_STATE" ]; then
 fi
 
 REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}"
+
+# Invariant: .backlog/ state lives on TRUNK ONLY. This writer must run at the trunk root on the
+# trunk branch — never inside a worktree/<slug> checkout — or a task-transition commit would land on
+# a code-only branch and contaminate it (the integrate reject-loop). Assert it defensively when /go
+# has told us which branch trunk is; a mismatch means a caller bug, so refuse rather than poison.
+if [ -n "${ACFW_TRUNK_BRANCH:-}" ]; then
+  HEAD_BRANCH=$(git -C "$REPO_ROOT" symbolic-ref --short HEAD 2>/dev/null || true)
+  if [ -n "$HEAD_BRANCH" ] && [ "$HEAD_BRANCH" != "$ACFW_TRUNK_BRANCH" ]; then
+    echo "FATAL: apply-transition.sh must run on trunk ($ACFW_TRUNK_BRANCH) at $REPO_ROOT, but HEAD is $HEAD_BRANCH. Refusing to commit .backlog state off-trunk." >&2
+    exit 3
+  fi
+fi
+
 FNAME=$(basename "$TASK_FILE")
 FROM_STATE=$(basename "$(dirname "$TASK_FILE")")
 DEST="$REPO_ROOT/.backlog/$TO_STATE/$FNAME"
