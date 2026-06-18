@@ -151,3 +151,62 @@ acfw_load_namespace() { # <repo-root>
   [ -z "$ACFW_WORKTREE_DIR" ] && ACFW_WORKTREE_DIR=".worktree"
   [ -z "$ACFW_BRANCH_PREFIX" ] && ACFW_BRANCH_PREFIX="worktree"
 }
+
+# ============================================================================
+# LP-CAS (3.0.0): Ledger-In-Tree Compare-And-Swap integration primitives.
+#
+# Integration truth is a fact about git, never a markdown field:
+#   A task K is integrated  IFF  the in-tree marker .acfwhip/integrated/<shard>/<K>.json
+#   is present in the tree of the live trunk tip.
+# These helpers are the only sanctioned way to read/derive that fact. No caller may
+# assert "integrated" any other way (no Integrated-At field, no folder location).
+# ============================================================================
+
+# acfw_marker_path <key> — print the sharded in-tree ledger marker path for a task key.
+# Sharded by the first 2 hex of git's content hash of the key so a 600+ task backlog never
+# becomes one flat directory. Pure function of the key (no repo access needed); git hash-object
+# is used only as a stable, always-available hash. The key is the task id (already kebab-safe).
+acfw_marker_path() { # <key>
+  local key="$1" h
+  h=$(printf '%s' "$key" | git hash-object --stdin 2>/dev/null)
+  [ -n "$h" ] || h="00$(printf '%s' "$key" | cksum | tr -dc '0-9a-f')0"  # never-empty fallback
+  printf '.acfwhip/integrated/%s/%s.json' "${h:0:2}" "$key"
+}
+
+# acfw_live_trunk <root> <trunk-branch> — print the current trunk commit OID; nonzero exit if
+# the trunk is unobservable (detached/missing). NEVER cached: trunk is a live branch in the same
+# repo as every linked worktree, so its objects are already shared — there is no snapshot to go
+# stale. This is the keystone-defect (#1) cure by construction: nothing to freeze.
+acfw_live_trunk() { # <root> <trunk-branch>
+  git -C "$1" rev-parse --verify "$2^{commit}" 2>/dev/null
+}
+
+# acfw_is_integrated <root> <committish> <key> — exit 0 iff key's ledger marker exists in the
+# tree of <committish>. O(1) tree-path lookup; no history scan, no cursor; survives any history
+# rewrite that preserves the tree content. This is THE integration oracle.
+acfw_is_integrated() { # <root> <committish> <key>
+  local mp; mp=$(acfw_marker_path "$3")
+  git -C "$1" cat-file -e "$2:$mp" 2>/dev/null
+}
+
+# acfw_publish_candidate <root> <worktree> <fork-base> <key> [msg] — the sanctioned PRODUCER primitive.
+# Squashes the worktree's committed work into exactly ONE single-parent commit (tree = worktree HEAD's
+# tree, parent = fork-base) and publishes it at refs/acfw/patch/<key>. The integrator consumes exactly
+# this ref: a single-parent commit whose diff-vs-parent is the task's whole change, so cherry-pick's
+# 3-way base is the fork-base — never a merge-base computed against trunk. The worktree's work must be
+# committed (HEAD tree is read); the fork-base is the trunk tip the task forked from (need not be
+# current trunk — the integrator applies onto the live tip regardless). Idempotent per (tree, base).
+acfw_publish_candidate() { # <root> <worktree> <forkbase> <key> [msg]
+  local root="$1" wt="$2" base="$3" key="$4" msg="${5:-acfw candidate: $4}" tree p
+  tree=$(git -C "$wt" rev-parse "HEAD^{tree}" 2>/dev/null) || return 1
+  p=$(printf '%s\n\nACFW-Task: %s\n' "$msg" "$key" | git -C "$wt" commit-tree "$tree" -p "$base" 2>/dev/null) || return 1
+  git -C "$root" update-ref "refs/acfw/patch/$key" "$p"
+}
+
+# acfw_integrated_keys <root> <committish> — print every integrated task key present in the tree
+# of <committish>, one per line. Used by the scanner to build the integrated-set and by the loop's
+# external-epoch check. Lists the ledger tree; basenames minus .json are the keys.
+acfw_integrated_keys() { # <root> <committish>
+  git -C "$1" ls-tree -r --name-only "$2" -- .acfwhip/integrated/ 2>/dev/null \
+    | sed -n 's#^\.acfwhip/integrated/[^/]*/\(.*\)\.json$#\1#p'
+}
