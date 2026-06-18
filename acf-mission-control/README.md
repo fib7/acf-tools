@@ -10,25 +10,28 @@ surfaces.
 ## What it shows
 
 ```
-🚀 Opus · 📁 acf-tools · 🌿 main ✎3 ⊕2
-⛽ [███░░░░░░░] 18% · 200k · 💰$0.42 · ⏱12m · +156/-23 · 🔥 warm · 5h 23% 7d 41%
+◆ Opus · ▸ acf-tools · ⎇ main ✎3 ⊕2
+▰▰▱▱▱▱▱▱▱▱ 18% · 200k · $0.42 · 12m · +156/-23 · ● warm · 5h 23% 7d 41%
 ```
 
 | Segment | Source | Notes |
 |---------|--------|-------|
-| 🚀 model | `model.display_name` | Color per family (see below); ` [1m]` on 1M-context models |
-| 📁 dir | `workspace.current_dir` | Basename only |
-| 🌿 branch | `git` / `worktree.branch` | `✎N` modified, `⊕N` staged |
-| ⛽ fuel bar | `context_window.used_percentage` | Pre-calculated by Claude Code (input-only); never parses the transcript |
+| ◆ model | `model.display_name` | Color per family (see below); ` [1m]` on 1M-context models |
+| ▸ dir | `workspace.current_dir` | Basename only |
+| ⎇ branch | `git` / `worktree.branch` | `✎N` modified, `⊕N` staged |
+| ▰▱ fuel bar | `context_window.used_percentage` | Pre-calculated by Claude Code (input-only); never parses the transcript |
 | window | `context_window.context_window_size` | `200k` or `1M` — auto-detected |
-| 💰 cost | `cost.total_cost_usd` | Session estimate |
-| ⏱ duration | `cost.total_duration_ms` | Session wall-clock |
+| cost | `cost.total_cost_usd` | Session estimate |
+| duration | `cost.total_duration_ms` | Session wall-clock |
 | +/- lines | `cost.total_lines_added/removed` | Lines changed this session |
-| 🔥 cache | transcript mtime vs 5-min TTL | Warmth heuristic (see below) |
+| ● cache | transcript mtime vs 5-min TTL | Warmth heuristic (see below) |
 | 5h / 7d | `rate_limits.*.used_percentage` | Pro/Max only; auto-hidden otherwise |
 
 Core segments (model, dir, branch, fuel bar) are always shown. The rest are
 toggleable and auto-hide when their data is absent.
+
+Glyphs are themeable via `CONFIG["glyphs"]` (default `sleek`) — see
+[Customization](#customization).
 
 ## Color: semantic, not decorative
 
@@ -38,6 +41,7 @@ Each hue means one thing, so critical state jumps out and routine metadata reced
 |-------|---------|
 | Per-model | 🟣 Opus · 🔵 Sonnet (cyan) · 🟢 Haiku · 🔷 Fable — spot "I'm on the wrong model" instantly |
 | Green / Yellow / Red | Health zones, reused for the fuel bar **and its %**, rate limits, cost, and cache warmth |
+| Anchor glyphs | Line-1 icons carry a stable identity hue so segments are findable at a glance — model `◆` in its family color, dir `▸` blue, branch `⎇` cyan (line-art themes `sleek`/`nerd`) |
 | Dim | Recessive metadata (separators, directory, window size, duration) |
 | Bright cyan | A `1M` window (capability highlight) |
 
@@ -48,7 +52,7 @@ Color is never the *only* signal — bar glyphs (`█`/`░`) and numbers carry 
 information, so colorblind and no-color terminals lose nothing. Honors the
 `NO_COLOR` environment variable and a `CONFIG['color']` master switch.
 
-## Cache warmth 🔥 — the unique signal
+## Cache warmth — the unique signal
 
 Claude Code prompt-caches your conversation. The cache TTL is **5 minutes,
 sliding** (every turn resets it). Idle past it and your **next message is a cache
@@ -59,9 +63,9 @@ The indicator estimates this from how long since your last turn:
 
 | State | Idle time | Meaning |
 |-------|-----------|---------|
-| 🔥 warm | `< 4 min` | Next turn is a cheap cache read |
-| 🔥 cooling | `4–5 min` | TTL about to lapse |
-| ❄ cold | `≥ 5 min` | Next turn reprocesses the whole conversation |
+| ● warm | `< 4 min` | Next turn is a cheap cache read |
+| ◐ cooling | `4–5 min` | TTL about to lapse |
+| ○ cold | `≥ 5 min` | Next turn reprocesses the whole conversation |
 
 It's a **heuristic** (true cache state isn't exposed by the API) derived from the
 transcript file's modification time. To keep it ticking toward "cold" while you're
@@ -80,7 +84,8 @@ On first `SessionStart` the plugin copies `status-line.py` into your repo at
 it keeps working after the plugin is uninstalled and can be customized per project.
 
 **Requirements**: Python 3.6+ (standard library only). `git` optional (branch
-display). A modern terminal for ANSI colors and emoji.
+display). A terminal with ANSI color (the default `sleek`/`text` glyph themes use
+only standard Unicode — no special font; the `emoji` and `nerd` themes are opt-in).
 
 ## Self-upgrading
 
@@ -106,13 +111,17 @@ apply on the next status-line update — no reinstall.
 CONFIG = {
     "cost": True, "rate_limits": True, "git_dirty": True,
     "duration": True, "lines": True, "cache": True,
-    "color": True, "single_line": False, "bar_width": 10,
+    "glyphs": "sleek", "color": True, "single_line": False, "bar_width": 10,
     "cache_ttl": 300, "ctx_warn": 70, "ctx_crit": 90,
     "cost_warn": 5.0, "cost_crit": 20.0,
 }
 ```
 
 - Toggle any optional segment on/off.
+- `glyphs` picks the icon theme — `sleek` (default, monochrome geometric),
+  `emoji` (the original pictographs), `nerd` (Nerd-Font glyphs — needs a Nerd
+  Font installed), or `text` (no icons; color + labels only). Each theme's glyph
+  table lives in the `GLYPHS` dict; edit a slot there to swap a single icon.
 - `single_line: True` collapses both rows into one.
 - Tune thresholds, bar width, or the cache TTL (set to `3600` if you use the
   1-hour extended cache).
