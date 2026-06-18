@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# mission-control-version: 1.1.0
+# mission-control-version: 1.2.0
 """ACF Mission Control - Status Line HUD
 
 Two-line "Mission Control" status line for Claude Code.
@@ -24,14 +24,15 @@ import time
 # --------------------------------------------------------------------------- #
 CONFIG = {
     # Optional segments (core: model, dir, branch, fuel bar are always shown)
-    "cost": True,          # 💰 session cost
+    "cost": True,          # session cost
     "rate_limits": True,   # 5h / 7d usage (auto-hidden for non-Pro/Max)
-    "git_dirty": True,     # ✎ modified / ⊕ staged counts
-    "duration": True,      # ⏱ session wall-clock
+    "git_dirty": True,     # modified / staged counts
+    "duration": True,      # session wall-clock
     "lines": True,         # +added/-removed
-    "cache": True,         # 🔥 prompt-cache warmth (needs refreshInterval)
+    "cache": True,         # prompt-cache warmth (needs refreshInterval)
 
     # Presentation
+    "glyphs": "sleek",     # icon theme: sleek | emoji | nerd | text
     "color": True,         # master color switch (also honors NO_COLOR env var)
     "single_line": False,  # collapse to one line
     "bar_width": 10,       # fuel gauge cells
@@ -66,6 +67,72 @@ MODEL_COLORS = {
 }
 
 COLOR_ENABLED = CONFIG["color"] and not os.environ.get("NO_COLOR")
+
+# --------------------------------------------------------------------------- #
+# Glyph themes — every segment's icon resolves through here so the look is one #
+# switch (CONFIG["glyphs"]). Glyphs inherit their segment's ANSI color; an     #
+# empty string means "no icon" (the spacing helper drops the would-be space).  #
+#                                                                              #
+#   sleek  monochrome geometric — default; standard Unicode, no special font   #
+#   emoji  the original pictographs (regression-preserving)                    #
+#   nerd   Nerd Font private-use glyphs — REQUIRES a Nerd Font installed       #
+#   text   no pictographs at all; color + labels carry the meaning             #
+# --------------------------------------------------------------------------- #
+GLYPHS = {
+    "sleek": {
+        "model": "◆", "dir": "▸", "branch": "⎇",
+        "modified": "✎", "staged": "⊕",
+        "fuel": "", "bar_open": "", "bar_close": "",
+        "bar_fill": "▰", "bar_empty": "▱",
+        "cost": "", "dur": "",
+        "warm": "●", "cooling": "◐", "cold": "○",
+    },
+    "emoji": {
+        "model": "🚀", "dir": "📁", "branch": "🌿",
+        "modified": "✎", "staged": "⊕",
+        "fuel": "⛽", "bar_open": "[", "bar_close": "]",
+        "bar_fill": "█", "bar_empty": "░",
+        "cost": "💰", "dur": "⏱",
+        "warm": "🔥", "cooling": "🔥", "cold": "❄",
+    },
+    "nerd": {
+        # FontAwesome glyphs from any Nerd Font; render as boxes without one.
+        "model": "", "dir": "", "branch": "",
+        "modified": "✎", "staged": "⊕",
+        "fuel": "", "bar_open": "", "bar_close": "",
+        "bar_fill": "▰", "bar_empty": "▱",
+        "cost": "", "dur": "",
+        "warm": "", "cooling": "", "cold": "",
+    },
+    "text": {
+        "model": "", "dir": "", "branch": "",
+        "modified": "✎", "staged": "⊕",
+        "fuel": "", "bar_open": "[", "bar_close": "]",
+        "bar_fill": "█", "bar_empty": "░",
+        "cost": "", "dur": "",
+        "warm": "", "cooling": "", "cold": "",
+    },
+}
+
+GLYPH = GLYPHS.get(CONFIG["glyphs"], GLYPHS["sleek"])
+
+# Structural anchor colors — give each line-1 leading glyph a stable identity hue
+# so segments are findable at a glance (model = its family color, dir = blue,
+# branch = cyan). Scoped to the line-art themes: emoji glyphs keep their own
+# built-in color (preserving the original look), text has no glyph to paint.
+ANCHOR_COLORS = CONFIG["glyphs"] in ("sleek", "nerd")
+
+
+def lead(glyph):
+    """Prefix an icon with a trailing space — or emit nothing for empty icons."""
+    return (glyph + " ") if glyph else ""
+
+
+def anchor(glyph, color):
+    """Leading icon in its structural color (line-art themes), with a space."""
+    if not glyph:
+        return ""
+    return (paint(glyph, color) if ANCHOR_COLORS else glyph) + " "
 
 
 def paint(text, color):
@@ -171,7 +238,8 @@ def git_info(session_id):
 def cache_warmth(transcript_path, ttl):
     """Heuristic prompt-cache staleness from transcript mtime vs the TTL.
 
-    Returns (label, color) or None when it can't be determined.
+    Returns (state, color) where state is 'warm'/'cooling'/'cold', or None when
+    it can't be determined. The caller maps the state to a themed glyph.
     """
     if not transcript_path:
         return None
@@ -180,17 +248,17 @@ def cache_warmth(transcript_path, ttl):
     except OSError:
         return None
     if idle < 0.8 * ttl:
-        return "🔥 warm", GREEN
+        return "warm", GREEN
     if idle < ttl:
-        return "🔥 cooling", YELLOW
-    return "❄ cold", RED
+        return "cooling", YELLOW
+    return "cold", RED
 
 
 def main():
     try:
         data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
-        print("🚀 Mission Control")
+        print(lead(GLYPH["model"]) + "Mission Control")
         return
 
     sep = paint(" · ", DIM)
@@ -200,7 +268,7 @@ def main():
     window_size = g(data, "context_window.context_window_size", 200000)
     is_1m = window_size >= 1_000_000
 
-    model_label = "🚀 " + paint(model, model_color(model))
+    model_label = anchor(GLYPH["model"], model_color(model)) + paint(model, model_color(model))
     if is_1m:
         model_label += paint(" [1m]", CYAN + BOLD)
 
@@ -208,18 +276,18 @@ def main():
 
     current_dir = g(data, "workspace.current_dir") or g(data, "cwd", "")
     if current_dir:
-        line1.append("📁 " + paint(os.path.basename(current_dir), DIM))
+        line1.append(anchor(GLYPH["dir"], BLUE) + paint(os.path.basename(current_dir), DIM))
 
     branch, modified, staged = git_info(g(data, "session_id", ""))
     # Prefer explicit worktree branch when Claude Code provides one.
     branch = g(data, "worktree.branch") or g(data, "workspace.git_worktree") or branch
     if branch:
-        seg = "🌿 " + branch
+        seg = anchor(GLYPH["branch"], CYAN) + branch
         if CONFIG["git_dirty"]:
             if modified:
-                seg += " " + paint("✎{}".format(modified), YELLOW)
+                seg += " " + paint("{}{}".format(GLYPH["modified"], modified), YELLOW)
             if staged:
-                seg += " " + paint("⊕{}".format(staged), GREEN)
+                seg += " " + paint("{}{}".format(GLYPH["staged"], staged), GREEN)
         line1.append(seg)
 
     # ---- Line 2: telemetry -------------------------------------------------
@@ -229,10 +297,12 @@ def main():
     pct = int(pct_raw)
     width = CONFIG["bar_width"]
     filled = max(0, min(width, pct * width // 100))
-    bar = paint("█" * filled, zone_color(pct, CONFIG["ctx_warn"], CONFIG["ctx_crit"]))
-    bar += "░" * (width - filled)
+    bar = paint(GLYPH["bar_fill"] * filled, zone_color(pct, CONFIG["ctx_warn"], CONFIG["ctx_crit"]))
+    bar += GLYPH["bar_empty"] * (width - filled)
     pct_txt = paint("{}%".format(pct), zone_color(pct, CONFIG["ctx_warn"], CONFIG["ctx_crit"]))
-    line2.append("⛽ [{}] {}".format(bar, pct_txt))
+    line2.append(
+        lead(GLYPH["fuel"]) + GLYPH["bar_open"] + bar + GLYPH["bar_close"] + " " + pct_txt
+    )
     line2.append(paint(fmt_window(window_size), (CYAN + BOLD) if is_1m else DIM))
 
     if CONFIG["cost"]:
@@ -242,12 +312,12 @@ def main():
             # Below warn threshold, keep it muted rather than green.
             if cost < CONFIG["cost_warn"]:
                 c_color = DIM
-            line2.append(paint("💰${:.2f}".format(cost), c_color))
+            line2.append(paint(GLYPH["cost"] + "${:.2f}".format(cost), c_color))
 
     if CONFIG["duration"]:
         dur = g(data, "cost.total_duration_ms")
         if dur is not None:
-            line2.append(paint("⏱{}".format(fmt_duration(dur)), DIM))
+            line2.append(paint(GLYPH["dur"] + fmt_duration(dur), DIM))
 
     if CONFIG["lines"]:
         added = g(data, "cost.total_lines_added")
@@ -263,8 +333,8 @@ def main():
     if CONFIG["cache"]:
         warmth = cache_warmth(g(data, "transcript_path"), CONFIG["cache_ttl"])
         if warmth:
-            label, color = warmth
-            line2.append(paint(label, color))
+            state, color = warmth
+            line2.append(paint(lead(GLYPH[state]) + state, color))
 
     if CONFIG["rate_limits"]:
         rl = []

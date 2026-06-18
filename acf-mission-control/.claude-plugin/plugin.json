@@ -1,7 +1,7 @@
 {
   "name": "acf-mission-control",
-  "version": "1.1.0",
-  "description": "Mission Control HUD for Claude Code - two-line status line with 1M-context-aware fuel gauge, per-model colors, session cost, 5h/7d rate limits, git dirty state, and a prompt-cache-warmth indicator. Self-upgrading.",
+  "version": "1.2.0",
+  "description": "Mission Control HUD for Claude Code - two-line status line with 1M-context-aware fuel gauge, per-model colors, session cost, 5h/7d rate limits, git dirty state, and a prompt-cache-warmth indicator. Sleek monochrome glyphs by default, themeable (sleek/emoji/nerd/text). Self-upgrading.",
   "author": {
     "name": "ACF Project",
     "email": "acf@fib7.ai"
