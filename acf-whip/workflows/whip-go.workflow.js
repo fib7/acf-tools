@@ -29,7 +29,10 @@ const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=$
 const SCAN = `${pluginRoot}/skills/go/bin/scan-backlog.sh`
 const APPLY = `${pluginRoot}/skills/go/bin/apply-transition.sh`
 const DOCTOR = `${pluginRoot}/skills/whip-doctor/bin/doctor.sh`
-const INTEGRATE = `${pluginRoot}/skills/integrate-worktree/bin/integrate-worktree.sh`
+// LP-CAS (3.0.0) integrator: lands one accepted task's single-parent candidate onto the LIVE trunk by
+// cherry-pick + co-committed in-tree ledger marker + union gate + compare-and-swap. Replaces the retired
+// integrate-worktree (rebase-into-cached-snapshot fold), whose stale snapshot was the keystone defect.
+const INTEGRATE = `${pluginRoot}/skills/integrate-lpcas/bin/integrate-lpcas.sh`
 const CLEAN_CHECKOUT = `${pluginRoot}/skills/clean-checkout-before-task/bin/clean-checkout.sh`
 
 // IMPORTANT (isolation): acf-whip provides its OWN per-task isolation via git worktrees
@@ -114,7 +117,7 @@ const INTEGRATE_RESULT = {
   type: 'object', additionalProperties: false,
   required: ['exitCode', 'outcome', 'note', 'resolverWorktree', 'resolverBranch', 'resolverAgent', 'resolverConflictedFiles', 'resolverConflictingCommits'],
   properties: {
-    exitCode: { type: 'integer', description: 'the integrate-worktree.sh exit code (0,4,6,7,8,10,99,...)' },
+    exitCode: { type: 'integer', description: 'the integrate-lpcas.sh exit code (0,3,4,6,7,9,11,12,99,...)' },
     outcome: { type: 'string', enum: ['integrated', 'resolver-needed', 'rejected', 'transient', 'skipped', 'contaminated', 'error'] },
     note: { type: 'string' },
     resolverWorktree: { type: 'string', description: 'from the resolver-needed block "worktree:" line, else ""' },
@@ -366,39 +369,38 @@ function integratePrompt(t, postResolver) {
     ? `bash ${sq(INTEGRATE)} --post-resolver ${sq(acceptedPath)}`
     : `bash ${sq(INTEGRATE)} ${sq(acceptedPath)}`
   return `${ENV}
-Run the acf-whip integrator for one accepted task and report its result. Run EXACTLY:
+Run the acf-whip LP-CAS integrator for one accepted task and report its result. Run EXACTLY:
   ${cmd}
-Capture the exit code and stdout. Map exit code -> outcome:
-  0  -> integrated      (folded into trunk; Integrated-At written)
-  4  -> skipped         (no worktree/<slug> branch — historical/pre-2.0.0 task already on trunk; nothing to integrate, do NOT retry)
-  6  -> rejected        (conflict unresolved; task moved to rejected/)
-  7  -> resolver-needed  (cherry-pick conflict; stdout carries a "ACFW-INTEGRATE: resolver-needed" block — DO NOT touch the worktree, just parse and report)
-  8  -> contaminated     (retired in 2.5.0 — .backlog-carrying branches now self-salvage in-path; not emitted. Kept for back-compat: if seen, treat like resolver-needed/transient and report note.)
-  10 -> transient        (anti-orphan guard; leave accepted, retry later)
+Capture the exit code and stdout (stdout carries an "ACFW-INTEGRATE: <verdict> ..." line). Map exit code -> outcome:
+  0  -> integrated      (the change + its in-tree ledger marker are now on trunk, landed by compare-and-swap; or an idempotent already-integrated skip)
+  3  -> contaminated    (quarantine: malformed/poison candidate — isolate THIS task for an operator, do NOT retry, do NOT reject the others)
+  4  -> skipped         (no candidate ref — historical task already on trunk, or nothing to integrate; do NOT retry)
+  6  -> rejected        (quality-fault: the union gate FAILED on the candidate tree; task is a genuine quality reject)
+  7  -> resolver-needed  (cherry-pick conflict; stdout carries an "ACFW-INTEGRATE: resolver-needed" block — DO NOT touch the worktree, just parse and report)
+  9  -> transient        (MECHANISM fault: unresolved conflict / resolution-syntax-broken / worktree error — NOT a quality reject; leave accepted, retry later)
+  11 -> transient        (cas-lost: trunk moved under us; leave accepted, re-observe and retry later)
+  12 -> transient        (stall: trunk unobservable this attempt; leave accepted, retry later)
   99 -> transient        (git lock contention)
   other -> error
-If and ONLY if exit code is 7, parse the resolver-needed stdout block and fill: resolverWorktree (the "worktree:" line value), resolverBranch ("branch:"), resolverAgent ("assigned_agent:" — may be empty), resolverConflictedFiles (the lines under "conflicted_files:", newline-joined), resolverConflictingCommits (the lines under "conflicting_commits:", newline-joined). Otherwise set those five to "".
+If and ONLY if exit code is 7, parse the resolver-needed stdout block and fill: resolverWorktree (the "worktree:" line value), resolverAgent ("assigned_agent:" — may be empty), resolverConflictedFiles (the lines under "conflicted_files:", newline-joined). Set resolverBranch and resolverConflictingCommits to "" (the LP-CAS integration worktree is detached — there is no branch and no commit list). Otherwise set all five to "".
 Return the structured IntegrateResult. Do NOT dispatch a resolver yourself; the orchestrator does that.`
 }
 
 function resolverPrompt(t, r) {
   return `${ENV}
-You are the conflict resolver (${r.resolverAgent || t.agent || 'assigned specialist'}) for an acf-whip integration.
-The worktree at ${sq(r.resolverWorktree)} (branch ${r.resolverBranch}) is MID-CHERRY-PICK onto trunk with conflicts. Do NOT abort unless the conflict is irreconcilable.
+You are the conflict resolver (${r.resolverAgent || t.agent || 'assigned specialist'}) for an acf-whip LP-CAS integration.
+The integration worktree at ${sq(r.resolverWorktree)} is a DETACHED checkout of the live trunk tip, mid-cherry-pick of this task's candidate, with conflicts. Your ONLY job is to resolve the conflicted files and stage them — the integrator owns the commit, gate, and land.
 
 Conflicted files:
 ${r.resolverConflictedFiles || '(none reported)'}
 
-FORBIDDEN — these DESTROY the task's accepted work or corrupt the fold (the orchestrator will reject the integration if it detects them):
-  - git reset (any form), git checkout/switch to another branch, git branch -D/-f, git stash drop, deleting the worktree.
-  - Moving the worktree off branch ${r.resolverBranch}. Stay on this branch the entire time.
-  - Editing or committing anything under .backlog/ (task state lives on trunk only).
-ALLOWED — only: edit the conflicted files in place, git -C ${sq(r.resolverWorktree)} add <file>, and git -C ${sq(r.resolverWorktree)} cherry-pick --continue / --abort.
+FORBIDDEN — these corrupt the fold or destroy work (the integrator detects unmerged paths and reports a mechanism fault if you leave them):
+  - git reset (any form), git checkout/switch to another commit/branch, git rebase, deleting the worktree.
+  - Running git cherry-pick --continue / --commit / --abort / --quit. Do NOT advance or finish the cherry-pick — the integrator does that. You only resolve + stage.
+  - Editing or committing anything under .backlog/ or .acfwhip/ (task state and the integration ledger are the orchestrator's; never touch them).
+ALLOWED — only: edit the conflicted files in place, then  git -C ${sq(r.resolverWorktree)} add <file>  for each resolved file.
 
-Resolve every conflict preserving BOTH intents, run the project's quality gates inside the worktree, then:
-  - if resolved cleanly:  git -C ${sq(r.resolverWorktree)} cherry-pick --continue   (continue until the cherry-pick sequence finishes; HEAD must stay on ${r.resolverBranch})
-  - if irreconcilable:    git -C ${sq(r.resolverWorktree)} cherry-pick --abort   AND append a line "| <date> | FATAL: <reason> |" to the task file ${sq(`${trunkRoot}/.backlog/accepted/${t.stem}.md`)}
-Do NOT move task files. When done, report what you did in one line.`
+Resolve every conflict preserving BOTH intents (the task's change AND what is already on trunk), then  git -C ${sq(r.resolverWorktree)} add  every conflicted file. Do NOT commit. If the conflict is genuinely irreconcilable, leave the conflict markers UNstaged — the integrator will report a mechanism fault and the task stays accepted for a later attempt. Do NOT move task files. When done, report what you did in one line.`
 }
 
 // Bounded-retry wrapper around a schema agent() call (retro I1). A StructuredOutput non-emit (the
@@ -698,14 +700,24 @@ Return the ScanResult.`
       r = await safeAgent(integratePrompt(t, true), { label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
     }
     if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); integratedThisIter++; log(`✓ integrated ${t.stem}`) }
-    else if (r && r.outcome === 'rejected') { rejectedStems.push(t.stem); log(`✗ integrate rejected ${t.stem} — ${r.note}`) }
+    else if (r && r.outcome === 'rejected') {
+      // LP-CAS exit 6 = the union gate failed on (trunk + this change). The integrator mutates ONLY git;
+      // unlike the retired integrate-worktree it does NOT move the task file. So the orchestrator (the
+      // single .backlog writer) moves accepted -> rejected here, with a rejection increment, so the task
+      // re-enters the rejection self-heal (retry as pending, or blocked at the cap) instead of being
+      // re-attempted as an integration candidate every iteration. Keeps the run convergent.
+      rejectedStems.push(t.stem)
+      await streamWrite([{ path: `${trunkRoot}/.backlog/accepted/${t.stem}.md`, toState: 'rejected', agent: 'orchestrator', notes: (r.note || 'union gate failed at integration').slice(0, 200), inc: 1 }], `integ-reject#${iter}:${t.stem}`)
+      log(`✗ integrate rejected ${t.stem} — ${r.note}`)
+    }
     else if (r && r.outcome === 'skipped') { log(`↷ skipped ${t.stem} — no worktree branch (historical; terminal)`) }
     else if (r && r.outcome === 'contaminated') {
-      // The branch carries trunk .backlog/ commits (pre-2.4.1 import) — rebasing it produces phantom
-      // conflicts. Park for an operator instead of rejecting/re-running (a re-run re-contaminates).
+      // LP-CAS exit 3 = quarantine: the candidate is malformed (not single-parent) or poison (writes the
+      // .acfwhip/ ledger namespace). Isolate THIS task for an operator — never reject the others, never
+      // re-run (a re-run re-quarantines). Integration of every other accepted task continues unaffected.
       parkedThisRun.add(t.stem)
-      parkedNeeds.set(t.stem, (r.note || `contaminated branch — cherry-pick the tip code commit of ${t.slug} onto trunk, then remove the worktree+branch`).slice(0, 200))
-      log(`⚑ ${t.stem}: contaminated worktree branch (${t.slug}) — parked for operator, manual recovery required`)
+      parkedNeeds.set(t.stem, (r.note || `quarantined candidate for ${t.slug} — inspect refs/acfw/patch/${t.stem}; the candidate is not a single-parent code-only commit`).slice(0, 200))
+      log(`⚑ ${t.stem}: quarantined candidate (${t.slug}) — parked for operator, isolated from the rest of the run`)
     }
     // transient/error -> leave accepted, retry next iteration
   }
@@ -762,7 +774,7 @@ Return the ScanResult.`
   // Pre-existing accepted leftovers (from the scan) CAN be interdependent — integrate them in one
   // topo-ordered, lock-held pass that runs concurrently with the dispatch wave below. A branchless
   // historical/pre-2.0.0 accepted task is already on trunk (isTerminal treats it terminal) — never
-  // enqueue it, or integrate-worktree would fetch a missing ref and retry forever.
+  // enqueue it (it has no candidate, so the integrator would exit 4 skip anyway; skip the dispatch).
   let priorIntegratePass = Promise.resolve()
   if (mode === 'default') {
     const seenC = new Set()
@@ -821,7 +833,7 @@ Final integration drain. Run  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trun
   // BUG-6a: if the drain scan itself can't emit (it routes through the same schema-forced agent as the
   // main scan), drain off the last good in-memory snapshot instead of skipping integration entirely. A
   // stale snapshot may list a just-integrated task as still-accepted, so exclude stems already integrated
-  // this run; integrate-worktree treats an already-folded (empty) branch as terminal, so it is a no-op
+  // this run; the LP-CAS integrator's O(1) already-integrated check makes a folded task a no-op (exit 0)
   // even if one slips through.
   if (!snap2) snap2 = lastSnapshot
   finalSnap = snap2 || lastSnapshot

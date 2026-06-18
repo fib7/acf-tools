@@ -16,7 +16,7 @@
 - **PR Group**: [kebab-case-slug] (defaults to the same value as Worktree; sibling tasks ship together as one PR)
 - **Touches Globs**: [comma-separated file globs this task will modify, e.g. `services/user-api/**, go.mod`] or "none" (used by the doctor to WARN when two different-slug pending tasks overlap — a mis-partition signal)
 - **Dependencies**: [task-id-1, task-id-2] or "none"
-- **Integrated-At**: (left blank by task-engineer; written by `integrate-worktree` after a successful merge into the local trunk; format: trunk SHA after merge)
+- **Integrated-At**: (INERT as of 3.0.0 / LP-CAS — kept only for display. Integration truth is the in-tree ledger marker `.acfwhip/integrated/<shard>/<key>.json` on trunk, written by `integrate-lpcas`; nothing reads this field.)
 - **Rejection Count**: 0 (max 5; quality-reviewer increments on reject; after 5th rejection, task-engineer redesigns)
 - **Block-Count**: 0 (per-task re-block counter; `/go` increments when a specialist re-blocks a dispatched task and stops re-dispatching once it reaches the cap, parking the task for an operator)
 - **Created By**: task-engineer
@@ -110,17 +110,12 @@
 
 Quality-reviewer auto-rejects any task in `.backlog/in-review/` whose transition log lacks at least one `clean-checkout | ok` line.
 
-**Integration token (default mode, written by `integrate-worktree` after FF-merge into local trunk)**:
-
-```
-| <UTC ts> | accepted | accepted | integrate-worktree | <slug> | <trunk-sha-after> | integrated |
-```
-
-If the task could not be auto-merged because a rebase conflict could not be resolved, `integrate-worktree` instead increments `Rejection Count`, moves the file to `.backlog/rejected/`, and appends:
-
-```
-| <UTC ts> | accepted | rejected | integrate-worktree | <slug> | conflict-unresolved by <agent> |
-```
+**Integration (default mode, 3.0.0 / LP-CAS)**: `integrate-lpcas` lands the task's in-tree ledger marker
+(`.acfwhip/integrated/<shard>/<key>.json`) on trunk, co-committed with the change in one single-parent
+commit, after the union gate passes. The marker's presence on trunk IS the integration record; the
+integrator does **not** write the task markdown. If the union gate fails, the orchestrator moves the task
+to `.backlog/rejected/` (rejection +1) so it re-enters the self-heal; a cherry-pick conflict routes to a
+resolver (mechanism), never a silent drop.
 
 The existing rejection/retry/block machinery picks up from there.
 
@@ -275,7 +270,7 @@ nothing to commit, working tree clean
 - **task-engineer** commits on the trunk branch at the repo root (`.backlog/pending/` creations, retry/unblock/redesign moves). NEVER enters a worktree.
 - **`/go` orchestrator** commits all `.backlog/` state-machine moves on the trunk branch at the repo root (pending→in-progress, in-progress→completed/blocked, completed→in-review, in-review→accepted/rejected, accepted→accepted with `Integrated-At:`).
 - **Implementer specialists and quality-reviewer** commit only **code** inside `.worktree/<slug>` on `worktree/<slug>`. They do NOT move task files and do NOT commit `.backlog/` changes on the worktree branch — they signal state via the ACFW-RESULT marker; the orchestrator performs the move at root.
-- **`integrate-worktree`** (orchestrator-driven, default mode) FF-merges `worktree/<slug>` into the trunk branch at the end of each iteration. Override via `CLAUDE.md` (e.g. PR-per-group) is honored automatically.
+- **`integrate-lpcas`** (orchestrator-driven, default mode) cherry-picks each accepted task's single-parent candidate onto the live trunk and CAS-lands it with a co-committed ledger marker. Override via `CLAUDE.md` (e.g. PR-per-group) is honored automatically.
 
 ### When Creating Task (task-engineer)
 

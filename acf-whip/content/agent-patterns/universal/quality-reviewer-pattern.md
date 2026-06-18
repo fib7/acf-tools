@@ -196,7 +196,7 @@ ACFW-RESULT:
   notes: Coverage below threshold (75% vs 85% required); see review comments for details
 ```
 
-Your job ends here. The orchestrator performs the file move + `git mv` + commit on the trunk branch at root, and increments `Rejection Count` if you set `rejection_increment: 1`. Integration of `worktree/<slug>` (code) into the local trunk is also orchestrator-owned, via the `integrate-worktree` skill. You never touch trunk's `.git/index`. (If the project's `CLAUDE.md` directs PR-based integration instead, the orchestrator follows that — still none of your concern.)
+Your job ends here. The orchestrator performs the file move + `git mv` + commit on the trunk branch at root, and increments `Rejection Count` if you set `rejection_increment: 1`. Integration of `worktree/<slug>` (code) into the local trunk is also orchestrator-owned, via the `integrate-lpcas` skill. You never touch trunk's `.git/index`. (If the project's `CLAUDE.md` directs PR-based integration instead, the orchestrator follows that — still none of your concern.)
 
 ### Step 11: MANDATORY Marker Emission
 **Verify before returning**:

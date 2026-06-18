@@ -147,13 +147,13 @@ fi
 **3.5c — doctor config.** Scaffold `.backlog/.acfw-config` with the operator-tunable
 in-progress timeout (default 8h; lower it for overnight runs so an agent killed mid-edit
 frees its slug sooner) and the worktree namespace acf-whip owns. Read by `doctor.sh`,
-`scan-backlog.sh`, `clean-checkout.sh`, `integrate-worktree.sh`, and `/go`.
+`scan-backlog.sh`, `clean-checkout.sh`, `integrate-lpcas.sh`, and `/go`.
 
 ```bash
 if [ ! -f .backlog/.acfw-config ]; then
   cat > .backlog/.acfw-config <<'EOF'
 # ACF Whip runtime config (sourced by doctor.sh, scan-backlog.sh, clean-checkout.sh,
-# integrate-worktree.sh, and /go).
+# integrate-lpcas.sh, and /go).
 
 # Hours before an in-progress task is flagged stale / timed out to blocked.
 ACFW_INPROGRESS_TIMEOUT_HOURS=8
@@ -164,6 +164,15 @@ ACFW_INPROGRESS_TIMEOUT_HOURS=8
 # Change these ONLY on a fresh backlog: existing worktrees are pinned to the old namespace.
 ACFW_WORKTREE_DIR=.worktree
 ACFW_BRANCH_PREFIX=worktree
+
+# LP-CAS (3.0.0) integration gates, run by integrate-lpcas on the CANDIDATE tree (trunk + the
+# task's change) before it lands — the backstop that catches a union-level break a per-worktree
+# gate cannot see (#8) and a botched conflict resolution (#18). Both optional; empty = skip.
+#   ACFW_PARSE_SANITY_CMD — cheap parse/lint, run first; failure = mechanism (re-resolve), not a reject.
+#   ACFW_GATE_CMD         — the full union gate; failure = quality reject. CWD is the candidate worktree.
+# Example (uncomment + adapt to your stack):
+# ACFW_PARSE_SANITY_CMD='npx tsc --noEmit'
+# ACFW_GATE_CMD='npm test --silent'
 EOF
   echo "✓ Created .backlog/.acfw-config (timeout=8h, worktree namespace .worktree / worktree)"
 fi
@@ -174,7 +183,7 @@ are invoked by both the legacy and workflow paths. Verify availability:
 
 ```bash
 for s in skills/clean-checkout-before-task/bin/clean-checkout.sh \
-         skills/integrate-worktree/bin/integrate-worktree.sh \
+         skills/integrate-lpcas/bin/integrate-lpcas.sh \
          skills/whip-doctor/bin/doctor.sh \
          skills/lib/acfw-git.sh; do
   [ -f "${CLAUDE_PLUGIN_ROOT}/$s" ] || echo "WARN: missing ${CLAUDE_PLUGIN_ROOT}/$s — concurrency/integrity will not work." >&2

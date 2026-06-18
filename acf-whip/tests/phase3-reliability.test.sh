@@ -3,13 +3,13 @@
 #   I4  apply-transition.sh syncs "- **Status**:" to the destination folder (no self-inflicted FATAL)
 #   I2  apply-transition.sh increments "- **Block-Count**:" on a flagged specialist re-block
 #   I3  append_log_row splices rows INTO the "## Transition Log" table and caps the body length
-#   I5B integrate-worktree.sh treats a branch with no commits ahead of trunk as terminal (no retry loop)
+#   I5B LP-CAS integrator lands a no-code branch as terminal (ledger marker on trunk; no retry loop)
 # Run: bash acf-whip/tests/phase3-reliability.test.sh
 
 set -u
 ACF_WHIP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APPLY="$ACF_WHIP/skills/go/bin/apply-transition.sh"
-INTEGRATE="$ACF_WHIP/skills/integrate-worktree/bin/integrate-worktree.sh"
+INTEGRATE="$ACF_WHIP/skills/integrate-lpcas/bin/integrate-lpcas.sh"
 LIB="$ACF_WHIP/skills/lib/acfw-git.sh"
 
 PASS=0 FAIL=0
@@ -106,16 +106,17 @@ NOLOG="$WORK/nolog.md"; printf '# Task\n\nnotes only\n' > "$NOLOG"
 append_log_row "$NOLOG" "| x | y | z |"
 check "I3: falls back to EOF append when no table exists" "grep -qE '^\| x \| y \| z \|' '$NOLOG'"
 
-echo "== I5B: integrate-worktree treats a branch with no commits ahead of trunk as terminal =="
+echo "== I5B: LP-CAS lands an empty (no-code) branch as terminal — marker on trunk, no retry loop =="
 mktask accepted gate-201-review emptyslug accepted
 git add -A; git commit -qm gate-task
 # create the worktree branch from trunk with NO further commits (a gate/verification task did no code)
 git -C "$REPO" worktree add -q "$REPO/.worktree/emptyslug" -b worktree/emptyslug trunk 2>/dev/null
 bash "$INTEGRATE" "$REPO/.backlog/accepted/gate-201-review.md" >/tmp/p3-integ.out 2>/dev/null; RC=$?
-check "I5B: exit 0 (terminal, not an exit-10 retry loop)" "[ $RC -eq 0 ]"
-check "I5B: empty-branch message emitted" "grep -q 'empty-branch' /tmp/p3-integ.out"
-check "I5B: Integrated-At written -> counts terminal" "grep -qE '^- \*\*Integrated-At\*\*: [0-9a-f]{7,}' '$REPO/.backlog/accepted/gate-201-review.md'"
-check "I5B: empty worktree branch reaped" "! git -C '$REPO' show-ref --verify --quiet refs/heads/worktree/emptyslug"
+check "I5B: exit 0 (terminal, not a retry loop)" "[ $RC -eq 0 ]"
+check "I5B: integrated verdict emitted" "grep -q 'ACFW-INTEGRATE: integrated' /tmp/p3-integ.out"
+# LP-CAS: integration truth is the in-tree ledger marker on trunk (NOT an Integrated-At field).
+check "I5B: ledger marker reachable from trunk -> counts terminal" \
+  ". '$ACF_WHIP/skills/lib/acfw-git.sh'; acfw_is_integrated '$REPO' trunk gate-201-review"
 rm -f /tmp/p3-integ.out
 
 echo ""

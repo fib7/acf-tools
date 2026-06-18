@@ -202,15 +202,11 @@ for st in $LOOP_FOLDERS; do
     fi
     [ "$agentOk" = "0" ] && emit "$sev_struct" unknown-agent "$stem" "Assigned Agent '$agent' has no .claude/agents/$agent.md — create it or run /whip-add-agents, or reassign the task"
 
-    if [ -n "$integ" ] && [ "$folder" != "accepted" ]; then
-      if [ "$FIX" = "1" ]; then
-        sed -i.bak -E 's|^(- \*\*Integrated-At\*\*:).*|\1|' "$f" && rm -f "$f.bak"
-        commit_fix ".backlog/$folder/$stem.md" "doctor: clear stray Integrated-At on $stem"
-        emit REPAIRABLE integrated-at-on-non-accepted "$stem" "cleared (was set in .backlog/$folder/)"
-      else
-        emit REPAIRABLE integrated-at-on-non-accepted "$stem" "Integrated-At set but task is in .backlog/$folder/ (not accepted)"
-      fi
-    fi
+    # LP-CAS (3.0.0): the Integrated-At markdown field is INERT — integration truth is the in-tree
+    # ledger marker (.acfwhip/integrated/), which the doctor never reads or writes. The old
+    # "clear stray Integrated-At" reconciliation is dropped: it existed only to keep a metadata field
+    # in sync with reality, and clearing a VALID stamp with no git-ancestry check was itself defect #5
+    # (re-arming integration). Nothing the doctor does can re-arm integration now, by construction.
     if printf '%s' "$rc" | grep -qE '^-?[0-9]+$'; then
       if [ "$rc" -lt 0 ] || [ "$rc" -gt 5 ]; then
         clamped=$rc; [ "$rc" -lt 0 ] && clamped=0; [ "$rc" -gt 5 ] && clamped=5
@@ -263,7 +259,11 @@ function resolve(d,   s){ if(d in stems) return d; for(s in stems){ if(index(s,d
   if(folder=="pending"){ pend[stem]=1 }
 }
 END{
-  for(i in idcount) if(idcount[i]>1) print "FATAL|duplicate-id|" i "|ID appears in " idcount[i] " task files";
+  # LP-CAS (3.0.0): a duplicate ID QUARANTINES that id only — it is advisory (WARN), never a FATAL that
+  # aborts the whole run. The split-state duplicate that fired FATAL|duplicate-id and aborted 600+ healthy
+  # tasks before any dispatch (#6) can no longer happen. The two files carry distinct stems, so each runs
+  # on its own slug + ledger key (no integration collision); an operator de-dups the id at leisure.
+  for(i in idcount) if(idcount[i]>1) print "WARN|duplicate-id|" i "|ID appears in " idcount[i] " task files (quarantine: de-dup; run continues)";
   for(s in foldcount) if(foldcount[s]>1) print "REPAIRABLE|dup-folder|" s "|present in folders:" foldlist[s];
 
   for(s in stems){

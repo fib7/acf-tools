@@ -72,27 +72,41 @@ check "unknown-agent" "echo \"$OUT\" | grep -q '^FATAL|unknown-agent|bad-agent'"
 check "dangling-dep" "echo \"$OUT\" | grep -q '^FATAL|dangling-dep|dangle'"
 check "cyclic-deps detected" "echo \"$OUT\" | grep -qE '^FATAL\|cyclic-deps\|cyc-[ab]'"
 
-echo "== duplicate ID across files =="
+echo "== duplicate ID across files (LP-CAS: WARN/quarantine, NEVER a run-aborting FATAL) =="
 cp .backlog/pending/h1.md .backlog/blocked/h1-copy.md   # same ID 'h1' inside, different stem -> duplicate-id
 git add -A; git commit -qm dupid
 OUT=$(bash "$DOC" "$REPO")
-check "duplicate-id" "echo \"$OUT\" | grep -q '^FATAL|duplicate-id|h1'"
+check "duplicate-id reported as WARN (advisory)" "echo \"$OUT\" | grep -q '^WARN|duplicate-id|h1'"
+check "duplicate-id is NOT FATAL (no global abort, #6)" "! echo \"$OUT\" | grep -q '^FATAL|duplicate-id'"
 rm .backlog/blocked/h1-copy.md; git add -A; git commit -qm undup
+# Clean-backlog proof that a lone duplicate id keeps the gate GREEN (run proceeds, operator de-dups later).
+echo "== duplicate ID on an otherwise-healthy backlog keeps ok=true / exit 0 =="
+DUPWORK=$(mktemp -d "${TMPDIR:-/tmp}/acfw-dupid.XXXXXX")
+git init -qb trunk "$DUPWORK"; git -C "$DUPWORK" config user.email t@t; git -C "$DUPWORK" config user.name t
+mkdir -p "$DUPWORK"/.backlog/{pending,in-progress,completed,in-review,blocked,rejected,accepted} "$DUPWORK/.claude/agents"
+: > "$DUPWORK/.claude/agents/go-engineer.md"
+printf '# Task\n## Metadata\n- **ID**: dz\n- **Status**: pending\n- **Assigned Agent**: go-engineer\n- **Worktree**: none\n- **Dependencies**: none\n' > "$DUPWORK/.backlog/pending/d1.md"
+printf '# Task\n## Metadata\n- **ID**: dz\n- **Status**: blocked\n- **Assigned Agent**: go-engineer\n- **Worktree**: none\n- **Dependencies**: none\n' > "$DUPWORK/.backlog/blocked/d1-copy.md"
+DUP_OUT=$(bash "$DOC" "$DUPWORK"); DUP_RC=$?
+rm -rf "$DUPWORK"
+check "clean backlog + duplicate id: gate exit 0 (#6 fixed)" "[ $DUP_RC -eq 0 ]"
+check "clean backlog + duplicate id: SUMMARY ok=true" "echo \"$DUP_OUT\" | grep -q 'ok=true'"
 
 echo "== REPAIRABLE + --fix =="
 # Clean slate of repairables
 rm -f .backlog/pending/bad-*.md .backlog/pending/dangle.md .backlog/pending/cyc-*.md
-mktask accepted r-integ alpha accepted go-engineer none "" 0           # we'll add bad integ below in non-accepted
-mktask pending r-stray-integ gg pending go-engineer none "abc1234" 0   # integ on non-accepted -> repairable
+mktask accepted r-integ alpha accepted go-engineer none "" 0           # terminal accepted (advisory only)
+mktask pending r-stray-integ gg pending go-engineer none "abc1234" 0   # LP-CAS: Integrated-At is INERT — no finding
 mktask pending r-rc gg2 pending go-engineer none "" 9                  # rc out of range
 mktask in-progress r-status rst completed go-engineer none "" 0        # I4: Status 'completed' but in in-progress/
 git add -A; git commit -qm repairables
 OUT=$(bash "$DOC" "$REPO")
-check "integrated-at-on-non-accepted reported" "echo \"$OUT\" | grep -q '^REPAIRABLE|integrated-at-on-non-accepted|r-stray-integ'"
+# LP-CAS (3.0.0): Integrated-At is inert (the ledger is the oracle), so the doctor no longer reconciles
+# it — an Integrated-At on a non-accepted task produces NO finding and --fix leaves it untouched (#5 gone).
+check "Integrated-At on non-accepted: NO finding (field is inert)" "! echo \"$OUT\" | grep -q 'integrated-at-on-non-accepted'"
 check "rejection-count-out-of-range reported" "echo \"$OUT\" | grep -q '^REPAIRABLE|rejection-count-out-of-range|r-rc'"
 check "I4: status-folder-mismatch reported REPAIRABLE" "echo \"$OUT\" | grep -q '^REPAIRABLE|status-folder-mismatch|r-status'"
 bash "$DOC" --fix "$REPO" >/dev/null
-check "stray Integrated-At cleared after --fix" "! grep -qE '^- \*\*Integrated-At\*\*: abc1234' '$REPO/.backlog/pending/r-stray-integ.md'"
 check "Rejection Count clamped to 5 after --fix" "grep -qE '^- \*\*Rejection Count\*\*: 5' '$REPO/.backlog/pending/r-rc.md'"
 check "I4: Status synced to folder after --fix (completed -> in-progress)" "grep -qE '^- \*\*Status\*\*: in-progress\$' '$REPO/.backlog/in-progress/r-status.md'"
 rm -f .backlog/in-progress/r-status.md; git add -A; git commit -qm cleanup-rstatus
@@ -282,7 +296,9 @@ check "terminal accepted retained as PREFIX dep target" "echo \"\$SNAP\" | grep 
 # and the heavy full-object fields (status/agent/priority) are dropped — the slim layout puts
 # deps/touchesGlobs immediately after slug, which a full object never does.
 check "dep-target accepted emitted with slim:true" "echo \"\$SNAP\" | grep -qE '\"stem\":\"dep-target-acc\"[^}]*\"slim\":true'"
-check "slim dep-target drops full-only fields (deps right after slug)" "echo \"\$SNAP\" | grep -qE '\"stem\":\"dep-target-acc\",\"id\":\"[^\"]*\",\"folder\":\"accepted\",\"slug\":\"dta\",\"deps\":\[\],\"touchesGlobs\":\[\],\"hasIntegratedAt\":true'"
+# LP-CAS: hasIntegratedAt now reflects the git ledger, not the (inert) Integrated-At field. This
+# dep-target is terminal via no worktree branch (already on trunk the old way) and has no ledger marker.
+check "slim dep-target drops full-only fields (deps right after slug)" "echo \"\$SNAP\" | grep -qE '\"stem\":\"dep-target-acc\",\"id\":\"[^\"]*\",\"folder\":\"accepted\",\"slug\":\"dta\",\"deps\":\[\],\"touchesGlobs\":\[\],\"hasIntegratedAt\":false'"
 rm -f .backlog/accepted/dep-target-acc.md .backlog/accepted/prefixacc-full.md .backlog/pending/dep-consumer.md .backlog/pending/dep-consumer-pfx.md
 git add -A; git commit -qm cleanup-deptarget
 

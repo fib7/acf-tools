@@ -90,7 +90,7 @@ async function agent(prompt, opts) {
     return r
   }
   // integrator
-  if (/acf-whip integrator for one accepted/.test(prompt)) {
+  if (/integrator for one accepted task/.test(prompt)) {
     const stem = prompt.replace(/^[\s\S]*\/accepted\/([^/']+)\.md[\s\S]*$/, '$1')
     const t = model.get(stem)
     if (t) t.hasIntegratedAt = true

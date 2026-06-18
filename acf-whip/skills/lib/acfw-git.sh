@@ -6,7 +6,7 @@
 #   . "$SCRIPT_DIR/../../lib/acfw-git.sh"
 #
 # Single source of truth for the lock-backoff primitive used by clean-checkout.sh,
-# integrate-worktree.sh, apply-transition.sh, and the orchestrator's own trunk writes.
+# integrate-lpcas.sh, apply-transition.sh, and the orchestrator's own trunk writes.
 #
 # Shell safety: every acf-whip script runs under bash (`#!/usr/bin/env bash`), never
 # zsh. Refspecs like "${BRANCH}:refs/acfw/${SLUG}" place a ':' immediately after a

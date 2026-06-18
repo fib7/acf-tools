@@ -41,7 +41,7 @@ Execute backlog continuously:
 
 ## Integration mode
 
-**Default**: at the end of each iteration, the orchestrator folds every newly-accepted worktree branch into the branch checked out at the repo root (the local trunk) via the `integrate-worktree` skill. Linear history; conflicts resolved intelligently by the task's `assigned_agent`.
+**Default (LP-CAS, 3.0.0)**: the orchestrator lands every newly-accepted task onto the live trunk via the `integrate-lpcas` skill — a single-parent candidate cherry-picked onto the live tip, co-committed with an in-tree ledger marker, union-gated, and CAS-landed. The marker's presence on trunk is the sole integration oracle (no cached snapshot, no rebase); conflicts route to the task's `assigned_agent` as a resolver. See `skills/integrate-lpcas/SKILL.md`. (The legacy bash reference further down predates the dynamic-workflow path; `workflows/whip-go.workflow.js` + `integrate-lpcas` are authoritative.)
 
 **Override**: if the project's `CLAUDE.md` (or any other persistent agent instructions) directs a different integration strategy — for example "open a PR per PR Group via `gh pr create` instead of merging locally" — follow those instructions and skip Step 4.5. In that mode, the loop reverts to the 1.2.0 terminal check (`accepted ∪ blocked`); operator handles integration.
 

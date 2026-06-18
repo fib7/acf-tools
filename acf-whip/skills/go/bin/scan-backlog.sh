@@ -115,12 +115,12 @@ emit_task_full() {
   priority=$(field "$f" "Priority" | tr -d '[:space:]')
   deps=$(field "$f" "Dependencies")
   globs=$(field "$f" "Touches Globs")
-  integ=$(field "$f" "Integrated-At" | tr -d '[:space:]')
+  integ=$(field "$f" "Integrated-At" | tr -d '[:space:]')   # display only — inert in 3.0.0 (LP-CAS)
   rc=$(field "$f" "Rejection Count" | tr -d '[:space:]')
   printf '%s' "$rc" | grep -qE '^-?[0-9]+$' || rc=0
   bc=$(field "$f" "Block-Count" | tr -d '[:space:]')
   printf '%s' "$bc" | grep -qE '^-?[0-9]+$' || bc=0
-  hasInteg=false; [ -n "$integ" ] && hasInteg=true
+  hasInteg=false; is_integrated_key "$stem" && hasInteg=true   # ledger is the oracle, not the field
   hasTok=false; grep -qE '\| clean-checkout \| ok \|' "$f" && hasTok=true
   codeMut=true; { [ -z "$slug" ] || [ "$slug" = "none" ]; } && codeMut=false
   hasWtBranch=false
@@ -158,6 +158,19 @@ emit_task_full() {
 TRUNK_BRANCH=$(git -C "$REPO_ROOT" symbolic-ref --short HEAD 2>/dev/null || true)
 DETACHED=false; [ -z "$TRUNK_BRANCH" ] && DETACHED=true
 TRUNK_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+
+# ---- LP-CAS integration oracle (3.0.0) ----
+# The authoritative integration state is a fact about git, NEVER the markdown Integrated-At field:
+# a task is integrated IFF its in-tree ledger marker is present in the CURRENT trunk tree. We list
+# that ledger ONCE (acfw_integrated_keys) and key membership by task stem (= the integrator's KEY).
+# This is what eliminates the keystone-cascade class (#1,4,5,9,10,11,16): there is no cached snapshot
+# and no metadata to drift — the marker is on trunk or it is not. Integrated-At is read only for the
+# (now inert) integratedAt display field; it no longer decides hasIntegratedAt.
+INTEGRATED_KEYS=$(acfw_integrated_keys "$REPO_ROOT" "${TRUNK_SHA:-HEAD}" 2>/dev/null)
+IK_FILE=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-ik.XXXXXX")
+printf '%s\n' "$INTEGRATED_KEYS" > "$IK_FILE"
+trap 'rm -f "$IK_FILE"' EXIT
+is_integrated_key() { [ -n "$1" ] && printf '%s\n' "$INTEGRATED_KEYS" | grep -qxF "$1"; }
 
 # ---- Counts ----
 c_pending=$(count_md "$BL/pending")
@@ -212,7 +225,7 @@ if [ "$DIGEST" = true ]; then
   ACC_LIST=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-acc.XXXXXX")
   WT_FILE=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-wt.XXXXXX")
   DT_FILE=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-dt.XXXXXX")
-  trap 'rm -f "$ACC_LIST" "$WT_FILE" "$DT_FILE"' EXIT
+  trap 'rm -f "$ACC_LIST" "$WT_FILE" "$DT_FILE" "$IK_FILE"' EXIT
   find "$BL/accepted" -maxdepth 1 -type f -name '*.md' ! -name 'README.md' 2>/dev/null > "$ACC_LIST"
   printf '%s\n' "$EXISTING_WT_SLUGS" > "$WT_FILE"
   printf '%s\n' "$DEP_TOKENS" > "$DT_FILE"
@@ -224,7 +237,7 @@ if [ "$DIGEST" = true ]; then
   # toward OVER-keeping (a borderline accepted task lands in satisfiedDeps) — harmless; under-keeping
   # would silently hang a dependent.
   DIGEST_AWK=$(grep -HE '^- \*\*(ID|Worktree|Integrated-At)\*\*:' "$BL/accepted/"*.md 2>/dev/null | awk \
-    -v wtf="$WT_FILE" -v dtf="$DT_FILE" -v accf="$ACC_LIST" -v mode="$MODE_ARG" '
+    -v wtf="$WT_FILE" -v dtf="$DT_FILE" -v accf="$ACC_LIST" -v ikf="$IK_FILE" -v mode="$MODE_ARG" '
     function is_dep_target(s, i,    d) {
       if (s in dt) return 1
       if (i != "" && i in dt) return 1
@@ -234,6 +247,7 @@ if [ "$DIGEST" = true ]; then
     BEGIN {
       while ((getline l < wtf) > 0) if (l != "") wt[l]=1
       while ((getline l < dtf) > 0) if (l != "") dt[l]=1
+      while ((getline l < ikf) > 0) if (l != "") ik[l]=1
       while ((getline l < accf) > 0) {
         if (l == "") continue
         files[l]=1
@@ -251,8 +265,8 @@ if [ "$DIGEST" = true ]; then
     END {
       cInteg=0; cTerm=0
       for (f in files) {
-        s=stem[f]; i=(f in id)?id[f]:""; sl=(f in slug)?slug[f]:""; ig=(f in integ)?integ[f]:""
-        hasInteg=(ig!="")?1:0
+        s=stem[f]; i=(f in id)?id[f]:""; sl=(f in slug)?slug[f]:""
+        hasInteg=(s in ik)?1:0   # LP-CAS: integration truth is the ledger marker, keyed by stem
         hasBranch=(sl!="" && sl!="none" && (sl in wt))?1:0
         if (hasInteg) cInteg++
         if (mode=="override") term=1
@@ -288,9 +302,9 @@ elif [ -d "$BL/accepted" ]; then
   # accepted): hasIntegratedAt (non-empty Integrated-At), OR non-code slug ("" / "none"), OR no branch.
   for f in "$BL/accepted"/*.md; do
     [ -f "$f" ] || continue
-    grep -qE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' "$f" && c_integrated=$((c_integrated + 1))
+    a_stem=$(basename "$f" .md)
     a_slug=$(field "$f" "Worktree" | tr -d '[:space:]')
-    a_hasInteg=false; [ -n "$(field "$f" "Integrated-At" | tr -d '[:space:]')" ] && a_hasInteg=true
+    a_hasInteg=false; is_integrated_key "$a_stem" && { a_hasInteg=true; c_integrated=$((c_integrated + 1)); }
     a_hasBranch=false
     if [ -n "$a_slug" ] && [ "$a_slug" != "none" ] && printf '%s\n' "$EXISTING_WT_SLUGS" | grep -qxF "$a_slug"; then a_hasBranch=true; fi
     if [ "$a_hasInteg" = true ] || [ -z "$a_slug" ] || [ "$a_slug" = "none" ] || [ "$a_hasBranch" = false ]; then
@@ -374,8 +388,7 @@ EOF
       stem=$(basename "$f" .md)
       id=$(field "$f" "ID")
       slug=$(field "$f" "Worktree" | tr -d '[:space:]')
-      integ=$(field "$f" "Integrated-At" | tr -d '[:space:]')
-      hasInteg=false; [ -n "$integ" ] && hasInteg=true
+      hasInteg=false; is_integrated_key "$stem" && hasInteg=true   # ledger oracle, not Integrated-At
       hasWtBranch=false
       if [ -n "$slug" ] && [ "$slug" != "none" ] && printf '%s\n' "$EXISTING_WT_SLUGS" | grep -qxF "$slug"; then hasWtBranch=true; fi
 

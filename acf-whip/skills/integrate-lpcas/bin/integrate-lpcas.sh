@@ -72,6 +72,32 @@ SANITY_CMD="${ACFW_PARSE_SANITY_CMD:-}"
 emit() { echo "ACFW-INTEGRATE: $*"; }
 cleanup_wt() { git -C "$ROOT" worktree remove --force "$INTEG_WT" >/dev/null 2>&1 || true; }
 
+# Deterministic PRODUCER: publish the task's single-parent candidate from its worktree branch tip.
+# This is the sanctioned worker emission point — it runs in the integrator (not an LLM specialist) so
+# the candidate is a pure, reproducible function of (branch tree, fork-base) with no agent in the loop.
+# candidate = commit-tree(branch^{tree}, parent=fork-base); cherry-pick of it applies exactly
+# diff(fork-base, branch-tree) = the task's edits, onto the live trunk. No-op when no branch exists
+# (a historical task already on trunk -> no candidate -> terminal skip). Idempotent per (tree, base).
+publish_from_branch() {
+  local branch="$ACFW_BRANCH_PREFIX/$SLUG" tree fb p
+  git -C "$ROOT" show-ref --verify --quiet "refs/heads/$branch" || return 0
+  tree=$(git -C "$ROOT" rev-parse --verify "$branch^{tree}" 2>/dev/null) || return 0
+  fb=$(git -C "$ROOT" rev-parse --verify "refs/acfw/forkbase/$SLUG" 2>/dev/null) \
+    || fb=$(git -C "$ROOT" merge-base "$branch" "$OBSERVED" 2>/dev/null) || return 0
+  p=$(printf 'acfw candidate: %s\n\nACFW-Task: %s\n' "$KEY" "$KEY" \
+      | git -C "$ROOT" commit-tree "$tree" -p "$fb" 2>/dev/null) || return 0
+  git -C "$ROOT" update-ref "$PATCH_REF" "$p"
+}
+
+# Strip any .backlog/ delta from the staged candidate before commit: the integrated commit carries
+# CODE + the ledger marker only. Normal candidates never touch .backlog (specialists are forbidden to
+# commit it); this is a safety net for a legacy branch that imported trunk's .backlog history pre-3.0.0,
+# so such a phantom can never ride into trunk via the fold. Restores .backlog to the observed trunk tree.
+strip_backlog_from_index() {
+  [ -e "$INTEG_WT/.backlog" ] || git -C "$INTEG_WT" cat-file -e "$OBSERVED:.backlog" 2>/dev/null || return 0
+  git -C "$INTEG_WT" checkout "$OBSERVED" -- .backlog >/dev/null 2>&1 || true
+}
+
 # ---- Observe the live trunk tip (never cached). ----
 OBSERVED=$(acfw_live_trunk "$ROOT" "$TRUNK") || { emit "stall trunk-unobservable"; exit 12; }
 
@@ -95,6 +121,7 @@ land() { # <new-oid>
 # ---- Build (marker co-commit) + sanity + union gate + land. Called when the candidate worktree
 #      INTEG_WT holds the applied changeset staged/clean (no commit yet). ----
 build_gate_land() {
+  strip_backlog_from_index
   mkdir -p "$INTEG_WT/$(dirname "$MARKER")"
   printf '{"key":"%s","patch":"%s","patch_parent":"%s","observed_trunk":"%s","slug":"%s"}\n' \
     "$KEY" "$PATCH" "$PATCH_PARENT" "$OBSERVED" "$SLUG" > "$INTEG_WT/$MARKER"
@@ -150,6 +177,9 @@ fi
 if acfw_is_integrated "$ROOT" "$OBSERVED" "$KEY"; then
   emit "already-integrated key=$KEY"; exit 0
 fi
+
+# Publish the candidate deterministically from the task's worktree branch (the producer step).
+publish_from_branch
 
 # Candidate must exist. Absent ref = nothing to integrate (historical / not-yet-built) -> terminal skip.
 PATCH=$(git -C "$ROOT" rev-parse --verify "$PATCH_REF^{commit}" 2>/dev/null) || { emit "no-candidate key=$KEY"; exit 4; }

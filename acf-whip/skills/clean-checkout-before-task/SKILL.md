@@ -37,10 +37,11 @@ files, daemons, or schedulers.
    dev files like `.env`, `node_modules` so the worktree runs a full sandbox). No-op when
    the manifest is absent. See `hydrate-worktree.sh`.
 5. Validate the worktree is on `worktree/<slug>` (drift → exit 3).
-6. Re-align the branch's own commits onto local trunk — **code-only** — via
-   `rebase --onto <trunk-snapshot> <fork-base>` (picks up sibling worktrees' integrated commits
-   without ever merging trunk's `.backlog` history into the branch). On conflict it aborts and
-   defers to integrate time, leaving the branch on its existing code-only state.
+6. Ensure the per-slug fork-base ref exists (backfill via `merge-base` for a pre-3.0.0 worktree).
+   **No rebase, no trunk-snapshot, no re-align** (3.0.0 / LP-CAS): the branch simply carries the
+   specialist's code on top of its fork-base, and `integrate-lpcas` applies that change onto the
+   **live** trunk at integration time. The cached `refs/acfw/trunk-snapshot` and the snapshot rebase —
+   the keystone defect that froze every worktree's base on a rewritten trunk — are gone by construction.
 7. Stash unrelated working-tree changes.
 8. Append the OK token; print the worktree path.
 
@@ -79,7 +80,8 @@ rejects any task in `.backlog/in-review/` whose transition log lacks at least on
 
 Each worktree has its own `.git/index` (no shared lock; no pre-commit stash bundling).
 Two agents claiming the same slug: first wins, second sees exit 2 and defers. Cross-worktree
-file conflicts surface at integration time (`integrate-worktree`). Stale edits are stashed.
+file conflicts surface at integration time (`integrate-lpcas`, as a resolver — never a silent
+drop). Stale edits are stashed.
 
 ---
 

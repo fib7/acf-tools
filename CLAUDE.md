@@ -33,12 +33,12 @@
 | **acf-nitro** | Cognitive | Parallel execution enforcer | 6 |
 | **acf-mission-control** | Functional | Two-line status line HUD (1M-aware fuel gauge, cost, rate limits, cache warmth); themeable glyphs (sleek/emoji/nerd/text); self-upgrading | 6 |
 | **acf-librarian** | Functional | Convention enforcement | 9 |
-| **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe) | 67 |
+| **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe; LP-CAS integration) | 68 |
 | **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 17 |
 
-**Total**: 117 plugin files + 10 project/docs files = 127 tracked files.
+**Total**: 118 plugin files + 10 project/docs files = 128 tracked files.
 
-**acf-whip** is a workflow-native backlog automation engine. `/task` decomposes a scope into atomic, dependency-aware tasks. `/go` orchestrates them to completion — dispatching parallel specialists in isolated git worktrees (one per slug), running quality review, integrating accepted branches into the trunk in topological order, and looping until every task is accepted or blocked. It is concurrency-safe (the git-worktree branch registry is the parallelism lock), self-healing via `/whip-doctor`, and runs as deterministic dynamic workflows so Claude's context stays flat across long runs; worktree branches are code-only by construction. Integration is patch-id aware (2.5.0): branches whose code is already on trunk short-circuit to terminal with no rebase, legacy pre-2.4.1 branches self-heal in-path (their real commits are replayed, `.backlog` phantoms dropped), and a pre-integration backup ref (`refs/acfw/preintegrate/<slug>`) guarantees accepted work is never destroyed by a failed fold. See `acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
+**acf-whip** is a workflow-native backlog automation engine. `/task` decomposes a scope into atomic, dependency-aware tasks. `/go` orchestrates them to completion — dispatching parallel specialists in isolated git worktrees (one per slug), running quality review, integrating accepted branches into the trunk in topological order, and looping until every task is accepted or blocked. It is concurrency-safe (the git-worktree branch registry is the parallelism lock), self-healing via `/whip-doctor`, and runs as deterministic dynamic workflows so Claude's context stays flat across long runs; worktree branches are code-only by construction. Integration is **LP-CAS** (Ledger-In-Tree Compare-And-Swap, 3.0.0): each accepted task's change is published as a single-parent candidate and `cherry-pick`ed onto the **live** trunk (no cached snapshot, no rebase, no replay — the keystone defect that froze every worktree's base on a rewritten trunk is gone by construction); the change and an in-tree ledger marker (`.acfwhip/integrated/<shard>/<key>.json`) are co-committed in one commit, union-gated, and landed by compare-and-swap. The marker's presence in the live-trunk tree is the **sole** integration oracle — no `Integrated-At` field, no folder-as-state — so metadata can never diverge from reality, same-file parallel writes surface as resolvable conflicts instead of silent losses, and a duplicate id or poison candidate quarantines that task alone instead of aborting the run. See `acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
 
 **Plugin architecture**: Each plugin is fully self-contained with no cross-dependencies. Users can install any combination.
 
@@ -58,7 +58,7 @@ acf-tools/
 ├── acf-nitro/                       # Parallel enforcement (6 files)
 ├── acf-mission-control/             # Status HUD (6 files)
 ├── acf-librarian/                   # Convention enforcement (9 files)
-├── acf-whip/                        # Workflow automation, workflow-native (67 files; skills/ + workflows/ + tests/)
+├── acf-whip/                        # Workflow automation, workflow-native (68 files; skills/ + workflows/ + tests/)
 └── acf-advisor/                     # Second-opinion LLM client (17 files)
 ```
 
@@ -352,6 +352,6 @@ The plugins themselves CREATE documentation when installed in user projects:
 ---
 
 **Repository Version**: v1.0
-**Last Updated**: 2026-06-02
+**Last Updated**: 2026-06-18
 **Marketplace Plugins**: 7
-**Total Files**: 125 (tracked)
+**Total Files**: 128 (tracked)

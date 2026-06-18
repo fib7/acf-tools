@@ -5,11 +5,19 @@
 #   TASK_FILE: absolute path to the task markdown (in .backlog/pending/ or in-progress/).
 #
 # Resolves the task's Worktree slug, lazy-creates an isolated git worktree on
-# worktree/<slug>, validates the branch, re-aligns the branch's own commits onto local trunk
-# (code-only, never importing .backlog history), stashes unrelated changes, logs the
-# clean-checkout OK token, and prints the worktree path.
+# worktree/<slug> forked from the LIVE trunk tip, validates the branch, records the
+# per-slug fork-base, stashes unrelated changes, logs the clean-checkout OK token, and
+# prints the worktree path.
 # The lock is git itself: `git worktree add -b <branch>` fails when the branch is
 # already checked out elsewhere — that failure is the mutual-exclusion primitive.
+#
+# LP-CAS (3.0.0): this is a PRODUCER-side primitive only. It NEVER rebases/resets the
+# branch onto a cached trunk snapshot — the keystone defect (#1) was exactly that snapshot
+# going stale on a rewritten trunk and silently freezing every worktree's base. There is no
+# snapshot here anymore. The branch keeps the code the specialist commits on top of its
+# fork-base; the LP-CAS integrator applies that change onto the LIVE trunk at integration
+# time via cherry-pick (base = the recorded fork-base), so a long-lived branch is never
+# stale by construction and never needs a re-align pass.
 #
 # Exit codes (all fatal to the caller unless noted):
 #   0  success (worktree path printed on stdout)
@@ -65,9 +73,11 @@ if [ ! -d "$WORKTREE_PATH" ]; then
     exit 2
   fi
   WORKTREE_WAS_CREATED=1
-  # Record the fork base: the branch's code commits sit on top of this trunk SHA. Both the
-  # code-only re-sync (Step 5) and integrate-worktree replay ONLY base..HEAD, never merging trunk's
-  # .backlog history into the branch — so the branch stays code-only by construction.
+  # Record the fork base: the trunk tip the branch forked from. The LP-CAS integrator builds the
+  # task's candidate as commit-tree(branch-tree, parent=fork-base) and cherry-picks it onto the LIVE
+  # trunk — diff(fork-base, branch-tree) is exactly the task's edits, so the apply is minimal and
+  # never replays trunk history. The fork-base need not track trunk (it is the 3-way base, not a
+  # rebase target), which is precisely why no snapshot can go stale here.
   git -C "$REPO_ROOT" update-ref "refs/acfw/forkbase/$SLUG" "$(git -C "$REPO_ROOT" rev-parse "$TRUNK_BRANCH")" 2>/dev/null || true
 fi
 
@@ -88,53 +98,18 @@ if [ "$ACTUAL_BRANCH" != "$BRANCH" ]; then
   exit 3
 fi
 
-# ---- Step 5: Re-align the slug branch onto current trunk — CODE-ONLY ----
-# NEVER merge trunk's .backlog history into the branch (the historical `merge --ff-only` did exactly
-# that whenever the branch had no code commit yet, then drifted on a stale base once it did — the
-# root cause of the integrate reject-loop). Instead replay ONLY the branch's own commits (base..HEAD)
-# onto a fresh trunk snapshot via `rebase --onto`, so the branch is code-only by construction. On any
-# conflict (or a dirty tree) abort and leave the branch on its existing code-only state; integrate-
-# worktree rebases + resolves at integration time.
+# ---- Step 5: Ensure the per-slug fork-base is recorded (NO rebase, NO snapshot) ----
+# LP-CAS removes the entire re-align pass. The branch is NEVER reset/rebased onto a cached trunk
+# snapshot — that snapshot was the keystone defect: a non-force fetch silently refused to advance it
+# on a rewritten trunk, freezing every worktree's base ~1292 commits stale. There is no snapshot now.
+# The branch simply carries the specialist's code on top of its fork-base; the integrator applies
+# that change onto the LIVE trunk at integration time (cherry-pick, base = fork-base), so the branch
+# can never be stale. All we do here is BACKFILL a missing fork-base for a pre-3.0.0 worktree so the
+# integrator has a 3-way base; if even that is unavailable the integrator falls back to merge-base.
 BASE_REF="refs/acfw/forkbase/$SLUG"
-git_with_lock_backoff -C "$WORKTREE_PATH" fetch "$REPO_ROOT" "${TRUNK_BRANCH}:refs/acfw/trunk-snapshot" --quiet >&2
-BASE=$(git -C "$WORKTREE_PATH" rev-parse --verify "$BASE_REF" 2>/dev/null || true)
-SNAP=$(git -C "$WORKTREE_PATH" rev-parse refs/acfw/trunk-snapshot 2>/dev/null || true)
-if [ -n "$(git -C "$WORKTREE_PATH" status --porcelain)" ]; then
-  echo "WARN: $SLUG worktree has uncommitted changes; skipping trunk re-align (defer to integrate)." >&2
-elif [ -n "$BASE" ]; then
-  # Fork base known (2.4.1+ branch): replay ONLY base..HEAD onto fresh trunk — code-only by construction.
-  if git_with_lock_backoff -C "$WORKTREE_PATH" rebase --onto refs/acfw/trunk-snapshot "$BASE" "$BRANCH" >&2; then
-    git -C "$WORKTREE_PATH" update-ref "$BASE_REF" "$SNAP" 2>/dev/null || true
-  else
-    git -C "$WORKTREE_PATH" rebase --abort 2>/dev/null || true
-    echo "WARN: cannot re-align $BRANCH onto $TRUNK_BRANCH (code-only rebase hit conflicts)." >&2
-    echo "Continue on existing code-only state; integrate-worktree will rebase + resolve at integration time." >&2
-  fi
-else
-  # Pre-2.4.1 branch with NO recorded fork base. NEVER fall back to a far-back merge-base — on a
-  # long-lived repo that base trails trunk by hundreds of commits and the replay drags the whole
-  # imported .backlog phantom range, the root cause of the phantom-conflict reject-loop. Instead
-  # derive the branch's genuine code commits by patch-id and reconstruct a clean code-only tip on
-  # fresh trunk. A specialist must never inherit a mid-sequencer worktree, so on ANY conflict we
-  # abort + restore and defer to integrate-time.
-  PENDING=$(acfw_pending_code_commits "$WORKTREE_PATH" refs/acfw/trunk-snapshot "$BRANCH")
-  BK=$(git -C "$WORKTREE_PATH" rev-parse "$BRANCH" 2>/dev/null || true)
-  if [ -z "$PENDING" ]; then
-    # All of the branch's code is already on trunk by patch-id (or it carries only .backlog phantoms):
-    # align the branch to current trunk; the code is preserved on trunk, the phantoms are dropped.
-    git_with_lock_backoff -C "$WORKTREE_PATH" reset --hard refs/acfw/trunk-snapshot >&2
-    git -C "$WORKTREE_PATH" update-ref "$BASE_REF" "$SNAP" 2>/dev/null || true
-  else
-    git_with_lock_backoff -C "$WORKTREE_PATH" reset --hard refs/acfw/trunk-snapshot >&2
-    if git_with_lock_backoff -C "$WORKTREE_PATH" cherry-pick $PENDING >&2; then
-      git -C "$WORKTREE_PATH" update-ref "$BASE_REF" "$SNAP" 2>/dev/null || true
-    else
-      git -C "$WORKTREE_PATH" cherry-pick --abort 2>/dev/null || true
-      [ -n "$BK" ] && git -C "$WORKTREE_PATH" reset --hard "$BK" >&2
-      echo "WARN: cannot re-align legacy $BRANCH onto $TRUNK_BRANCH (patch-id replay hit conflicts)." >&2
-      echo "Continue on existing code-only state; integrate-worktree will reconstruct + resolve at integration time." >&2
-    fi
-  fi
+if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$BASE_REF" >/dev/null 2>&1; then
+  MB=$(git -C "$REPO_ROOT" merge-base "$BRANCH" "$TRUNK_BRANCH" 2>/dev/null || true)
+  [ -n "$MB" ] && git -C "$REPO_ROOT" update-ref "$BASE_REF" "$MB" 2>/dev/null || true
 fi
 
 # ---- Step 6: Stash unrelated working-tree changes ----
