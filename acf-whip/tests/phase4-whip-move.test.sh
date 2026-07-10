@@ -50,9 +50,27 @@ git add -A; git commit -qm task
 bash "$MOVE" test-041-promote blocked --add-dep fixture-readiness --reason "needs fixture" >/dev/null
 check "moved pending -> blocked (file relocated)" "[ -f .backlog/blocked/test-041-promote.md ] && [ ! -f .backlog/pending/test-041-promote.md ]"
 check "Status synced to blocked" "grep -qE '^- \*\*Status\*\*: blocked' .backlog/blocked/test-041-promote.md"
-check "dependency appended" "grep -qE '^- \*\*Dependencies\*\*: \[fixture-readiness\]' .backlog/blocked/test-041-promote.md"
+# WHIP-19: the Dependencies line is a BARE comma list — the only format doctor.sh and scan-backlog.sh
+# parse. The old JSON-style "[a, b]" made both ids unresolvable -> false FATAL|dangling-dep -> /go blocked.
+check "dependency appended as a BARE id (no brackets)" "grep -qE '^- \*\*Dependencies\*\*: fixture-readiness\$' .backlog/blocked/test-041-promote.md"
+check "no JSON-style brackets written" "! grep -qE '^- \*\*Dependencies\*\*:.*[][]' .backlog/blocked/test-041-promote.md"
 check "transition row spliced into table" "grep -qE '\| blocked \| operator \| needs fixture \|' .backlog/blocked/test-041-promote.md"
 check "move was committed (clean tree)" "[ -z \"\$(git status --porcelain)\" ]"
+
+# ---- second --add-dep appends to the existing bare list, and parses back to exactly 2 ids ----
+bash "$MOVE" test-041-promote blocked --add-dep second-dep >/dev/null
+check "second dependency appends to the bare list" "grep -qE '^- \*\*Dependencies\*\*: fixture-readiness, second-dep\$' .backlog/blocked/test-041-promote.md"
+NDEPS=$(grep -E '^- \*\*Dependencies\*\*:' .backlog/blocked/test-041-promote.md | sed -E 's/^- \*\*Dependencies\*\*:[[:space:]]*//' | tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -c .)
+check "parser (comma split) resolves exactly 2 clean ids" "[ \"$NDEPS\" -eq 2 ]"
+
+# ---- legacy bracketed line found in the file is de-bracketed on the way through ----
+sed -i.bak -E 's|^- \*\*Dependencies\*\*:.*|- **Dependencies**: [legacy-a]|' .backlog/blocked/test-041-promote.md && rm -f .backlog/blocked/test-041-promote.md.bak
+git add -A; git commit -qm legacy-brackets
+bash "$MOVE" test-041-promote blocked --add-dep legacy-b >/dev/null
+check "legacy [a] is de-bracketed when appending" "grep -qE '^- \*\*Dependencies\*\*: legacy-a, legacy-b\$' .backlog/blocked/test-041-promote.md"
+# restore a simple dep line for the rest of the suite
+sed -i.bak -E 's|^- \*\*Dependencies\*\*:.*|- **Dependencies**: none|' .backlog/blocked/test-041-promote.md && rm -f .backlog/blocked/test-041-promote.md.bak
+git add -A; git commit -qm restore-deps
 
 # ---- resolve by unique PREFIX, accepted + --integrated-at ----
 bash "$MOVE" test-041 accepted --integrated-at a042d461 >/dev/null

@@ -80,6 +80,50 @@ bash "$APPLY" "$REPO/.backlog/blocked/t-move.md" pending orchestrator "unblocked
 bash "$APPLY" "$REPO/.backlog/pending/t-move.md" blocked orchestrator "timeout — stale dispatch" 0 0 >/dev/null
 check "I2: unflagged block does NOT bump Block-Count (stays 2)" "grep -qE '^- \*\*Block-Count\*\*: 2\$' '$REPO/.backlog/blocked/t-move.md'"
 
+echo "== WHIP-08: --stage commits a none-slug task's standalone deliverables with the state move =="
+# A "Worktree: none" task writes its deliverable into the ROOT tree and may not commit. Nothing else
+# ever staged those paths, so the next checkout/stash destroyed them. The single writer stages them
+# BY EXPLICIT PATH in the same commit as the folder move.
+mktask pending t-deliv none pending
+git add -A; git commit -qm t-deliv
+mkdir -p docs/research; echo "findings" > docs/research/20260709-topic.md
+echo "table" > docs/research/data.csv
+BEFORE=$(git rev-parse HEAD)
+bash "$APPLY" --stage docs/research/20260709-topic.md --stage docs/research/data.csv \
+  "$REPO/.backlog/pending/t-deliv.md" completed go-engineer "done" 0 0 >/dev/null
+check "deliverables are tracked after the transition" "git ls-files --error-unmatch docs/research/20260709-topic.md docs/research/data.csv >/dev/null 2>&1"
+check "deliverables landed in the SAME commit as the move" \
+  "git diff-tree --no-commit-id --name-only -r HEAD | grep -q '^docs/research/20260709-topic.md\$' && git diff-tree --no-commit-id --name-only -r HEAD | grep -q '^\.backlog/completed/t-deliv.md\$'"
+check "exactly one commit was made" "[ \"\$(git rev-list --count $BEFORE..HEAD)\" -eq 1 ]"
+check "tree is clean (nothing left uncommitted)" "[ -z \"\$(git status --porcelain)\" ]"
+
+echo "== WHIP-08: --stage refuses state paths and never half-applies =="
+mktask pending t-poison none pending
+git add -A; git commit -qm t-poison
+bash "$APPLY" --stage .backlog/pending/t-poison.md "$REPO/.backlog/pending/t-poison.md" completed go-engineer "x" 0 0 >/dev/null 2>&1
+check ".backlog/ stage path exits 2" "[ \$? -eq 2 ]"
+bash "$APPLY" --stage .acfwhip/integrated/aa/x.json "$REPO/.backlog/pending/t-poison.md" completed go-engineer "x" 0 0 >/dev/null 2>&1
+check ".acfwhip/ stage path exits 2" "[ \$? -eq 2 ]"
+bash "$APPLY" --stage /etc/passwd "$REPO/.backlog/pending/t-poison.md" completed go-engineer "x" 0 0 >/dev/null 2>&1
+check "absolute stage path exits 2" "[ \$? -eq 2 ]"
+bash "$APPLY" --stage ../outside.md "$REPO/.backlog/pending/t-poison.md" completed go-engineer "x" 0 0 >/dev/null 2>&1
+check "traversing stage path exits 2" "[ \$? -eq 2 ]"
+check "refusal did NOT move the task (validated before any mutation)" "[ -f '$REPO/.backlog/pending/t-poison.md' ]"
+
+echo "== WHIP-08: a missing --stage path is skipped, never strands the transition =="
+bash "$APPLY" --stage docs/research/never-written.md "$REPO/.backlog/pending/t-poison.md" completed go-engineer "x" 0 0 >/dev/null 2>&1
+check "transition still applied despite the missing deliverable" "[ -f '$REPO/.backlog/completed/t-poison.md' ]"
+check "tree clean after skip" "[ -z \"\$(git status --porcelain)\" ]"
+
+echo "== WHIP-08: a crash between mv and commit is repaired on re-apply (rescue path) =="
+# Simulate: the file is already in completed/ (move committed) but the deliverable never got staged.
+mktask completed t-rescue none completed
+git add -A; git commit -qm t-rescue
+echo "orphan deliverable" > docs/research/rescued.md
+bash "$APPLY" --stage docs/research/rescued.md "$REPO/.backlog/pending/t-rescue.md" completed go-engineer "x" 0 0 >/dev/null
+check "no-op re-apply still commits the orphaned deliverable" "git ls-files --error-unmatch docs/research/rescued.md >/dev/null 2>&1"
+check "tree clean after rescue" "[ -z \"\$(git status --porcelain)\" ]"
+
 echo "== I3: append_log_row caps the Transition Log body length =="
 # shellcheck disable=SC1090
 . "$LIB"

@@ -35,6 +35,15 @@ const DOCTOR = `${pluginRoot}/skills/whip-doctor/bin/doctor.sh`
 const INTEGRATE = `${pluginRoot}/skills/integrate-lpcas/bin/integrate-lpcas.sh`
 const CLEAN_CHECKOUT = `${pluginRoot}/skills/clean-checkout-before-task/bin/clean-checkout.sh`
 
+// Run lock (WHIP-15). Two concurrent /go runs collide on the same slugs: tasks cycle in-review without
+// accepting, and one run's broad `git add` in the SHARED root checkout sweeps the other's staged work
+// into an unrelated commit. The lock is the heartbeat file that already existed for observability —
+// freshness by MTIME (no JSON parse, no PID, no daemon, no new file). It is a GUARDRAIL, not the
+// correctness keystone: CAS-land and idempotent transitions are what actually make concurrency safe.
+// After a crash it self-expires in LOCK_FRESH_MIN; the documented override is one `rm`.
+const RUN_LOCK = `${trunkRoot}/.backlog/.acfw-run.json`
+const LOCK_FRESH_MIN = 30
+
 // IMPORTANT (isolation): acf-whip provides its OWN per-task isolation via git worktrees
 // (.worktree/<slug>, created by clean-checkout.sh). Agents always operate against the REAL trunk
 // via ACFW_TRUNK_ROOT (absolute paths), so we do NOT use the runtime's isolation:'worktree' — that
@@ -72,9 +81,10 @@ const byPriorityThenStem = (a, b) => (prank(a.priority) - prank(b.priority)) || 
 // ============================ schemas ============================
 const BOOTSTRAP = {
   type: 'object', additionalProperties: false,
-  required: ['detached', 'doctorOk', 'doctorSummary', 'fatals'],
+  required: ['detached', 'lockFresh', 'doctorOk', 'doctorSummary', 'fatals'],
   properties: {
     detached: { type: 'boolean', description: 'true if HEAD is detached at the trunk root' },
+    lockFresh: { type: 'boolean', description: 'true if the run-lock heartbeat file exists AND was modified within the freshness window (another /go is live)' },
     doctorOk: { type: 'boolean', description: 'true if doctor reported ok=true after --fix' },
     doctorSummary: { type: 'string', description: 'verbatim SUMMARY|... line from the report-only doctor run' },
     fatals: { type: 'array', items: { type: 'string' }, description: 'verbatim FATAL|... lines remaining after --fix' },
@@ -111,6 +121,7 @@ const ACFW_RESULT = {
     notes: { type: 'string', description: 'one-line reason' },
     blockedReason: { type: 'string', enum: ['dependency-missing', 'environment', 'unrecoverable', 'none'], description: 'ONLY meaningful when transition=blocked. "dependency-missing" = the REAL blocker is unmodeled work that should be its own task (name it in needsTask) — the orchestrator then PARKS this task for an operator instead of re-dispatching it (re-running /go will not help). Omit or "none" for an ordinary block.' },
     needsTask: { type: 'string', description: 'when blockedReason=dependency-missing: a one-line description of the missing task an operator should create; else "".' },
+    deliverableFiles: { type: 'array', items: { type: 'string' }, description: 'NON-CODE (Worktree: none) tasks ONLY: every standalone file you created or modified outside .backlog/, repo-relative (e.g. "docs/research/20260709-foo.md"). The single writer commits these with the state move — list them or they are LOST. Empty when the deliverable lives inside the task file itself.' },
   },
 }
 const INTEGRATE_RESULT = {
@@ -334,7 +345,11 @@ function directReviewPrompt(t) {
   return `${ENV}
 You are quality-reviewer reviewing one NON-CODE acf-whip task (Worktree: none — NO worktree, do NOT run clean-checkout, and do NOT apply the "missing clean-checkout token" auto-reject rule; non-code tasks have no worktree).
 
-Read the task and its deliverable at ${sq(rootPath)} and review it against the task's Acceptance Criteria. Write your review comments into that ROOT file, then end with the ACFW-RESULT marker:
+Read the task and its deliverable at ${sq(rootPath)} and review it against the task's Acceptance Criteria.
+
+If the Acceptance Criteria name a standalone deliverable file (one outside .backlog/), verify for EACH such file that it (a) exists and (b) is COMMITTED — run  git -C ${sq(trunkRoot)} log -1 --oneline -- <file>  and require non-empty output. An existing but uncommitted deliverable is a REJECT (the specialist did not report it to the writer, so the next checkout destroys it); say so in notes, naming the file.
+
+Write your review comments into that ROOT file, then end with the ACFW-RESULT marker:
   ACFW-RESULT:
     transition: accepted | rejected
     commit_sha: n/a
@@ -350,17 +365,24 @@ function directPrompt(t) {
   return `${ENV}
 You are the ${t.agent || 'assigned'} agent executing one NON-CODE acf-whip task (Worktree: none — research/docs-only, NO worktree, do NOT run clean-checkout).
 
-Read the task at ${sq(rootPath)}, do the work, and write the deliverable/evidence directly into that ROOT task file. Do NOT create a worktree, do NOT move the file between .backlog/ folders, do NOT commit .backlog/ — the orchestrator is the single writer. End your response with the ACFW-RESULT marker:
+Read the task at ${sq(rootPath)}, do the work, and write the deliverable/evidence into that ROOT task file (and, when the task calls for a standalone document, into its own file under the repo — e.g. docs/research/<date>-<topic>.md).
+
+Do NOT create a worktree, do NOT move the file between .backlog/ folders, do NOT commit anything — the orchestrator is the single writer and it commits FOR you.
+
+DELIVERABLE FILES (load-bearing): if you created or modified ANY file outside .backlog/, list every one of them, repo-relative, in deliverable_files. The writer stages exactly those paths in the same commit as this task's state move. A file you do not list is never committed, and the next checkout or stash DESTROYS it — this has permanently lost finished work. If your whole deliverable lives inside the task file, leave the list empty.
+
+End your response with the ACFW-RESULT marker:
   ACFW-RESULT:
     transition: completed | blocked
     commit_sha: n/a
     rejection_increment: 0
     notes: <one line>
+    deliverable_files: <comma-separated repo-relative paths you created/modified outside .backlog/, or n/a>
     blocked_reason: <only if blocked: dependency-missing | environment | unrecoverable | none>
     needs_task: <only if blocked_reason=dependency-missing: the missing task to create, else n/a>
 If you block because of unmodeled work that should be its own task, set blocked_reason "dependency-missing" and name that task in needs_task so the orchestrator parks this for an operator.
 
-Return the structured ACFWResult matching your marker (plus blockedReason/needsTask if you blocked on a missing dependency).`
+Return the structured ACFWResult matching your marker (deliverableFiles as an array; plus blockedReason/needsTask if you blocked on a missing dependency).`
 }
 
 function integratePrompt(t, postResolver) {
@@ -452,12 +474,30 @@ Output its stdout — a single JSON object — as your ENTIRE final message. No 
   return snap && snap.counts ? snap : null
 }
 
-// One sequential writer call. actions: [{ path, toState, agent, notes, inc, binc }].
+// Deliverable paths a NON-CODE task reported (WHIP-08). apply-transition.sh refuses a state path with
+// exit 2 — which would strand the state move — so filter here too: a specialist that names .backlog/
+// or an absolute path loses its staging, never its transition. Defense in depth, not duplication.
+function safeStagePaths(files, stem) {
+  const out = []
+  for (const raw of (Array.isArray(files) ? files : [])) {
+    const p = String(raw || '').trim().replace(/^\.\//, '')
+    if (!p) continue
+    if (p.startsWith('/') || p.includes('..') || p.startsWith('.backlog/') || p.startsWith('.acfwhip/')) {
+      log(`WARN ${stem}: ignoring unstageable deliverable path '${p}' (absolute, traversing, or a state path)`)
+      continue
+    }
+    out.push(p)
+  }
+  return out
+}
+
+// One sequential writer call. actions: [{ path, toState, agent, notes, inc, binc, stage }].
 async function applyTransitions(actions, label) {
   if (!actions.length) return { applied: [], note: 'nothing to do' }
-  const lines = actions.map((a) =>
-    `  bash ${sq(APPLY)} ${sq(a.path)} ${sq(a.toState)} ${sq(a.agent || 'orchestrator')} ${sq(a.notes || '')} ${sq(String(a.inc || 0))} ${sq(String(a.binc || 0))}`,
-  ).join('\n')
+  const lines = actions.map((a) => {
+    const stage = (a.stage || []).map((p) => `--stage ${sq(p)} `).join('')
+    return `  bash ${sq(APPLY)} ${stage}${sq(a.path)} ${sq(a.toState)} ${sq(a.agent || 'orchestrator')} ${sq(a.notes || '')} ${sq(String(a.inc || 0))} ${sq(String(a.binc || 0))}`
+  }).join('\n')
   // Non-emit here is non-fatal: the moves are re-planned from the next scan (folder state is the truth)
   // and apply-transition.sh is idempotent, so deferring a write one iteration is safe.
   return safeAgent(
@@ -466,7 +506,9 @@ You are the SINGLE backlog writer. Run these apply-transition.sh calls IN ORDER,
 
 ${lines}
 
-Capture each call's stdout (an "ok:" or "noop:" line) into applied[]. If any call errors, record it in applied[] and continue with the rest. Return the WriteResult.`,
+Then run exactly once (best-effort — ignore any failure):  touch ${sq(RUN_LOCK)}
+
+Capture each apply-transition call's stdout (an "ok:", "noop:" or "warn:" line) into applied[]. If any call errors, record it in applied[] and continue with the rest. Return the WriteResult.`,
     { label, phase: 'Iterate', schema: WRITE_BATCH, model: SHELL_MODEL },
     () => ({ applied: [], note: 'writer agent non-emit after retries — transitions deferred to next iteration' }),
   )
@@ -477,8 +519,9 @@ phase('Bootstrap')
 const boot = await safeAgent(
   `${ENV}
 Bootstrap the acf-whip orchestrator at trunk root ${sq(trunkRoot)}.
-1. Detached HEAD check: run  git -C ${sq(trunkRoot)} symbolic-ref --quiet HEAD  — if it FAILS, set detached true and stop (do not run the doctor).
-2. If a branch is checked out: apply repairable integrity issues, then re-scan:
+1. Run-lock check: run  find ${sq(`${trunkRoot}/.backlog`)} -maxdepth 1 -name .acfw-run.json -mmin -${LOCK_FRESH_MIN}  — if it prints a path, set lockFresh true and stop (do not run the doctor). Otherwise set lockFresh false.
+2. Detached HEAD check: run  git -C ${sq(trunkRoot)} symbolic-ref --quiet HEAD  — if it FAILS, set detached true and stop (do not run the doctor).
+3. If a branch is checked out: apply repairable integrity issues, then re-scan:
      bash ${sq(DOCTOR)} --fix ${sq(trunkRoot)} >/dev/null 2>&1 || true
      bash ${sq(DOCTOR)} --quiet ${sq(trunkRoot)}
    From the second run capture: doctorOk (SUMMARY ok=true), doctorSummary (the verbatim SUMMARY line), fatals (verbatim FATAL| lines).
@@ -488,6 +531,10 @@ Return the BootstrapResult.`,
 )
 if (!boot) {
   return { aborted: true, reason: 'bootstrap agent never emitted after retries; re-run /go (git + .backlog/ are durable, nothing is lost)', mode }
+}
+if (boot.lockFresh) {
+  // Refuse, do not warn: a double-start is unattended by definition, so a console warning protects nothing.
+  return { aborted: true, reason: `another /go run appears active (${RUN_LOCK} touched within ${LOCK_FRESH_MIN}m). Never run two /go against one repo — they collide on slugs and on the shared root index. If the previous run crashed, the lock expires on its own, or clear it now:  rm ${RUN_LOCK}`, mode }
 }
 if (boot.detached) {
   return { aborted: true, reason: 'detached HEAD at trunk root; /go requires a branch checked out at the repo root', mode }
@@ -763,8 +810,13 @@ Return the ScanResult.`
       return
     }
     // completed: move in-progress -> completed -> in-review (one writer call), then review+integrate inline.
+    // A NON-CODE task's standalone deliverables (it works in the ROOT tree and may not commit) are staged
+    // by the writer in the FIRST of those commits — the earliest possible moment, so the window in which
+    // a concurrent checkout/stash can destroy them is as small as the design allows (WHIP-08).
+    const stage = d.kind === 'direct' ? safeStagePaths(r.deliverableFiles, d.t.stem) : []
+    if (stage.length) log(`${d.t.stem}: committing ${stage.length} deliverable file(s) — ${stage.join(', ')}`)
     await streamWrite([
-      { path: `${trunkRoot}/.backlog/in-progress/${d.t.stem}.md`, toState: 'completed', agent: d.t.agent || 'orchestrator', notes: (r.notes || '').slice(0, 200), inc: 0 },
+      { path: `${trunkRoot}/.backlog/in-progress/${d.t.stem}.md`, toState: 'completed', agent: d.t.agent || 'orchestrator', notes: (r.notes || '').slice(0, 200), inc: 0, stage },
       { path: `${trunkRoot}/.backlog/completed/${d.t.stem}.md`, toState: 'in-review', agent: 'orchestrator', notes: 'review-dispatch', inc: 0 },
     ], `done#${iter}:${d.t.stem}`)
     productiveDispatch = true
@@ -848,6 +900,16 @@ Final integration drain. Run  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trun
     }
   }
 }
+
+// ============================ RELEASE THE RUN LOCK ============================
+// A run that reaches here is over (complete | no-progress | max-iterations | scan-degraded), so release
+// the lock immediately — otherwise a finished run would block its own re-run for LOCK_FRESH_MIN. The
+// mid-run abort paths return earlier and deliberately leave the lock to expire on its own: they end in
+// a state an operator should look at before relaunching. Best-effort by construction (the lock is a
+// guardrail): if this never runs, the freshness window releases it anyway.
+try {
+  await agent(`Run exactly this command and report nothing else:  rm -f ${sq(RUN_LOCK)}`, { label: 'unlock', phase: 'Drain', model: SHELL_MODEL })
+} catch (e) { /* lock expires on its own */ }
 
 // ============================ REPORT ============================
 // WS5 / retro #9: RECONCILE the run tallies against the freshest on-disk snapshot (finalSnap). The

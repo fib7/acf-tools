@@ -393,6 +393,151 @@ check "active-only: NO false dangling-dep for pending->terminal-accepted" "! ech
 check "active-only suppresses accepted advisory WARNs (fewer warns than full)" \
   "[ \"\$(echo \"\$AO_ACT\"|sed -nE 's/.*warn=([0-9]+).*/\1/p')\" -lt \"\$(echo \"\$AO_FULL\"|sed -nE 's/.*warn=([0-9]+).*/\1/p')\" ]"
 
+echo "== WHIP-22: a raw NUL byte is ONE clear FATAL, not a cascade of phantom findings =="
+# grep treats a NUL-bearing file as binary, so every field() lookup returns nothing and a perfectly
+# well-formed task reports unparseable-frontmatter AND missing-worktree-slug. Detect the byte instead.
+NB="$WORK/nul-repo"; git init -q -b trunk "$NB" >/dev/null
+git -C "$NB" config user.email t@t; git -C "$NB" config user.name t
+mkdir -p "$NB"/.backlog/{pending,in-progress,completed,in-review,blocked,rejected,accepted} "$NB/.claude/agents"
+: > "$NB/.claude/agents/go-engineer.md"
+printf '# Task\n\n- **ID**: nul-1\n- **Status**: pending\n- **Assigned Agent**: go-engineer\n- **Worktree**: nulslug\n- **Dependencies**: none\n' > "$NB/.backlog/pending/nul-1.md"
+printf 'note: a literal \000 byte here\n' >> "$NB/.backlog/pending/nul-1.md"
+git -C "$NB" add -A >/dev/null 2>&1; git -C "$NB" commit -qm nul >/dev/null 2>&1
+NUL_OUT=$(bash "$DOC" "$NB"); NUL_RC=$?
+check "control-bytes FATAL emitted" "echo \"\$NUL_OUT\" | grep -q '^FATAL|control-bytes|nul-1'"
+check "control-bytes makes the gate fail (exit 1)" "[ $NUL_RC -eq 1 ]"
+check "NO phantom unparseable-frontmatter for the same stem" "! echo \"\$NUL_OUT\" | grep -q 'unparseable-frontmatter|nul-1'"
+check "NO phantom missing-worktree-slug for the same stem" "! echo \"\$NUL_OUT\" | grep -q 'missing-worktree-slug|nul-1'"
+check "exactly one finding for the corrupted stem" "[ \"\$(echo \"\$NUL_OUT\" | grep -c '|nul-1|')\" -eq 1 ]"
+# --fix must NOT silently 'heal' it: a NUL usually marks a torn write.
+bash "$DOC" --fix "$NB" >/dev/null 2>&1
+check "--fix does NOT strip the NUL (no silent heal of a torn write)" "[ \"\$(LC_ALL=C tr -dc '\\000' < '$NB/.backlog/pending/nul-1.md' | wc -c | tr -d '[:space:]')\" -gt 0 ]"
+# the documented recipe actually clears it
+LC_ALL=C tr -d '\000' < "$NB/.backlog/pending/nul-1.md" > "$NB/t" && mv "$NB/t" "$NB/.backlog/pending/nul-1.md"
+FIXED_OUT=$(bash "$DOC" "$NB"); FIXED_RC=$?
+check "runbook strip recipe clears the FATAL (exit 0)" "[ $FIXED_RC -eq 0 ]"
+rm -rf "$NB"
+
+echo "== WHIP-19: legacy JSON-style Dependencies is REPAIRABLE and --fix clears the false dangling-dep =="
+BD="$WORK/brackets-repo"; git init -q -b trunk "$BD" >/dev/null
+git -C "$BD" config user.email t@t; git -C "$BD" config user.name t
+mkdir -p "$BD"/.backlog/{pending,in-progress,completed,in-review,blocked,rejected,accepted} "$BD/.claude/agents"
+: > "$BD/.claude/agents/go-engineer.md"
+mkbd(){ printf '# Task\n\n- **ID**: %s\n- **Status**: pending\n- **Assigned Agent**: go-engineer\n- **Worktree**: %s\n- **Dependencies**: %s\n' "$1" "$2" "$3" > "$BD/.backlog/pending/$1.md"; }
+mkbd bd-a aslug '[bd-b]'
+mkbd bd-b bslug none
+git -C "$BD" add -A >/dev/null 2>&1; git -C "$BD" commit -qm bd >/dev/null 2>&1
+BD_OUT=$(bash "$DOC" "$BD"); BD_RC=$?
+check "bracketed-deps reported REPAIRABLE" "echo \"\$BD_OUT\" | grep -q '^REPAIRABLE|bracketed-deps|bd-a'"
+check "brackets DO cause the false dangling-dep FATAL today" "echo \"\$BD_OUT\" | grep -q '^FATAL|dangling-dep|bd-a'"
+check "false dangling-dep blocks the gate (exit 1)" "[ $BD_RC -eq 1 ]"
+bash "$DOC" --fix "$BD" >/dev/null 2>&1
+check "--fix rewrites the line to a bare comma list" "grep -qE '^- \*\*Dependencies\*\*: bd-b\$' '$BD/.backlog/pending/bd-a.md'"
+BD_OUT2=$(bash "$DOC" "$BD"); BD_RC2=$?
+check "after --fix the dangling-dep FATAL is gone" "! echo \"\$BD_OUT2\" | grep -q '^FATAL|dangling-dep|bd-a'"
+check "after --fix the gate passes (exit 0)" "[ $BD_RC2 -eq 0 ]"
+rm -rf "$BD"
+
+echo "== WHIP-26: a DIRTY orphan worktree is never force-removed =="
+mktask pending wghost2 wghost2 pending go-engineer none "" 0; git add .backlog; git commit -qm wghost2
+git -C "$REPO" worktree add -q "$REPO/.worktree/dirtyghost" -b worktree/dirtyghost trunk 2>/dev/null
+echo "one-of-a-kind findings" > "$REPO/.worktree/dirtyghost/findings.md"   # untracked = still precious
+rm -f .backlog/pending/wghost2.md; git add .backlog; git commit -qm orphan-it   # no live task on the slug
+OUT=$(bash "$DOC" "$REPO")
+check "dirty orphan reported as orphaned-worktree-dirty WARN" "echo \"\$OUT\" | grep -q '^WARN|orphaned-worktree-dirty|dirtyghost'"
+check "dirty orphan NOT offered as a REPAIRABLE removal" "! echo \"\$OUT\" | grep -q '^REPAIRABLE|orphaned-worktree|dirtyghost'"
+bash "$DOC" --fix "$REPO" >/dev/null 2>&1
+check "dirty orphan SURVIVES --fix" "[ -d '$REPO/.worktree/dirtyghost' ]"
+check "its uncommitted work SURVIVES --fix" "[ -f '$REPO/.worktree/dirtyghost/findings.md' ]"
+# clean it, and the reaper takes it
+rm -f "$REPO/.worktree/dirtyghost/findings.md"
+bash "$DOC" --fix "$REPO" >/dev/null 2>&1
+check "a CLEAN orphan is still reaped by --fix" "[ ! -d '$REPO/.worktree/dirtyghost' ]"
+git -C "$REPO" branch -D worktree/dirtyghost >/dev/null 2>&1
+
+echo "== WHIP-07: accepted + no branch + no ledger marker -> advisory, never silent =="
+AB="$WORK/branchless-repo"; git init -q -b trunk "$AB" >/dev/null
+git -C "$AB" config user.email t@t; git -C "$AB" config user.name t
+mkdir -p "$AB"/.backlog/{pending,in-progress,completed,in-review,blocked,rejected,accepted} "$AB/.claude/agents"
+: > "$AB/.claude/agents/go-engineer.md"
+mkab(){ printf '# Task\n\n- **ID**: %s\n- **Status**: accepted\n- **Assigned Agent**: go-engineer\n- **Worktree**: %s\n- **Dependencies**: none\n- **Integrated-At**: %s\n' "$1" "$2" "$3" > "$AB/.backlog/accepted/$1.md"; }
+mkab ab-unverified uslug ""      # accepted, no branch, no marker, no stamp -> WARN
+mkab ab-stamped sslug abc1234    # legacy operator ack -> silent
+mkab ab-marked mslug ""          # ledger marker present -> silent
+# lay down the real ledger marker for ab-marked exactly where the integrator would
+MP=$(cd "$AB" && . "$ACF_WHIP/skills/lib/acfw-git.sh" && acfw_marker_path ab-marked)
+mkdir -p "$AB/$(dirname "$MP")"; printf '{"key":"ab-marked"}\n' > "$AB/$MP"
+git -C "$AB" add -A >/dev/null 2>&1; git -C "$AB" commit -qm ab >/dev/null 2>&1
+AB_OUT=$(bash "$DOC" "$AB"); AB_RC=$?
+check "branchless accepted with no marker -> WARN" "echo \"\$AB_OUT\" | grep -q '^WARN|accepted-branchless-unverified|ab-unverified'"
+check "WARN names the whip-move ack" "echo \"\$AB_OUT\" | grep -q 'accepted-branchless-unverified|ab-unverified|.*--integrated-at'"
+check "operator-stamped accepted stays silent" "! echo \"\$AB_OUT\" | grep -q 'accepted-branchless-unverified|ab-stamped'"
+check "ledger-marked accepted stays silent (oracle consulted)" "! echo \"\$AB_OUT\" | grep -q 'accepted-branchless-unverified|ab-marked'"
+check "it stays TERMINAL: advisory only, gate still passes (exit 0)" "[ $AB_RC -eq 0 ]"
+rm -rf "$AB"
+
+echo "== oracle agreement: an LEDGER-integrated dep with an unreaped branch must NOT FATAL =="
+# Nothing reaps worktree/<slug> right after integration, and Integrated-At is inert in 3.0.0. So a dep
+# whose change IS on trunk (marker present) used to read as "not integrated" to the doctor's cross-slug
+# gate while the SCHEDULER (which asks the ledger) had already dispatched the dependent -> the next
+# per-iteration `doctor --quiet --active-only` recheck FATAL'd and aborted the whole run.
+OA="$WORK/oracle-repo"; git init -q -b trunk "$OA" >/dev/null
+git -C "$OA" config user.email t@t; git -C "$OA" config user.name t
+mkdir -p "$OA"/.backlog/{pending,in-progress,completed,in-review,blocked,rejected,accepted} "$OA/.claude/agents"
+: > "$OA/.claude/agents/go-engineer.md"
+mkoa(){ printf '# T\n\n- **ID**: %s\n- **Status**: %s\n- **Assigned Agent**: go-engineer\n- **Worktree**: %s\n- **Dependencies**: %s\n- **Integrated-At**:\n- **Rejection Count**: 0\n' "$1" "$2" "$3" "$4" > "$OA/.backlog/$2/$1.md"; }
+mkoa oa-dep accepted oaslug none
+mkoa oa-use in-progress obslug oa-dep
+printf '| 2026-06-02 10:00:00 | clean-checkout | ok |\n' >> "$OA/.backlog/in-progress/oa-use.md"
+OMP=$(cd "$OA" && . "$ACF_WHIP/skills/lib/acfw-git.sh" && acfw_marker_path oa-dep)
+mkdir -p "$OA/$(dirname "$OMP")"; printf '{}\n' > "$OA/$OMP"     # dep IS integrated: marker on trunk
+git -C "$OA" add -A >/dev/null 2>&1; git -C "$OA" commit -qm oa >/dev/null 2>&1
+git -C "$OA" branch worktree/oaslug; git -C "$OA" branch worktree/obslug   # branch NOT yet reaped
+OA_FULL=$(bash "$DOC" "$OA"); OA_FRC=$?
+OA_ACT=$(bash "$DOC" --quiet --active-only "$OA"); OA_ARC=$?
+check "full pass: ledger-integrated dep does NOT FATAL" "! echo \"\$OA_FULL\" | grep -q '^FATAL|cross-slug-dep-not-integrated|oa-use'"
+check "full pass: gate green (exit 0)" "[ $OA_FRC -eq 0 ]"
+check "active-only (the mid-run recheck): no FATAL" "! echo \"\$OA_ACT\" | grep -q '^FATAL|cross-slug-dep-not-integrated|oa-use'"
+check "active-only: gate green -> run is not aborted" "[ $OA_ARC -eq 0 ]"
+# and the gate STILL fires when the dep genuinely has not landed (no marker, live branch)
+rm -f "$OA/$OMP"; git -C "$OA" add -A >/dev/null 2>&1; git -C "$OA" commit -qm unintegrate >/dev/null 2>&1
+OA_NEG=$(bash "$DOC" --quiet --active-only "$OA")
+check "no marker + live branch: cross-slug FATAL still fires (gate not defanged)" "echo \"\$OA_NEG\" | grep -q '^FATAL|cross-slug-dep-not-integrated|oa-use'"
+rm -rf "$OA"
+
+echo "== WHIP-25 / WHIP-06: repo-level advisories (dirty trunk root, unpushed trunk) =="
+RL="$WORK/repolevel"; git init -q -b trunk "$RL" >/dev/null
+git -C "$RL" config user.email t@t; git -C "$RL" config user.name t
+mkdir -p "$RL"/.backlog/{pending,in-progress,completed,in-review,blocked,rejected,accepted} "$RL/.claude/agents"
+printf 'seed\n' > "$RL/src.txt"; git -C "$RL" add -A >/dev/null 2>&1; git -C "$RL" commit -qm seed >/dev/null 2>&1
+RL_OUT=$(bash "$DOC" "$RL")
+check "clean root: no dirty-trunk-root WARN" "! echo \"\$RL_OUT\" | grep -q 'dirty-trunk-root'"
+check "no origin ref: no trunk-unpushed WARN" "! echo \"\$RL_OUT\" | grep -q 'trunk-unpushed'"
+printf 'untracked scratch\n' > "$RL/scratch.txt"
+RL_OUT=$(bash "$DOC" "$RL")
+check "UNTRACKED root file is not flagged (operator scratch is legitimate)" "! echo \"\$RL_OUT\" | grep -q 'dirty-trunk-root'"
+printf 'escaped worktree write\n' >> "$RL/src.txt"
+RL_OUT=$(bash "$DOC" "$RL")
+check "TRACKED dirty root file -> dirty-trunk-root WARN" "echo \"\$RL_OUT\" | grep -q '^WARN|dirty-trunk-root|'"
+git -C "$RL" checkout -- src.txt; rm -f "$RL/scratch.txt"
+printf 'bl\n' > "$RL/.backlog/marker.txt"; git -C "$RL" add -A >/dev/null 2>&1; git -C "$RL" commit -qm bl >/dev/null 2>&1
+printf 'state churn\n' >> "$RL/.backlog/marker.txt"
+RL_OUT=$(bash "$DOC" "$RL")
+check "dirty .backlog/ alone is NOT flagged (that is the writer's business)" "! echo \"\$RL_OUT\" | grep -q 'dirty-trunk-root'"
+git -C "$RL" checkout -- .backlog/marker.txt
+# simulate an origin that is 2 commits behind (no network, no remote needed)
+BEHIND=$(git -C "$RL" rev-parse HEAD)
+printf 'a\n' >> "$RL/src.txt"; git -C "$RL" commit -qam c1 >/dev/null 2>&1
+printf 'b\n' >> "$RL/src.txt"; git -C "$RL" commit -qam c2 >/dev/null 2>&1
+git -C "$RL" update-ref refs/remotes/origin/trunk "$BEHIND"
+RL_OUT=$(bash "$DOC" "$RL"); RL_RC=$?
+check "local trunk ahead of origin -> trunk-unpushed WARN with the count" "echo \"\$RL_OUT\" | grep -qE '^WARN\\|trunk-unpushed\\|.*2 commit'"
+check "repo-level advisories never block the gate (exit 0)" "[ $RL_RC -eq 0 ]"
+git -C "$RL" update-ref refs/remotes/origin/trunk "$(git -C "$RL" rev-parse HEAD)"
+RL_OUT=$(bash "$DOC" "$RL")
+check "in sync with origin -> no trunk-unpushed WARN" "! echo \"\$RL_OUT\" | grep -q 'trunk-unpushed'"
+rm -rf "$RL"
+
 echo ""
 echo "==================================================="
 echo "Phase 1 doctor+hydrate test: $PASS passed, $FAIL failed"

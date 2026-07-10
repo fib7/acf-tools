@@ -16,7 +16,7 @@
 #                     (use the task's CURRENT state to apply field edits without moving)
 #     --reason TEXT   transition-log note (default: "manual operator move")
 #     --integrated-at SHA   set "- **Integrated-At**: SHA" on the task (typical with TO_STATE=accepted)
-#     --add-dep ID    append ID to the task's "- **Dependencies**:" list
+#     --add-dep ID    append ID to the task's "- **Dependencies**:" bare comma list
 #     --agent NAME    transition-log actor (default: operator)
 #
 # All edits land in the SAME commit as the move (apply-transition.sh commits the moved file). When
@@ -99,18 +99,21 @@ if [ -n "$INTEGRATED_AT" ]; then
   fi
   EDITED=1
 fi
+# Dependencies is a BARE comma list ("a, b") — the format /task authors and the ONLY format the doctor
+# and scanner parse (both split on commas without stripping brackets). Writing JSON-style "[a, b]" here
+# made both ids unresolvable and raised a false dangling-dep FATAL that blocked /go. Any legacy bracket
+# wrapping found in the file is dropped on the way through (doctor --fix repairs the rest).
 if [ -n "$ADD_DEP" ]; then
   if grep -qE '^- \*\*Dependencies\*\*:' "$TASK_FILE"; then
-    CUR=$(grep -E '^- \*\*Dependencies\*\*:' "$TASK_FILE" | head -1 | sed -E 's/^- \*\*Dependencies\*\*:[[:space:]]*//')
+    CUR=$(grep -E '^- \*\*Dependencies\*\*:' "$TASK_FILE" | head -1 | sed -E 's/^- \*\*Dependencies\*\*:[[:space:]]*//; s/^\[//; s/\]$//; s/[[:space:]]+$//')
     case "$CUR" in
-      none|\"none\"|"") NEW="[$ADD_DEP]" ;;
-      \[*\]) NEW=$(printf '%s' "$CUR" | sed -E "s/\]$/, $ADD_DEP]/") ;;
-      *) NEW="[$CUR, $ADD_DEP]" ;;
+      none|\"none\"|"") NEW="$ADD_DEP" ;;
+      *) NEW="$CUR, $ADD_DEP" ;;
     esac
     sed -i.bak -E "s|^- \*\*Dependencies\*\*:.*|- **Dependencies**: $NEW|" "$TASK_FILE" && rm -f "$TASK_FILE.bak"
   else
     sed -i.bak -E "/^- \*\*Status\*\*:/a\\
-- **Dependencies**: [$ADD_DEP]" "$TASK_FILE" && rm -f "$TASK_FILE.bak"
+- **Dependencies**: $ADD_DEP" "$TASK_FILE" && rm -f "$TASK_FILE.bak"
   fi
   EDITED=1
 fi

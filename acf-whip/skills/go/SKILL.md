@@ -41,7 +41,7 @@ Execute backlog continuously:
 
 ## Integration mode
 
-**Default (LP-CAS, 3.0.0)**: the orchestrator lands every newly-accepted task onto the live trunk via the `integrate-lpcas` skill — a single-parent candidate cherry-picked onto the live tip, co-committed with an in-tree ledger marker, union-gated, and CAS-landed. The marker's presence on trunk is the sole integration oracle (no cached snapshot, no rebase); conflicts route to the task's `assigned_agent` as a resolver. See `skills/integrate-lpcas/SKILL.md`. (The legacy bash reference further down predates the dynamic-workflow path; `workflows/whip-go.workflow.js` + `integrate-lpcas` are authoritative.)
+**Default (LP-CAS, 3.0.0)**: the orchestrator lands every newly-accepted task onto the live trunk via the `integrate-lpcas` skill — a single-parent candidate cherry-picked onto the live tip, co-committed with an in-tree ledger marker, union-gated, and CAS-landed. The marker's presence on trunk is the sole integration oracle (no cached snapshot, no rebase); conflicts route to the task's `assigned_agent` as a resolver. See `skills/integrate-lpcas/SKILL.md`. (`workflows/whip-go.workflow.js` is the authoritative implementation; the bash loop further down is the fallback for when the Workflow tool is unavailable, and mirrors it.)
 
 **Override**: if the project's `CLAUDE.md` (or any other persistent agent instructions) directs a different integration strategy — for example "open a PR per PR Group via `gh pr create` instead of merging locally" — follow those instructions and skip Step 4.5. In that mode, the loop reverts to the 1.2.0 terminal check (`accepted ∪ blocked`); operator handles integration.
 
@@ -112,7 +112,7 @@ WHILE (terminal_tasks < total_tasks):
   2. Scan ALL Workflow States
   3. Process ALL Transitions (TodoWrite single call), gating on dependencies
   4. Partition pending by Worktree slug; dispatch one specialist per slug (parallel across slugs)
-  4.5. Integrate Newly-Accepted (default mode): topo-sort by deps; merge into local trunk
+  4.5. Integrate Newly-Accepted (default mode): topo-sort by deps; LP-CAS onto live trunk
   5. Check Completion (exit if 100%, else CONTINUE)
   6. Prevent Infinite Loop (max 1000 iterations)
 POST-LOOP: Final integration drain (defensive).
@@ -122,7 +122,7 @@ POST-LOOP: Final integration drain (defensive).
 
 ## Pre-Loop: Capture Trunk Identity
 
-Before iteration begins, snapshot the branch checked out at the repo root and export it as environment variables for every dispatched skill (`clean-checkout-before-task`, `integrate-worktree`).
+Before iteration begins, snapshot the branch checked out at the repo root and export it as environment variables for every dispatched skill (`clean-checkout-before-task`, `integrate-lpcas`).
 
 ```bash
 export ACFW_TRUNK_ROOT=$(git rev-parse --show-toplevel)
@@ -194,6 +194,15 @@ If the marker is missing or malformed, the orchestrator treats the dispatch as a
 
 Backoff: 1s → 2s → 4s. Never `rm` the lock; let the holding process finish. (The shared helper captures git's exit status directly and uses a per-invocation temp error file, so it never masks a real failure as success and never clobbers a concurrent agent's error capture.)
 
+### Integration oracle (LP-CAS)
+
+The same file provides the **only** sanctioned integration test. A task is integrated **iff** its in-tree ledger marker (`.acfwhip/integrated/<shard>/<key>.json`, `key` = task stem) is present in the tree of the live trunk tip. Never grep `Integrated-At:` — that field is inert display/ack metadata and can diverge from reality.
+
+```bash
+acfw_is_integrated "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH" "$(basename "$f" .md)"   # exit 0 = integrated
+acfw_integrated_keys "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH"                        # all integrated keys, one per line
+```
+
 ### Orchestrator move primitive
 
 After every Task() return, parse the marker and perform the move at root:
@@ -245,10 +254,10 @@ while [ $iteration -lt $max_iterations ]; do
   # ... process workflow ...
 
   # Count terminal tasks. Override (PR) mode: accepted alone is terminal. Default (auto-merge)
-  # mode: an accepted task is terminal once nothing remains to fold into trunk — it carries
-  # Integrated-At, OR is non-code ("none"), OR has no worktree/<slug> branch (historical/pre-2.0.0,
+  # mode: an accepted task is terminal once nothing remains to fold into trunk — its LEDGER MARKER
+  # is on trunk, OR it is non-code ("none"), OR it has no worktree/<slug> branch (historical,
   # already on trunk). Equivalently: accepted MINUS the ones still pending integration (a real
-  # branch, not yet integrated). Mirrors the workflow's isTerminal.
+  # branch, no marker). Mirrors the workflow's isTerminal.
   accepted_count=$(ls -1 .backlog/accepted/*.md 2>/dev/null | wc -l | tr -d ' ')
   blocked_count=$(ls -1 .backlog/blocked/*.md 2>/dev/null | wc -l | tr -d ' ')
   if [ "$ACFW_INTEGRATION_OVERRIDE" = "1" ]; then
@@ -259,7 +268,7 @@ while [ $iteration -lt $max_iterations ]; do
       [ -f "$f" ] || continue
       slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | head -1 | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
       { [ -z "$slug" ] || [ "$slug" = "none" ]; } && continue
-      grep -qE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' "$f" && continue
+      acfw_is_integrated "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH" "$(basename "$f" .md)" && continue
       git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$slug" && pending_integration=$((pending_integration + 1))
     done
     terminal_count=$((accepted_count + blocked_count - pending_integration))
@@ -429,9 +438,9 @@ For each task in `.backlog/pending/`:
 A task may dispatch only from a codebase that already contains all its dependencies. For each dep:
 
 - **Same-slug dep** (dep's `Worktree:` equals this task's `Worktree:`): satisfied as soon as `dep` is in `.backlog/accepted/`. Its commits already live on the shared `worktree/<slug>` branch and will be present in the worktree when the within-slug serializer picks the next task.
-- **Cross-slug dep** (different `Worktree:` slug): `dep` must be in `.backlog/accepted/` **AND** its commits must already be on the local trunk — i.e. it has a non-empty `Integrated-At:`, **or** it is a historical task with no `worktree/<slug>` branch (already merged the old way; nothing left to integrate). A cross-slug dep blocks only while it is genuinely pending integration (accepted, a live branch, no `Integrated-At:` yet). A non-code (`none`) dep never integrates, so it is satisfied on acceptance.
+- **Cross-slug dep** (different `Worktree:` slug): `dep` must be in `.backlog/accepted/` **AND** its commits must already be on the local trunk — i.e. its **ledger marker is on trunk**, **or** it is a historical task with no `worktree/<slug>` branch (already merged the old way; nothing left to integrate). A cross-slug dep blocks only while it is genuinely pending integration (accepted, a live branch, no marker). A non-code (`none`) dep never integrates, so it is satisfied on acceptance.
 
-In override (PR) mode, where there is no `Integrated-At:` field because no auto-merge happens, treat acceptance as sufficient for cross-slug deps too (operator is responsible for ordering).
+In override (PR) mode no marker is ever written, so treat acceptance as sufficient for cross-slug deps too (operator is responsible for ordering).
 
 ```javascript
 {
@@ -534,7 +543,7 @@ for f in $(ls -1 .backlog/pending/*.md 2>/dev/null | sort); do
   [ -n "${IN_PROGRESS_SLUGS[$slug]:-}" ] && continue   # group already busy
   [ -n "${SEEN_SLUGS[$slug]:-}" ] && continue   # already picked one task from this group this iteration
   # Apply dependency-gating rule (see Step 3): skip if any dep unsatisfied.
-  # Cross-slug dep needs Integrated-At; same-slug dep needs accepted/.
+  # Cross-slug dep needs its ledger marker on trunk; same-slug dep needs accepted/.
   deps_ok=$(./.claude/skills/go/check-deps.sh "$f")  # conceptual; real impl inlines the check
   [ "$deps_ok" != "ok" ] && continue
   SEEN_SLUGS["$slug"]=1
@@ -555,10 +564,10 @@ for dep_id in $(echo "$DEPS" | tr ',' '\n' | tr -d '[:space:]'); do
   dep_slug=$(grep -E '^- \*\*Worktree\*\*:' "$dep_file" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
   if [ "$dep_slug" != "$THIS_SLUG" ] && [ "$dep_slug" != "none" ]; then
     # Cross-slug code dep: blocks only while genuinely pending integration — accepted, a live
-    # worktree/<slug> branch, and no Integrated-At yet. A branchless historical dep is already on
-    # trunk (satisfied); a non-code "none" dep never integrates (satisfied).
-    integrated=$(grep -E '^- \*\*Integrated-At\*\*:' "$dep_file" | sed -E 's/.*Integrated-At\*\*:[[:space:]]*//' | tr -d '[:space:]')
-    if [ -z "$integrated" ] && git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$dep_slug"; then
+    # worktree/<slug> branch, and no ledger marker on trunk. A branchless historical dep is already
+    # on trunk (satisfied); a non-code "none" dep never integrates (satisfied).
+    if ! acfw_is_integrated "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH" "$(basename "$dep_file" .md)" \
+       && git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$dep_slug"; then
       return 1
     fi
   fi
@@ -604,7 +613,7 @@ After all Task() calls return, the orchestrator parses each agent's ACFW-RESULT 
 | Transition | Performed by | Notes |
 |------------|--------------|-------|
 | retry (rejected→pending) | task-engineer at root | Adjusts rejection_count narrative; orchestrator commits the move on trunk after task-engineer returns. task-engineer NEVER enters a worktree. |
-| unblock (blocked→pending) | task-engineer at root | Validates dependencies satisfied (cross-slug deps need `Integrated-At:`). |
+| unblock (blocked→pending) | task-engineer at root | Validates dependencies satisfied (cross-slug deps need their ledger marker on trunk). |
 | dispatch (pending→in-progress) | **orchestrator** at root, before Task() | Single writer; atomic mv + commit on trunk before specialist starts. |
 | start work | specialist agent inside worktree | Reads task at root path; does code work in `.worktree/<slug>`; commits CODE only on `worktree/<slug>`; never moves task file. Returns ACFW-RESULT. |
 | in-progress→completed | **orchestrator** at root, on specialist's `transition: completed` signal | acfw_apply_result moves + commits on trunk. |
@@ -631,57 +640,63 @@ If no specialist assigned, use task-engineer for guidance.
 
 ## Step 4.5: Integrate Newly-Accepted (default mode only)
 
-After dispatch returns and specialists have moved their tasks to `.backlog/accepted/`, fold every newly-accepted worktree into the local trunk. The orchestrator (this skill, running as the parent agent) is the **only writer of trunk's `.git/index`**; no parallelism here.
+After dispatch returns and specialists have moved their tasks to `.backlog/accepted/`, land every newly-accepted task onto the live trunk with the **LP-CAS integrator**, one task at a time. The orchestrator (this skill, running as the parent agent) is the **only writer of trunk's `.git/index`**; no parallelism here.
 
-**Skip this step entirely if project instructions (CLAUDE.md, AGENTS.md, etc.) direct a different integration strategy** (e.g. "open a PR per PR Group via `gh pr create` instead"). In that case, leave accepted tasks with empty `Integrated-At:` and let the operator handle integration; the loop's terminal check falls back to `accepted ∪ blocked`.
+**Skip this step entirely if project instructions (CLAUDE.md, AGENTS.md, etc.) direct a different integration strategy** (e.g. "open a PR per PR Group via `gh pr create` instead"). In that case no ledger marker is ever written, the operator handles integration, and the loop's terminal check falls back to `accepted ∪ blocked`.
+
+The integrator mutates **only git** (the trunk ref + a disposable integration worktree). It never moves a task file — `.backlog/` moves stay the orchestrator's job (see exit 6 below).
 
 ### Step 4.5a: Topologically sort unintegrated accepted tasks
 
-Read `.backlog/accepted/*.md`. For each task whose `Integrated-At:` is empty, add it to the integration queue. Sort the queue so that, for any cross-slug dep, the dep is integrated before the dependent. Same-slug ordering is implicit (rebase preserves intra-branch order).
+Enqueue every accepted task that has a code slug, a live `worktree/<slug>` branch, and **no ledger marker on trunk**. Sort so that, for any cross-slug dep, the dep integrates first (Kahn's algorithm over the dep edges among queue members).
 
 ```bash
 declare -a INTEGRATE_QUEUE
 for f in .backlog/accepted/*.md; do
   [ -f "$f" ] || continue
-  integrated=$(grep -E '^- \*\*Integrated-At\*\*:' "$f" | sed -E 's/.*Integrated-At\*\*:[[:space:]]*//' | tr -d '[:space:]')
-  [ -n "$integrated" ] && continue
   slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | head -1 | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
-  # Only enqueue tasks with a real worktree branch to fold in. A branchless historical/pre-2.0.0
-  # task is already on trunk (terminal) — skip it, or integrate-worktree would exit 4 every pass.
   { [ -z "$slug" ] || [ "$slug" = "none" ]; } && continue
+  acfw_is_integrated "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH" "$(basename "$f" .md)" && continue
   git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$slug" && INTEGRATE_QUEUE+=("$f")
 done
-
-# Topo-sort INTEGRATE_QUEUE by cross-slug deps (dep first). Implementation: simple
-# Kahn's algorithm over the dep edges among queue members.
 ```
 
 ### Step 4.5b: Integrate sequentially
 
+`ACFW_TRUNK_ROOT` and `ACFW_TRUNK_BRANCH` must be exported (Pre-Loop). Optionally export `ACFW_GATE_CMD` (the project's union quality gate, run with CWD = the candidate tree) and `ACFW_PARSE_SANITY_CMD` (a cheap parse/lint check, run before the heavy gate so a botched conflict resolution surfaces as a mechanism fault, not a coverage regression).
+
 ```bash
-IW="${CLAUDE_PLUGIN_ROOT}/skills/integrate-worktree/bin/integrate-worktree.sh"
+LP="${CLAUDE_PLUGIN_ROOT}/skills/integrate-lpcas/bin/integrate-lpcas.sh"
 for task_file in "${SORTED_QUEUE[@]}"; do
-  OUT=$(bash "$IW" "$task_file"); rc=$?
-  if [ $rc -eq 7 ]; then
-    # resolver-needed. OUT carries: worktree, branch, assigned_agent, conflicting_commits,
-    # source_tasks, conflicted_files. Dispatch the task's assigned_agent as a conflict resolver
-    # INSIDE that worktree via the Task tool (see the integrate-worktree skill "Resolver dispatch"
-    # contract): resolve conflicts preserving both intents, run quality gates, then
-    # `git rebase --continue` — or `git rebase --abort` + append `FATAL: <reason>` if irreconcilable.
-    # After the resolver returns, validate + retry the fast-forward:
-    bash "$IW" --post-resolver "$task_file"; rc=$?
-  fi
-  case $rc in
-    0)     echo "✓ integrated: $(basename "$task_file" .md)" ;;
-    4)     echo "↷ skipped (historical; no worktree branch): $(basename "$task_file" .md)" ;;
-    6)     echo "✗ resolver failed: $(basename "$task_file" .md) → rejected/, retry next iteration" ;;
-    10|99) echo "↻ transient: $(basename "$task_file" .md) → leave accepted, retry next iteration" ;;
-    *)     echo "⚠ integrate-worktree exit $rc on $(basename "$task_file" .md)" ;;
-  esac
+  OUT=$(bash "$LP" "$task_file"); rc=$?
+  # rc 7: OUT carries `worktree:`, `assigned_agent:`, and a `conflicted_files:` block. Dispatch that
+  # agent into that worktree as a conflict resolver (see below), then resume the SAME attempt:
+  [ $rc -eq 7 ] && { bash "$LP" --post-resolver "$task_file"; rc=$?; }
 done
 ```
 
-The orchestrator drives `integrate-worktree.sh` per task via the two-call protocol (initial attempt → on exit 7 dispatch the resolver → `--post-resolver`). The script owns the FF → rebase ladder, the exit-10 anti-orphan guards, the cleanup of empty worktrees, and writing `Integrated-At:` on success; resolver dispatch is hoisted to the orchestrator (bash cannot spawn a subagent).
+Map each exit code exactly as `workflows/whip-go.workflow.js` does:
+
+| exit | outcome | orchestrator action |
+|------|---------|---------------------|
+| 0 | integrated / already-integrated | Change + marker are on trunk. Nothing to write. |
+| 3 | contaminated (quarantine) | Malformed or poison candidate. **Park this task for an operator**; do not retry, do not reject the others. |
+| 4 | skipped | No candidate ref — historical task already on trunk. Terminal; do not retry. |
+| 6 | rejected (quality-fault) | The union gate failed on the candidate tree. **You** move `accepted → rejected` and increment Rejection Count, so the task re-enters the rejection self-heal instead of being re-queued as a candidate every iteration. |
+| 7 | resolver-needed | Cherry-pick conflict. Dispatch the resolver, then re-invoke `--post-resolver`. |
+| 9, 11, 12, 99 | transient | Mechanism fault / `cas-lost` / trunk unobservable / git lock. **Never** a quality reject: leave the task accepted and retry next iteration. |
+
+Only exit 6 consumes the rejection budget. A conflict (7) or a mechanism fault (9) never does.
+
+### Resolver dispatch (exit 7 only)
+
+The integration worktree printed on the `worktree:` line is a **detached** checkout of the live trunk tip, mid-cherry-pick. Dispatch the task's `assigned_agent` into it via the Task tool with exactly this contract:
+
+- **Allowed**: edit the conflicted files in place, then `git -C <worktree> add <file>` for each. Preserve **both** intents (the task's change and what is already on trunk).
+- **Forbidden**: `git cherry-pick --continue` / `--commit` / `--abort` / `--quit` (the integrator owns the commit); `git reset`, `checkout`/`switch` to another commit, `rebase`, deleting the worktree; editing anything under `.backlog/` or `.acfwhip/`.
+- If the conflict is genuinely irreconcilable, leave the markers **unstaged** — `--post-resolver` then reports a mechanism fault (exit 9) and the task stays accepted for a later attempt.
+
+Resolver dispatch is hoisted to the orchestrator because bash cannot spawn a subagent. Everything else — the already-integrated check, the single-parent and poison guards, the marker co-commit, the sanity + union gate, and the compare-and-swap land — belongs to the script.
 
 ---
 
@@ -691,22 +706,23 @@ After all agents complete in iteration AND Step 4.5 has integrated newly-accepte
 
 ```bash
 # Count terminal states. Override mode: accepted alone is terminal. Default mode: an accepted task
-# is terminal once nothing remains to fold into trunk — Integrated-At set, OR non-code ("none"), OR
-# no worktree/<slug> branch (historical, already on trunk). = accepted MINUS those still pending
-# integration (a live branch, not yet integrated). Mirrors the workflow's isTerminal.
+# is terminal once nothing remains to fold into trunk — its LEDGER MARKER is on trunk, OR it is
+# non-code ("none"), OR it has no worktree/<slug> branch (historical, already on trunk). = accepted
+# MINUS those still pending integration (a live branch, no marker). Mirrors the workflow's isTerminal.
 accepted_count=$(ls -1 .backlog/accepted/*.md 2>/dev/null | wc -l | tr -d ' ')
 blocked_count=$(ls -1 .backlog/blocked/*.md 2>/dev/null | wc -l | tr -d ' ')
 if [ "$ACFW_INTEGRATION_OVERRIDE" = "1" ]; then
   integrated_count=$accepted_count   # treat accepted as terminal in override mode
   terminal_count=$((accepted_count + blocked_count))
 else
-  integrated_count=$(grep -lE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' .backlog/accepted/*.md 2>/dev/null | wc -l | tr -d ' ')
-  pending_integration=0
+  integrated_count=0; pending_integration=0
   for f in .backlog/accepted/*.md; do
     [ -f "$f" ] || continue
+    if acfw_is_integrated "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH" "$(basename "$f" .md)"; then
+      integrated_count=$((integrated_count + 1)); continue
+    fi
     slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | head -1 | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
     { [ -z "$slug" ] || [ "$slug" = "none" ]; } && continue
-    grep -qE '^- \*\*Integrated-At\*\*:[[:space:]]*[0-9a-f]{7,}' "$f" && continue
     git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$slug" && pending_integration=$((pending_integration + 1))
   done
   terminal_count=$((accepted_count + blocked_count - pending_integration))
@@ -781,16 +797,15 @@ Defensive: in case the last iteration accepted tasks but exited the loop before 
 
 ```bash
 if [ "$ACFW_INTEGRATION_OVERRIDE" != "1" ]; then
-  IW="${CLAUDE_PLUGIN_ROOT}/skills/integrate-worktree/bin/integrate-worktree.sh"
+  LP="${CLAUDE_PLUGIN_ROOT}/skills/integrate-lpcas/bin/integrate-lpcas.sh"
   for f in .backlog/accepted/*.md; do
     [ -f "$f" ] || continue
-    integrated=$(grep -E '^- \*\*Integrated-At\*\*:' "$f" | sed -E 's/.*Integrated-At\*\*:[[:space:]]*//' | tr -d '[:space:]')
-    [ -n "$integrated" ] && continue
+    acfw_is_integrated "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH" "$(basename "$f" .md)" && continue
     slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | head -1 | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
     { [ -z "$slug" ] || [ "$slug" = "none" ]; } && continue
     # Defensive drain. An exit 7 (resolver-needed) here is left for the next /go run rather than
     # dispatching a resolver post-loop; a branchless historical task has no branch to fold (skip).
-    git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$slug" && bash "$IW" "$f" >/dev/null 2>&1 || true
+    git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$slug" && bash "$LP" "$f" >/dev/null 2>&1 || true
   done
 fi
 ```

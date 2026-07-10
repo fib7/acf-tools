@@ -70,6 +70,11 @@ commit_fix() { # <path-rel> <msg>
 EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' "refs/heads/$ACFW_BRANCH_PREFIX/" 2>/dev/null | sed "s#^${ACFW_BRANCH_PREFIX}/##")
 has_branch() { printf '%s\n' "$EXISTING_WT_SLUGS" | grep -qxF "$1"; }
 
+# Integration ledger keys present on the CURRENT trunk tree (ONE git call). The doctor still never
+# WRITES integration state — it reads the oracle only to tell "landed" from "assumed landed" below.
+INTEGRATED_KEYS=$(acfw_integrated_keys "$REPO_ROOT" HEAD 2>/dev/null || true)
+is_integrated_key() { printf '%s\n' "$INTEGRATED_KEYS" | grep -qxF "$1"; }
+
 # --active-only: emit a cheap BATCHED TSV stub row per accepted task so the cross-task awk graph keeps
 # every accepted stem as a dep-resolution target (resolve/dangling-dep/cross-slug-dep-not-integrated/
 # duplicate-id/dup-folder stay correct) WITHOUT the per-file field() extraction. ONE find + ONE grep
@@ -79,15 +84,18 @@ has_branch() { printf '%s\n' "$EXISTING_WT_SLUGS" | grep -qxF "$1"; }
 # emitted (duplicate-id is FATAL across folders). TSV columns mirror the full pass exactly (11 cols).
 emit_accepted_stub_tsv() {
   [ -d "$BL/accepted" ] || return 0
-  local accf wtf
+  local accf wtf ikf
   accf=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-acc.XXXXXX")
   wtf=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-wt.XXXXXX")
+  ikf=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-ik.XXXXXX")
   find "$BL/accepted" -maxdepth 1 -type f -name '*.md' ! -name 'README.md' 2>/dev/null > "$accf"
   printf '%s\n' "$EXISTING_WT_SLUGS" > "$wtf"
+  printf '%s\n' "$INTEGRATED_KEYS" > "$ikf"
   grep -HE '^- \*\*(ID|Worktree|Integrated-At)\*\*:' "$BL/accepted/"*.md 2>/dev/null | awk \
-    -v accf="$accf" -v wtf="$wtf" '
+    -v accf="$accf" -v wtf="$wtf" -v ikf="$ikf" '
     BEGIN {
       while ((getline l < wtf) > 0) if (l != "") wt[l]=1
+      while ((getline l < ikf) > 0) if (l != "") ik[l]=1
       while ((getline l < accf) > 0) { if (l=="") continue; files[l]=1; n=split(l,p,"/"); b=p[n]; sub(/\.md$/,"",b); stem[l]=b }
     }
     {
@@ -101,12 +109,14 @@ emit_accepted_stub_tsv() {
     END {
       for (f in files) {
         s=stem[f]; i=(f in id)?id[f]:""; sl=(f in slug)?slug[f]:""; ig=(f in integ)?integ[f]:""
+        # Ledger truth wins over the inert Integrated-At field: the gate asks the same oracle the scheduler does.
+        if (ig=="" && (s in ik)) ig="ledger"
         hb=(sl!="" && sl!="none" && (sl in wt))?1:0
         printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s, "accepted", i, "accepted", sl, "", "none", ig, "", 0, hb
       }
     }
   '
-  rm -f "$accf" "$wtf"
+  rm -f "$accf" "$wtf" "$ikf"
 }
 
 # Derive a kebab-case worktree slug from a task id: drop the "<category>-<NNN>-" prefix and keep
@@ -142,6 +152,24 @@ if ! git -C "$REPO_ROOT" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
   emit FATAL detached-head "(repo)" "HEAD is detached at $REPO_ROOT; /go requires a branch checked out at the repo root"
 fi
 
+# ---- WARN: tracked files dirty at the shared trunk root, outside .backlog/ ----
+# A specialist is supposed to write only inside its own worktree. A relative path resolved against the
+# SHARED root instead leaves work here, where the integrator's post-land `reset --hard` will discard it.
+# Untracked files are excluded: operator scratch lives at the root legitimately.
+ndirty=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | awk 'substr($0,1,2)!="??" && substr($0,4,9)!=".backlog/"{n++} END{print n+0}')
+[ "${ndirty:-0}" -gt 0 ] && emit WARN dirty-trunk-root "(repo)" "$ndirty tracked file(s) modified/staged at the trunk root outside .backlog/ — a specialist may have escaped its worktree; commit or stash them before the next integration resyncs the root (git reset --hard)"
+
+# ---- WARN: local trunk ahead of origin ----
+# The LP-CAS integrator lands on the LOCAL trunk by compare-and-swap and NEVER pushes — by design (a
+# push per landing would need credentials in every agent env, fire CI per task, and drag network faults
+# into the integrator's exit taxonomy). Divergence is a fact to surface, not a fault to automate away.
+# Zero network: reads only the local remote-tracking ref, and says nothing when there is no origin.
+HEAD_BR=$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)
+if [ -n "$HEAD_BR" ] && git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/remotes/origin/$HEAD_BR" >/dev/null 2>&1; then
+  nahead=$(git -C "$REPO_ROOT" rev-list --count "refs/remotes/origin/$HEAD_BR..HEAD" 2>/dev/null || echo 0)
+  [ "${nahead:-0}" -gt 0 ] && emit WARN trunk-unpushed "(repo)" "local $HEAD_BR is $nahead commit(s) ahead of origin/$HEAD_BR — acf-whip lands integrations locally and never pushes; push when ready"
+fi
+
 # ---- Per-file pass: emit independent findings, apply per-file repairs, build TSV ----
 # --active-only restricts the full per-file pass to the non-accepted folders (accepted is fed to the
 # awk graph as a cheap batched stub appended below); full/--fix runs always cover every active folder.
@@ -152,6 +180,20 @@ for st in $LOOP_FOLDERS; do
   for f in "$d"/*.md; do
     [ -f "$f" ] || continue
     stem=$(basename "$f" .md); folder="$st"
+
+    # A raw NUL byte makes grep treat the file as binary: every field() lookup silently returns nothing,
+    # so a task whose fields are all present reports unparseable-frontmatter AND missing-worktree-slug,
+    # and /go aborts on a phantom. Detect it FIRST and skip the file — one true finding beats a cascade
+    # of false ones. Deliberately NOT --fix-able: a NUL usually marks a torn write, and the bootstrap
+    # --fix must never silently commit a half-written task as "healed". Scoped to NUL, not the whole C0
+    # class: ESC/formfeed pasted from terminal output are harmless here, and flagging them would newly
+    # block runs on files that parse fine.
+    nnul=$(LC_ALL=C tr -dc '\000' < "$f" 2>/dev/null | wc -c | tr -d '[:space:]')
+    if [ "${nnul:-0}" -gt 0 ]; then
+      emit FATAL control-bytes "$stem" "$nnul raw NUL byte(s) (0x00) in the task file — every field lookup is unreliable. Strip: LC_ALL=C tr -d '\\000' < .backlog/$folder/$stem.md > /tmp/t && mv /tmp/t .backlog/$folder/$stem.md"
+      continue
+    fi
+
     id=$(field "$f" "ID"); status=$(field "$f" "Status"); slug=$(field "$f" "Worktree" | tr -d '[:space:]')
     deps=$(field "$f" "Dependencies"); integ=$(field "$f" "Integrated-At" | tr -d '[:space:]')
     agent=$(field "$f" "Assigned Agent" | tr -d '[:space:]'); rc=$(field "$f" "Rejection Count" | tr -d '[:space:]')
@@ -202,6 +244,25 @@ for st in $LOOP_FOLDERS; do
     fi
     [ "$agentOk" = "0" ] && emit "$sev_struct" unknown-agent "$stem" "Assigned Agent '$agent' has no .claude/agents/$agent.md — create it or run /whip-add-agents, or reassign the task"
 
+    # Legacy JSON-style Dependencies ("[a, b]"): every dep parser here and in the scanner splits on
+    # commas and does NOT strip brackets, so "[a" and "b]" resolve to nothing -> a FALSE dangling-dep
+    # FATAL on both ids, blocking /go. whip-move used to write this form; repair it at the source so a
+    # damaged backlog self-heals on the bootstrap --fix pass instead of teaching three parsers to
+    # tolerate a format nothing should emit.
+    case "$deps" in
+      \[*\])
+        bare=$(printf '%s' "$deps" | sed -E 's/^\[//; s/\]$//')
+        if [ "$FIX" = "1" ]; then
+          sed -i.bak -E "s|^- \*\*Dependencies\*\*:.*|- **Dependencies**: $bare|" "$f" && rm -f "$f.bak"
+          commit_fix ".backlog/$folder/$stem.md" "doctor: de-bracket Dependencies on $stem"
+          emit REPAIRABLE bracketed-deps "$stem" "rewrote '$deps' -> '$bare' (parsers expect a bare comma list)"
+          deps="$bare"
+        else
+          emit REPAIRABLE bracketed-deps "$stem" "Dependencies '$deps' is JSON-style; --fix rewrites it to the bare comma list '$bare'"
+        fi
+        ;;
+    esac
+
     # LP-CAS (3.0.0): the Integrated-At markdown field is INERT — integration truth is the in-tree
     # ledger marker (.acfwhip/integrated/), which the doctor never reads or writes. The old
     # "clear stray Integrated-At" reconciliation is dropped: it existed only to keep a metadata field
@@ -239,8 +300,27 @@ for st in $LOOP_FOLDERS; do
 
     # hasBranch: does a real worktree/<slug> branch exist? (col 11; consumed by the awk graph pass)
     hasBranch=0; [ -n "$slug" ] && [ "$slug" != "none" ] && has_branch "$slug" && hasBranch=1
+
+    # The cross-slug dep gate below must ask the SAME oracle the scheduler asks. Integrated-At is inert
+    # in 3.0.0, so a task integrated by LP-CAS carries an empty field while its worktree branch still
+    # exists (nothing reaps the branch until a later --fix). Reading the field alone therefore declared
+    # a dep that IS on trunk "not integrated": the scheduler dispatched the dependent (marker present),
+    # and the next per-iteration doctor recheck FATAL'd on it and aborted the whole run. Fold ledger
+    # truth into the column the gate reads, so scheduler and doctor can never disagree.
+    integGate="$integ"
+    [ -z "$integGate" ] && is_integrated_key "$stem" && integGate="ledger"
+
+    # An accepted code task with NO branch is counted terminal on the assumption "already on trunk the
+    # old way" — correct for pre-ledger tasks, and a silent hole for anything else: a branch deleted
+    # before its change landed makes a never-integrated task look finished (this shipped an accepted
+    # billing engine that was absent from trunk). Keep it terminal (a FATAL here would deadlock every
+    # historical backlog), but say so once per run. The ack clears the WARN and is itself the evidence.
+    if [ "$folder" = "accepted" ] && [ -n "$slug" ] && [ "$slug" != "none" ] && [ "$hasBranch" = "0" ] \
+       && [ -z "$integ" ] && ! is_integrated_key "$stem"; then
+      emit WARN accepted-branchless-unverified "$stem" "accepted, but no worktree branch and no ledger marker on trunk — integration was never recorded. Verify the deliverable is on trunk, then ack: whip-move $stem accepted --integrated-at <sha>"
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$stem" "$folder" "$id" "$status" "$slug" "$agent" "${deps:-none}" "$integ" "${globs}" "$rc" "$hasBranch" >> "$TSV"
+      "$stem" "$folder" "$id" "$status" "$slug" "$agent" "${deps:-none}" "$integGate" "${globs}" "$rc" "$hasBranch" >> "$TSV"
   done
 done
 
@@ -330,10 +410,16 @@ if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
     esac
     [ "$actual" != "$ACFW_BRANCH_PREFIX/$slug" ] && emit FATAL worktree-wrong-branch "$slug" "$ACFW_WORKTREE_DIR/$slug is on '$actual', expected '$ACFW_BRANCH_PREFIX/$slug'"
     if ! printf '%s\n' "$LIVE_SLUGS" | grep -qx "$slug"; then
-      if [ "$FIX" = "1" ]; then
+      # NEVER --force a worktree that holds uncommitted work. This reaper is the one place acf-whip can
+      # destroy one-of-a-kind deliverables (a `remove --force` discards modified AND untracked files:
+      # thousands of cassettes, a findings doc, an .env). A dirty orphan is reported and left for a
+      # human; only a clean one is reaped. Not repairable by definition — the judgement is the operator's.
+      if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+        emit WARN orphaned-worktree-dirty "$slug" "$ACFW_WORKTREE_DIR/$slug has no live task but holds UNCOMMITTED changes — not auto-removed; inspect (git -C $wt status), salvage, then remove by hand"
+      elif [ "$FIX" = "1" ]; then
         git_with_lock_backoff -C "$REPO_ROOT" worktree remove --force "$wt" >/dev/null 2>&1 || true
         git_with_lock_backoff -C "$REPO_ROOT" branch -D "$ACFW_BRANCH_PREFIX/$slug" >/dev/null 2>&1 || true
-        emit REPAIRABLE orphaned-worktree "$slug" "removed (no live task on slug)"
+        emit REPAIRABLE orphaned-worktree "$slug" "removed (no live task on slug; worktree was clean)"
       else
         emit REPAIRABLE orphaned-worktree "$slug" "$ACFW_WORKTREE_DIR/$slug has no pending/in-progress/completed/in-review task"
       fi

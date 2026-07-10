@@ -212,6 +212,7 @@ Use Read/Write tool sequence for each file. Create `docs/development/` directory
 | **Research style guide** | `${CLAUDE_PLUGIN_ROOT}/content/style/research-documents.md` | `docs/acf/style/research-documents.md` |
 | **Task template** | `${CLAUDE_PLUGIN_ROOT}/content/backlog/task-template.md` | `docs/acf/backlog/task-template.md` |
 | **Workflow** | `${CLAUDE_PLUGIN_ROOT}/content/backlog/workflow.md` | `docs/acf/backlog/workflow.md` |
+| **Recovery runbook** | `${CLAUDE_PLUGIN_ROOT}/content/backlog/recovery-runbook.md` | `docs/acf/backlog/recovery-runbook.md` |
 | **Research protocol** | `${CLAUDE_PLUGIN_ROOT}/content/acf/research-protocol.md` | `docs/acf/research-protocol.md` |
 
 Create directories if missing.
@@ -605,7 +606,7 @@ ACF Whip active. State machine: `pending → in-progress → completed → in-re
 
 **Commands**: `/task` (decompose), `/go` (execute all), `/whip-doctor` (backlog integrity check; `--fix` auto-repairs), `/retro` (improvement), `/whip-add-agents` (create specialists)
 
-**Core Docs**: `docs/acf/backlog/workflow.md`, `docs/acf/backlog/task-template.md`, `docs/acf/style/task-descriptions.md`, `.backlog/README.md`
+**Core Docs**: `docs/acf/backlog/workflow.md`, `docs/acf/backlog/recovery-runbook.md`, `docs/acf/backlog/task-template.md`, `docs/acf/style/task-descriptions.md`, `.backlog/README.md`
 
 **Universal Agents**: task-engineer (WHAT/WHY only), quality-reviewer (accept/reject), lean-architect (design, max 2-3 line snippets), retro, precommit, research-agent (Perplexity/Context7)
 
@@ -621,7 +622,7 @@ Compare expected state (Steps 1-9) with actual state on disk:
 ```bash
 # 1. Check Universal Agents: expected_agents=(task-engineer quality-reviewer lean-architect precommit retro research-agent [+devops]) → missing_agents=[]
 # 2. Check Manifests: docs/agents/{agent}.md → missing_manifests=[]
-# 3. Check Core Docs: docs/acf/style/task-descriptions.md, docs/acf/backlog/task-template.md, docs/acf/backlog/workflow.md → missing_docs=[]
+# 3. Check Core Docs: docs/acf/style/task-descriptions.md, docs/acf/backlog/task-template.md, docs/acf/backlog/workflow.md, docs/acf/backlog/recovery-runbook.md → missing_docs=[]
 # 4. Check Quality Gates: .pre-commit-config.yaml, docs/development/quality-gates-{stack}.md → missing_quality_gates=[]
 # 5. Check CLAUDE.md Sections (if exists): "## Pure Delegation Architecture", "## Backlog Workflow", devops in matrix (if create_devops=true) → missing_claude_sections=[], outdated_claude_sections=[]
 ```
@@ -650,7 +651,7 @@ Compare expected state (Steps 1-9) with actual state on disk:
 
 📁 .backlog/: 9 state folders (draft, pending, in-progress, completed, in-review, blocked, rejected, accepted, archive)
 
-📋 Core Docs: ✓ task-descriptions.md, ✓ research-documents.md, ✓ research-protocol.md, ✓ task-template.md, ✓ workflow.md, ✓ .backlog/README.md
+📋 Core Docs: ✓ task-descriptions.md, ✓ research-documents.md, ✓ research-protocol.md, ✓ task-template.md, ✓ workflow.md, ✓ recovery-runbook.md, ✓ .backlog/README.md
 
 👥 Universal Agents (customized for {stack}):
    ✓ task-engineer, quality-reviewer, lean-architect, retro, precommit, research-agent
@@ -680,7 +681,7 @@ Compare expected state (Steps 1-9) with actual state on disk:
 2. /task "Scope description" (decompose)
 3. /go (execute)
 
-📚 Quick Reference: docs/acf/backlog/workflow.md, docs/acf/style/task-descriptions.md, docs/acf/backlog/task-template.md, .backlog/README.md, docs/agents/
+📚 Quick Reference: docs/acf/backlog/workflow.md, docs/acf/backlog/recovery-runbook.md, docs/acf/style/task-descriptions.md, docs/acf/backlog/task-template.md, .backlog/README.md, docs/agents/
 
 💡 Key Features: Pattern-based generation (YOUR stack) | Deep manifest customization | Gap analysis on re-init | Pure Delegation (3x+ speedup){IF create_devops} | DevOps agent (infrastructure-aware){IF with_specialists} | Auto-specialist generation (--with-specialists)
 ```

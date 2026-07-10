@@ -45,6 +45,16 @@ files, daemons, or schedulers.
 7. Stash unrelated working-tree changes.
 8. Append the OK token; print the worktree path.
 
+## Standalone re-hydration
+
+Hydration also runs on its own against an existing worktree — e.g. one created by a bare `git worktree add`, or one whose `.env`/`node_modules` you want refreshed after editing `.worktreeinclude`:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/skills/clean-checkout-before-task/bin/hydrate-worktree.sh" <REPO_ROOT> <WORKTREE_PATH>
+```
+
+Idempotent and safe to re-run: existing targets are skipped, and a missing manifest is a no-op.
+
 ## When to invoke
 
 | Caller | When |

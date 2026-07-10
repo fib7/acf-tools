@@ -8,7 +8,14 @@
 # with no extra locking.
 #
 # Usage:
-#   apply-transition.sh <TASK_FILE> <TO_STATE> [AGENT] [NOTES] [REJECTION_INCREMENT] [BLOCK_INCREMENT]
+#   apply-transition.sh [--stage PATH]... <TASK_FILE> <TO_STATE> [AGENT] [NOTES] [REJECTION_INCREMENT] [BLOCK_INCREMENT]
+#     --stage PATH  repo-relative deliverable file to commit ALONGSIDE this transition (repeatable).
+#                   A "Worktree: none" task writes standalone deliverables (docs/research/*.md) into
+#                   the ROOT tree; the specialist may not commit, and nothing else ever staged those
+#                   paths, so the next checkout/stash wiped them (permanent loss). The single writer
+#                   stages them by EXPLICIT path in the SAME commit as the folder move. State
+#                   namespaces are refused: .backlog/ is this writer's own business, .acfwhip/ is the
+#                   integrator's ledger. Non-existent paths are skipped with a note.
 #     TASK_FILE  absolute path to the task file in its CURRENT state folder
 #     TO_STATE   target folder under .backlog/ (pending|in-progress|completed|
 #                in-review|accepted|rejected|blocked)
@@ -32,6 +39,28 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/../../lib/acfw-git.sh"
+
+# --stage PATH... — validated up-front (before any file mutation) so a bad path never leaves a
+# half-applied transition. Refusal is exit 2: a caller that hands us a state path has a bug.
+STAGE_PATHS=()
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --stage)
+      [ $# -ge 2 ] || { echo "FATAL: --stage requires a PATH" >&2; exit 2; }
+      p="${2#./}"
+      case "$p" in
+        "") echo "FATAL: --stage path is empty" >&2; exit 2 ;;
+        /*) echo "FATAL: --stage path must be repo-relative, got absolute: $p" >&2; exit 2 ;;
+        *..*) echo "FATAL: --stage path must not traverse '..': $p" >&2; exit 2 ;;
+        .backlog/*|.acfwhip/*) echo "FATAL: --stage refuses state paths (.backlog/, .acfwhip/): $p" >&2; exit 2 ;;
+      esac
+      STAGE_PATHS[${#STAGE_PATHS[@]}]="$p"
+      shift 2 ;;
+    --) shift; break ;;
+    -*) echo "FATAL: unknown option: $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
 
 TASK_FILE="${1:-}"
 TO_STATE="${2:-}"
@@ -63,12 +92,32 @@ FNAME=$(basename "$TASK_FILE")
 FROM_STATE=$(basename "$(dirname "$TASK_FILE")")
 DEST="$REPO_ROOT/.backlog/$TO_STATE/$FNAME"
 
+# On a no-op re-apply, the move already happened but a crash between `mv` and `commit` would have
+# left the deliverables uncommitted — the exact loss this flag exists to prevent. Commit whatever of
+# them is still uncommitted, then no-op. Nothing to commit -> git commit is skipped, so this is inert
+# on the common path.
+rescue_deliverables() {
+  [ ${#STAGE_PATHS[@]} -gt 0 ] || return 0
+  local dirty=0 p
+  for p in "${STAGE_PATHS[@]}"; do
+    [ -e "$REPO_ROOT/$p" ] || continue
+    if [ -n "$(git -C "$REPO_ROOT" status --porcelain -- "$p" 2>/dev/null)" ]; then
+      git_with_lock_backoff -C "$REPO_ROOT" add -- "$p"; dirty=1
+    fi
+  done
+  [ "$dirty" = "1" ] || return 0
+  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME deliverables" --quiet
+  echo "ok: committed uncommitted deliverables for $FNAME"
+}
+
 # Idempotency: already in the target folder -> no-op (safe re-apply after resume).
 if [ "$FROM_STATE" = "$TO_STATE" ]; then
+  rescue_deliverables
   echo "noop: $FNAME already in $TO_STATE"
   exit 0
 fi
 if [ ! -f "$TASK_FILE" ] && [ -f "$DEST" ]; then
+  rescue_deliverables
   echo "noop: $FNAME already in $TO_STATE (source absent)"
   exit 0
 fi
@@ -109,7 +158,28 @@ sed -i.bak -E "s/^- \*\*Status\*\*:.*/- **Status**: $TO_STATE/" "$TASK_FILE" && 
 append_log_row "$TASK_FILE" "$(printf '| %s | %s | %s | %s | %s |' "$TS" "$FROM_STATE" "$TO_STATE" "$AGENT" "$NOTES")"
 mkdir -p "$REPO_ROOT/.backlog/$TO_STATE"
 mv "$TASK_FILE" "$DEST"
-git_with_lock_backoff -C "$REPO_ROOT" add ".backlog/$FROM_STATE/$FNAME" ".backlog/$TO_STATE/$FNAME"
-git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME $FROM_STATE -> $TO_STATE" --quiet
-echo "ok: $FNAME $FROM_STATE -> $TO_STATE"
+
+# Deliverables ride the SAME commit as the state move: one atomic record of "this task produced
+# these files and reached this state". A listed path that does not exist is a specialist bookkeeping
+# slip, not a reason to strand the transition — skip it and say so.
+STAGE_ADD=()
+STAGE_MSG=""
+if [ ${#STAGE_PATHS[@]} -gt 0 ]; then
+  for p in "${STAGE_PATHS[@]}"; do
+    if [ -e "$REPO_ROOT/$p" ]; then
+      STAGE_ADD[${#STAGE_ADD[@]}]="$p"
+    else
+      echo "warn: --stage path not found, skipped: $p" >&2
+    fi
+  done
+  [ ${#STAGE_ADD[@]} -gt 0 ] && STAGE_MSG=" (+${#STAGE_ADD[@]} deliverable file(s))"
+fi
+
+if [ ${#STAGE_ADD[@]} -gt 0 ]; then
+  git_with_lock_backoff -C "$REPO_ROOT" add -- ".backlog/$FROM_STATE/$FNAME" ".backlog/$TO_STATE/$FNAME" "${STAGE_ADD[@]}"
+else
+  git_with_lock_backoff -C "$REPO_ROOT" add -- ".backlog/$FROM_STATE/$FNAME" ".backlog/$TO_STATE/$FNAME"
+fi
+git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME $FROM_STATE -> $TO_STATE$STAGE_MSG" --quiet
+echo "ok: $FNAME $FROM_STATE -> $TO_STATE$STAGE_MSG"
 exit 0

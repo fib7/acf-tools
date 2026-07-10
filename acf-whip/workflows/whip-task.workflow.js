@@ -302,6 +302,18 @@ phase('Write')
 
 let writeResult = { committed: false, commitSha: 'n/a', files: writtenFiles, note: 'no files to commit' }
 if (writtenFiles.length) {
+  // The dependency graph was validated in JS (in-plan, acyclic, no self-edges) and is authoritative.
+  // The Dependencies LINE, though, was transcribed into markdown by an author agent from a prompt blob —
+  // a silent-loss channel: a whole decomposition once emerged "Dependencies: none" and /go dispatched
+  // downstream tasks before their upstreams landed. Stamp the validated value over whatever was written,
+  // in the committer (it runs after every author, before `git add`, so the stamp rides the same commit).
+  // Injection-safe: ID_RE admits only kebab-case ids, so no sed metacharacter can reach these lines.
+  const depStamps = writtenTasks.map((t) => {
+    const deps = (Array.isArray(t.dependencies) ? t.dependencies : []).join(', ') || 'none'
+    const f = `.backlog/pending/${t.filename}`
+    return `   if grep -qE '^- \\*\\*Dependencies\\*\\*:' ${sq(f)}; then sed -i.bak -E 's|^- \\*\\*Dependencies\\*\\*:.*|- **Dependencies**: ${deps}|' ${sq(f)}; else sed -i.bak -E '/^- \\*\\*Status\\*\\*:/a\\\\\n- **Dependencies**: ${deps}' ${sq(f)}; fi; rm -f ${sq(`${f}.bak`)}`
+  }).join('\n')
+
   writeResult = await agent(
     `You are the single backlog writer. ${ENV} Working at the trunk repo root ${sq(trunkRoot)} on branch ${sq(trunkBranch)}.
 
@@ -311,11 +323,13 @@ ${writtenFiles.map((f) => `  - .backlog/pending/${f}`).join('\n')}
 Do EXACTLY this, nothing else:
 1. cd ${sq(trunkRoot)}
 2. Verify each listed file exists under .backlog/pending/. If any are missing, report them in note and continue with the ones present.
-3. Stage ONLY those files:  git add ${writtenFiles.map((f) => `.backlog/pending/${sq(f)}`).join(' ')}
-4. Commit once:  git commit -q -m "task: create ${writtenFiles.length} backlog task(s) [${[...new Set(writtenTasks.map((t) => t.worktreeSlug))].join(', ')}]"
-5. Capture the new HEAD sha:  git rev-parse HEAD
+3. Stamp the VALIDATED dependency graph over each file's Dependencies line (the plan is authoritative; the authored line is not). Run these, skipping any whose file is missing:
+${depStamps}
+4. Stage ONLY those files:  git add ${writtenFiles.map((f) => `.backlog/pending/${sq(f)}`).join(' ')}
+5. Commit once:  git commit -q -m "task: create ${writtenFiles.length} backlog task(s) [${[...new Set(writtenTasks.map((t) => t.worktreeSlug))].join(', ')}]"
+6. Capture the new HEAD sha:  git rev-parse HEAD
 
-Do NOT modify the files. Do NOT touch any other path. Return the WriteResult.`,
+Make NO other edit to the files. Do NOT touch any other path. Return the WriteResult.`,
     { label: 'write:commit', phase: 'Write', schema: WRITE_RESULT },
   )
 }
