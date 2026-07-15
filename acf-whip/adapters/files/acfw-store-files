@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# acfw-store-files — the `files` task-store adapter (acf-whip store contract v1).
+#
+# The reference adapter: task state is markdown files in .backlog/<state>/ folders,
+# committed to trunk. This adapter is a THIN SHIM over the pre-3.1 engines, which
+# stay in place and remain directly invocable (tests, legacy /go loop, operators):
+#   snapshot   -> skills/go/bin/scan-backlog.sh        (read engine)
+#   transition -> skills/go/bin/apply-transition.sh    (write engine)
+#   doctor     -> skills/whip-doctor/bin/doctor.sh     (integrity engine)
+# so the files path stays byte-identical to acf-whip 3.0.x.
+#
+# Invoked by skills/lib/bin/acfw-store (the dispatcher), which exports:
+#   ACFW_TRUNK_ROOT, ACFW_TRUNK_BRANCH, ACFW_STORE_CONFIG, ACFW_CONTRACT_VERSION,
+#   ACFW_PLUGIN_LIB (abs path of skills/lib/)
+# Direct invocation works too (env falls back to git rev-parse).
+#
+# Contract exit codes: 0 ok/noop · 2 usage · 3 not-found/ambiguous · 4 conflict
+# (duplicate key) · 7 invalid state/value · 8 policy refusal (off-trunk) · 99 transient.
+#
+# Portability: pure bash 3.2 (no `declare -A`). No jq. macOS ships bash 3.2.
+
+set -u
+ADAPTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_ROOT="$(cd "$ADAPTER_DIR/../.." && pwd)"
+LIB="${ACFW_PLUGIN_LIB:-$PLUGIN_ROOT/skills/lib}"
+. "$LIB/acfw-git.sh"
+
+SCAN="$PLUGIN_ROOT/skills/go/bin/scan-backlog.sh"
+APPLY="$PLUGIN_ROOT/skills/go/bin/apply-transition.sh"
+DOCTOR="$PLUGIN_ROOT/skills/whip-doctor/bin/doctor.sh"
+
+REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+[ -n "$REPO_ROOT" ] || { echo "FATAL: not inside a git repo and ACFW_TRUNK_ROOT unset" >&2; exit 2; }
+BL="$REPO_ROOT/.backlog"
+
+ACTIVE_STATES="pending in-progress completed in-review accepted rejected blocked"
+ALL_STATES="draft $ACTIVE_STATES archive"
+
+SUB="${1:-}"
+[ -n "$SUB" ] && shift
+
+# ---- helpers ---------------------------------------------------------------
+
+field() { grep -E "^- \*\*$2\*\*:" "$1" 2>/dev/null | head -1 | sed -E "s/.*$2\*\*:[[:space:]]*//" | sed -E 's/[[:space:]]+$//'; }
+jesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
+# Multi-line body -> single JSON string value (escapes \ " \t \r; joins lines with \n;
+# strips remaining control bytes first so the output is always valid JSON).
+jesc_body() { # <file>
+  tr -d '\000-\010\013\014\016-\037' < "$1" | awk '
+    { gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\t/,"\\t"); gsub(/\r/,"\\r");
+      if (NR>1) printf "\\n"; printf "%s", $0 }'
+}
+
+valid_state() { case " $ALL_STATES " in *" $1 "*) return 0;; *) return 1;; esac; }
+
+# resolve_task_file <stem-or-unique-prefix> — echo the task's current path.
+# Exact stem match across the active folders first, then unique substring match
+# (mirrors whip-move.sh). Not found / ambiguous -> exit 3 with a FATAL on stderr.
+resolve_task_file() {
+  local q="$1" st f n=0 hit=""
+  for st in $ACTIVE_STATES; do
+    f="$BL/$st/$q.md"
+    if [ -f "$f" ]; then n=$((n+1)); hit="$f"; fi
+  done
+  if [ "$n" -eq 0 ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] && { n=$((n+1)); hit="$f"; }
+    done < <(for st in $ACTIVE_STATES; do ls "$BL/$st/"*"$q"*.md 2>/dev/null || true; done)
+  fi
+  if [ "$n" -eq 0 ]; then echo "FATAL: no task matching '$q' under $BL/" >&2; return 3; fi
+  if [ "$n" -gt 1 ]; then echo "FATAL: '$q' is ambiguous ($n matches) — use the full stem" >&2; return 3; fi
+  printf '%s' "$hit"
+}
+
+# set_field <file> <Field> <Value> — replace the "- **Field**:" line, inserting it
+# after "- **Status**:" when absent (the whip-move.sh edit pattern).
+set_field() {
+  local f="$1" name="$2" val="$3"
+  if grep -qE "^- \*\*$name\*\*:" "$f"; then
+    ACFW_SF_VAL="$val" ACFW_SF_NAME="$name" awk '
+      BEGIN { name=ENVIRON["ACFW_SF_NAME"]; val=ENVIRON["ACFW_SF_VAL"]; done=0 }
+      {
+        if (!done && $0 ~ ("^- \\*\\*" name "\\*\\*:")) { printf "- **%s**: %s\n", name, val; done=1; next }
+        print
+      }' "$f" > "$f.acfwtmp" && mv "$f.acfwtmp" "$f"
+  else
+    ACFW_SF_VAL="$val" ACFW_SF_NAME="$name" awk '
+      BEGIN { name=ENVIRON["ACFW_SF_NAME"]; val=ENVIRON["ACFW_SF_VAL"]; done=0 }
+      {
+        print
+        if (!done && $0 ~ /^- \*\*Status\*\*:/) { printf "- **%s**: %s\n", name, val; done=1 }
+      }' "$f" > "$f.acfwtmp" && mv "$f.acfwtmp" "$f"
+  fi
+}
+
+# ---- subcommands -----------------------------------------------------------
+
+cmd_capabilities() {
+  printf '{"backend":"files","contractVersion":1,"commitsToGit":true,"capabilities":["snapshot","snapshot-enriched","read","create","transition","stage","update-field","update-body","log-event","comment","doctor","doctor-fix","doctor-complete","init","sync"]}\n'
+}
+
+cmd_init() {
+  local st
+  for st in $ALL_STATES; do
+    mkdir -p "$BL/$st"
+    [ -f "$BL/$st/.gitkeep" ] || : > "$BL/$st/.gitkeep"
+  done
+  printf '{"backend":"files","initialized":true,"path":"%s"}\n' "$(jesc "$BL")"
+}
+
+cmd_snapshot() { exec bash "$SCAN" "$@" "$REPO_ROOT"; }
+
+cmd_doctor() { exec bash "$DOCTOR" "$@" "$REPO_ROOT"; }
+
+cmd_sync() { printf '{"backend":"files","synced":true}\n'; }   # git IS the durability
+
+cmd_read() {
+  local body=0 mat="" stem f folder
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --body) body=1; shift ;;
+      --materialize) mat="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown read flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  stem="${1:-}"; [ -n "$stem" ] || { echo "FATAL: usage: read [--body] [--materialize DIR] <stem>" >&2; exit 2; }
+  f=$(resolve_task_file "$stem") || exit 3
+  stem=$(basename "$f" .md)
+  folder=$(basename "$(dirname "$f")")
+  if [ -n "$mat" ]; then
+    # files backend: the task document already lives at a stable root path — print it.
+    printf '%s\n' "$f"
+    return 0
+  fi
+  printf '{'
+  printf '"stem":"%s","folder":"%s",' "$(jesc "$stem")" "$(jesc "$folder")"
+  printf '"fields":{'
+  printf '"id":"%s",' "$(jesc "$(field "$f" ID)")"
+  printf '"status":"%s",' "$(jesc "$(field "$f" Status)")"
+  printf '"priority":"%s",' "$(jesc "$(field "$f" Priority)")"
+  printf '"agent":"%s",' "$(jesc "$(field "$f" "Assigned Agent")")"
+  printf '"worktree":"%s",' "$(jesc "$(field "$f" Worktree)")"
+  printf '"pr_group":"%s",' "$(jesc "$(field "$f" "PR Group")")"
+  printf '"touches_globs":"%s",' "$(jesc "$(field "$f" "Touches Globs")")"
+  printf '"dependencies":"%s",' "$(jesc "$(field "$f" Dependencies)")"
+  local rc bc
+  rc=$(field "$f" "Rejection Count" | tr -dc '0-9'); bc=$(field "$f" Block-Count | tr -dc '0-9')
+  printf '"rejection_count":%s,' "${rc:-0}"
+  printf '"block_count":%s' "${bc:-0}"
+  printf '}'
+  if [ "$body" -eq 1 ]; then
+    printf ',"body":"%s"' "$(jesc_body "$f")"
+  fi
+  printf '}\n'
+}
+
+cmd_create() {
+  local folder="pending" src="" stem="" tmp dest st
+  local -a SETS
+  SETS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --folder) folder="${2:-}"; shift 2 ;;
+      --file) src="${2:-}"; shift 2 ;;
+      --stem) stem="${2:-}"; shift 2 ;;
+      --set) [ $# -ge 2 ] || { echo "FATAL: --set requires Field=Value" >&2; exit 2; }
+             SETS[${#SETS[@]}]="$2"; shift 2 ;;
+      --*) echo "FATAL: unknown create flag: $1" >&2; exit 2 ;;
+      *) echo "FATAL: unexpected argument: $1" >&2; exit 2 ;;
+    esac
+  done
+  valid_state "$folder" || { echo "FATAL: invalid folder '$folder'" >&2; exit 7; }
+  if [ -n "$src" ]; then
+    [ -f "$src" ] || { echo "FATAL: --file not found: $src" >&2; exit 2; }
+    [ -n "$stem" ] || stem=$(basename "$src" .md)
+  else
+    [ -n "$stem" ] || { echo "FATAL: create from stdin requires --stem" >&2; exit 2; }
+  fi
+  # Duplicate key -> typed conflict (contract: caller owns the key; create is never an upsert).
+  for st in $ALL_STATES; do
+    if [ -f "$BL/$st/$stem.md" ]; then
+      echo "FATAL: task '$stem' already exists in $st" >&2; exit 4
+    fi
+  done
+  mkdir -p "$BL/$folder"
+  dest="$BL/$folder/$stem.md"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/acfw-create.XXXXXX") || exit 2
+  if [ -n "$src" ]; then cat "$src" > "$tmp"; else cat > "$tmp"; fi
+  mv "$tmp" "$dest"
+  local kv
+  if [ ${#SETS[@]} -gt 0 ]; then
+    for kv in "${SETS[@]}"; do
+      set_field "$dest" "${kv%%=*}" "${kv#*=}"
+    done
+  fi
+  set_field "$dest" "Status" "$folder"
+  git_with_lock_backoff -C "$REPO_ROOT" add -- ".backlog/$folder/$stem.md" || exit 99
+  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: create $stem in $folder" --quiet || exit 99
+  printf '{"key":"%s","folder":"%s"}\n' "$(jesc "$stem")" "$(jesc "$folder")"
+}
+
+cmd_transition() {
+  local -a STAGE
+  STAGE=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stage) [ $# -ge 2 ] || { echo "FATAL: --stage requires a PATH" >&2; exit 2; }
+               STAGE[${#STAGE[@]}]="--stage"; STAGE[${#STAGE[@]}]="$2"; shift 2 ;;
+      --*) echo "FATAL: unknown transition flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  local stem="${1:-}" to="${2:-}" agent="${3:-orchestrator}" notes="${4:-}" rinc="${5:-0}" binc="${6:-0}" f rc
+  if [ -z "$stem" ] || [ -z "$to" ]; then
+    echo "FATAL: usage: transition [--stage PATH]... <stem> <TO_STATE> [AGENT] [NOTES] [RINC] [BINC]" >&2
+    exit 2
+  fi
+  valid_state "$to" || { echo "FATAL: invalid TO_STATE '$to' (one of: $ALL_STATES)" >&2; exit 7; }
+  f=$(resolve_task_file "$stem") || {
+    # Fully archived/drafted stems are outside the active resolver; a re-applied
+    # transition whose destination already holds the file must still no-op (idempotency).
+    if [ -f "$BL/$to/$stem.md" ]; then echo "noop: $stem.md already in $to"; exit 0; fi
+    exit 3
+  }
+  if [ ${#STAGE[@]} -gt 0 ]; then
+    bash "$APPLY" "${STAGE[@]}" "$f" "$to" "$agent" "$notes" "$rinc" "$binc"
+  else
+    bash "$APPLY" "$f" "$to" "$agent" "$notes" "$rinc" "$binc"
+  fi
+  rc=$?
+  [ $rc -eq 3 ] && exit 8   # off-trunk refusal -> contract "policy refusal"
+  exit $rc
+}
+
+cmd_update_field() {
+  local stem="" f fname folder edited=0
+  local -a SETS ADDDEPS
+  SETS=(); ADDDEPS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set) [ $# -ge 2 ] || { echo "FATAL: --set requires Field=Value" >&2; exit 2; }
+             SETS[${#SETS[@]}]="$2"; shift 2 ;;
+      --add-dep) [ $# -ge 2 ] || { echo "FATAL: --add-dep requires an ID" >&2; exit 2; }
+                 ADDDEPS[${#ADDDEPS[@]}]="$2"; shift 2 ;;
+      --*) echo "FATAL: unknown update-field flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] || { echo "FATAL: usage: update-field <stem> [--set Field=Value]... [--add-dep ID]..." >&2; exit 2; }
+  f=$(resolve_task_file "$stem") || exit 3
+  fname=$(basename "$f"); folder=$(basename "$(dirname "$f")")
+  local kv dep cur new
+  if [ ${#SETS[@]} -gt 0 ]; then
+    for kv in "${SETS[@]}"; do set_field "$f" "${kv%%=*}" "${kv#*=}"; edited=1; done
+  fi
+  # Dependencies is a BARE comma list — same normalization as whip-move.sh (brackets
+  # dropped on the way through; "none"/empty replaced rather than appended to).
+  if [ ${#ADDDEPS[@]} -gt 0 ]; then
+    for dep in "${ADDDEPS[@]}"; do
+      cur=$(field "$f" Dependencies | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//')
+      case "$cur" in none|\"none\"|"") new="$dep" ;; *) new="$cur, $dep" ;; esac
+      set_field "$f" "Dependencies" "$new"
+      edited=1
+    done
+  fi
+  if [ "$edited" -eq 1 ]; then
+    git_with_lock_backoff -C "$REPO_ROOT" add -- ".backlog/$folder/$fname" || exit 99
+    git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $fname field edit" --quiet || exit 99
+    printf '{"key":"%s","edited":true}\n' "$(jesc "$(basename "$f" .md)")"
+  else
+    printf '{"key":"%s","edited":false}\n' "$(jesc "$(basename "$f" .md)")"
+  fi
+}
+
+cmd_update_body() {
+  local stem="${1:-}" f fname folder tmp
+  [ -n "$stem" ] || { echo "FATAL: usage: update-body <stem>  (document on stdin)" >&2; exit 2; }
+  f=$(resolve_task_file "$stem") || exit 3
+  fname=$(basename "$f"); folder=$(basename "$(dirname "$f")")
+  tmp=$(mktemp "${TMPDIR:-/tmp}/acfw-body.XXXXXX") || exit 2
+  cat > "$tmp"
+  [ -s "$tmp" ] || { rm -f "$tmp"; echo "FATAL: refusing to replace $fname with an empty document" >&2; exit 2; }
+  mv "$tmp" "$f"
+  set_field "$f" "Status" "$folder"   # keep Status in sync with the folder (doctor invariant)
+  git_with_lock_backoff -C "$REPO_ROOT" add -- ".backlog/$folder/$fname" || exit 99
+  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $fname body update" --quiet || exit 99
+  printf '{"key":"%s","updated":true}\n' "$(jesc "$(basename "$f" .md)")"
+}
+
+cmd_log_event() {
+  local stem="" row="" f
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --row) row="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown log-event flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  if [ -z "$stem" ] || [ -z "$row" ]; then
+    echo "FATAL: usage: log-event <stem> --row '| ... |'" >&2; exit 2
+  fi
+  f=$(resolve_task_file "$stem") || exit 3
+  # Uncommitted by design: the token/event rides the task file and is committed by the
+  # next transition (exactly how clean-checkout.sh has always written the ok token).
+  append_log_row "$f" "$row"
+  printf '{"key":"%s","logged":true}\n' "$(jesc "$(basename "$f" .md)")"
+}
+
+cmd_comment() {
+  local stem="" author="" f ts
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --author) author="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown comment flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] || { echo "FATAL: usage: comment <stem> [--author A]  (text on stdin)" >&2; exit 2; }
+  f=$(resolve_task_file "$stem") || exit 3
+  ts=$(date -u +"%Y-%m-%d %H:%M:%S")
+  {
+    printf '\n### Comment (%s%s)\n\n' "$ts" "${author:+ — $author}"
+    cat
+  } >> "$f"
+  printf '{"key":"%s","commented":true}\n' "$(jesc "$(basename "$f" .md)")"
+}
+
+# ---- dispatch --------------------------------------------------------------
+
+case "$SUB" in
+  capabilities) cmd_capabilities ;;
+  init)         cmd_init "$@" ;;
+  snapshot)     cmd_snapshot "$@" ;;
+  read)         cmd_read "$@" ;;
+  create)       cmd_create "$@" ;;
+  transition)   cmd_transition "$@" ;;
+  update-field) cmd_update_field "$@" ;;
+  update-body)  cmd_update_body "$@" ;;
+  log-event)    cmd_log_event "$@" ;;
+  comment)      cmd_comment "$@" ;;
+  doctor)       cmd_doctor "$@" ;;
+  sync)         cmd_sync "$@" ;;
+  "")           echo "FATAL: usage: acfw-store-files <subcommand> [args]" >&2; exit 2 ;;
+  *)            echo "FATAL: unsupported subcommand: $SUB" >&2; exit 2 ;;
+esac

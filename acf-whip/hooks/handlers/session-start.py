@@ -52,10 +52,27 @@ def main() -> None:
             Path("docs/acf/backlog/workflow.md")
         )
 
-        # 4. Warn if .backlog/ is missing (README.md is no longer auto-generated)
+        # 4. Warn if no task store is initialized. The store is pluggable (3.1.0): the default
+        # files backend lives at .backlog/; any other backend is declared by an ACFW_STORE= key
+        # in .acfwhip/config (or the legacy .backlog/.acfw-config). Either signal counts as
+        # initialized — the warning fires only when NEITHER exists.
         backlog_warning = ""
-        if not Path(".backlog").exists():
-            backlog_warning = "\n\n⚠️ **WARNING**: `.backlog/` directory not found. Run `/whip-init` to initialize backlog workflow, install agents, and configure quality gates.\n"
+        store_backend = ""
+        for cfg in (Path(".acfwhip/config"), Path(".backlog/.acfw-config")):
+            if cfg.exists():
+                try:
+                    for line in cfg.read_text(encoding="utf-8").splitlines():
+                        stripped = line.strip()
+                        if stripped.startswith("ACFW_STORE="):
+                            store_backend = stripped.split("=", 1)[1].strip().strip("\"'")
+                except Exception:
+                    pass
+                break
+        if Path(".backlog").exists() or store_backend:
+            if store_backend and store_backend != "files":
+                backlog_warning = f"\n\nℹ️ acf-whip task store backend: `{store_backend}` (configured via ACFW_STORE).\n"
+        else:
+            backlog_warning = "\n\n⚠️ **WARNING**: no acf-whip task store found (no `.backlog/` directory and no `ACFW_STORE` config). Run `/whip-init` to initialize the backlog workflow, install agents, and configure quality gates.\n"
 
         # 5. Build context with style guide for immediate injection
         style_guide_path = Path("docs/acf/style/task-descriptions.md")

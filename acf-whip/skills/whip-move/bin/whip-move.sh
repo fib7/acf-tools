@@ -60,6 +60,32 @@ fi
 case " $VALID_STATES " in *" $TO_STATE "*) : ;; *) echo "FATAL: invalid TO_STATE '$TO_STATE' (one of: $VALID_STATES)" >&2; exit 2 ;; esac
 
 REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}"
+
+# Non-files task store (3.1.0): route the same operator surface through the acfw-store dispatcher.
+# The files path below stays exactly as it always was (direct file resolution + apply-transition).
+STORE_BACKEND=$(acfw_resolve_store "$REPO_ROOT")
+if [ "$STORE_BACKEND" != "files" ]; then
+  STORE_BIN="$SCRIPT_DIR/../../lib/bin/acfw-store"
+  RD=$(bash "$STORE_BIN" read "$TASK") || { echo "FATAL: no task matching '$TASK' in the '$STORE_BACKEND' store" >&2; exit 2; }
+  STEM=$(printf '%s' "$RD" | sed -n 's/.*"stem":"\([^"]*\)".*/\1/p')
+  FROM_STATE=$(printf '%s' "$RD" | sed -n 's/.*"folder":"\([^"]*\)".*/\1/p')
+  FNAME="$STEM.md"
+  EDITED=0
+  if [ -n "$INTEGRATED_AT" ]; then
+    bash "$STORE_BIN" update-field "$STEM" --set "Integrated-At=$INTEGRATED_AT" >/dev/null || exit 2
+    EDITED=1
+  fi
+  if [ -n "$ADD_DEP" ]; then
+    bash "$STORE_BIN" update-field "$STEM" --add-dep "$ADD_DEP" >/dev/null || exit 2
+    EDITED=1
+  fi
+  if [ "$FROM_STATE" = "$TO_STATE" ]; then
+    if [ "$EDITED" = "1" ]; then echo "ok: $FNAME edited in place ($FROM_STATE)"; else echo "noop: $FNAME already in $TO_STATE (no edits requested)"; fi
+    exit 0
+  fi
+  exec bash "$STORE_BIN" transition "$STEM" "$TO_STATE" "$AGENT" "$REASON" 0 0
+fi
+
 [ -d "$REPO_ROOT/.backlog" ] || { echo "FATAL: no .backlog/ at $REPO_ROOT (run /whip-init)" >&2; exit 2; }
 
 # ---- resolve TASK -> a single file under an active state folder ----

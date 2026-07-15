@@ -60,12 +60,41 @@ Use AskUserQuestion to gather preferences:
 
 | Question | Options | Default | Variable |
 |----------|---------|---------|----------|
+| **Task Store** | files (`.backlog/` folders in git), beads (`bd` issue tracker), multica (multica server), linear (Linear workspace) | files | `task_store` |
 | **Priority System** | 3-level (high/medium/low) or 5-level (blocker/critical/high/medium/low) | 3-level (smaller projects), 5-level (team > 5) | `priority_system` |
 | **Coverage Thresholds** | 60% (rapid prototyping), 80% (standard), 95% (critical systems) | 80% | `coverage_threshold` |
 | **Quality Gate Strictness** | Standard (10 retry attempts), Aggressive (5 retry attempts) | Standard | `max_retries` |
 | **DevOps Agent** | "Yes, create devops" (for Docker/K8s/CI/CD), "No, skip devops" (add later via /whip-add-agents) | "Yes" if `suggest_devops=true`, else "No" | `create_devops` |
 
-### Step 3: Create .backlog/ Structure
+Only offer the Task Store question when the user asks about it or a non-files store is already
+configured — `files` is the right default for almost everyone. Skip the question otherwise.
+
+### Step 2.5: Non-files Task Store (only when `task_store` ≠ files)
+
+The task store is pluggable behind an executable adapter contract (see the plugin's
+`adapters/CONTRACT.md` and the mechanics guide `adapters/README.md`; shipped adapters: `files`,
+`beads`, `multica`, `linear`; third-party adapters drop into `.acfwhip/adapters/`). For a
+non-files store:
+
+1. Write the backend-neutral config (this replaces `.backlog/.acfw-config` as the config home):
+   ```bash
+   mkdir -p .acfwhip
+   printf 'ACFW_STORE=%s\n' "$task_store" >> .acfwhip/config
+   ```
+   Backend env goes to the operator's shell, never into the repo: beads needs `bd` on PATH
+   (optional `ACFW_BEADS_PREFIX`); multica needs `MULTICA_SERVER_URL`, `MULTICA_TOKEN`,
+   `MULTICA_WORKSPACE_ID` (optional `ACFW_MULTICA_PROJECT`); linear needs `LINEAR_API_KEY` and
+   `ACFW_LINEAR_TEAM` (team key, e.g. `ENG`; optional `ACFW_LINEAR_PROJECT`, `ACFW_LINEAR_LABEL`).
+2. Initialize the store and verify it:
+   ```bash
+   bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" init
+   bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info
+   ```
+3. **Skip Step 3 entirely** (there is no `.backlog/` on a non-files store) and in Step 3.5a
+   gitignore `.acfwhip/run/` and `.acfwhip/specs/` instead of `.backlog/.acfw-run.json`.
+   Everything else (agents, quality gates, docs) proceeds unchanged.
+
+### Step 3: Create .backlog/ Structure (files store only)
 
 **Check if .backlog/ already exists**:
 ```bash

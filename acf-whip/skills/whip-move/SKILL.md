@@ -9,6 +9,11 @@ allowed-tools:
 
 # /whip-move
 
+Works on every task-store backend: on the default `files` store it resolves `.backlog/<state>/`
+files and runs the apply-transition writer; on any other configured store (`ACFW_STORE` in
+`.acfwhip/config`) it routes the same surface through the `acfw-store` dispatcher
+(`read`/`update-field`/`transition`) — same flags, same output shapes.
+
 Operator-facing wrapper around the single `.backlog/` writer primitive
 (`${CLAUDE_PLUGIN_ROOT}/skills/go/bin/apply-transition.sh`). `/go` uses that primitive
 internally; `/whip-move` surfaces it for **manual** close-out — e.g. finishing the last

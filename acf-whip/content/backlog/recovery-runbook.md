@@ -130,6 +130,11 @@ Only when a run stops for good and one or two tasks need closing by hand:
 
 A run that finishes cleanly removes the lock itself. After a crash the lock self-expires once it ages past 30 minutes. To clear it sooner: `rm .backlog/.acfw-run.json`.
 
+On a non-files task store (`ACFW_STORE` set in `.acfwhip/config`) the lock lives at
+`.acfwhip/run/acfw-run.json` instead — same freshness window, same `rm` override. Confirm the
+active path any time with `bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info` (the
+`runLock` field).
+
 ---
 
 ## Parking a task away from automation

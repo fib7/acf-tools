@@ -1,5 +1,29 @@
 # Task Workflow
 
+## Pluggable task store (3.1.0)
+
+Task state lives in a **task store** behind an executable adapter contract (plugin
+`adapters/CONTRACT.md`). The dispatcher `skills/lib/bin/acfw-store` resolves the active backend
+(`ACFW_STORE` env → `ACFW_STORE=` in `.acfwhip/config` or the legacy `.backlog/.acfw-config` →
+`files`), locates its adapter (project-local `.acfwhip/adapters/` → shipped `adapters/<backend>/` →
+`$PATH`), and routes every read/write: `snapshot` (the scan), `transition` (the single-writer
+primitive), `read`/`create`/`update-field`, `doctor`.
+
+| Backend | State lives in | Notes |
+|---|---|---|
+| `files` (default) | `.backlog/<state>/*.md` on trunk | reference backend; everything below describes it literally |
+| `beads` | `bd` issue tracker (`.beads/`, sqlite) | custom statuses mirror the whip states; deps native |
+| `multica` | multica server (Postgres, via CLI) | `whip_state` metadata is canonical; comments are the audit trail |
+| `linear` | Linear workspace (GraphQL API) | `whip_*` state in per-issue attachment metadata; native status is a display projection; comments are the audit trail |
+
+Invariants that hold on EVERY backend: the whip-canonical state machine below, the single sequential
+writer, worktree-slug partitioning, the dependency gate, idempotent transitions, and the **LP-CAS
+integration ledger staying git-native** (`.acfwhip/integrated/` on trunk — integration truth never
+moves into a store backend). On non-files backends, dispatched agents read a spec **materialized**
+from the store (`acfw-store read --materialize`) instead of a live `.backlog/` path, and evidence
+flows back via `acfw-store comment`; the `.backlog/`-literal prose below applies to the files
+backend. The legacy (non-workflow) `/go` loop is files-only.
+
 ## State Machine
 
 ```

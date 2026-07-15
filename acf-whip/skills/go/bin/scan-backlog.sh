@@ -62,11 +62,13 @@ ACTIVE_NONACC="pending in-progress completed in-review blocked rejected"
 NOW_S=$(date -u +%s)
 GEN_TS=$(date -u +"%Y-%m-%d %H:%M:%S")
 
-# In-progress timeout threshold (hours): env > .backlog/.acfw-config > default 8. Mirrors the
+# In-progress timeout threshold (hours): env > committed config > default 8. Mirrors the
 # precedence in doctor.sh so /go's in-progress->blocked timeout uses the operator's setting. The
-# config is sourced with stdout suppressed so this script's stdout stays a single JSON object.
+# config location is resolved by acfw_resolve_config_file (.acfwhip/config > .backlog/.acfw-config);
+# it is sourced with stdout suppressed so this script's stdout stays a single JSON object.
 ENV_TIMEOUT="${ACFW_INPROGRESS_TIMEOUT_HOURS:-}"
-[ -f "$BL/.acfw-config" ] && . "$BL/.acfw-config" >/dev/null 2>&1
+ACFW_CFG_FILE=$(acfw_resolve_config_file "$REPO_ROOT" || true)
+[ -n "$ACFW_CFG_FILE" ] && . "$ACFW_CFG_FILE" >/dev/null 2>&1
 TIMEOUT_H="${ENV_TIMEOUT:-${ACFW_INPROGRESS_TIMEOUT_HOURS:-8}}"
 printf '%s' "$TIMEOUT_H" | grep -qE '^[0-9]+$' || TIMEOUT_H=8
 

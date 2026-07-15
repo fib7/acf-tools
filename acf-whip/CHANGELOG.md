@@ -2,6 +2,69 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.1.0 — pluggable task stores (files / beads / multica / linear behind an executable adapter contract)
+
+`.backlog/` is now ONE task-store backend among several. Task state routes through a dispatcher
+(`skills/lib/bin/acfw-store`) and an **executable adapter contract** (`adapters/CONTRACT.md`, contract
+v1, git-remote-helper style: one executable per backend, JSON I/O, typed exit codes, capability
+flags). Zero migration: `files` stays the default; an existing `.backlog/` project resolves and
+behaves exactly as on 3.0.1 with no action.
+
+- **Contract v1 + dispatcher.** Required subcommands `capabilities`/`snapshot`/`read`/`create`/
+  `transition` (+ optional `init`, `update-field`, `update-body`, `log-event`, `comment`, `doctor`,
+  `sync`). The dispatcher resolves the backend (`ACFW_STORE` env → config → `files`), discovers the
+  adapter (`$ACFW_STORE_ADAPTER_PATH` → project-local `.acfwhip/adapters/` → shipped
+  `adapters/<backend>/` → `$PATH` — third parties add a backend by committing ONE executable, no
+  fork), and compensates for missing capabilities: raw snapshots are enriched with the git facts
+  (LP-CAS ledger oracle, worktree branches, terminal-count model — `acfw-enrich-snapshot.sh`),
+  `--stage` deliverables are committed to trunk by the dispatcher when the adapter can't co-commit
+  them, and non-files doctors merge store-native findings with the generic graph/git battery
+  (`acfw-doctor-generic.sh`).
+- **files adapter** (`adapters/files/`) is a thin shim over the unmoved 3.0.x engines
+  (`scan-backlog.sh`, `apply-transition.sh`, `doctor.sh`) — byte-identical behavior, all directly
+  invocable as before.
+- **beads adapter** (`adapters/beads/`): whip states as `bd` custom statuses, deterministic
+  `whip-<stem>` ids (LP-CAS-key stable), native dependency edges (cycle-checked), `whip_*` metadata
+  for slugs/counters, one-call snapshots via `bd export`, audit rows + clean-checkout tokens as
+  comments. sqlite backend; single-writer discipline documented.
+- **multica adapter** (`adapters/multica/`): canonical state in `whip_state` metadata with the native
+  status as a doctor-repairable display projection, `whip_key` server-side resolution, deps in
+  `whip_deps` (multica has no dependency API — whip's scheduler computes readiness, as it always
+  did), paginated snapshots, comments as the durable audit trail, crash-safe `whip_key`-last create.
+- **linear adapter** (`adapters/linear/`): Linear has no custom fields, so canonical whip state
+  lives in the official integration-state mechanism — one **attachment** per issue whose `metadata`
+  holds the `whip_*` keys and whose deterministic URL (`https://acfw.fib7.ai/<namespace>/<stem>`)
+  doubles as the idempotent write key and the exact `attachmentsForURL` lookup handle; native
+  status is a lossy per-team projection by workflow-state *type* (doctor-repairable), the task
+  document is the issue description, comments are the audit trail, deps ride `whip_deps` with
+  native `blocks` relations as best-effort mirrors. Speaks GraphQL directly (curl + jq, injectable
+  transport — no third-party CLI); needs `LINEAR_API_KEY` + `ACFW_LINEAR_TEAM`.
+- **`adapters/README.md`** documents the store layer end to end: architecture, dispatcher
+  mechanics (resolution, discovery, env, exit codes), the capability-compensation table, data-flow
+  walkthroughs (snapshot/transition/materialize), a write-your-own authoring guide, and a
+  backend comparison table.
+- **Workflows are store-parametric.** `whip-go`/`whip-task` take a `store` arg (from
+  `acfw-store info` at launch); every writer action is now **stem-keyed** (the adapter resolves the
+  task's current state — strictly more robust on resume than folder paths). On non-files stores,
+  dispatched agents read a spec **materialized** from the store (`read --materialize` →
+  `.acfwhip/specs/`), evidence/review comments flow back via `acfw-store comment`, the
+  clean-checkout token is recorded via `log-event`, and `/task` authors into `.acfwhip/staging/`
+  before the single writer ingests via `create`. Prompts and commands on the files path are
+  byte-identical to 3.0.1.
+- **Config gains a backend-neutral home**: `.acfwhip/config` (first match wins over the legacy
+  `.backlog/.acfw-config`, which keeps working untouched); run lock moves to
+  `.acfwhip/run/acfw-run.json` on non-files stores. `whip-init` gains a task-store selection;
+  `whip-move`/`whip-doctor`/`retro`/`research` and the SessionStart hook are store-aware. The
+  **LP-CAS ledger stays git-native on every backend** — integration truth never moves into a store.
+- The legacy (non-workflow) `/go` markdown loop is declared **files-only**.
+- Regression tests: new `phase9-store-conformance.test.sh` (the executable contract spec — 36
+  assertions, run against every adapter; beads wrapper builds/uses a real `bd`, multica wrapper is
+  skip-guarded on `MULTICA_TEST_SERVER`, linear wrapper runs the full conformance suite offline
+  against a GraphQL emulator pinned to doc-verified API semantics with a live path skip-guarded on
+  `LINEAR_TEST_API_KEY`), `phase9-dispatcher.test.sh` (37 assertions: resolution
+  precedence, discovery order, enrichment against a seeded ledger marker, stage compensation,
+  doctor merge). Phases 0–8 pass unchanged.
+
 ## 3.0.1 — field-inventory residue (oracle agreement, deliverable durability, run lock)
 
 A 31-defect field inventory taken across ~890 tasks and 195 runs (2.0.3 → 3.0.0). Most entries were already dead by construction under LP-CAS — whole-branch rebase, the cached snapshot ref, poison quarantine on a stale base, re-rejecting landed work, branch-ref resets, `Integrated-At` drift, duplicate-id aborts, re-dispatch livelock, uncaught schema errors, unsafe resume, final-iteration unblock, EOF transition-log growth, non-atomic Status+move, doctor scan cost, and worktrees for non-code tasks. What follows is the residue, plus one live run-killer the inventory implied but had not isolated.

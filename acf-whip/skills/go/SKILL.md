@@ -68,17 +68,21 @@ legacy loop has). Prefer it.
    echo "PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT"
    echo "TRUNK_ROOT=$(git rev-parse --show-toplevel)"
    echo "TRUNK_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)"
+   bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info
    ```
    If `TRUNK_BRANCH` is empty, STOP — `/go` requires a branch checked out at the repo root.
+   The `acfw-store info` line reports the active **task-store backend** (`store`, default `files`),
+   its adapter, and the run-lock path (`runLock`) — pass both through in step 3.
 3. Launch the orchestrator (it runs in the background; bootstrap runs a doctor `--fix` hard gate and
    the loop re-checks integrity every iteration):
    ```
    Workflow({
      scriptPath: "<PLUGIN_ROOT>/workflows/whip-go.workflow.js",
-     args: { pluginRoot: "<PLUGIN_ROOT>", trunkRoot: "<TRUNK_ROOT>", trunkBranch: "<TRUNK_BRANCH>", mode: "default" | "override" }
+     args: { pluginRoot: "<PLUGIN_ROOT>", trunkRoot: "<TRUNK_ROOT>", trunkBranch: "<TRUNK_BRANCH>",
+             mode: "default" | "override", store: "<info.store>", runLockPath: "<info.runLock>" }
    })
    ```
-   The per-iteration scan runs `scan-backlog.sh --digest` (a small scheduling snapshot — counts +
+   The per-iteration scan runs `acfw-store snapshot --digest` (a small scheduling snapshot — counts +
    actionable tasks + a compact `satisfiedDeps` list, with terminal-accepted tasks collapsed) and
    `whip-doctor --active-only` (full integrity over active folders; accepted fed as cheap stubs), so a
    lived-in backlog scans in seconds instead of tens of seconds. The deterministic shell-runner agents
@@ -87,8 +91,8 @@ legacy loop has). Prefer it.
    and conflict-resolvers always run on the session model.
 4. When it completes, report the returned `RunReport` (completed?, iterations, finalCounts,
    integrated[], stopReason). If it returns `aborted: true` (detached HEAD or an unrepairable FATAL),
-   surface the reason + fatals and STOP. Re-running `/go` is the documented resume — git + `.backlog/`
-   are the only durable state.
+   surface the reason + fatals and STOP. Re-running `/go` is the documented resume — git + the task
+   store (`.backlog/` on the default files backend) are the only durable state.
 5. Do **not** also run the legacy loop below — the workflow replaces it.
 
 **Only if the `Workflow` tool is NOT available** (dynamic workflows disabled, or older Claude Code):
@@ -101,6 +105,11 @@ loop lives in your context (and grows it).
 
 > Everything below runs only when the `Workflow` tool is unavailable. It is the byte-compatible
 > Claude-as-orchestrator implementation of the same `.backlog/` state machine.
+>
+> **files backend only**: this legacy loop reads and moves `.backlog/<state>/` files directly, so it
+> requires the default `files` task store. A project configured with another store backend
+> (`ACFW_STORE` in `.acfwhip/config` — e.g. `beads` or `multica`) needs dynamic workflows; if the
+> `Workflow` tool is unavailable there, STOP and tell the operator instead of running this loop.
 
 ## Continuous Execution Loop
 

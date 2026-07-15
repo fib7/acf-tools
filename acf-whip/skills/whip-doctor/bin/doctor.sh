@@ -48,9 +48,10 @@ ACTIVE="pending in-progress completed in-review blocked rejected accepted"
 # Non-accepted active folders: in --active-only mode the full per-file pass runs only over these
 # (accepted is fed to the awk graph as a cheap batched stub — see emit_accepted_stub_tsv).
 ACTIVE_NONACC="pending in-progress completed in-review blocked rejected"
-# Timeout precedence: env var > .backlog/.acfw-config > default 8h.
+# Timeout precedence: env var > committed config (.acfwhip/config > .backlog/.acfw-config) > default 8h.
 ENV_TIMEOUT="${ACFW_INPROGRESS_TIMEOUT_HOURS:-}"
-[ -f "$BL/.acfw-config" ] && . "$BL/.acfw-config" 2>/dev/null
+ACFW_CFG_FILE=$(acfw_resolve_config_file "$REPO_ROOT" || true)
+[ -n "$ACFW_CFG_FILE" ] && . "$ACFW_CFG_FILE" 2>/dev/null
 TIMEOUT_H="${ENV_TIMEOUT:-${ACFW_INPROGRESS_TIMEOUT_HOURS:-8}}"
 
 FINDINGS=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor.XXXXXX")

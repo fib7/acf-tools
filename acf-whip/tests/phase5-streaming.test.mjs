@@ -42,14 +42,13 @@ function buildSnapshot() {
   return { trunkRoot: '/r', counts, tasks, satisfiedDeps: [], inProgressTimeoutHours: 8 }
 }
 
-// ---- writer: parse the apply-transition.sh command lines out of the prompt and mutate the model ----
+// ---- writer: parse the acfw-store transition command lines out of the prompt and mutate the model ----
 function applyWriter(prompt) {
   const applied = []
-  const re = /bash '[^']*apply-transition\.sh' '([^']*)' '([^']*)' '([^']*)' '([^']*)' '([^']*)' '([^']*)'/g
+  const re = /bash '[^']*acfw-store' transition '([^']*)' '([^']*)' '([^']*)' '([^']*)' '([^']*)' '([^']*)'/g
   let m
   while ((m = re.exec(prompt)) !== null) {
-    const [, path, toState] = m
-    const stem = path.replace(/^.*\/([^/]+)\.md$/, '$1')
+    const [, stem, toState] = m
     const t = model.get(stem)
     if (t) { t.folder = toState; applied.push(`ok: ${stem} -> ${toState}`) }
     else applied.push(`noop: ${stem}`)
@@ -78,7 +77,7 @@ async function agent(prompt, opts) {
   // bootstrap
   if (/Bootstrap the acf-whip/.test(prompt)) return { detached: false, doctorOk: true, doctorSummary: 'SUMMARY|ok=true', fatals: [] }
   // scan / drain scan (verbatim digest echo)
-  if (/scan-backlog\.sh/.test(prompt)) return { snapshotJson: JSON.stringify(buildSnapshot()), doctorOk: true, doctorSummary: 'SUMMARY|ok=true', doctorFatals: [] }
+  if (/acfw-store' snapshot/.test(prompt)) return { snapshotJson: JSON.stringify(buildSnapshot()), doctorOk: true, doctorSummary: 'SUMMARY|ok=true', doctorFatals: [] }
   // single writer
   if (/SINGLE backlog writer/.test(prompt)) {
     if (writerActive > 0) writerOverlap = true

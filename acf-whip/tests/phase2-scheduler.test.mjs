@@ -149,7 +149,7 @@ const T = (o) => ({
     const B = T({ stem: 'b', folder: 'blocked', slug: 'sb', deps: ['a'], rejectionCount: 0 })
     const tasks = [A, B]
     const r = planUnblockAndTimeout(tasks, indexTasks(tasks), { trunkRoot: '/r' })
-    check('blocked+deps-satisfied+rc<cap -> unblock action', r.unblockActions.length === 1 && r.unblockActions[0].toState === 'pending' && r.unblockActions[0].path === '/r/.backlog/blocked/b.md')
+    check('blocked+deps-satisfied+rc<cap -> unblock action', r.unblockActions.length === 1 && r.unblockActions[0].toState === 'pending' && r.unblockActions[0].stem === 'b')
   }
   // (2) blocked, deps satisfied, rejectionCount >= cap -> NOT unblocked (max-rejection redesign)
   {
@@ -238,7 +238,7 @@ const T = (o) => ({
   const tasks = [A, B, P]
   const idx = indexTasks(tasks)
   const r = planUnblockAndTimeout(tasks, idx, { trunkRoot: '/r' })
-  check('gaptrap: B unblocks (blocked->pending)', r.unblockActions.some((a) => a.path.endsWith('/blocked/b.md') && a.toState === 'pending'))
+  check('gaptrap: B unblocks (blocked->pending)', r.unblockActions.some((a) => a.stem === 'b' && a.toState === 'pending'))
   check('gaptrap: P stays gated while B still blocked (deps not yet satisfied)', depsSatisfied(P, idx) === false)
 }
 

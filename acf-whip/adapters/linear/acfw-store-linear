@@ -1,0 +1,836 @@
+#!/usr/bin/env bash
+# acfw-store-linear — the `linear` task-store adapter (acf-whip store contract v1).
+#
+# Backs acf-whip's task store with a Linear (linear.app) team: one Linear *issue*
+# per whip task. The adapter speaks Linear's GraphQL API directly (curl + jq) — there
+# is no official Linear CLI — and never touches git, so `commitsToGit` is false and
+# the dispatcher stages code deliverables to trunk itself (no `stage` capability).
+#
+# CANONICAL STATE MODEL
+#   Linear issues have NO custom fields, so the authoritative whip state lives in ONE
+#   Attachment per issue: its `metadata` (a key/value JSONObject) holds every whip_*
+#   field, and its `url` is a deterministic per-task key that Linear treats as an
+#   idempotency handle (re-`attachmentCreate` with the same url+issueId UPDATES in
+#   place — an upsert). The native issue workflow-state is a LOSSY DISPLAY PROJECTION
+#   of `whip_state`; all reads (snapshot/read) report the whip-canonical name from
+#   metadata, and doctor repairs the native state FROM `whip_state`, never the reverse.
+#   The join handle is the attachment `url` (https://acfw.fib7.ai/<ns>/<stem>); the
+#   attachment is written LAST on create so a half-created issue (no key attachment)
+#   is invisible to resolve()/snapshot — a crash orphans (never duplicates) the task.
+#   The full task document is stored verbatim as the issue `description` (body/
+#   materialize parity with the files adapter).
+#
+#   whip_state -> native workflow-state TYPE (lowest-position state of that type;
+#     completed/in-review prefer a state literally named "In Review" when present):
+#       draft=backlog  pending=unstarted  rejected=unstarted  in-progress=started
+#       blocked=started  completed=started(In Review)  in-review=started(In Review)
+#       accepted=completed  archive=canceled
+#   whip priority -> Linear priority int: blocker=1 critical=2 high=2 medium=3 low=4
+#     unknown/empty=0(none)
+#
+# ENV:
+#   LINEAR_API_KEY        (required) personal API key; sent as the `Authorization`
+#                         header with NO "Bearer" prefix.
+#   ACFW_LINEAR_TEAM      (required) team KEY (e.g. ENG); resolved to a team id.
+#   ACFW_LINEAR_PROJECT   (optional) project id (or name — best-effort resolved).
+#   ACFW_LINEAR_LABEL     (optional) marker label name (default acf-whip); every whip
+#                         issue carries it, and snapshot filters the team by it.
+#   ACFW_LINEAR_URL_NS    (optional) attachment-URL namespace. Falls back to
+#                         acfw_load_namespace's ACFW_BRANCH_PREFIX, then the repo dir
+#                         basename. Isolates this repo's tasks from other repos that
+#                         share the same Linear team+label.
+#   ACFW_LINEAR_URL       (optional) GraphQL endpoint (default https://api.linear.app/graphql).
+#   ACFW_LINEAR_TRANSPORT (optional) test hook — a command that reads a GraphQL request
+#                         JSON on stdin and prints the response body on stdout; when set
+#                         it REPLACES the whole curl invocation (a non-zero exit -> 5).
+#
+# Contract exit codes: 0 ok/noop · 2 usage · 3 not-found/ambiguous · 4 conflict
+# (duplicate key) · 5 backend unavailable · 6 auth · 7 invalid state/value · 99 transient.
+#
+# Portability: pure bash 3.2 (no `declare -A`, no `${var,,}`). Requires jq (exit 5 if
+# absent) and, for the default transport, curl (exit 5 if absent). `set -u`-safe.
+
+set -u
+
+ACFW_LINEAR_URL="${ACFW_LINEAR_URL:-https://api.linear.app/graphql}"
+LABEL="${ACFW_LINEAR_LABEL:-acf-whip}"
+KEY_HOST="https://acfw.fib7.ai"
+ALL_STATES="draft pending in-progress completed in-review accepted rejected blocked archive"
+
+SUB="${1:-}"
+[ -n "$SUB" ] && shift
+
+# ---- GraphQL operation strings ---------------------------------------------
+Q_VIEWER='query { viewer { id } }'
+Q_TEAMS='query($key:String!){ teams(filter:{key:{eq:$key}}){ nodes { id key } } }'
+Q_TEAM_STATES='query($id:String!){ team(id:$id){ id states { nodes { id name type position } } } }'
+Q_TEAM_LABELS='query($id:String!){ team(id:$id){ id labels { nodes { id name } } } }'
+Q_ATTURL='query($url:String!){ attachmentsForURL(url:$url){ nodes { id url metadata issue { id identifier } } } }'
+Q_ISSUE_DESC='query($id:String!){ issue(id:$id){ id description } }'
+Q_ISSUE_COMMENTS='query($id:String!){ issue(id:$id){ id comments { nodes { body createdAt } } } }'
+Q_ISSUES='query($label:String!,$after:String){ issues(filter:{labels:{name:{eq:$label}}}, first:50, after:$after){ pageInfo { hasNextPage endCursor } nodes { id identifier title priority state { id name type } attachments { nodes { url metadata } } } } }'
+Q_PROJECTS='query($name:String!){ projects(filter:{name:{eq:$name}}){ nodes { id name } } }'
+M_LABEL_CREATE='mutation($name:String!,$teamId:String!){ issueLabelCreate(input:{name:$name, teamId:$teamId}){ issueLabel { id name } success } }'
+M_ISSUE_CREATE='mutation($input:IssueCreateInput!){ issueCreate(input:$input){ issue { id identifier } success } }'
+M_ISSUE_UPDATE='mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id, input:$input){ success } }'
+M_ATTACH_CREATE='mutation($input:AttachmentCreateInput!){ attachmentCreate(input:$input){ attachment { id url } success } }'
+M_COMMENT_CREATE='mutation($input:CommentCreateInput!){ commentCreate(input:$input){ comment { id } success } }'
+M_RELATION_CREATE='mutation($input:IssueRelationCreateInput!){ issueRelationCreate(input:$input){ success } }'
+
+# ---- pure helpers (no backend, no jq) --------------------------------------
+
+jesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
+
+# field <file> <Field> — extract "- **Field**: value" (mirrors the files adapter).
+field() { grep -E "^- \*\*$2\*\*:" "$1" 2>/dev/null | head -1 | sed -E "s/.*$2\*\*:[[:space:]]*//" | sed -E 's/[[:space:]]+$//'; }
+
+# set_field <file> <Field> <Value> — replace the "- **Field**:" bullet in place,
+# inserting after "- **Status**:" when absent. Used by materialize to refresh the
+# stored document's bullets from live metadata.
+set_field() {
+  local f="$1" name="$2" val="$3"
+  if grep -qE "^- \*\*$name\*\*:" "$f"; then
+    ACFW_SF_VAL="$val" ACFW_SF_NAME="$name" awk '
+      BEGIN { name=ENVIRON["ACFW_SF_NAME"]; val=ENVIRON["ACFW_SF_VAL"]; done=0 }
+      { if (!done && $0 ~ ("^- \\*\\*" name "\\*\\*:")) { printf "- **%s**: %s\n", name, val; done=1; next } print }
+    ' "$f" > "$f.acfwtmp" && mv "$f.acfwtmp" "$f"
+  else
+    ACFW_SF_VAL="$val" ACFW_SF_NAME="$name" awk '
+      BEGIN { name=ENVIRON["ACFW_SF_NAME"]; val=ENVIRON["ACFW_SF_VAL"]; done=0 }
+      { print; if (!done && $0 ~ /^- \*\*Status\*\*:/) { printf "- **%s**: %s\n", name, val; done=1 } }
+    ' "$f" > "$f.acfwtmp" && mv "$f.acfwtmp" "$f"
+  fi
+}
+
+valid_state() { case " $ALL_STATES " in *" $1 "*) return 0;; *) return 1;; esac; }
+
+# type_for_whip <whip-state> — the Linear workflow-state TYPE the whip state projects to.
+type_for_whip() {
+  case "$1" in
+    draft) echo backlog ;;
+    pending|rejected) echo unstarted ;;
+    in-progress|blocked|completed|in-review) echo started ;;
+    accepted) echo completed ;;
+    archive) echo canceled ;;
+    *) echo "" ;;
+  esac
+}
+
+# lpriority <whip-priority> — whip priority -> Linear priority int (0=none).
+lpriority() {
+  case "$1" in
+    blocker) echo 1 ;;
+    critical) echo 2 ;;
+    high) echo 2 ;;
+    medium) echo 3 ;;
+    low) echo 4 ;;
+    *) echo 0 ;;
+  esac
+}
+
+# map_field_to_key <Field> — echo "<metakey> <type>" for a task-document field name,
+# or nothing when unmapped. Shared by create --set and update-field. Status is
+# intentionally absent (state changes go through create --folder / transition).
+map_field_to_key() {
+  case "$1" in
+    ID) echo "whip_id string" ;;
+    Priority) echo "whip_priority string" ;;
+    "Assigned Agent") echo "whip_agent string" ;;
+    Worktree) echo "whip_worktree string" ;;
+    "PR Group") echo "whip_pr_group string" ;;
+    "Touches Globs") echo "whip_touches string" ;;
+    Dependencies) echo "whip_deps string" ;;
+    "Rejection Count") echo "whip_rejections number" ;;
+    Block-Count) echo "whip_blocks number" ;;
+    *) echo "" ;;
+  esac
+}
+
+# ---- capabilities (no backend, no jq needed) -------------------------------
+
+cmd_capabilities() {
+  printf '{"backend":"linear","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition","update-field","update-body","log-event","comment","doctor","doctor-fix","init"]}\n'
+}
+
+if [ "$SUB" = "capabilities" ]; then cmd_capabilities; exit 0; fi
+if [ -z "$SUB" ]; then echo "FATAL: usage: acfw-store-linear <subcommand> [args]" >&2; exit 2; fi
+
+# ---- everything below needs jq (and, on the default transport, curl) --------
+
+command -v jq >/dev/null 2>&1 || { echo "FATAL: jq is required by acfw-store-linear" >&2; exit 5; }
+if [ -z "${ACFW_LINEAR_TRANSPORT:-}" ]; then
+  command -v curl >/dev/null 2>&1 || { echo "FATAL: curl is required by acfw-store-linear (or set ACFW_LINEAR_TRANSPORT)" >&2; exit 5; }
+fi
+
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/acfw-linear.XXXXXX") || { echo "FATAL: mktemp failed" >&2; exit 5; }
+trap 'rm -rf "$TMPD"' EXIT
+mk_tmp() { mktemp "$TMPD/f.XXXXXX"; }
+
+# ---- transport seam --------------------------------------------------------
+# gql <query> [variables-json] — POST one GraphQL request. Sets globals GQL_BODY
+# (raw response), GQL_HTTP, GQL_ERRCODE, and returns the contract exit code:
+#   curl/transport failure -> 5 · HTTP 401/403 -> 6 · 429 -> 99 · 5xx -> 5 ·
+#   GraphQL entity-not-found -> 3 · any other GraphQL errors -> 5 · else 0.
+GQL_BODY=""; GQL_HTTP=""; GQL_ERRCODE=0
+gql() {
+  local q="$1" vars="${2:-{\}}" payload raw trc crc
+  payload=$(jq -cn --arg q "$q" --argjson v "$vars" '{query:$q, variables:$v}') || { GQL_ERRCODE=5; return 5; }
+  if [ -n "${ACFW_LINEAR_TRANSPORT:-}" ]; then
+    GQL_BODY=$(printf '%s' "$payload" | eval "$ACFW_LINEAR_TRANSPORT" 2>/dev/null); trc=$?
+    [ "$trc" -eq 0 ] || { GQL_ERRCODE=5; return 5; }
+    GQL_HTTP=200
+  else
+    raw=$(printf '%s' "$payload" | curl -sS --max-time 30 -X POST "$ACFW_LINEAR_URL" \
+      -H "Authorization: ${LINEAR_API_KEY:-}" -H "Content-Type: application/json" \
+      -w '\n%{http_code}' -d @- 2>/dev/null); crc=$?
+    [ "$crc" -eq 0 ] || { GQL_ERRCODE=5; return 5; }
+    GQL_HTTP="${raw##*$'\n'}"
+    GQL_BODY="${raw%$'\n'*}"
+  fi
+  case "$GQL_HTTP" in
+    401|403) GQL_ERRCODE=6; return 6 ;;
+    429)     GQL_ERRCODE=99; return 99 ;;
+    5??)     GQL_ERRCODE=5; return 5 ;;
+  esac
+  if printf '%s' "$GQL_BODY" | jq -e '(.errors // []) | length > 0' >/dev/null 2>&1; then
+    if printf '%s' "$GQL_BODY" | jq -e 'any((.errors // [])[]; ((.extensions.type // .extensions.code // "") | ascii_downcase | test("not.?found|entitynotfound")) or (((.message // "") | ascii_downcase) | test("not found|could not find|entity not")))' >/dev/null 2>&1; then
+      GQL_ERRCODE=3; return 3
+    fi
+    GQL_ERRCODE=5; return 5
+  fi
+  GQL_ERRCODE=0; return 0
+}
+
+# ---- namespace / key URL ---------------------------------------------------
+NS_CACHE=""
+ns() {
+  if [ -n "$NS_CACHE" ]; then printf '%s' "$NS_CACHE"; return 0; fi
+  local n=""
+  if [ -n "${ACFW_LINEAR_URL_NS:-}" ]; then
+    n="$ACFW_LINEAR_URL_NS"
+  elif [ -n "${ACFW_PLUGIN_LIB:-}" ] && [ -f "$ACFW_PLUGIN_LIB/acfw-git.sh" ]; then
+    # shellcheck disable=SC1090
+    . "$ACFW_PLUGIN_LIB/acfw-git.sh" >/dev/null 2>&1 || true
+    if command -v acfw_load_namespace >/dev/null 2>&1; then
+      acfw_load_namespace "${ACFW_TRUNK_ROOT:-}" >/dev/null 2>&1 || true
+      n="${ACFW_BRANCH_PREFIX:-}"
+    fi
+  fi
+  if [ -z "$n" ]; then
+    local root="${ACFW_TRUNK_ROOT:-}"
+    [ -n "$root" ] || root=$(git rev-parse --show-toplevel 2>/dev/null)
+    [ -n "$root" ] || root="$PWD"
+    n=$(basename "$root")
+  fi
+  NS_CACHE="$n"; printf '%s' "$n"
+}
+ns_prefix() { printf '%s/%s/' "$KEY_HOST" "$(ns)"; }
+key_url() { printf '%s/%s/%s' "$KEY_HOST" "$(ns)" "$1"; }
+
+# ---- team / label / state projection ---------------------------------------
+TEAM_LOADED=""; TEAM_ID=""; TEAM_STATES_JSON="[]"
+load_team() {
+  [ -z "$TEAM_LOADED" ] || return 0
+  [ -n "${ACFW_LINEAR_TEAM:-}" ] || { echo "FATAL: ACFW_LINEAR_TEAM (team key) is required" >&2; exit 2; }
+  gql "$Q_TEAMS" "$(jq -cn --arg k "$ACFW_LINEAR_TEAM" '{key:$k}')" || exit "$GQL_ERRCODE"
+  TEAM_ID=$(printf '%s' "$GQL_BODY" | jq -r '.data.teams.nodes[0].id // empty')
+  [ -n "$TEAM_ID" ] || { echo "FATAL: team '$ACFW_LINEAR_TEAM' not found" >&2; exit 7; }
+  gql "$Q_TEAM_STATES" "$(jq -cn --arg id "$TEAM_ID" '{id:$id}')" || exit "$GQL_ERRCODE"
+  TEAM_STATES_JSON=$(printf '%s' "$GQL_BODY" | jq -c '.data.team.states.nodes // []')
+  TEAM_LOADED=1
+}
+
+# state_id_for_whip <whip-state> — the Linear workflow-state UUID the whip state
+# projects to (lowest-position state of the target type; completed/in-review prefer
+# a state literally named "In Review"). Requires load_team first.
+state_id_for_whip() {
+  local ws="$1" typ sid
+  typ=$(type_for_whip "$ws")
+  [ -n "$typ" ] || return 1
+  if [ "$ws" = "completed" ] || [ "$ws" = "in-review" ]; then
+    sid=$(printf '%s' "$TEAM_STATES_JSON" | jq -r '[.[] | select((.name // "" | ascii_downcase) == "in review")] | sort_by(.position) | .[0].id // empty')
+    [ -n "$sid" ] && { printf '%s' "$sid"; return 0; }
+  fi
+  sid=$(printf '%s' "$TEAM_STATES_JSON" | jq -r --arg t "$typ" '[.[] | select(.type == $t)] | sort_by(.position) | .[0].id // empty')
+  [ -n "$sid" ] || return 1
+  printf '%s' "$sid"
+}
+
+LABEL_LOADED=""; LABEL_ID=""
+ensure_label() {
+  [ -z "$LABEL_LOADED" ] || return 0
+  load_team
+  gql "$Q_TEAM_LABELS" "$(jq -cn --arg id "$TEAM_ID" '{id:$id}')" || exit "$GQL_ERRCODE"
+  LABEL_ID=$(printf '%s' "$GQL_BODY" | jq -r --arg n "$LABEL" '.data.team.labels.nodes[]? | select(.name == $n) | .id' | head -1)
+  if [ -z "$LABEL_ID" ]; then
+    gql "$M_LABEL_CREATE" "$(jq -cn --arg n "$LABEL" --arg id "$TEAM_ID" '{name:$n, teamId:$id}')" || exit "$GQL_ERRCODE"
+    LABEL_ID=$(printf '%s' "$GQL_BODY" | jq -r '.data.issueLabelCreate.issueLabel.id // empty')
+    [ -n "$LABEL_ID" ] || { echo "FATAL: could not create marker label '$LABEL'" >&2; exit 5; }
+  fi
+  LABEL_LOADED=1
+}
+
+# resolve_project — set PROJECT_ID from ACFW_LINEAR_PROJECT (UUID used verbatim; a
+# name is best-effort resolved, falling back to the raw value). Empty when unset.
+PROJECT_ID=""
+resolve_project() {
+  local p="${ACFW_LINEAR_PROJECT:-}"
+  [ -n "$p" ] || { PROJECT_ID=""; return 0; }
+  case "$p" in
+    *-*-*-*-*) PROJECT_ID="$p"; return 0 ;;
+  esac
+  if gql "$Q_PROJECTS" "$(jq -cn --arg n "$p" '{name:$n}')"; then
+    local pid; pid=$(printf '%s' "$GQL_BODY" | jq -r '.data.projects.nodes[0].id // empty' 2>/dev/null)
+    [ -n "$pid" ] && { PROJECT_ID="$pid"; return 0; }
+  fi
+  PROJECT_ID="$p"
+}
+
+# ---- resolve / write helpers -----------------------------------------------
+# resolve_issue <stem> — set R_ISSUE_ID, R_META, R_URL by reverse-looking the key URL.
+# 0 hits -> 3 (not found); >1 -> 3 (ambiguous); exactly one -> globals set, return 0.
+R_ISSUE_ID=""; R_META="{}"; R_URL=""
+resolve_issue() {
+  local stem="$1" url n
+  url=$(key_url "$stem")
+  gql "$Q_ATTURL" "$(jq -cn --arg u "$url" '{url:$u}')" || return "$GQL_ERRCODE"
+  n=$(printf '%s' "$GQL_BODY" | jq '.data.attachmentsForURL.nodes | length')
+  if [ "$n" -eq 0 ]; then echo "FATAL: no task matching key '$stem'" >&2; return 3; fi
+  if [ "$n" -gt 1 ]; then echo "FATAL: key '$stem' is ambiguous ($n attachments share its URL)" >&2; return 3; fi
+  R_ISSUE_ID=$(printf '%s' "$GQL_BODY" | jq -r '.data.attachmentsForURL.nodes[0].issue.id')
+  R_META=$(printf '%s' "$GQL_BODY" | jq -c '.data.attachmentsForURL.nodes[0].metadata // {}')
+  R_URL="$url"
+  return 0
+}
+
+# write_key_attachment <issueId> <url> <metaJSON> — attachmentCreate upsert (same
+# url+issueId updates in place). The key attachment is the whip state-of-record.
+write_key_attachment() {
+  gql "$M_ATTACH_CREATE" "$(jq -cn --arg iid "$1" --arg url "$2" --argjson md "$3" \
+    '{input:{issueId:$iid, title:"acf-whip", subtitle:($md.whip_state // ""), url:$url, metadata:$md}}')" \
+    || return "$GQL_ERRCODE"
+  return 0
+}
+
+# add_comment <issueId> <body> — commentCreate.
+add_comment() {
+  gql "$M_COMMENT_CREATE" "$(jq -cn --arg iid "$1" --arg body "$2" '{input:{issueId:$iid, body:$body}}')" \
+    || return "$GQL_ERRCODE"
+  return 0
+}
+
+# issue_has_token <issueId> — true iff a comment carries the clean-checkout token.
+issue_has_token() {
+  gql "$Q_ISSUE_COMMENTS" "$(jq -cn --arg id "$1" '{id:$id}')" || return 1
+  printf '%s' "$GQL_BODY" | jq -r '.data.issue.comments.nodes[]?.body // ""' 2>/dev/null \
+    | grep -qE '\| clean-checkout \| ok \|'
+}
+
+# collect_issues <outfile> — paginate the team's marker-labelled issues and write, as
+# JSONL, one object per issue that carries a key attachment in THIS repo's namespace:
+#   {id, identifier, stateId, stateName, stateType, priority, url, meta}
+# Namespace-scoped so multiple repos can share a team+label. Shared by snapshot/doctor.
+collect_issues() {
+  local out="$1" after="null" prefix rc more end
+  prefix=$(ns_prefix)
+  : > "$out"
+  while :; do
+    gql "$Q_ISSUES" "$(jq -cn --arg l "$LABEL" --arg a "$after" '{label:$l, after:(if $a=="null" then null else $a end)}')"
+    rc=$?
+    [ "$rc" -eq 0 ] || { echo "FATAL: issues query failed" >&2; exit "$rc"; }
+    printf '%s' "$GQL_BODY" | jq -c --arg p "$prefix" '
+      .data.issues.nodes[]?
+      | . as $iss
+      | (($iss.attachments.nodes // []) | map(select((.url // "") | startswith($p))) | .[0]) as $att
+      | select($att != null)
+      | { id: $iss.id, identifier: ($iss.identifier // ""), stateId: ($iss.state.id // ""),
+          stateName: ($iss.state.name // ""), stateType: ($iss.state.type // ""),
+          priority: ($iss.priority // 0), url: $att.url, meta: ($att.metadata // {}) }
+    ' >> "$out"
+    more=$(printf '%s' "$GQL_BODY" | jq -r '.data.issues.pageInfo.hasNextPage // false')
+    end=$(printf '%s' "$GQL_BODY" | jq -r '.data.issues.pageInfo.endCursor // empty')
+    [ "$more" = "true" ] && [ -n "$end" ] || break
+    after="$end"
+  done
+}
+
+# ---- subcommands -----------------------------------------------------------
+
+cmd_init() {
+  [ -n "${LINEAR_API_KEY:-}" ] || { echo "FATAL: LINEAR_API_KEY is required" >&2; exit 6; }
+  [ -n "${ACFW_LINEAR_TEAM:-}" ] || { echo "FATAL: ACFW_LINEAR_TEAM (team key) is required" >&2; exit 2; }
+  gql "$Q_VIEWER" '{}' || exit "$GQL_ERRCODE"
+  local viewer; viewer=$(printf '%s' "$GQL_BODY" | jq -r '.data.viewer.id // empty')
+  [ -n "$viewer" ] || { echo "FATAL: viewer probe returned no id (auth/endpoint problem)" >&2; exit 5; }
+  ensure_label   # resolves the team (missing -> exit 7) and creates the marker label if absent
+  printf '{"backend":"linear","initialized":true,"team":"%s","label":"%s"}\n' "$(jesc "$TEAM_ID")" "$(jesc "$LABEL")"
+}
+
+cmd_create() {
+  local folder="pending" src="" stem="" doc rc iid now
+  local -a SETS; SETS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --folder) folder="${2:-}"; shift 2 ;;
+      --file) src="${2:-}"; shift 2 ;;
+      --stem) stem="${2:-}"; shift 2 ;;
+      --set) [ $# -ge 2 ] || { echo "FATAL: --set requires Field=Value" >&2; exit 2; }
+             SETS[${#SETS[@]}]="$2"; shift 2 ;;
+      --*) echo "FATAL: unknown create flag: $1" >&2; exit 2 ;;
+      *) echo "FATAL: unexpected argument: $1" >&2; exit 2 ;;
+    esac
+  done
+  valid_state "$folder" || { echo "FATAL: invalid folder '$folder'" >&2; exit 7; }
+  doc=$(mk_tmp)
+  if [ -n "$src" ]; then
+    [ -f "$src" ] || { echo "FATAL: --file not found: $src" >&2; exit 2; }
+    cat "$src" > "$doc"
+    [ -n "$stem" ] || stem=$(basename "$src" .md)
+  else
+    [ -n "$stem" ] || { echo "FATAL: create from stdin requires --stem" >&2; exit 2; }
+    cat > "$doc"
+  fi
+
+  # Duplicate key -> typed conflict (create is NEVER an upsert). Pre-check the key URL
+  # BEFORE issueCreate so a duplicate is refused with no side effects.
+  gql "$Q_ATTURL" "$(jq -cn --arg u "$(key_url "$stem")" '{url:$u}')" || exit "$GQL_ERRCODE"
+  [ "$(printf '%s' "$GQL_BODY" | jq '.data.attachmentsForURL.nodes | length')" -eq 0 ] \
+    || { echo "FATAL: task '$stem' already exists" >&2; exit 4; }
+
+  # Parse task-document fields (same extractor as the files adapter).
+  local f_id f_prio f_agent f_wt f_prg f_touch f_deps f_rej f_blk f_parent title
+  f_id=$(field "$doc" "ID")
+  f_prio=$(field "$doc" "Priority")
+  f_agent=$(field "$doc" "Assigned Agent")
+  f_wt=$(field "$doc" "Worktree")
+  f_prg=$(field "$doc" "PR Group")
+  f_touch=$(field "$doc" "Touches Globs")
+  f_deps=$(field "$doc" "Dependencies")
+  f_rej=$(field "$doc" "Rejection Count")
+  f_blk=$(field "$doc" "Block-Count")
+  f_parent=$(field "$doc" "Parent")
+  title=$(grep -m1 -E '^# ' "$doc" | sed -E 's/^#[[:space:]]+//; s/^Task:[[:space:]]*//')
+  [ -n "$title" ] || title="$stem"
+
+  # Apply --set overrides after parse (keyed by task-document field name).
+  local kv fld val
+  if [ ${#SETS[@]} -gt 0 ]; then
+    for kv in "${SETS[@]}"; do
+      fld="${kv%%=*}"; val="${kv#*=}"
+      case "$fld" in
+        ID) f_id="$val" ;;
+        Priority) f_prio="$val" ;;
+        "Assigned Agent") f_agent="$val" ;;
+        Worktree) f_wt="$val" ;;
+        "PR Group") f_prg="$val" ;;
+        "Touches Globs") f_touch="$val" ;;
+        Dependencies) f_deps="$val" ;;
+        "Rejection Count") f_rej="$val" ;;
+        Block-Count) f_blk="$val" ;;
+        Parent) f_parent="$val" ;;
+        *) : ;;  # unmapped field: ignored on create (whip_state comes from --folder)
+      esac
+    done
+  fi
+
+  # Normalize: deps bare comma list (brackets dropped; NEVER validated — a dep MAY name
+  # a not-yet-created key), counters numeric.
+  f_deps=$(printf '%s' "$f_deps" | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//'); [ -n "$f_deps" ] || f_deps="none"
+  printf '%s' "$f_rej" | grep -qE '^[0-9]+$' || f_rej=0
+  printf '%s' "$f_blk" | grep -qE '^[0-9]+$' || f_blk=0
+
+  load_team
+  ensure_label
+  resolve_project
+  local sid lp; sid=$(state_id_for_whip "$folder") || { echo "FATAL: no native state projection for '$folder'" >&2; exit 7; }
+  lp=$(lpriority "$f_prio")
+
+  # Optional parent (whip stem -> issue id).
+  local parent_iid=""
+  if [ -n "$f_parent" ] && [ "$f_parent" != "none" ]; then
+    resolve_issue "$f_parent" || { echo "FATAL: parent '$f_parent' not resolvable" >&2; exit 3; }
+    parent_iid="$R_ISSUE_ID"
+  fi
+
+  # 1) issueCreate with the full document as description (body parity). No key
+  #    attachment yet, so the issue is invisible to resolve/snapshot until step 2.
+  local ivars
+  ivars=$(jq -cn --arg team "$TEAM_ID" --arg title "$title" --rawfile desc "$doc" \
+    --argjson prio "$lp" --arg state "$sid" --arg label "$LABEL_ID" \
+    --arg parent "$parent_iid" --arg project "$PROJECT_ID" '
+    {input: ({teamId:$team, title:$title, description:$desc, priority:$prio, stateId:$state, labelIds:[$label]}
+      + (if $parent != "" then {parentId:$parent} else {} end)
+      + (if $project != "" then {projectId:$project} else {} end))}')
+  gql "$M_ISSUE_CREATE" "$ivars" || { echo "FATAL: issueCreate failed: $(printf '%s' "$GQL_BODY" | jq -c '.errors // empty' 2>/dev/null)" >&2; exit "$GQL_ERRCODE"; }
+  iid=$(printf '%s' "$GQL_BODY" | jq -r '.data.issueCreate.issue.id // empty')
+  [ -n "$iid" ] || { echo "FATAL: issueCreate returned no id" >&2; exit 5; }
+
+  # 2) attachmentCreate LAST: writes whip_key + the whole whip_* projection. The
+  #    write of the key url is the commit point; a crash before it orphans the issue.
+  now=$(date -u +"%Y-%m-%d %H:%M:%S")
+  local meta
+  meta=$(jq -cn --arg k "$stem" --arg s "$folder" --arg p "$f_prio" --arg a "$f_agent" \
+    --arg w "$f_wt" --arg g "$f_prg" --arg t "$f_touch" --arg d "$f_deps" \
+    --argjson r "$f_rej" --argjson b "$f_blk" --arg ts "$now" '
+    {whip_key:$k, whip_state:$s, whip_priority:$p, whip_agent:$a, whip_worktree:$w,
+     whip_pr_group:$g, whip_touches:$t, whip_deps:$d, whip_rejections:$r, whip_blocks:$b,
+     whip_last_transition_ts:$ts}')
+  write_key_attachment "$iid" "$(key_url "$stem")" "$meta" || exit $?
+
+  printf '{"key":"%s","folder":"%s"}\n' "$(jesc "$stem")" "$(jesc "$folder")"
+}
+
+cmd_read() {
+  local body=0 mat="" stem
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --body) body=1; shift ;;
+      --materialize) mat="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown read flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  stem="${1:-}"; [ -n "$stem" ] || { echo "FATAL: usage: read [--body] [--materialize DIR] <stem>" >&2; exit 2; }
+  resolve_issue "$stem" || exit $?
+
+  if [ -n "$mat" ]; then
+    [ -d "$mat" ] || mkdir -p "$mat"
+    local out="$mat/$stem.md"
+    gql "$Q_ISSUE_DESC" "$(jq -cn --arg id "$R_ISSUE_ID" '{id:$id}')" || exit "$GQL_ERRCODE"
+    printf '%s' "$GQL_BODY" | jq -r '.data.issue.description // ""' > "$out"
+    # Refresh the stored bullets from CURRENT metadata (they froze at create time).
+    set_field "$out" "Status"          "$(printf '%s' "$R_META" | jq -r '.whip_state // ""')"
+    set_field "$out" "Priority"        "$(printf '%s' "$R_META" | jq -r '.whip_priority // ""')"
+    set_field "$out" "Assigned Agent"  "$(printf '%s' "$R_META" | jq -r '.whip_agent // ""')"
+    set_field "$out" "Worktree"        "$(printf '%s' "$R_META" | jq -r '.whip_worktree // ""')"
+    set_field "$out" "PR Group"        "$(printf '%s' "$R_META" | jq -r '.whip_pr_group // ""')"
+    set_field "$out" "Touches Globs"   "$(printf '%s' "$R_META" | jq -r '.whip_touches // ""')"
+    set_field "$out" "Dependencies"    "$(printf '%s' "$R_META" | jq -r '.whip_deps // ""')"
+    set_field "$out" "Rejection Count" "$(printf '%s' "$R_META" | jq -r '(.whip_rejections // 0) | tostring')"
+    set_field "$out" "Block-Count"     "$(printf '%s' "$R_META" | jq -r '(.whip_blocks // 0) | tostring')"
+    # Append the stored audit trail verbatim, oldest-first. Transition rows AND the
+    # clean-checkout token live as issue comments; the quality-reviewer greps the
+    # refreshed doc for `| clean-checkout | ok |`, so without this every review auto-rejects.
+    gql "$Q_ISSUE_COMMENTS" "$(jq -cn --arg id "$R_ISSUE_ID" '{id:$id}')" || exit "$GQL_ERRCODE"
+    local trail; trail=$(printf '%s' "$GQL_BODY" | jq -r '(.data.issue.comments.nodes // []) | sort_by(.createdAt // "") | .[].body // empty')
+    [ -n "$trail" ] && printf '\n## Store Audit Trail\n\n%s\n' "$trail" >> "$out"
+    printf '%s\n' "$out"
+    return 0
+  fi
+
+  local desc=""
+  if [ "$body" = "1" ]; then
+    gql "$Q_ISSUE_DESC" "$(jq -cn --arg id "$R_ISSUE_ID" '{id:$id}')" || exit "$GQL_ERRCODE"
+    desc=$(printf '%s' "$GQL_BODY" | jq -r '.data.issue.description // ""')
+  fi
+  printf '%s' "$R_META" | jq -c --arg body "$body" --arg desc "$desc" '
+    {
+      stem: (.whip_key // ""),
+      folder: (.whip_state // ""),
+      fields: {
+        id: (.whip_id // ""),
+        status: (.whip_state // ""),
+        priority: (.whip_priority // ""),
+        agent: (.whip_agent // ""),
+        worktree: (.whip_worktree // ""),
+        pr_group: (.whip_pr_group // ""),
+        touches_globs: (.whip_touches // ""),
+        dependencies: (.whip_deps // ""),
+        rejection_count: (((.whip_rejections // 0) | tonumber?) // 0),
+        block_count: (((.whip_blocks // 0) | tonumber?) // 0)
+      }
+    } + (if $body == "1" then {body: $desc} else {} end)
+  '
+}
+
+cmd_transition() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stage) echo "FATAL: linear adapter has no 'stage' capability; the dispatcher must stage deliverables to trunk itself" >&2; exit 2 ;;
+      --*) echo "FATAL: unknown transition flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  local stem="${1:-}" to="${2:-}" agent="${3:-orchestrator}" notes="${4:-}" rinc="${5:-0}" binc="${6:-0}"
+  if [ -z "$stem" ] || [ -z "$to" ]; then
+    echo "FATAL: usage: transition <stem> <TO_STATE> [AGENT] [NOTES] [RINC] [BINC]" >&2; exit 2
+  fi
+  valid_state "$to" || { echo "FATAL: invalid TO_STATE '$to' (one of: $ALL_STATES)" >&2; exit 7; }
+  resolve_issue "$stem" || exit $?
+  local from; from=$(printf '%s' "$R_META" | jq -r '.whip_state // ""')
+  load_team
+  local sid; sid=$(state_id_for_whip "$to") || { echo "FATAL: no native state projection for '$to'" >&2; exit 7; }
+
+  if [ "$from" = "$to" ]; then
+    # Idempotent no-op: reassert the native display projection (repairs drift), bump
+    # no counters, append no audit comment.
+    gql "$M_ISSUE_UPDATE" "$(jq -cn --arg id "$R_ISSUE_ID" --arg s "$sid" '{id:$id, input:{stateId:$s}}')" >/dev/null 2>&1 || true
+    echo "noop: $stem already in $to"
+    exit 0
+  fi
+
+  local now cur_rej cur_blk new_rej new_blk
+  now=$(date -u +"%Y-%m-%d %H:%M:%S")
+  cur_rej=$(printf '%s' "$R_META" | jq -r '((.whip_rejections // 0) | tonumber?) // 0')
+  cur_blk=$(printf '%s' "$R_META" | jq -r '((.whip_blocks // 0) | tonumber?) // 0')
+  new_rej="$cur_rej"; new_blk="$cur_blk"
+  [ "$to" = "rejected" ] && [ "$rinc" = "1" ] && new_rej=$((cur_rej + 1))
+  [ "$to" = "blocked" ] && [ "$binc" = "1" ] && new_blk=$((cur_blk + 1))
+  local newmeta
+  newmeta=$(printf '%s' "$R_META" | jq -c --arg st "$to" --arg ts "$now" --argjson r "$new_rej" --argjson b "$new_blk" \
+    '. + {whip_state:$st, whip_last_transition_ts:$ts, whip_rejections:$r, whip_blocks:$b}')
+
+  # Order = crash-safety: native display state first, then the key-attachment commit
+  # point (flips whip_state atomically), then the audit comment.
+  gql "$M_ISSUE_UPDATE" "$(jq -cn --arg id "$R_ISSUE_ID" --arg s "$sid" '{id:$id, input:{stateId:$s}}')" \
+    || { echo "FATAL: set native state failed" >&2; exit "$GQL_ERRCODE"; }
+  write_key_attachment "$R_ISSUE_ID" "$R_URL" "$newmeta" || exit $?
+  add_comment "$R_ISSUE_ID" "whip-transition | $now | $from | $to | $agent | $notes" >/dev/null 2>&1 || true
+
+  echo "ok: $stem $from -> $to"
+  exit 0
+}
+
+cmd_update_field() {
+  local stem="" edited=0 kv fld val mapping mk mt
+  local -a SETS ADDDEPS; SETS=(); ADDDEPS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set) [ $# -ge 2 ] || { echo "FATAL: --set requires Field=Value" >&2; exit 2; }
+             SETS[${#SETS[@]}]="$2"; shift 2 ;;
+      --add-dep) [ $# -ge 2 ] || { echo "FATAL: --add-dep requires an ID" >&2; exit 2; }
+                 ADDDEPS[${#ADDDEPS[@]}]="$2"; shift 2 ;;
+      --*) echo "FATAL: unknown update-field flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] || { echo "FATAL: usage: update-field <stem> [--set Field=Value]... [--add-dep ID]..." >&2; exit 2; }
+
+  # Validate field names BEFORE touching the backend (deterministic usage errors).
+  if [ ${#SETS[@]} -gt 0 ]; then
+    for kv in "${SETS[@]}"; do
+      fld="${kv%%=*}"
+      [ "$fld" = "Status" ] && { echo "FATAL: update-field cannot change state; use transition" >&2; exit 2; }
+      [ -n "$(map_field_to_key "$fld")" ] || { echo "FATAL: field '$fld' is not mapped by the linear backend" >&2; exit 2; }
+    done
+  fi
+
+  resolve_issue "$stem" || exit $?
+
+  # Apply every edit to ONE metadata object, then write once (fewer round-trips; the
+  # attachment upsert is a full replace, so we always send the complete projection).
+  local newmeta="$R_META" prio_changed="" deps_changed=""
+  if [ ${#SETS[@]} -gt 0 ]; then
+    for kv in "${SETS[@]}"; do
+      fld="${kv%%=*}"; val="${kv#*=}"
+      mapping=$(map_field_to_key "$fld"); mk="${mapping%% *}"; mt="${mapping##* }"
+      [ "$fld" = "Dependencies" ] && { val=$(printf '%s' "$val" | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//'); [ -n "$val" ] || val="none"; deps_changed=1; }
+      [ "$fld" = "Priority" ] && prio_changed="$val"
+      if [ "$mt" = "number" ]; then
+        printf '%s' "$val" | grep -qE '^[0-9]+$' || val=0
+        newmeta=$(printf '%s' "$newmeta" | jq -c --arg k "$mk" --argjson v "$val" '. + {($k):$v}')
+      else
+        newmeta=$(printf '%s' "$newmeta" | jq -c --arg k "$mk" --arg v "$val" '. + {($k):$v}')
+      fi
+      edited=1
+    done
+  fi
+  if [ ${#ADDDEPS[@]} -gt 0 ]; then
+    local dep cur new
+    for dep in "${ADDDEPS[@]}"; do
+      cur=$(printf '%s' "$newmeta" | jq -r '.whip_deps // ""' | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//')
+      case "$cur" in none|"") new="$dep" ;; *) new="$cur, $dep" ;; esac
+      newmeta=$(printf '%s' "$newmeta" | jq -c --arg v "$new" '. + {whip_deps:$v}')
+      edited=1; deps_changed=1
+    done
+  fi
+
+  if [ "$edited" -eq 1 ]; then
+    write_key_attachment "$R_ISSUE_ID" "$R_URL" "$newmeta" || exit $?
+  fi
+
+  # Best-effort native sync (metadata stays the contract-of-record; swallow failures).
+  if [ -n "$prio_changed" ]; then
+    local lp; lp=$(lpriority "$prio_changed")
+    gql "$M_ISSUE_UPDATE" "$(jq -cn --arg id "$R_ISSUE_ID" --argjson p "$lp" '{id:$id, input:{priority:$p}}')" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$deps_changed" ]; then
+    local dstem durl dcount
+    for dstem in $(printf '%s' "$newmeta" | jq -r '(.whip_deps // "") | split(",") | .[] | gsub("^\\s+|\\s+$";"")' 2>/dev/null); do
+      [ -n "$dstem" ] && [ "$dstem" != "none" ] || continue
+      durl=$(key_url "$dstem")
+      gql "$Q_ATTURL" "$(jq -cn --arg u "$durl" '{url:$u}')" >/dev/null 2>&1 || continue
+      dcount=$(printf '%s' "$GQL_BODY" | jq '.data.attachmentsForURL.nodes | length' 2>/dev/null)
+      [ "${dcount:-0}" = "1" ] || continue
+      local depiid; depiid=$(printf '%s' "$GQL_BODY" | jq -r '.data.attachmentsForURL.nodes[0].issue.id')
+      gql "$M_RELATION_CREATE" "$(jq -cn --arg a "$depiid" --arg b "$R_ISSUE_ID" '{input:{issueId:$a, relatedIssueId:$b, type:"blocks"}}')" >/dev/null 2>&1 || true
+    done
+  fi
+
+  printf '{"key":"%s","edited":%s}\n' "$(jesc "$stem")" "$([ "$edited" -eq 1 ] && echo true || echo false)"
+}
+
+cmd_update_body() {
+  local stem="${1:-}" tmp
+  [ -n "$stem" ] || { echo "FATAL: usage: update-body <stem>  (document on stdin)" >&2; exit 2; }
+  resolve_issue "$stem" || exit $?
+  tmp=$(mk_tmp); cat > "$tmp"
+  [ -s "$tmp" ] || { echo "FATAL: refusing to replace the body with an empty document" >&2; exit 2; }
+  gql "$M_ISSUE_UPDATE" "$(jq -cn --arg id "$R_ISSUE_ID" --rawfile d "$tmp" '{id:$id, input:{description:$d}}')" \
+    || { echo "FATAL: update body failed" >&2; exit "$GQL_ERRCODE"; }
+  printf '{"key":"%s","updated":true}\n' "$(jesc "$stem")"
+}
+
+cmd_log_event() {
+  local stem="" row=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --row) row="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown log-event flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] && [ -n "$row" ] || { echo "FATAL: usage: log-event <stem> --row '| ... |'" >&2; exit 2; }
+  resolve_issue "$stem" || exit $?
+  # The event row rides an issue comment verbatim; snapshot's token scan greps
+  # in-review/completed issues' comments for it, and materialize renders it.
+  add_comment "$R_ISSUE_ID" "$row" || { echo "FATAL: log-event comment failed" >&2; exit "$GQL_ERRCODE"; }
+  printf '{"key":"%s","logged":true}\n' "$(jesc "$stem")"
+}
+
+cmd_comment() {
+  local stem="" author="" tmp
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --author) author="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown comment flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] || { echo "FATAL: usage: comment <stem> [--author A]  (text on stdin)" >&2; exit 2; }
+  resolve_issue "$stem" || exit $?
+  tmp=$(mk_tmp)
+  { [ -n "$author" ] && printf '_(%s)_\n\n' "$author"; cat; } > "$tmp"
+  [ -s "$tmp" ] || { echo "FATAL: refusing to add an empty comment" >&2; exit 2; }
+  add_comment "$R_ISSUE_ID" "$(cat "$tmp")" || { echo "FATAL: comment failed" >&2; exit "$GQL_ERRCODE"; }
+  printf '{"key":"%s","commented":true}\n' "$(jesc "$stem")"
+}
+
+cmd_snapshot() {
+  # --digest / --counts-only / --mode are hints; a full snapshot is always valid.
+  local jsonl; jsonl=$(mk_tmp)
+  collect_issues "$jsonl"
+
+  # clean-checkout token: bounded N+1 over ONLY in-review/completed tasks (whose
+  # comments persist from when clean-checkout logged the token). All others false.
+  local toks="" id
+  for id in $(jq -rs 'map(select((.meta.whip_state == "in-review") or (.meta.whip_state == "completed")) | .id) | .[]' "$jsonl"); do
+    if issue_has_token "$id"; then toks="$toks$id"$'\n'; fi
+  done
+  local tok_json; tok_json=$(printf '%s' "$toks" | jq -Rn '[inputs | select(length > 0)]')
+
+  jq -rs --argjson tok "$tok_json" --arg gen "$(date -u +"%Y-%m-%d %H:%M:%S")" '
+    def splitlist: (. // "") | split(",") | map(gsub("^\\s+";"") | gsub("\\s+$";"")) | map(select(. != "" and . != "none"));
+    ( map(select((.meta.whip_key // "") != ""))
+      | map({
+          stem: .meta.whip_key,
+          id: (.meta.whip_id // .identifier // ""),
+          backendId: (.identifier // ""),
+          folder: (.meta.whip_state // ""),
+          status: (.meta.whip_state // ""),
+          slug: (.meta.whip_worktree // ""),
+          agent: (.meta.whip_agent // ""),
+          priority: (.meta.whip_priority // ""),
+          deps: (.meta.whip_deps | splitlist),
+          touchesGlobs: (.meta.whip_touches | splitlist),
+          rejectionCount: (((.meta.whip_rejections // 0) | tonumber?) // 0),
+          blockCount: (((.meta.whip_blocks // 0) | tonumber?) // 0),
+          lastTransitionTs: (.meta.whip_last_transition_ts // ""),
+          hasCleanCheckoutToken: (.id as $iid | ($tok | index($iid)) != null)
+        }) ) as $tasks
+    | ($tasks | map(.folder)) as $f
+    | {
+        raw: true,
+        generatedAt: $gen,
+        counts: {
+          "pending":     ([$f[] | select(. == "pending")]     | length),
+          "in-progress": ([$f[] | select(. == "in-progress")] | length),
+          "completed":   ([$f[] | select(. == "completed")]   | length),
+          "in-review":   ([$f[] | select(. == "in-review")]   | length),
+          "blocked":     ([$f[] | select(. == "blocked")]     | length),
+          "rejected":    ([$f[] | select(. == "rejected")]    | length),
+          "accepted":    ([$f[] | select(. == "accepted")]    | length),
+          "total":       ($tasks | length)
+        },
+        tasks: $tasks
+      }
+  ' "$jsonl"
+}
+
+cmd_doctor() {
+  local fix=0 quiet=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fix) fix=1; shift ;;
+      --quiet) quiet=1; shift ;;
+      --active-only) shift ;;  # accepted; the linear scan is team-wide regardless
+      --*) shift ;;            # tolerate unknown flags
+      *) shift ;;
+    esac
+  done
+  local jsonl; jsonl=$(mk_tmp)
+  collect_issues "$jsonl"
+  load_team
+
+  local sev_file drift_file; sev_file=$(mk_tmp); drift_file=$(mk_tmp)
+  # FATAL: same key URL on >1 issue (attachmentsForURL would be ambiguous).
+  jq -rs 'group_by(.url)[] | select(length > 1) | "FATAL|duplicate-key|\(.[0].meta.whip_key // .[0].url)|\(length) issues share this key URL"' "$jsonl" >> "$sev_file"
+  # FATAL: namespace key attachment present but whip metadata missing/empty.
+  jq -rs '.[] | select(((.meta.whip_key // "") == "") or ((.meta.whip_state // "") == "")) | "FATAL|missing-metadata|\(.url)|namespace key attachment carries no whip metadata"' "$jsonl" >> "$sev_file"
+
+  # REPAIRABLE: native workflow-state drifted from the whip_state projection.
+  local iid sid ws key want
+  while IFS=$'\t' read -r iid sid ws key; do
+    [ -n "$ws" ] || continue
+    want=$(state_id_for_whip "$ws") || continue
+    if [ "$want" != "$sid" ]; then
+      printf 'REPAIRABLE|status-drift|%s|native=%s want=%s\n' "$key" "$sid" "$want" >> "$sev_file"
+      printf '%s\t%s\n' "$iid" "$want" >> "$drift_file"
+    fi
+  done < <(jq -rs '.[] | select((.meta.whip_state // "") != "") | [.id, .stateId, .meta.whip_state, (.meta.whip_key // "")] | @tsv' "$jsonl")
+
+  local sev; sev=$(cat "$sev_file")
+  local fatal repairable warn
+  fatal=$(printf '%s\n' "$sev" | grep -c '^FATAL|'); fatal=${fatal//[^0-9]/}
+  repairable=$(printf '%s\n' "$sev" | grep -c '^REPAIRABLE|'); repairable=${repairable//[^0-9]/}
+  warn=$(printf '%s\n' "$sev" | grep -c '^WARN|'); warn=${warn//[^0-9]/}
+
+  [ "$quiet" -eq 1 ] || { [ -n "$sev" ] && printf '%s\n' "$sev"; }
+
+  if [ "$fix" -eq 1 ] && [ -s "$drift_file" ]; then
+    while IFS=$'\t' read -r iid want; do
+      [ -n "$iid" ] && [ -n "$want" ] || continue
+      gql "$M_ISSUE_UPDATE" "$(jq -cn --arg id "$iid" --arg s "$want" '{id:$id, input:{stateId:$s}}')" >/dev/null 2>&1 || true
+    done < "$drift_file"
+  fi
+
+  printf 'SUMMARY|fatal=%d|repairable=%d|warn=%d|ok=%s\n' "${fatal:-0}" "${repairable:-0}" "${warn:-0}" "$([ "${fatal:-0}" -eq 0 ] && echo true || echo false)"
+  [ "${fatal:-0}" -eq 0 ] || exit 1
+  exit 0
+}
+
+# ---- dispatch --------------------------------------------------------------
+
+case "$SUB" in
+  init)         cmd_init "$@" ;;
+  snapshot)     cmd_snapshot "$@" ;;
+  read)         cmd_read "$@" ;;
+  create)       cmd_create "$@" ;;
+  transition)   cmd_transition "$@" ;;
+  update-field) cmd_update_field "$@" ;;
+  update-body)  cmd_update_body "$@" ;;
+  log-event)    cmd_log_event "$@" ;;
+  comment)      cmd_comment "$@" ;;
+  doctor)       cmd_doctor "$@" ;;
+  *)            echo "FATAL: unsupported subcommand: $SUB" >&2; exit 2 ;;
+esac

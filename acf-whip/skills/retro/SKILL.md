@@ -14,6 +14,13 @@ allowed-tools:
 
 Hostile retrospective command. Finds root causes of failures and creates tasks to fix them.
 
+> **Task store**: check `bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info` first. On the
+> default `files` store the instructions below read/write `.backlog/` directly. On any other store,
+> replace raw folder reads with `acfw-store snapshot` (task states, rejection counts, deps are in
+> its JSON) and `acfw-store read --body <stem>` (full task document), and create improvement tasks
+> via `acfw-store create --file <authored.md> --folder pending` instead of writing into
+> `.backlog/pending/`.
+
 ## Purpose
 
 Two-phase process:

@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# acfw-store — the task-store dispatcher (acf-whip store contract v1).
+#
+# The single entry point between the orchestration layer (workflows, skills, operator
+# tools) and the task store. Resolves WHICH backend is active, locates its adapter
+# executable, exports the env contract, and execs the adapter — compensating for
+# optional capabilities the adapter lacks:
+#   • snapshot without `snapshot-enriched`  -> piped through acfw-enrich-snapshot.sh
+#     (git-derived facts: LP-CAS integration oracle, worktree branches, terminal counts)
+#   • transition --stage without `stage`    -> dispatcher commits the deliverables to
+#     trunk itself, then calls the adapter without --stage (deliverables are repo-tree
+#     artifacts and must land in git no matter where task STATE lives)
+#   • doctor without `doctor-complete`      -> adapter's store-native findings merged
+#     with the generic battery (acfw-doctor-generic.sh) into one report
+#
+# Usage: acfw-store <subcommand> [args...]
+#   info           dispatcher-implemented: {"store","configFile","adapter","runLock",...}
+#   anything else  forwarded to the adapter (see adapters/CONTRACT.md)
+#
+# Backend resolution:  ACFW_STORE env > ACFW_STORE key in config > "files"
+# Config resolution:   ACFW_CONFIG_FILE env > .acfwhip/config > .backlog/.acfw-config
+# Adapter discovery:   ACFW_STORE_ADAPTER_PATH > <root>/.acfwhip/adapters/ >
+#                      <plugin>/adapters/<backend>/ > $PATH   (see acfw-store.sh)
+#
+# Portability: pure bash 3.2 (no `declare -A`). No jq. macOS ships bash 3.2.
+
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$LIB_DIR/acfw-git.sh"
+
+REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+[ -n "$REPO_ROOT" ] || { echo "FATAL: not inside a git repo and ACFW_TRUNK_ROOT unset" >&2; exit 2; }
+
+SUB="${1:-}"
+[ -n "$SUB" ] || { echo "FATAL: usage: acfw-store <subcommand> [args]" >&2; exit 2; }
+shift
+
+STORE=$(acfw_resolve_store "$REPO_ROOT")
+CFG=$(acfw_resolve_config_file "$REPO_ROOT" || true)
+RUN_LOCK=$(acfw_run_lock_path "$REPO_ROOT" "$STORE")
+jesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
+
+if [ "$SUB" = "info" ]; then
+  ADAPTER=$(acfw_locate_adapter "$STORE" "$REPO_ROOT" || true)
+  printf '{"store":"%s","configFile":"%s","adapter":"%s","runLock":"%s","contractVersion":%s}\n' \
+    "$(jesc "$STORE")" "$(jesc "$CFG")" "$(jesc "$ADAPTER")" "$(jesc "$RUN_LOCK")" "$ACFW_CONTRACT_VERSION"
+  exit 0
+fi
+
+ADAPTER=$(acfw_locate_adapter "$STORE" "$REPO_ROOT") || {
+  echo "FATAL: no adapter found for store backend '$STORE' (looked in \$ACFW_STORE_ADAPTER_PATH, $REPO_ROOT/.acfwhip/adapters/, the plugin adapters/ dir, and \$PATH for 'acfw-store-$STORE')" >&2
+  exit 5
+}
+
+# ---- env contract (every adapter invocation, including the capability probe) ----
+export ACFW_TRUNK_ROOT="$REPO_ROOT"
+export ACFW_TRUNK_BRANCH="${ACFW_TRUNK_BRANCH:-}"
+export ACFW_STORE_CONFIG="${CFG:-}"
+export ACFW_CONTRACT_VERSION
+export ACFW_PLUGIN_LIB="$LIB_DIR"
+
+# Capability probe — run at most once per dispatcher call, and only for the
+# subcommands whose routing depends on it (snapshot, doctor, transition --stage).
+CAPS=""
+load_caps() { [ -n "$CAPS" ] || CAPS=$("$ADAPTER" capabilities 2>/dev/null || true); }
+has_cap() { load_caps; printf '%s' "$CAPS" | grep -q "\"$1\""; }
+
+case "$SUB" in
+
+  snapshot)
+    OUT=$("$ADAPTER" snapshot "$@") || exit $?
+    # Additive dispatcher metadata: which store produced this snapshot.
+    OUT=$(printf '%s\n' "$OUT" | sed '1s/^{/{"store":"'"$STORE"'",/')
+    if has_cap snapshot-enriched; then
+      printf '%s\n' "$OUT"
+    else
+      # Raw adapters know nothing about git: merge in the LP-CAS integration oracle,
+      # worktree-branch facts, and the terminal-count model.
+      printf '%s\n' "$OUT" | bash "$LIB_DIR/bin/acfw-enrich-snapshot.sh" "$REPO_ROOT"
+    fi
+    ;;
+
+  transition)
+    # Collect --stage flags so we can compensate when the adapter can't co-commit them.
+    STAGE_PATHS=()
+    REST=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --stage)
+          [ $# -ge 2 ] || { echo "FATAL: --stage requires a PATH" >&2; exit 2; }
+          STAGE_PATHS[${#STAGE_PATHS[@]}]="$2"; shift 2 ;;
+        *) REST[${#REST[@]}]="$1"; shift ;;
+      esac
+    done
+    if [ ${#STAGE_PATHS[@]} -eq 0 ]; then
+      exec "$ADAPTER" transition ${REST[@]+"${REST[@]}"}
+    fi
+    if has_cap stage; then
+      STAGED=()
+      for p in "${STAGE_PATHS[@]}"; do
+        STAGED[${#STAGED[@]}]="--stage"; STAGED[${#STAGED[@]}]="$p"
+      done
+      exec "$ADAPTER" transition "${STAGED[@]}" ${REST[@]+"${REST[@]}"}
+    fi
+    # Compensation: deliverables are repo-tree artifacts — commit them to trunk here,
+    # with the same path refusals as apply-transition.sh, then transition stateside.
+    STEM="${REST[0]:-task}"
+    ADDED=0
+    for p in "${STAGE_PATHS[@]}"; do
+      p="${p#./}"
+      case "$p" in
+        "")                    echo "FATAL: --stage path is empty" >&2; exit 2 ;;
+        /*)                    echo "FATAL: --stage path must be repo-relative, got absolute: $p" >&2; exit 2 ;;
+        *..*)                  echo "FATAL: --stage path must not traverse '..': $p" >&2; exit 2 ;;
+        .backlog/*|.acfwhip/*) echo "FATAL: --stage refuses state paths (.backlog/, .acfwhip/): $p" >&2; exit 2 ;;
+      esac
+      if [ -e "$REPO_ROOT/$p" ]; then
+        git_with_lock_backoff -C "$REPO_ROOT" add -- "$p" || exit 99
+        ADDED=1
+      else
+        echo "warn: --stage path not found, skipped: $p" >&2
+      fi
+    done
+    if [ "$ADDED" = "1" ] && ! git -C "$REPO_ROOT" diff --cached --quiet 2>/dev/null; then
+      git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $STEM deliverables" --quiet || exit 99
+      echo "ok: committed deliverables for $STEM (store '$STORE' keeps state outside git)"
+    fi
+    exec "$ADAPTER" transition ${REST[@]+"${REST[@]}"}
+    ;;
+
+  doctor)
+    if has_cap doctor-complete; then
+      exec "$ADAPTER" doctor "$@"
+    fi
+    # Merge the adapter's store-native findings (optional) with the generic battery
+    # (graph + git/worktree invariants computed from the snapshot). One report, one
+    # recomputed SUMMARY; exit 0 iff no FATAL remains.
+    MERGED=$(mktemp "${TMPDIR:-/tmp}/acfw-doc-merge.XXXXXX") || exit 2
+    trap 'rm -f "$MERGED"' EXIT
+    if has_cap doctor; then
+      "$ADAPTER" doctor "$@" | grep -E '^(FATAL|REPAIRABLE|WARN)\|' >> "$MERGED" || true
+    fi
+    SNAP=$(bash "$SCRIPT_DIR/acfw-store" snapshot 2>/dev/null || true)
+    if [ -n "$SNAP" ]; then
+      printf '%s\n' "$SNAP" | bash "$LIB_DIR/bin/acfw-doctor-generic.sh" "$REPO_ROOT" \
+        | grep -E '^(FATAL|REPAIRABLE|WARN)\|' >> "$MERGED" || true
+    else
+      printf 'WARN|snapshot-unavailable|-|doctor generic battery skipped: snapshot failed\n' >> "$MERGED"
+    fi
+    awk -F'|' '
+      /^(FATAL|REPAIRABLE|WARN)\|/ { print; sev[$1]++; code[$2]++ }
+      END {
+        line=""
+        for (c in code) line = line (line=="" ? "" : "|") c "=" code[c]
+        if (line != "") print "BREAKDOWN|" line
+        f=sev["FATAL"]+0; r=sev["REPAIRABLE"]+0; w=sev["WARN"]+0
+        printf "SUMMARY|fatal=%d|repairable=%d|warn=%d|ok=%s\n", f, r, w, (f==0 ? "true" : "false")
+        exit (f==0 ? 0 : 1)
+      }' "$MERGED"
+    exit $?
+    ;;
+
+  *)
+    exec "$ADAPTER" "$SUB" "$@"
+    ;;
+esac

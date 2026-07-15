@@ -1,0 +1,733 @@
+#!/usr/bin/env bash
+# acfw-store-multica — the `multica` task-store adapter (acf-whip store contract v1).
+#
+# Backs acf-whip's task store with a Multica workspace: one Multica *issue* per
+# whip task. The adapter shells out to the `multica` CLI (`--output json`) and
+# never touches git — Multica is an API backend, so `commitsToGit` is false and
+# the dispatcher stages code deliverables to trunk itself (no `stage` capability).
+#
+# CANONICAL STATE MODEL
+#   whip state lives in per-issue *metadata* (`whip_state`); the native issue
+#   `status` is a LOSSY DISPLAY PROJECTION of it. All reads (snapshot/read)
+#   report the whip-canonical name from metadata; doctor repairs `status` FROM
+#   `whip_state`, never the reverse. The join key is metadata `whip_key` (= the
+#   task stem); it is written LAST on create so a half-created issue is invisible
+#   to resolve()/snapshot (crash-safe). The full task document is stored verbatim
+#   as the issue `description` (body/materialize parity with the files adapter),
+#   and the structured `whip_*` metadata keys are the authoritative projection
+#   the scheduler reads.
+#
+#   whip_state -> native status:   draft=backlog pending=todo in-progress=in_progress
+#     completed=in_review in-review=in_review accepted=done rejected=todo
+#     blocked=blocked archive=cancelled
+#   whip priority -> native priority: blocker=urgent critical=high high=high
+#     medium=medium low=low
+#
+# ENV (native multica vars, passed through by the dispatcher untouched):
+#   MULTICA_SERVER_URL, MULTICA_TOKEN (a `mul_` PAT → member identity),
+#   MULTICA_WORKSPACE_ID; optional ACFW_MULTICA_PROJECT (scope issues to a project);
+#   optional ACFW_MULTICA_BIN (path to the multica CLI; default `multica`).
+#
+# Contract exit codes: 0 ok/noop · 2 usage · 3 not-found/ambiguous · 4 conflict
+# (duplicate key) · 5 backend unavailable · 6 auth · 7 invalid state/value · 99 transient.
+#
+# Portability: pure bash 3.2 (no `declare -A`). Requires jq (exit 5 if absent).
+
+set -u
+
+MULTICA_BIN="${ACFW_MULTICA_BIN:-multica}"
+ALL_STATES="draft pending in-progress completed in-review accepted rejected blocked archive"
+
+SUB="${1:-}"
+[ -n "$SUB" ] && shift
+
+# ---- helpers (no backend needed) -------------------------------------------
+
+jesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
+
+# field <file> <Field> — extract "- **Field**: value" (mirrors the files adapter).
+field() { grep -E "^- \*\*$2\*\*:" "$1" 2>/dev/null | head -1 | sed -E "s/.*$2\*\*:[[:space:]]*//" | sed -E 's/[[:space:]]+$//'; }
+
+# set_field <file> <Field> <Value> — replace the "- **Field**:" line in place,
+# inserting it after "- **Status**:" when absent (the files/beads edit pattern).
+# Used by materialize to refresh the stored document's bullets from live metadata.
+set_field() {
+  local f="$1" name="$2" val="$3"
+  if grep -qE "^- \*\*$name\*\*:" "$f"; then
+    ACFW_SF_VAL="$val" ACFW_SF_NAME="$name" awk '
+      BEGIN { name=ENVIRON["ACFW_SF_NAME"]; val=ENVIRON["ACFW_SF_VAL"]; done=0 }
+      { if (!done && $0 ~ ("^- \\*\\*" name "\\*\\*:")) { printf "- **%s**: %s\n", name, val; done=1; next } print }
+    ' "$f" > "$f.acfwtmp" && mv "$f.acfwtmp" "$f"
+  else
+    ACFW_SF_VAL="$val" ACFW_SF_NAME="$name" awk '
+      BEGIN { name=ENVIRON["ACFW_SF_NAME"]; val=ENVIRON["ACFW_SF_VAL"]; done=0 }
+      { print; if (!done && $0 ~ /^- \*\*Status\*\*:/) { printf "- **%s**: %s\n", name, val; done=1 } }
+    ' "$f" > "$f.acfwtmp" && mv "$f.acfwtmp" "$f"
+  fi
+}
+
+valid_state() { case " $ALL_STATES " in *" $1 "*) return 0;; *) return 1;; esac; }
+
+# whip_state -> native issue status (the lossy display projection).
+nstatus() {
+  case "$1" in
+    draft) echo backlog ;;
+    pending) echo todo ;;
+    in-progress) echo in_progress ;;
+    completed) echo in_review ;;
+    in-review) echo in_review ;;
+    accepted) echo "done" ;;
+    rejected) echo todo ;;
+    blocked) echo blocked ;;
+    archive) echo cancelled ;;
+    *) echo "" ;;
+  esac
+}
+
+# whip priority -> native issue priority (empty = unmapped; caller omits the flag).
+npriority() {
+  case "$1" in
+    blocker) echo urgent ;;
+    critical) echo high ;;
+    high) echo high ;;
+    medium) echo medium ;;
+    low) echo low ;;
+    *) echo "" ;;
+  esac
+}
+
+# map_field_to_key <Field> — echo "<metakey> <type>" for a task-document field
+# name, or nothing when unmapped. Shared by create --set and update-field. Status
+# is intentionally absent (state changes go through create --folder / transition).
+map_field_to_key() {
+  case "$1" in
+    ID) echo "whip_id string" ;;
+    Priority) echo "whip_priority string" ;;
+    "Assigned Agent") echo "whip_agent string" ;;
+    Worktree) echo "whip_worktree string" ;;
+    "PR Group") echo "whip_pr_group string" ;;
+    "Touches Globs") echo "whip_touches string" ;;
+    Dependencies) echo "whip_deps string" ;;
+    "Rejection Count") echo "whip_rejections number" ;;
+    Block-Count) echo "whip_blocks number" ;;
+    *) echo "" ;;
+  esac
+}
+
+# ---- capabilities (no backend, no jq needed) -------------------------------
+
+cmd_capabilities() {
+  printf '{"backend":"multica","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition","update-field","update-body","log-event","comment","doctor","doctor-fix","init"]}\n'
+}
+
+if [ "$SUB" = "capabilities" ]; then cmd_capabilities; exit 0; fi
+if [ -z "$SUB" ]; then echo "FATAL: usage: acfw-store-multica <subcommand> [args]" >&2; exit 2; fi
+
+# ---- everything below needs jq + the CLI -----------------------------------
+
+command -v jq >/dev/null 2>&1 || { echo "FATAL: jq is required by acfw-store-multica" >&2; exit 5; }
+have_cli() { command -v "$MULTICA_BIN" >/dev/null 2>&1; }
+have_cli || { echo "FATAL: multica CLI '$MULTICA_BIN' not found; set ACFW_MULTICA_BIN or install multica" >&2; exit 5; }
+
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/acfw-multica.XXXXXX") || { echo "FATAL: mktemp failed" >&2; exit 5; }
+trap 'rm -rf "$TMPD"' EXIT
+mc_tmp() { mktemp "$TMPD/f.XXXXXX"; }
+
+# ---- CLI plumbing ----------------------------------------------------------
+# multica_call runs `$MULTICA_BIN ...` with LC_ALL=C (forces English diagnostics
+# so mc_classify's substring checks are stable) and retries likely-transient
+# failures. multica_once is the non-retrying variant for NON-idempotent calls
+# (issue create — a blind retry would risk a duplicate issue). Both set globals
+# MC_OUT / MC_ERR / MC_RC and read stdin from $MC_STDIN (default /dev/null),
+# which they reset after use so a stray file never leaks into the next call.
+
+MC_OUT=""; MC_ERR=""; MC_RC=0
+MC_STDIN=/dev/null
+
+_mc_transient() {  # <rc> <errfile>
+  case "$1" in
+    2) return 0 ;;  # any network/transport failure (timeout, refused, DNS, TLS)
+    1) grep -qiE 'temporarily unavailable|server error|too many requests|timed out|time.?out|deadline|try again' "$2" && return 0 ;;
+  esac
+  return 1
+}
+
+multica_once() {
+  local of ef; of=$(mc_tmp); ef=$(mc_tmp)
+  LC_ALL=C "$MULTICA_BIN" "$@" <"$MC_STDIN" >"$of" 2>"$ef"; MC_RC=$?
+  MC_OUT=$(cat "$of"); MC_ERR=$(cat "$ef"); rm -f "$of" "$ef"; MC_STDIN=/dev/null
+  return "$MC_RC"
+}
+
+multica_call() {
+  local attempt=1 max=3 of ef
+  of=$(mc_tmp); ef=$(mc_tmp)
+  while :; do
+    LC_ALL=C "$MULTICA_BIN" "$@" <"$MC_STDIN" >"$of" 2>"$ef"; MC_RC=$?
+    { [ "$MC_RC" -eq 0 ] || ! _mc_transient "$MC_RC" "$ef" || [ "$attempt" -ge "$max" ]; } && break
+    attempt=$((attempt + 1)); sleep "$attempt"
+  done
+  MC_OUT=$(cat "$of"); MC_ERR=$(cat "$ef"); rm -f "$of" "$ef"; MC_STDIN=/dev/null
+  return "$MC_RC"
+}
+
+# mc_classify — map the multica CLI's stable exit code (0 ok · 1 generic · 2
+# network · 3 auth · 4 not-found · 5 validation) plus its (English) message onto
+# the acf-whip contract exit code. Echoes the contract code.
+mc_classify() {
+  case "$MC_RC" in
+    0) echo 0 ;;
+    3) echo 6 ;;   # 401/403 -> auth
+    4) echo 3 ;;   # 404 -> not found
+    5) echo 7 ;;   # 400/422 -> invalid value/state
+    2) if printf '%s' "$MC_ERR" | grep -qiE 'timed out|time.?out|deadline'; then echo 99; else echo 5; fi ;;
+    1) if printf '%s' "$MC_ERR" | grep -qiE 'temporarily unavailable|server error|too many requests|conflict'; then echo 99; else echo 5; fi ;;
+    *) echo 5 ;;
+  esac
+}
+
+# ---- metadata helpers ------------------------------------------------------
+
+# mset <uuid> <key> <value> [type] — set one metadata key. type defaults to string.
+mset() {
+  local uuid="$1" k="$2" v="$3" t="${4:-string}" rc
+  multica_call issue metadata set "$uuid" --key "$k" --value "$v" --type "$t" --output json
+  rc=$(mc_classify)
+  [ "$rc" -eq 0 ] || { echo "FATAL: metadata set $k failed: $MC_ERR" >&2; return "$rc"; }
+  return 0
+}
+
+# mget_str <uuid> <key> — echo the string value ("" when the key is absent).
+mget_str() {
+  multica_call issue metadata get "$1" --key "$2" --output json
+  [ "$MC_RC" -eq 0 ] || { printf ''; return 0; }
+  printf '%s' "$MC_OUT" | jq -r '. // ""' 2>/dev/null
+}
+
+# mget_num <uuid> <key> — echo the integer value (0 when absent/non-numeric).
+mget_num() {
+  local v
+  multica_call issue metadata get "$1" --key "$2" --output json
+  [ "$MC_RC" -eq 0 ] || { printf '0'; return 0; }
+  v=$(printf '%s' "$MC_OUT" | tr -dc '0-9')
+  [ -n "$v" ] && printf '%s' "$v" || printf '0'
+}
+
+# proj_args — append `--project $ACFW_MULTICA_PROJECT` to the named array var
+# when the project scope is set. Bash-3.2 safe (index assignment, no `declare -A`).
+# usage: build an array then `add_proj arrname`.
+add_proj() {
+  [ -n "${ACFW_MULTICA_PROJECT:-}" ] || return 0
+  eval "$1[\${#$1[@]}]=--project; $1[\${#$1[@]}]=\"\$ACFW_MULTICA_PROJECT\""
+}
+
+# resolve_key <stem> — echo the issue UUID for the task whose whip_key == stem.
+# 0 hits -> exit 3 (not found); 2+ hits -> exit 3 (ambiguous/corrupt); backend
+# failure -> the classified code. Exactly one hit -> print UUID, return 0.
+resolve_key() {
+  local key="$1" rc n
+  local -a largs; largs=(issue list --metadata "whip_key=$key" --limit 2 --output json); add_proj largs
+  multica_call "${largs[@]}"
+  rc=$(mc_classify)
+  [ "$rc" -eq 0 ] || { echo "FATAL: multica list failed resolving '$key': $MC_ERR" >&2; return "$rc"; }
+  n=$(printf '%s' "$MC_OUT" | jq '.issues | length')
+  if [ "$n" -eq 0 ]; then echo "FATAL: no task matching whip_key '$key'" >&2; return 3; fi
+  if [ "$n" -gt 1 ]; then echo "FATAL: whip_key '$key' is ambiguous ($n issues share it)" >&2; return 3; fi
+  printf '%s' "$MC_OUT" | jq -r '.issues[0].id'
+}
+
+# collect_whip_issues <outfile> — paginate `issue list` and write, as JSONL, the
+# full issue objects (metadata inline) that carry a whip_key. Exits (classified)
+# on backend failure. Shared by snapshot and doctor.
+collect_whip_issues() {
+  local out="$1" offset=0 n more rc
+  : > "$out"
+  while :; do
+    local -a largs; largs=(issue list --limit 100 --offset "$offset" --output json); add_proj largs
+    multica_call "${largs[@]}"
+    rc=$(mc_classify)
+    [ "$rc" -eq 0 ] || { echo "FATAL: multica list failed: $MC_ERR" >&2; exit "$rc"; }
+    n=$(printf '%s' "$MC_OUT" | jq '.issues | length')
+    [ "$n" -eq 0 ] && break
+    printf '%s' "$MC_OUT" | jq -c '.issues[] | select(.metadata.whip_key != null and .metadata.whip_key != "")' >> "$out"
+    more=$(printf '%s' "$MC_OUT" | jq -r '.has_more')
+    offset=$((offset + n))
+    [ "$more" = "true" ] || break
+  done
+}
+
+# ---- subcommands -----------------------------------------------------------
+
+cmd_init() {
+  # Pure, idempotent verify: CLI present (checked above) + server/auth/workspace
+  # reachable via a cheap authenticated list. When ACFW_MULTICA_PROJECT is set the
+  # scoped list also verifies the project resolves. (Project auto-creation is out
+  # of scope — the project must pre-exist.)
+  local rc
+  local -a largs; largs=(issue list --limit 1 --output json); add_proj largs
+  multica_call "${largs[@]}"
+  rc=$(mc_classify)
+  [ "$rc" -eq 0 ] || { echo "FATAL: multica init check failed (server/auth/workspace/project): $MC_ERR" >&2; exit "$rc"; }
+  printf '{"backend":"multica","initialized":true}\n'
+}
+
+cmd_read() {
+  local body=0 mat="" stem uuid rc issue
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --body) body=1; shift ;;
+      --materialize) mat="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown read flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  stem="${1:-}"; [ -n "$stem" ] || { echo "FATAL: usage: read [--body] [--materialize DIR] <stem>" >&2; exit 2; }
+  uuid=$(resolve_key "$stem") || exit $?
+  multica_call issue get "$uuid" --output json
+  rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: issue get failed: $MC_ERR" >&2; exit "$rc"; }
+  issue="$MC_OUT"
+  if [ -n "$mat" ]; then
+    [ -d "$mat" ] || mkdir -p "$mat"
+    local out="$mat/$stem.md"
+    # The stored description is the whole task document; refresh its metadata
+    # bullets from the CURRENT whip_* metadata so the materialized spec is
+    # consistent with live state (the stored bullets froze at create time).
+    printf '%s' "$issue" | jq -r '.description // ""' > "$out"
+    set_field "$out" "Status"          "$(printf '%s' "$issue" | jq -r '.metadata.whip_state // ""')"
+    set_field "$out" "Priority"        "$(printf '%s' "$issue" | jq -r '.metadata.whip_priority // ""')"
+    set_field "$out" "Assigned Agent"  "$(printf '%s' "$issue" | jq -r '.metadata.whip_agent // ""')"
+    set_field "$out" "Worktree"        "$(printf '%s' "$issue" | jq -r '.metadata.whip_worktree // ""')"
+    set_field "$out" "PR Group"        "$(printf '%s' "$issue" | jq -r '.metadata.whip_pr_group // ""')"
+    set_field "$out" "Touches Globs"   "$(printf '%s' "$issue" | jq -r '.metadata.whip_touches // ""')"
+    set_field "$out" "Dependencies"    "$(printf '%s' "$issue" | jq -r '.metadata.whip_deps // ""')"
+    set_field "$out" "Rejection Count" "$(printf '%s' "$issue" | jq -r '(.metadata.whip_rejections // 0) | tostring')"
+    set_field "$out" "Block-Count"     "$(printf '%s' "$issue" | jq -r '(.metadata.whip_blocks // 0) | tostring')"
+    # Append the stored audit trail verbatim, oldest-first. Both the whip-transition
+    # rows AND the clean-checkout token live as issue comments on this backend; the
+    # quality-reviewer greps the refreshed doc for `| clean-checkout | ok |`, so
+    # without this every review would auto-reject.
+    multica_call issue comment list "$uuid" --full --output json
+    rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: materialize could not read audit comments: $MC_ERR" >&2; exit "$rc"; }
+    local trail; trail=$(printf '%s' "$MC_OUT" | jq -r 'sort_by(.created_at // "") | .[].content // empty')
+    [ -n "$trail" ] && printf '\n## Store Audit Trail\n\n%s\n' "$trail" >> "$out"
+    printf '%s\n' "$out"
+    return 0
+  fi
+  printf '%s' "$issue" | jq -c --arg body "$body" '
+    {
+      stem: (.metadata.whip_key // ""),
+      folder: (.metadata.whip_state // ""),
+      fields: {
+        id: (.metadata.whip_id // ""),
+        status: (.metadata.whip_state // ""),
+        priority: (.metadata.whip_priority // ""),
+        agent: (.metadata.whip_agent // ""),
+        worktree: (.metadata.whip_worktree // ""),
+        pr_group: (.metadata.whip_pr_group // ""),
+        touches_globs: (.metadata.whip_touches // ""),
+        dependencies: (.metadata.whip_deps // ""),
+        rejection_count: (((.metadata.whip_rejections // 0) | tonumber?) // 0),
+        block_count: (((.metadata.whip_blocks // 0) | tonumber?) // 0)
+      }
+    } + (if $body == "1" then {body: (.description // "")} else {} end)
+  '
+}
+
+cmd_create() {
+  local folder="pending" src="" stem="" doc rc uuid now
+  local -a SETS; SETS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --folder) folder="${2:-}"; shift 2 ;;
+      --file) src="${2:-}"; shift 2 ;;
+      --stem) stem="${2:-}"; shift 2 ;;
+      --set) [ $# -ge 2 ] || { echo "FATAL: --set requires Field=Value" >&2; exit 2; }
+             SETS[${#SETS[@]}]="$2"; shift 2 ;;
+      --*) echo "FATAL: unknown create flag: $1" >&2; exit 2 ;;
+      *) echo "FATAL: unexpected argument: $1" >&2; exit 2 ;;
+    esac
+  done
+  valid_state "$folder" || { echo "FATAL: invalid folder '$folder'" >&2; exit 7; }
+  doc=$(mc_tmp)
+  if [ -n "$src" ]; then
+    [ -f "$src" ] || { echo "FATAL: --file not found: $src" >&2; exit 2; }
+    cat "$src" > "$doc"
+    [ -n "$stem" ] || stem=$(basename "$src" .md)
+  else
+    [ -n "$stem" ] || { echo "FATAL: create from stdin requires --stem" >&2; exit 2; }
+    cat > "$doc"
+  fi
+
+  # Duplicate key -> typed conflict (create is never an upsert). A whip_key hit in
+  # ANY state (including archived) counts: the key is the store-wide identity.
+  local -a dargs; dargs=(issue list --metadata "whip_key=$stem" --limit 1 --output json); add_proj dargs
+  multica_call "${dargs[@]}"; rc=$(mc_classify)
+  [ "$rc" -eq 0 ] || { echo "FATAL: duplicate check failed: $MC_ERR" >&2; exit "$rc"; }
+  [ "$(printf '%s' "$MC_OUT" | jq '.issues | length')" -eq 0 ] || { echo "FATAL: task '$stem' already exists" >&2; exit 4; }
+
+  # Parse task-document fields (same extractor as the files adapter).
+  local f_id f_prio f_agent f_wt f_prg f_touch f_deps f_rej f_blk f_parent f_stage title
+  f_id=$(field "$doc" "ID")
+  f_prio=$(field "$doc" "Priority")
+  f_agent=$(field "$doc" "Assigned Agent")
+  f_wt=$(field "$doc" "Worktree")
+  f_prg=$(field "$doc" "PR Group")
+  f_touch=$(field "$doc" "Touches Globs")
+  f_deps=$(field "$doc" "Dependencies")
+  f_rej=$(field "$doc" "Rejection Count")
+  f_blk=$(field "$doc" "Block-Count")
+  f_parent=$(field "$doc" "Parent")
+  f_stage=$(field "$doc" "Stage")
+  title=$(grep -m1 -E '^# ' "$doc" | sed -E 's/^#[[:space:]]+//; s/^Task:[[:space:]]*//')
+  [ -n "$title" ] || title="$stem"
+
+  # Apply --set overrides after parse (keyed by task-document field name).
+  local kv fld val
+  if [ ${#SETS[@]} -gt 0 ]; then
+    for kv in "${SETS[@]}"; do
+      fld="${kv%%=*}"; val="${kv#*=}"
+      case "$fld" in
+        ID) f_id="$val" ;;
+        Priority) f_prio="$val" ;;
+        "Assigned Agent") f_agent="$val" ;;
+        Worktree) f_wt="$val" ;;
+        "PR Group") f_prg="$val" ;;
+        "Touches Globs") f_touch="$val" ;;
+        Dependencies) f_deps="$val" ;;
+        "Rejection Count") f_rej="$val" ;;
+        Block-Count) f_blk="$val" ;;
+        Parent) f_parent="$val" ;;
+        Stage) f_stage="$val" ;;
+        *) : ;;  # unmapped field: ignored on create (whip_state comes from --folder)
+      esac
+    done
+  fi
+
+  # Normalize: deps bare comma list (strip brackets), counters numeric.
+  f_deps=$(printf '%s' "$f_deps" | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//'); [ -n "$f_deps" ] || f_deps="none"
+  printf '%s' "$f_rej" | grep -qE '^[0-9]+$' || f_rej=0
+  printf '%s' "$f_blk" | grep -qE '^[0-9]+$' || f_blk=0
+
+  local ns np; ns=$(nstatus "$folder"); np=$(npriority "$f_prio")
+  [ -n "$ns" ] || { echo "FATAL: no native status projection for '$folder'" >&2; exit 7; }
+
+  # Optional parent (whip stem -> issue UUID) and stage.
+  local parent_uuid="" stage_ok=""
+  if [ -n "$f_parent" ] && [ "$f_parent" != "none" ]; then
+    parent_uuid=$(resolve_key "$f_parent") || { echo "FATAL: parent '$f_parent' not resolvable" >&2; exit 3; }
+  fi
+  printf '%s' "$f_stage" | grep -qE '^[0-9]+$' && [ "$f_stage" -ge 1 ] 2>/dev/null && stage_ok="$f_stage"
+
+  # Create the issue with the full document as its description (body parity).
+  local -a cargs
+  cargs=(issue create --title "$title" --description-stdin --status "$ns" --output json)
+  [ -n "$np" ] && { cargs[${#cargs[@]}]=--priority; cargs[${#cargs[@]}]="$np"; }
+  [ -n "$parent_uuid" ] && { cargs[${#cargs[@]}]=--parent; cargs[${#cargs[@]}]="$parent_uuid"; }
+  [ -n "$stage_ok" ] && { cargs[${#cargs[@]}]=--stage; cargs[${#cargs[@]}]="$stage_ok"; }
+  add_proj cargs
+  MC_STDIN="$doc"; multica_once "${cargs[@]}"; rc=$(mc_classify)
+  [ "$rc" -eq 0 ] || { echo "FATAL: issue create failed: $MC_ERR" >&2; exit "$rc"; }
+  uuid=$(printf '%s' "$MC_OUT" | jq -r '.id // empty')
+  [ -n "$uuid" ] || { echo "FATAL: issue create returned no id" >&2; exit 5; }
+
+  # Write structured metadata. whip_key LAST: until it lands the issue is invisible
+  # to resolve()/snapshot, so a crash mid-write orphans (never duplicates) the task.
+  now=$(date -u +"%Y-%m-%d %H:%M:%S")
+  mset "$uuid" whip_id "$f_id" string || exit $?
+  mset "$uuid" whip_state "$folder" string || exit $?
+  mset "$uuid" whip_priority "$f_prio" string || exit $?
+  mset "$uuid" whip_worktree "$f_wt" string || exit $?
+  mset "$uuid" whip_agent "$f_agent" string || exit $?
+  mset "$uuid" whip_pr_group "$f_prg" string || exit $?
+  mset "$uuid" whip_touches "$f_touch" string || exit $?
+  mset "$uuid" whip_deps "$f_deps" string || exit $?
+  mset "$uuid" whip_rejections "$f_rej" number || exit $?
+  mset "$uuid" whip_blocks "$f_blk" number || exit $?
+  mset "$uuid" whip_last_transition_ts "$now" string || exit $?
+  mset "$uuid" whip_key "$stem" string || exit $?
+
+  printf '{"key":"%s","folder":"%s"}\n' "$(jesc "$stem")" "$(jesc "$folder")"
+}
+
+cmd_transition() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stage) echo "FATAL: multica adapter has no 'stage' capability; the dispatcher must stage deliverables to trunk itself" >&2; exit 2 ;;
+      --*) echo "FATAL: unknown transition flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  local stem="${1:-}" to="${2:-}" agent="${3:-orchestrator}" notes="${4:-}" rinc="${5:-0}" binc="${6:-0}"
+  if [ -z "$stem" ] || [ -z "$to" ]; then
+    echo "FATAL: usage: transition <stem> <TO_STATE> [AGENT] [NOTES] [RINC] [BINC]" >&2; exit 2
+  fi
+  valid_state "$to" || { echo "FATAL: invalid TO_STATE '$to' (one of: $ALL_STATES)" >&2; exit 7; }
+  local uuid from nto rc now cur
+  uuid=$(resolve_key "$stem") || exit $?
+  from=$(mget_str "$uuid" whip_state)
+  nto=$(nstatus "$to")
+
+  if [ "$from" = "$to" ]; then
+    # Idempotent no-op: reassert the native status projection (repairs drift) but
+    # bump no counters and append no audit comment.
+    multica_call issue status "$uuid" "$nto" --output json >/dev/null 2>&1 || true
+    echo "noop: $stem already in $to"
+    exit 0
+  fi
+
+  # Forward transition. Order = crash-safety: native status, then counters/ts,
+  # then the whip_state commit point, then the audit comment.
+  multica_call issue status "$uuid" "$nto" --output json
+  rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: set native status failed: $MC_ERR" >&2; exit "$rc"; }
+  if [ "$to" = "rejected" ] && [ "$rinc" = "1" ]; then
+    cur=$(mget_num "$uuid" whip_rejections); mset "$uuid" whip_rejections "$((cur + 1))" number || exit $?
+  fi
+  if [ "$to" = "blocked" ] && [ "$binc" = "1" ]; then
+    cur=$(mget_num "$uuid" whip_blocks); mset "$uuid" whip_blocks "$((cur + 1))" number || exit $?
+  fi
+  now=$(date -u +"%Y-%m-%d %H:%M:%S")
+  mset "$uuid" whip_last_transition_ts "$now" string || exit $?
+  mset "$uuid" whip_state "$to" string || exit $?
+
+  local cf; cf=$(mc_tmp)
+  printf 'whip-transition | %s | %s | %s | %s | %s\n' "$now" "$from" "$to" "$agent" "$notes" > "$cf"
+  MC_STDIN="$cf"; multica_call issue comment add "$uuid" --content-stdin --output json >/dev/null 2>&1 || true
+
+  echo "ok: $stem $from -> $to"
+  exit 0
+}
+
+cmd_update_field() {
+  local stem="" uuid rc edited=0 kv fld val mapping mk mt np
+  local -a SETS ADDDEPS; SETS=(); ADDDEPS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set) [ $# -ge 2 ] || { echo "FATAL: --set requires Field=Value" >&2; exit 2; }
+             SETS[${#SETS[@]}]="$2"; shift 2 ;;
+      --add-dep) [ $# -ge 2 ] || { echo "FATAL: --add-dep requires an ID" >&2; exit 2; }
+                 ADDDEPS[${#ADDDEPS[@]}]="$2"; shift 2 ;;
+      --*) echo "FATAL: unknown update-field flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] || { echo "FATAL: usage: update-field <stem> [--set Field=Value]... [--add-dep ID]..." >&2; exit 2; }
+
+  # Validate field names BEFORE touching the backend so usage errors (state change
+  # attempt, unmapped field) are deterministic exit 2 regardless of reachability.
+  if [ ${#SETS[@]} -gt 0 ]; then
+    for kv in "${SETS[@]}"; do
+      fld="${kv%%=*}"
+      [ "$fld" = "Status" ] && { echo "FATAL: update-field cannot change state; use transition" >&2; exit 2; }
+      [ -n "$(map_field_to_key "$fld")" ] || { echo "FATAL: field '$fld' is not mapped by the multica backend" >&2; exit 2; }
+    done
+  fi
+
+  uuid=$(resolve_key "$stem") || exit $?
+
+  if [ ${#SETS[@]} -gt 0 ]; then
+    for kv in "${SETS[@]}"; do
+      fld="${kv%%=*}"; val="${kv#*=}"
+      mapping=$(map_field_to_key "$fld")
+      mk="${mapping%% *}"; mt="${mapping##* }"
+      # Dependencies via --set is a FULL replacement (bare comma list, brackets dropped).
+      [ "$fld" = "Dependencies" ] && { val=$(printf '%s' "$val" | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//'); [ -n "$val" ] || val="none"; }
+      mset "$uuid" "$mk" "$val" "$mt" || exit $?
+      # Priority also updates the native display projection.
+      if [ "$fld" = "Priority" ]; then
+        np=$(npriority "$val")
+        [ -n "$np" ] && { multica_call issue update "$uuid" --priority "$np" --output json >/dev/null 2>&1 || true; }
+      fi
+      edited=1
+    done
+  fi
+
+  if [ ${#ADDDEPS[@]} -gt 0 ]; then
+    local dep cur new
+    for dep in "${ADDDEPS[@]}"; do
+      cur=$(mget_str "$uuid" whip_deps | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//')
+      case "$cur" in none|"") new="$dep" ;; *) new="$cur, $dep" ;; esac
+      mset "$uuid" whip_deps "$new" string || exit $?
+      edited=1
+    done
+  fi
+
+  printf '{"key":"%s","edited":%s}\n' "$(jesc "$stem")" "$([ "$edited" -eq 1 ] && echo true || echo false)"
+}
+
+cmd_update_body() {
+  local stem="${1:-}" uuid rc tmp
+  [ -n "$stem" ] || { echo "FATAL: usage: update-body <stem>  (document on stdin)" >&2; exit 2; }
+  uuid=$(resolve_key "$stem") || exit $?
+  tmp=$(mc_tmp); cat > "$tmp"
+  [ -s "$tmp" ] || { echo "FATAL: refusing to replace the body with an empty document" >&2; exit 2; }
+  # Replaces the issue description only; the whip_* metadata projection is edited
+  # via update-field/transition, not re-parsed here (a deviation from files — see README).
+  MC_STDIN="$tmp"; multica_call issue update "$uuid" --description-stdin --output json
+  rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: update body failed: $MC_ERR" >&2; exit "$rc"; }
+  printf '{"key":"%s","updated":true}\n' "$(jesc "$stem")"
+}
+
+cmd_log_event() {
+  local stem="" row="" uuid rc tmp
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --row) row="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown log-event flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] && [ -n "$row" ] || { echo "FATAL: usage: log-event <stem> --row '| ... |'" >&2; exit 2; }
+  uuid=$(resolve_key "$stem") || exit $?
+  # The event row rides an issue comment; snapshot's clean-checkout token scan
+  # greps in-review issues' comments for it.
+  tmp=$(mc_tmp); printf '%s\n' "$row" > "$tmp"
+  MC_STDIN="$tmp"; multica_call issue comment add "$uuid" --content-stdin --output json
+  rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: log-event comment failed: $MC_ERR" >&2; exit "$rc"; }
+  printf '{"key":"%s","logged":true}\n' "$(jesc "$stem")"
+}
+
+cmd_comment() {
+  local stem="" author="" uuid rc tmp
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --author) author="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown comment flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] || { echo "FATAL: usage: comment <stem> [--author A]  (text on stdin)" >&2; exit 2; }
+  uuid=$(resolve_key "$stem") || exit $?
+  tmp=$(mc_tmp)
+  { [ -n "$author" ] && printf '_(%s)_\n\n' "$author"; cat; } > "$tmp"
+  [ -s "$tmp" ] || { echo "FATAL: refusing to add an empty comment" >&2; exit 2; }
+  MC_STDIN="$tmp"; multica_call issue comment add "$uuid" --content-stdin --output json
+  rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: comment failed: $MC_ERR" >&2; exit "$rc"; }
+  printf '{"key":"%s","commented":true}\n' "$(jesc "$stem")"
+}
+
+cmd_snapshot() {
+  # --digest / --counts-only / --mode are hints; a full snapshot is always valid.
+  local jsonl; jsonl=$(mc_tmp)
+  collect_whip_issues "$jsonl"
+
+  # clean-checkout token: bounded N+1 over ONLY in-review tasks (their comments
+  # persist from when clean-checkout logged the token). All others are false.
+  local toks="" id
+  for id in $(jq -rs 'map(select(.metadata.whip_state == "in-review") | .id) | .[]' "$jsonl"); do
+    multica_call issue comment list "$id" --full --output json
+    if [ "$MC_RC" -eq 0 ] && printf '%s' "$MC_OUT" | jq -r '.[].content // ""' 2>/dev/null | grep -qE '\| clean-checkout \| ok \|'; then
+      toks="$toks$id"$'\n'
+    fi
+  done
+  local tok_json; tok_json=$(printf '%s' "$toks" | jq -Rn '[inputs | select(length > 0)]')
+
+  jq -rs --argjson tok "$tok_json" --arg gen "$(date -u +"%Y-%m-%d %H:%M:%S")" '
+    def splitlist: (. // "") | split(",") | map(gsub("^\\s+";"") | gsub("\\s+$";"")) | map(select(. != "" and . != "none"));
+    ( map({
+        stem: .metadata.whip_key,
+        id: (.metadata.whip_id // .identifier // ""),
+        backendId: (.identifier // ""),
+        folder: (.metadata.whip_state // ""),
+        status: (.metadata.whip_state // ""),
+        slug: (.metadata.whip_worktree // ""),
+        agent: (.metadata.whip_agent // ""),
+        priority: (.metadata.whip_priority // ""),
+        deps: (.metadata.whip_deps | splitlist),
+        touchesGlobs: (.metadata.whip_touches | splitlist),
+        rejectionCount: (((.metadata.whip_rejections // 0) | tonumber?) // 0),
+        blockCount: (((.metadata.whip_blocks // 0) | tonumber?) // 0),
+        lastTransitionTs: (.metadata.whip_last_transition_ts // ""),
+        hasCleanCheckoutToken: (.id as $iid | ($tok | index($iid)) != null)
+      }) ) as $tasks
+    | ($tasks | map(.folder)) as $f
+    | {
+        raw: true,
+        generatedAt: $gen,
+        counts: {
+          "pending":     ([$f[] | select(. == "pending")]     | length),
+          "in-progress": ([$f[] | select(. == "in-progress")] | length),
+          "completed":   ([$f[] | select(. == "completed")]   | length),
+          "in-review":   ([$f[] | select(. == "in-review")]   | length),
+          "blocked":     ([$f[] | select(. == "blocked")]     | length),
+          "rejected":    ([$f[] | select(. == "rejected")]    | length),
+          "accepted":    ([$f[] | select(. == "accepted")]    | length),
+          "total":       ($tasks | length)
+        },
+        tasks: $tasks
+      }
+  ' "$jsonl"
+}
+
+cmd_doctor() {
+  local fix=0 quiet=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fix) fix=1; shift ;;
+      --quiet) quiet=1; shift ;;
+      --active-only) shift ;;  # accepted; the multica scan is store-wide regardless
+      --*) shift ;;            # tolerate unknown flags
+      *) shift ;;
+    esac
+  done
+  local jsonl; jsonl=$(mc_tmp)
+  collect_whip_issues "$jsonl"
+
+  # Store-native findings as SEV|code|task|detail lines.
+  local sev
+  sev=$(jq -rs '
+    def nstat: {"draft":"backlog","pending":"todo","in-progress":"in_progress","completed":"in_review","in-review":"in_review","accepted":"done","rejected":"todo","blocked":"blocked","archive":"cancelled"};
+    def states: ["draft","pending","in-progress","completed","in-review","accepted","rejected","blocked","archive"];
+    (group_by(.metadata.whip_key)[] | select(length > 1)
+       | "FATAL|duplicate-key|\(.[0].metadata.whip_key)|\(length) issues share this whip_key"),
+    (.[] | select((.metadata.whip_state // "") as $s | (states | index($s)) == null)
+       | "FATAL|invalid-state|\(.metadata.whip_key)|whip_state=\(.metadata.whip_state // "<none>")"),
+    (.[] | select((.metadata.whip_state // "") as $s | (nstat[$s] // "") as $w | ($w != "" and .status != $w))
+       | "REPAIRABLE|status-drift|\(.metadata.whip_key)|native=\(.status) want=\(nstat[.metadata.whip_state])"),
+    (.[] | select((.metadata.whip_rejections | type) != "number")
+       | "REPAIRABLE|bad-rejections|\(.metadata.whip_key)|whip_rejections is not a number"),
+    (.[] | select((.metadata.whip_blocks | type) != "number")
+       | "REPAIRABLE|bad-blocks|\(.metadata.whip_key)|whip_blocks is not a number")
+  ' "$jsonl")
+
+  local fatal repairable warn
+  fatal=$(printf '%s\n' "$sev" | grep -c '^FATAL|'); fatal=${fatal//[^0-9]/}
+  repairable=$(printf '%s\n' "$sev" | grep -c '^REPAIRABLE|'); repairable=${repairable//[^0-9]/}
+  warn=$(printf '%s\n' "$sev" | grep -c '^WARN|'); warn=${warn//[^0-9]/}
+
+  [ "$quiet" -eq 1 ] || { [ -n "$sev" ] && printf '%s\n' "$sev"; }
+
+  if [ "$fix" -eq 1 ] && [ -n "$sev" ]; then
+    local sk code task detail uuid ws
+    while IFS='|' read -r sk code task detail; do
+      [ "$sk" = "REPAIRABLE" ] || continue
+      uuid=$(resolve_key "$task" 2>/dev/null) || continue
+      case "$code" in
+        status-drift) ws=$(mget_str "$uuid" whip_state); multica_call issue status "$uuid" "$(nstatus "$ws")" --output json >/dev/null 2>&1 || true ;;
+        bad-rejections) mset "$uuid" whip_rejections 0 number >/dev/null 2>&1 || true ;;
+        bad-blocks) mset "$uuid" whip_blocks 0 number >/dev/null 2>&1 || true ;;
+      esac
+    done <<EOF
+$sev
+EOF
+  fi
+
+  printf 'SUMMARY|fatal=%d|repairable=%d|warn=%d|ok=%s\n' "${fatal:-0}" "${repairable:-0}" "${warn:-0}" "$([ "${fatal:-0}" -eq 0 ] && echo true || echo false)"
+  [ "${fatal:-0}" -eq 0 ] || exit 1
+  exit 0
+}
+
+# ---- dispatch --------------------------------------------------------------
+
+case "$SUB" in
+  init)         cmd_init "$@" ;;
+  snapshot)     cmd_snapshot "$@" ;;
+  read)         cmd_read "$@" ;;
+  create)       cmd_create "$@" ;;
+  transition)   cmd_transition "$@" ;;
+  update-field) cmd_update_field "$@" ;;
+  update-body)  cmd_update_body "$@" ;;
+  log-event)    cmd_log_event "$@" ;;
+  comment)      cmd_comment "$@" ;;
+  doctor)       cmd_doctor "$@" ;;
+  *)            echo "FATAL: unsupported subcommand: $SUB" >&2; exit 2 ;;
+esac

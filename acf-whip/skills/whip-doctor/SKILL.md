@@ -9,6 +9,11 @@ allowed-tools:
 
 # /whip-doctor
 
+Works on every task-store backend: invoke it through the dispatcher —
+`bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" doctor [--fix]`. On the default `files` store
+that routes to the full battery below; on any other store it merges the adapter's store-native
+checks with the generic graph/git battery (`acfw-doctor-generic.sh`) into one report.
+
 Deterministic backlog integrity gate. The check battery lives in
 `${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh`; this skill runs it and explains
 the result. `/go` runs the same script as a startup hard gate and a per-iteration recheck.

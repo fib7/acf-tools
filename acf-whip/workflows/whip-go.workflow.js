@@ -14,6 +14,11 @@ const pluginRoot = (args && args.pluginRoot) || ''
 const trunkRoot = (args && args.trunkRoot) || ''
 const trunkBranch = (args && args.trunkBranch) || ''
 const mode = (args && args.mode === 'override') ? 'override' : 'default'
+// Task-store backend (3.1.0): 'files' (default) keeps every command and prompt byte-identical to
+// 3.0.x; any other value routes task state through the acfw-store dispatcher's adapter for that
+// backend and swaps the file-path prompt surface for materialized specs (see taskLoc below).
+const store = (args && args.store) || 'files'
+const filesStore = store === 'files'
 // Worktree branch namespace acf-whip owns (<prefix>/<slug>). Defaults to 'worktree'; updated from
 // each scan snapshot's branchPrefix so prompt text matches a custom ACFW_BRANCH_PREFIX in .acfw-config.
 // Prompts are informational only — the agent always uses the path clean-checkout.sh prints — so a
@@ -25,10 +30,11 @@ if (!pluginRoot || !trunkRoot) {
 
 // ============================ shell + bin paths ============================
 const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
-const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=${sq(trunkBranch)};`
-const SCAN = `${pluginRoot}/skills/go/bin/scan-backlog.sh`
-const APPLY = `${pluginRoot}/skills/go/bin/apply-transition.sh`
-const DOCTOR = `${pluginRoot}/skills/whip-doctor/bin/doctor.sh`
+const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=${sq(trunkBranch)}; export ACFW_STORE=${sq(store)};`
+// The store dispatcher (3.1.0) is the single entry point for task state: snapshot (scan), transition
+// (the writer primitive), doctor, read/materialize. For the files backend it routes to the same
+// engines as 3.0.x (scan-backlog.sh / apply-transition.sh / doctor.sh) with identical output.
+const STORE = `${pluginRoot}/skills/lib/bin/acfw-store`
 // LP-CAS (3.0.0) integrator: lands one accepted task's single-parent candidate onto the LIVE trunk by
 // cherry-pick + co-committed in-tree ledger marker + union gate + compare-and-swap. Replaces the retired
 // integrate-worktree (rebase-into-cached-snapshot fold), whose stale snapshot was the keystone defect.
@@ -41,8 +47,21 @@ const CLEAN_CHECKOUT = `${pluginRoot}/skills/clean-checkout-before-task/bin/clea
 // freshness by MTIME (no JSON parse, no PID, no daemon, no new file). It is a GUARDRAIL, not the
 // correctness keystone: CAS-land and idempotent transitions are what actually make concurrency safe.
 // After a crash it self-expires in LOCK_FRESH_MIN; the documented override is one `rm`.
-const RUN_LOCK = `${trunkRoot}/.backlog/.acfw-run.json`
+// files keeps the historical .backlog/ location; other stores have no .backlog/, so /go passes
+// runLockPath (resolved by `acfw-store info`) pointing under .acfwhip/run/ (gitignored).
+const RUN_LOCK = (args && args.runLockPath) || `${trunkRoot}/.backlog/.acfw-run.json`
+const RUN_LOCK_DIR = RUN_LOCK.slice(0, RUN_LOCK.lastIndexOf('/'))
+const RUN_LOCK_BASE = RUN_LOCK.slice(RUN_LOCK.lastIndexOf('/') + 1)
 const LOCK_FRESH_MIN = 30
+
+// Where a dispatched agent READS (and, on files, writes) the task document.
+//   files : the live root path — prompts stay byte-identical to 3.0.x.
+//   other : a spec materialized from the store into .acfwhip/specs/<stem>.md by materializeCmd
+//           (deterministic path, so prompts can embed it before the file exists). Evidence and
+//           review comments flow back through `acfw-store comment`, never into the spec file.
+const SPECS_DIR = `${trunkRoot}/.acfwhip/specs`
+const taskLoc = (t, folder) => (filesStore ? `${trunkRoot}/.backlog/${folder}/${t.stem}.md` : `${SPECS_DIR}/${t.stem}.md`)
+const materializeCmd = (t) => `bash ${sq(STORE)} read --materialize ${sq(SPECS_DIR)} ${sq(t.stem)}`
 
 // IMPORTANT (isolation): acf-whip provides its OWN per-task isolation via git worktrees
 // (.worktree/<slug>, created by clean-checkout.sh). Agents always operate against the REAL trunk
@@ -94,7 +113,7 @@ const SCAN_RESULT = {
   type: 'object', additionalProperties: false,
   required: ['snapshotJson', 'doctorOk', 'doctorSummary', 'doctorFatals'],
   properties: {
-    snapshotJson: { type: 'string', description: 'the VERBATIM stdout of scan-backlog.sh — a single JSON object, copied exactly, nothing added' },
+    snapshotJson: { type: 'string', description: 'the VERBATIM stdout of the acfw-store snapshot command — a single JSON object, copied exactly, nothing added' },
     doctorOk: { type: 'boolean' },
     doctorSummary: { type: 'string', description: 'verbatim SUMMARY|... line' },
     doctorFatals: { type: 'array', items: { type: 'string' }, description: 'verbatim FATAL|... lines' },
@@ -104,7 +123,7 @@ const WRITE_BATCH = {
   type: 'object', additionalProperties: false,
   required: ['applied', 'note'],
   properties: {
-    applied: { type: 'array', items: { type: 'string' }, description: 'one line per apply-transition.sh call: its stdout (ok:/noop:) or an error note' },
+    applied: { type: 'array', items: { type: 'string' }, description: 'one line per acfw-store transition call: its stdout (ok:/noop:) or an error note' },
     note: { type: 'string' },
   },
 }
@@ -229,12 +248,13 @@ function planUnblockAndTimeout(tasks, idx, opts) {
   const maxReject = (o.maxReject != null) ? o.maxReject : MAX_REJECT_RETRY
   const maxBlock = (o.maxBlock != null) ? o.maxBlock : MAX_BLOCK_RETRY
   const timeoutH = (o.timeoutH != null) ? o.timeoutH : DEFAULT_TIMEOUT_H
-  const root = o.trunkRoot || ''
   // parked (BUG-2): stems a specialist blocked on with blocked_reason=dependency-missing this run. Their
   // DECLARED deps are satisfied (the real blocker is unmodeled), so without this they would be re-unblocked
   // and re-dispatched on a tight loop until Block-Count hit its cap. Parking stops the re-queue immediately.
   const parked = (o.parked instanceof Set) ? o.parked : new Set(o.parked || [])
-  const mk = (t, from, toState, notes) => ({ path: `${root}/.backlog/${from}/${t.stem}.md`, toState, agent: 'orchestrator', notes, inc: 0 })
+  // Actions are STEM-keyed (3.1.0): the store adapter resolves the stem to its current location, so a
+  // stale `from` folder can never mis-address a move (strictly more robust on resume than a full path).
+  const mk = (t, from, toState, notes) => ({ stem: t.stem, toState, agent: 'orchestrator', notes, inc: 0 })
 
   // blocked -> pending: deps now satisfied AND not a max-rejection "redesign" block (count >= cap)
   // AND not a max-re-block "needs operator" task (blockCount >= cap). A specialist-blocked or
@@ -296,18 +316,29 @@ function reconcileIntegrationTallies(integratedStems, rejectedStems, attemptedIn
 // </scheduler-pure> ==========================================================================
 
 // ============================ agent prompt builders ============================
-const NO_BACKLOG_WRITES = 'Do code work ONLY inside the worktree. Do NOT move task files between .backlog/ folders and do NOT commit any .backlog/ change — the orchestrator is the single writer of .backlog/.'
+const NO_BACKLOG_WRITES = filesStore
+  ? 'Do code work ONLY inside the worktree. Do NOT move task files between .backlog/ folders and do NOT commit any .backlog/ change — the orchestrator is the single writer of .backlog/.'
+  : 'Do code work ONLY inside the worktree. Do NOT change task state in the task store and do NOT edit the materialized spec file — the orchestrator is the single writer of task state.'
+
+// Non-files stores: the task document lives in the store, not on disk — every dispatched agent
+// first materializes a read-only spec (metadata + body + log) at the deterministic taskLoc path.
+const fetchSpecStep = (t) => (filesStore ? '' : `
+STEP -1 (task spec): run  ${materializeCmd(t)}  — it renders this task's CURRENT document from the '${store}' task store to the path it prints. Read the task there; treat it as read-only.
+`)
+const evidenceSink = (t, rootPath, author) => (filesStore
+  ? `Write evidence-of-completion back into the ROOT task file at ${sq(rootPath)} (append to its sections)`
+  : `Record evidence-of-completion in the task store — pipe your evidence text to:  bash ${sq(STORE)} comment ${sq(t.stem)} --author ${sq(author)}`)
 
 function specialistPrompt(t) {
-  const rootPath = `${trunkRoot}/.backlog/in-progress/${t.stem}.md`
+  const rootPath = taskLoc(t, 'in-progress')
   return `${ENV}
 You are the ${t.agent || 'assigned'} specialist executing one acf-whip backlog task.
-
+${fetchSpecStep(t)}
 STEP 0 (mandatory concurrency primitive): run
   bash ${sq(CLEAN_CHECKOUT)} ${sq(rootPath)}
 Its stdout is the absolute worktree path (branch ${branchPrefix}/${t.slug}). If it exits non-zero, do NOT proceed: return transition "none" with the exit code in notes (the orchestrator retries next iteration).
 
-Then: read the task at ${sq(rootPath)} (the ROOT path — read it there). Do the implementation INSIDE the worktree printed by Step 0, on branch ${branchPrefix}/${t.slug}. Run the project's quality gates. Commit your CODE to the worktree branch. Write evidence-of-completion back into the ROOT task file at ${sq(rootPath)} (append to its sections), then end your response with the ACFW-RESULT marker:
+Then: read the task at ${sq(rootPath)} (the ROOT path — read it there). Do the implementation INSIDE the worktree printed by Step 0, on branch ${branchPrefix}/${t.slug}. Run the project's quality gates. Commit your CODE to the worktree branch. ${evidenceSink(t, rootPath, t.agent || 'specialist')}, then end your response with the ACFW-RESULT marker:
   ACFW-RESULT:
     transition: completed | blocked
     commit_sha: <sha on ${branchPrefix}/${t.slug}, or n/a>
@@ -321,15 +352,21 @@ Finally return the structured ACFWResult matching your marker (transition, commi
 }
 
 function reviewerPrompt(t) {
-  const rootPath = `${trunkRoot}/.backlog/in-review/${t.stem}.md`
+  const rootPath = taskLoc(t, 'in-review')
+  const tokenRule = filesStore
+    ? `AUTO-REJECT rule: if the task's Transition Log lacks a "| clean-checkout | ok |" token, reject.`
+    : `AUTO-REJECT rule: AFTER Step 0, re-run  ${materializeCmd(t)}  (Step 0 recorded its own token in the store; the refresh picks it up) and check the refreshed document's Transition Log — if it lacks a "| clean-checkout | ok |" token, reject.`
+  const reviewSink = filesStore
+    ? `Write your review comments into the ROOT task file at ${sq(rootPath)}`
+    : `Record your review comments in the task store — pipe them to:  bash ${sq(STORE)} comment ${sq(t.stem)} --author quality-reviewer`
   return `${ENV}
 You are quality-reviewer reviewing one acf-whip task that an implementer marked completed.
-
+${fetchSpecStep(t)}
 STEP 0: run  bash ${sq(CLEAN_CHECKOUT)} ${sq(rootPath)}  to attach to the task's worktree (branch ${branchPrefix}/${t.slug}) and validate it. If it exits non-zero, return transition "none" with the exit code in notes.
 
 Then review the implementation against the task's Acceptance Criteria and quality gates, working in the worktree.
-AUTO-REJECT rule: if the task's Transition Log lacks a "| clean-checkout | ok |" token, reject.
-Write your review comments into the ROOT task file at ${sq(rootPath)}, then end with the ACFW-RESULT marker:
+${tokenRule}
+${reviewSink}, then end with the ACFW-RESULT marker:
   ACFW-RESULT:
     transition: accepted | rejected
     commit_sha: n/a
@@ -341,15 +378,18 @@ Return the structured ACFWResult matching your marker.`
 }
 
 function directReviewPrompt(t) {
-  const rootPath = `${trunkRoot}/.backlog/in-review/${t.stem}.md`
+  const rootPath = taskLoc(t, 'in-review')
+  const reviewSink = filesStore
+    ? `Write your review comments into that ROOT file`
+    : `Record your review comments in the task store — pipe them to:  bash ${sq(STORE)} comment ${sq(t.stem)} --author quality-reviewer`
   return `${ENV}
 You are quality-reviewer reviewing one NON-CODE acf-whip task (Worktree: none — NO worktree, do NOT run clean-checkout, and do NOT apply the "missing clean-checkout token" auto-reject rule; non-code tasks have no worktree).
-
+${fetchSpecStep(t)}
 Read the task and its deliverable at ${sq(rootPath)} and review it against the task's Acceptance Criteria.
 
 If the Acceptance Criteria name a standalone deliverable file (one outside .backlog/), verify for EACH such file that it (a) exists and (b) is COMMITTED — run  git -C ${sq(trunkRoot)} log -1 --oneline -- <file>  and require non-empty output. An existing but uncommitted deliverable is a REJECT (the specialist did not report it to the writer, so the next checkout destroys it); say so in notes, naming the file.
 
-Write your review comments into that ROOT file, then end with the ACFW-RESULT marker:
+${reviewSink}, then end with the ACFW-RESULT marker:
   ACFW-RESULT:
     transition: accepted | rejected
     commit_sha: n/a
@@ -361,11 +401,14 @@ Return the structured ACFWResult matching your marker.`
 }
 
 function directPrompt(t) {
-  const rootPath = `${trunkRoot}/.backlog/in-progress/${t.stem}.md`
+  const rootPath = taskLoc(t, 'in-progress')
+  const workSink = filesStore
+    ? `write the deliverable/evidence into that ROOT task file`
+    : `record the deliverable/evidence in the task store (pipe the text to:  bash ${sq(STORE)} comment ${sq(t.stem)} --author ${sq(t.agent || 'specialist')} )`
   return `${ENV}
 You are the ${t.agent || 'assigned'} agent executing one NON-CODE acf-whip task (Worktree: none — research/docs-only, NO worktree, do NOT run clean-checkout).
-
-Read the task at ${sq(rootPath)}, do the work, and write the deliverable/evidence into that ROOT task file (and, when the task calls for a standalone document, into its own file under the repo — e.g. docs/research/<date>-<topic>.md).
+${fetchSpecStep(t)}
+Read the task at ${sq(rootPath)}, do the work, and ${workSink} (and, when the task calls for a standalone document, into its own file under the repo — e.g. docs/research/<date>-<topic>.md).
 
 Do NOT create a worktree, do NOT move the file between .backlog/ folders, do NOT commit anything — the orchestrator is the single writer and it commits FOR you.
 
@@ -386,12 +429,13 @@ Return the structured ACFWResult matching your marker (deliverableFiles as an ar
 }
 
 function integratePrompt(t, postResolver) {
-  const acceptedPath = `${trunkRoot}/.backlog/accepted/${t.stem}.md`
+  const acceptedPath = taskLoc(t, 'accepted')
   const cmd = postResolver
     ? `bash ${sq(INTEGRATE)} --post-resolver ${sq(acceptedPath)}`
     : `bash ${sq(INTEGRATE)} ${sq(acceptedPath)}`
+  const fetchSpec = filesStore ? '' : `First run  ${materializeCmd(t)}  (renders the task spec the integrator reads — Worktree slug and Assigned Agent). Then r`
   return `${ENV}
-Run the acf-whip LP-CAS integrator for one accepted task and report its result. Run EXACTLY:
+Run the acf-whip LP-CAS integrator for one accepted task and report its result. ${fetchSpec ? fetchSpec : 'R'}un EXACTLY:
   ${cmd}
 Capture the exit code and stdout (stdout carries an "ACFW-INTEGRATE: <verdict> ..." line). Map exit code -> outcome:
   0  -> integrated      (the change + its in-tree ledger marker are now on trunk, landed by compare-and-swap; or an idempotent already-integrated skip)
@@ -465,7 +509,7 @@ async function textScanFallback(label) {
   try {
     txt = await agent(
       `${ENV}
-Run EXACTLY:  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trunkRoot)}
+Run EXACTLY:  bash ${sq(STORE)} snapshot --digest --mode ${mode}
 Output its stdout — a single JSON object — as your ENTIRE final message. No prose, no markdown fences, nothing else.`,
       { label, phase: 'Iterate', model: SHELL_MODEL },
     )
@@ -491,24 +535,24 @@ function safeStagePaths(files, stem) {
   return out
 }
 
-// One sequential writer call. actions: [{ path, toState, agent, notes, inc, binc, stage }].
+// One sequential writer call. actions: [{ stem, toState, agent, notes, inc, binc, stage }].
 async function applyTransitions(actions, label) {
   if (!actions.length) return { applied: [], note: 'nothing to do' }
   const lines = actions.map((a) => {
     const stage = (a.stage || []).map((p) => `--stage ${sq(p)} `).join('')
-    return `  bash ${sq(APPLY)} ${stage}${sq(a.path)} ${sq(a.toState)} ${sq(a.agent || 'orchestrator')} ${sq(a.notes || '')} ${sq(String(a.inc || 0))} ${sq(String(a.binc || 0))}`
+    return `  bash ${sq(STORE)} transition ${stage}${sq(a.stem)} ${sq(a.toState)} ${sq(a.agent || 'orchestrator')} ${sq(a.notes || '')} ${sq(String(a.inc || 0))} ${sq(String(a.binc || 0))}`
   }).join('\n')
-  // Non-emit here is non-fatal: the moves are re-planned from the next scan (folder state is the truth)
-  // and apply-transition.sh is idempotent, so deferring a write one iteration is safe.
+  // Non-emit here is non-fatal: the moves are re-planned from the next scan (store state is the truth)
+  // and the transition primitive is idempotent, so deferring a write one iteration is safe.
   return safeAgent(
     `${ENV}
-You are the SINGLE backlog writer. Run these apply-transition.sh calls IN ORDER, one at a time (never in parallel). Each moves one task file between .backlog/ folders, appends a transition-log row, and commits on trunk. apply-transition.sh is idempotent (no-ops if the file is already in the target folder), so re-running is safe.
+You are the SINGLE backlog writer. Run these acfw-store transition calls IN ORDER, one at a time (never in parallel). Each moves one task between states in the task store, appends a transition-log row, and records it durably. The transition is idempotent (no-ops if the task is already in the target state), so re-running is safe.
 
 ${lines}
 
-Then run exactly once (best-effort — ignore any failure):  touch ${sq(RUN_LOCK)}
+Then run exactly once (best-effort — ignore any failure):  mkdir -p ${sq(RUN_LOCK_DIR)} && touch ${sq(RUN_LOCK)}
 
-Capture each apply-transition call's stdout (an "ok:", "noop:" or "warn:" line) into applied[]. If any call errors, record it in applied[] and continue with the rest. Return the WriteResult.`,
+Capture each transition call's stdout (an "ok:", "noop:" or "warn:" line) into applied[]. If any call errors, record it in applied[] and continue with the rest. Return the WriteResult.`,
     { label, phase: 'Iterate', schema: WRITE_BATCH, model: SHELL_MODEL },
     () => ({ applied: [], note: 'writer agent non-emit after retries — transitions deferred to next iteration' }),
   )
@@ -519,11 +563,11 @@ phase('Bootstrap')
 const boot = await safeAgent(
   `${ENV}
 Bootstrap the acf-whip orchestrator at trunk root ${sq(trunkRoot)}.
-1. Run-lock check: run  find ${sq(`${trunkRoot}/.backlog`)} -maxdepth 1 -name .acfw-run.json -mmin -${LOCK_FRESH_MIN}  — if it prints a path, set lockFresh true and stop (do not run the doctor). Otherwise set lockFresh false.
+1. Run-lock check: run  find ${sq(RUN_LOCK_DIR)} -maxdepth 1 -name ${RUN_LOCK_BASE} -mmin -${LOCK_FRESH_MIN}  — if it prints a path, set lockFresh true and stop (do not run the doctor). Otherwise set lockFresh false (a "No such file or directory" error also means false).
 2. Detached HEAD check: run  git -C ${sq(trunkRoot)} symbolic-ref --quiet HEAD  — if it FAILS, set detached true and stop (do not run the doctor).
 3. If a branch is checked out: apply repairable integrity issues, then re-scan:
-     bash ${sq(DOCTOR)} --fix ${sq(trunkRoot)} >/dev/null 2>&1 || true
-     bash ${sq(DOCTOR)} --quiet ${sq(trunkRoot)}
+     bash ${sq(STORE)} doctor --fix >/dev/null 2>&1 || true
+     bash ${sq(STORE)} doctor --quiet
    From the second run capture: doctorOk (SUMMARY ok=true), doctorSummary (the verbatim SUMMARY line), fatals (verbatim FATAL| lines).
 Return the BootstrapResult.`,
   { label: 'bootstrap', phase: 'Bootstrap', schema: BOOTSTRAP, model: SHELL_MODEL },
@@ -566,9 +610,9 @@ while (iter < MAX_ITER) {
   // ---- scan (read-only) + doctor-lite + heartbeat ----
   const scanPrompt = `${ENV}
 Iteration ${iter} of the acf-whip orchestrator. Do three things and return the result:
-1. Read-only snapshot:  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trunkRoot)}  — its stdout is a single JSON object. Put that stdout VERBATIM (copy it exactly, add nothing) into snapshotJson.
-2. Integrity recheck (report-only):  bash ${sq(DOCTOR)} --quiet --active-only ${sq(trunkRoot)}  — set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (verbatim FATAL| lines).
-3. Heartbeat (best-effort, NOT committed): write a small JSON file at ${sq(`${trunkRoot}/.backlog/.acfw-run.json`)} containing {"iteration":${iter},"mode":"${mode}","ts":"<output of: date -u +%Y-%m-%dT%H:%M:%SZ>"}. If the write fails, ignore it.
+1. Read-only snapshot:  bash ${sq(STORE)} snapshot --digest --mode ${mode}  — its stdout is a single JSON object. Put that stdout VERBATIM (copy it exactly, add nothing) into snapshotJson.
+2. Integrity recheck (report-only):  bash ${sq(STORE)} doctor --quiet --active-only  — set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (verbatim FATAL| lines).
+3. Heartbeat (best-effort, NOT committed): write a small JSON file at ${sq(RUN_LOCK)} (create its parent directory first if missing) containing {"iteration":${iter},"mode":"${mode}","ts":"<output of: date -u +%Y-%m-%dT%H:%M:%SZ>"}. If the write fails, ignore it.
 Return the ScanResult.`
   let scan = await safeAgent(scanPrompt, { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT, model: SHELL_MODEL }, () => null)
 
@@ -637,7 +681,7 @@ Return the ScanResult.`
   // instead of 'complete'. Abort loudly instead.
   if (snap.counts.runtimeTerminalDefault == null || snap.counts.runtimeTerminalOverride == null) {
     stopReason = 'snapshot-version-skew'
-    return { aborted: true, reason: 'backlog snapshot is missing runtimeTerminal counts — scan-backlog.sh / workflow version skew; reinstall acf-whip so both are 2.0.2+', mode, iteration: iter }
+    return { aborted: true, reason: 'backlog snapshot is missing runtimeTerminal counts — snapshot engine / workflow version skew (or a store adapter emitting a pre-contract snapshot); reinstall acf-whip so both halves match', mode, iteration: iter }
   }
   const total = snap.counts.total
   const terminal = mode === 'override' ? snap.counts.runtimeTerminalOverride : snap.counts.runtimeTerminalDefault
@@ -693,8 +737,8 @@ Return the ScanResult.`
   const rejected = tasks.filter((t) => t.folder === 'rejected')
   const rejectActions = rejected.map((t) =>
     (t.rejectionCount < MAX_REJECT_RETRY)
-      ? { path: `${trunkRoot}/.backlog/rejected/${t.stem}.md`, toState: 'pending', agent: 'orchestrator', notes: `retry (rejection ${t.rejectionCount}/${MAX_REJECT_RETRY})`, inc: 0 }
-      : { path: `${trunkRoot}/.backlog/rejected/${t.stem}.md`, toState: 'blocked', agent: 'orchestrator', notes: `max rejections (${t.rejectionCount}) — blocked for redesign`, inc: 0 },
+      ? { stem: t.stem, toState: 'pending', agent: 'orchestrator', notes: `retry (rejection ${t.rejectionCount}/${MAX_REJECT_RETRY})`, inc: 0 }
+      : { stem: t.stem, toState: 'blocked', agent: 'orchestrator', notes: `max rejections (${t.rejectionCount}) — blocked for redesign`, inc: 0 },
   )
 
   if (warnings.length) for (const w of warnings) log(`WARN ${w}`)
@@ -704,9 +748,9 @@ Return the ScanResult.`
   const preActions = [
     ...unblockActions,
     ...timeoutActions,
-    ...reviewQ.filter((x) => x.premove).map((x) => ({ path: `${trunkRoot}/.backlog/completed/${x.t.stem}.md`, toState: 'in-review', agent: 'orchestrator', notes: 'review-dispatch', inc: 0 })),
-    ...specialistQ.filter((x) => x.premove).map((x) => ({ path: `${trunkRoot}/.backlog/pending/${x.t.stem}.md`, toState: 'in-progress', agent: 'orchestrator', notes: 'dispatch', inc: 0 })),
-    ...directQ.filter((x) => x.premove).map((x) => ({ path: `${trunkRoot}/.backlog/pending/${x.t.stem}.md`, toState: 'in-progress', agent: 'orchestrator', notes: 'dispatch', inc: 0 })),
+    ...reviewQ.filter((x) => x.premove).map((x) => ({ stem: x.t.stem, toState: 'in-review', agent: 'orchestrator', notes: 'review-dispatch', inc: 0 })),
+    ...specialistQ.filter((x) => x.premove).map((x) => ({ stem: x.t.stem, toState: 'in-progress', agent: 'orchestrator', notes: 'dispatch', inc: 0 })),
+    ...directQ.filter((x) => x.premove).map((x) => ({ stem: x.t.stem, toState: 'in-progress', agent: 'orchestrator', notes: 'dispatch', inc: 0 })),
     ...rejectActions,
   ]
   if (preActions.length) await applyTransitions(preActions, `premove#${iter}`)
@@ -754,7 +798,7 @@ Return the ScanResult.`
       // re-enters the rejection self-heal (retry as pending, or blocked at the cap) instead of being
       // re-attempted as an integration candidate every iteration. Keeps the run convergent.
       rejectedStems.push(t.stem)
-      await streamWrite([{ path: `${trunkRoot}/.backlog/accepted/${t.stem}.md`, toState: 'rejected', agent: 'orchestrator', notes: (r.note || 'union gate failed at integration').slice(0, 200), inc: 1 }], `integ-reject#${iter}:${t.stem}`)
+      await streamWrite([{ stem: t.stem, toState: 'rejected', agent: 'orchestrator', notes: (r.note || 'union gate failed at integration').slice(0, 200), inc: 1 }], `integ-reject#${iter}:${t.stem}`)
       log(`✗ integrate rejected ${t.stem} — ${r.note}`)
     }
     else if (r && r.outcome === 'skipped') { log(`↷ skipped ${t.stem} — no worktree branch (historical; terminal)`) }
@@ -779,7 +823,7 @@ Return the ScanResult.`
     const rr = await agent(rprompt, { label: `review:${isNone ? t.stem : t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' })
     const toState = resultToState('in-review', rr && rr.transition)
     if (!toState) return // none/mismatched -> transient, leave in in-review/
-    await streamWrite([{ path: `${trunkRoot}/.backlog/in-review/${t.stem}.md`, toState, agent: t.agent || 'orchestrator', notes: (rr.notes || '').slice(0, 200), inc: (toState === 'rejected' && rr.rejectionIncrement === 1) ? 1 : 0 }], `review#${iter}:${t.stem}`)
+    await streamWrite([{ stem: t.stem, toState, agent: t.agent || 'orchestrator', notes: (rr.notes || '').slice(0, 200), inc: (toState === 'rejected' && rr.rejectionIncrement === 1) ? 1 : 0 }], `review#${iter}:${t.stem}`)
     productiveDispatch = true
     if (toState === 'accepted' && mode === 'default' && codeSlug(t)) await serializeIntegrate(() => integrateOne(t))
   }
@@ -805,7 +849,7 @@ Return the ScanResult.`
         log(`⚑ ${d.t.stem}: blocked on unmodeled work — create a task: ${need || '(unspecified — see task notes)'} — parked, not re-dispatching this run`)
       }
       // binc:1 — a specialist re-block of a dispatched task is the unmodeled-blocker signal (retro I2).
-      await streamWrite([{ path: `${trunkRoot}/.backlog/in-progress/${d.t.stem}.md`, toState: 'blocked', agent: d.t.agent || 'orchestrator', notes: (r.notes || '').slice(0, 200), inc: 0, binc: 1 }], `block#${iter}:${d.t.stem}`)
+      await streamWrite([{ stem: d.t.stem, toState: 'blocked', agent: d.t.agent || 'orchestrator', notes: (r.notes || '').slice(0, 200), inc: 0, binc: 1 }], `block#${iter}:${d.t.stem}`)
       productiveDispatch = true
       return
     }
@@ -816,8 +860,8 @@ Return the ScanResult.`
     const stage = d.kind === 'direct' ? safeStagePaths(r.deliverableFiles, d.t.stem) : []
     if (stage.length) log(`${d.t.stem}: committing ${stage.length} deliverable file(s) — ${stage.join(', ')}`)
     await streamWrite([
-      { path: `${trunkRoot}/.backlog/in-progress/${d.t.stem}.md`, toState: 'completed', agent: d.t.agent || 'orchestrator', notes: (r.notes || '').slice(0, 200), inc: 0, stage },
-      { path: `${trunkRoot}/.backlog/completed/${d.t.stem}.md`, toState: 'in-review', agent: 'orchestrator', notes: 'review-dispatch', inc: 0 },
+      { stem: d.t.stem, toState: 'completed', agent: d.t.agent || 'orchestrator', notes: (r.notes || '').slice(0, 200), inc: 0, stage },
+      { stem: d.t.stem, toState: 'in-review', agent: 'orchestrator', notes: 'review-dispatch', inc: 0 },
     ], `done#${iter}:${d.t.stem}`)
     productiveDispatch = true
     await runReviewAndIntegrate(d.t)
@@ -876,7 +920,7 @@ let finalSnap = lastSnapshot
 if (mode === 'default' && lastSnapshot) {
   const rescan = await safeAgent(
     `${ENV}
-Final integration drain. Run  bash ${sq(SCAN)} --digest --mode ${mode} ${sq(trunkRoot)}  and return its stdout VERBATIM in snapshotJson (set doctorOk true, doctorSummary "drain", doctorFatals []).`,
+Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}  and return its stdout VERBATIM in snapshotJson (set doctorOk true, doctorSummary "drain", doctorFatals []).`,
     { label: 'drain:scan', phase: 'Drain', schema: SCAN_RESULT, model: SHELL_MODEL },
     () => null,
   )

@@ -47,6 +47,23 @@ When dynamic workflows are available (Claude Code ≥ 2.1.154), `/task` and `/go
 - **Integrity-gated**: the doctor runs as a hard gate at startup and a recheck every iteration.
 - **Automatic fallback**: if dynamic workflows are off, both commands fall back to the legacy single-context loop (same behavior, byte-compatible).
 
+### 🔌 Pluggable task stores (3.1.0)
+
+Task state lives behind an **executable adapter contract** (`adapters/CONTRACT.md`, contract v1).
+The `acfw-store` dispatcher resolves the configured backend and routes every read/write —
+`snapshot`, `transition`, `read`, `create`, `doctor` — to its adapter:
+
+| Backend | State lives in | Select with |
+|---|---|---|
+| `files` (default) | `.backlog/<state>/*.md` committed on trunk | nothing — zero-config default |
+| `beads` | [beads](https://github.com/gastownhall/beads) (`bd`, sqlite) | `ACFW_STORE=beads` in `.acfwhip/config` |
+| `multica` | [multica](https://github.com/multica-ai/multica) server | `ACFW_STORE=multica` + `MULTICA_*` env |
+| `linear` | [Linear](https://linear.app) issues (attachment metadata) | `ACFW_STORE=linear` + `LINEAR_API_KEY`/`ACFW_LINEAR_TEAM` env |
+
+- **Zero migration**: existing `.backlog/` projects run unchanged; `files` behavior is byte-identical to 3.0.x.
+- **Third-party backends without forking**: drop one executable at `.acfwhip/adapters/acfw-store-<name>`, set `ACFW_STORE=<name>`, pass the conformance test (`ADAPTER=<path> bash tests/phase9-store-conformance.test.sh`). Contract, discovery order, JSON shapes and exit codes: `adapters/CONTRACT.md`; architecture, dispatcher mechanics, and an authoring walkthrough: `adapters/README.md`.
+- **What never moves into a backend**: the LP-CAS integration ledger (`.acfwhip/integrated/` in the git tree) — integration truth stays git-native on every store.
+
 ### 🔄 Continuous Backlog Execution
 
 `/go` loops until 100% complete:

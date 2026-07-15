@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # clean-checkout.sh — concurrency primitive for ACF specialist agents.
 #
-# Usage: clean-checkout.sh <TASK_FILE>
-#   TASK_FILE: absolute path to the task markdown (in .backlog/pending/ or in-progress/).
+# Usage: clean-checkout.sh [--slug SLUG] <TASK_FILE>
+#   TASK_FILE: absolute path to the task markdown — the live .backlog/ document (files store)
+#              or a spec materialized by `acfw-store read --materialize` (any other store).
+#   --slug     explicit Worktree slug (optional); default is the TASK_FILE's Worktree: field.
 #
 # Resolves the task's Worktree slug, lazy-creates an isolated git worktree on
 # worktree/<slug> forked from the LIVE trunk tip, validates the branch, records the
@@ -38,13 +40,21 @@ ACFW_AGENT_FIELD="clean-checkout-before-task"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/../../lib/acfw-git.sh"
 
-# ---- Step 1: Resolve slug from task front-matter ----
+# ---- Step 1: Resolve slug (explicit --slug wins; else the task's Worktree: field) ----
+SLUG_OVERRIDE=""
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --slug) SLUG_OVERRIDE="${2:-}"; shift 2 ;;
+    *) break ;;
+  esac
+done
 TASK_FILE="${1:-}"
 if [ -z "$TASK_FILE" ]; then
   echo "FATAL: clean-checkout.sh requires a TASK_FILE argument." >&2
   exit 1
 fi
-SLUG=$(grep -E '^- \*\*Worktree\*\*:' "$TASK_FILE" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+SLUG="$SLUG_OVERRIDE"
+[ -n "$SLUG" ] || SLUG=$(grep -E '^- \*\*Worktree\*\*:' "$TASK_FILE" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
 
 if [ -z "$SLUG" ]; then
   echo "FATAL: task $TASK_FILE has no Worktree: field. Run '/whip-doctor --fix' to derive and backfill the slug (or have task-engineer set it)." >&2
@@ -125,6 +135,16 @@ fi
 TS=$(date -u +"%Y-%m-%d %H:%M:%S")
 LINE="| $TS | clean-checkout | ok | $ACFW_AGENT_FIELD | $SLUG | $BRANCH |"
 append_log_row "$TASK_FILE" "$LINE"
+# Non-files store (3.1.0): a TASK_FILE outside .backlog/ is a MATERIALIZED spec, not the live task
+# document — the append above only helps agents re-reading this spec. The durable token (what the
+# reviewer's auto-reject reads after a store refresh) must land in the task store itself.
+case "$TASK_FILE" in
+  */.backlog/*) : ;;
+  *)
+    bash "$SCRIPT_DIR/../../lib/bin/acfw-store" log-event "$TASK_ID" --row "$LINE" >/dev/null 2>&1 \
+      || echo "WARN: could not record the clean-checkout token in the task store for $TASK_ID (the reviewer may auto-reject)" >&2
+    ;;
+esac
 
 # ---- Step 8: Print the worktree path for the caller ----
 echo "$WORKTREE_PATH"

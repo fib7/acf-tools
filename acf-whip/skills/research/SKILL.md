@@ -21,6 +21,12 @@ allowed-tools:
 
 Research command. Delegates to research-agent for structured research using MCP tools (Perplexity, Context7, Figma).
 
+> **Task store**: check `bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info` first. On the
+> default `files` store the instructions below write the follow-up task into `.backlog/pending/`
+> directly. On any other store, author the task file to a temp path and ingest it with
+> `acfw-store create --file <path> --folder pending`; check store presence via `acfw-store info`
+> instead of testing for a `.backlog/` directory.
+
 ## Purpose
 
 Single-phase research workflow:

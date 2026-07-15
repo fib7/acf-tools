@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+# acfw-store-beads — the `beads` task-store adapter (acf-whip store contract v1).
+#
+# Task state lives in a beads (`bd`) SQLite database under <repo>/.beads/, NOT in
+# git-tracked markdown. whip's scheduler owns scheduling, so this adapter bypasses
+# bd's native ready/claim machinery and drives beads purely through custom statuses:
+# a whip-canonical state maps 1:1 onto a bd status (built-in or custom). The bd
+# issue id is a deterministic bijection of the whip key — `<prefix>-<key>` — so key
+# <-> id needs zero lookups. whip-specific facts bd has no native column for
+# (worktree, pr group, touches globs, dependency list, counters, last transition)
+# ride in issue metadata under `whip_*` keys; the task's whole markdown document is
+# the issue description.
+#
+# commitsToGit is FALSE: state writes land in the SQLite db, not in trunk commits.
+# The LP-CAS ledger (.acfwhip/integrated/) stays git-native and is NOT this
+# adapter's business; the dispatcher enriches snapshots with the git-derived facts.
+#
+# Invoked by skills/lib/bin/acfw-store (the dispatcher), which exports:
+#   ACFW_TRUNK_ROOT, ACFW_TRUNK_BRANCH, ACFW_STORE_CONFIG, ACFW_CONTRACT_VERSION,
+#   ACFW_PLUGIN_LIB. Direct invocation works too (env falls back to git rev-parse).
+# Backend env: ACFW_BEADS_PREFIX (issue-id prefix; default "whip").
+#
+# Contract exit codes: 0 ok/noop · 2 usage · 3 not-found/ambiguous · 4 conflict
+# (duplicate key) · 5 backend unavailable · 7 invalid state/value · 8 policy refusal
+# · 99 transient (database locked past retries).
+#
+# Dependencies: bash 3.2 (no `declare -A`), `bd` on PATH, `jq`. macOS ships bash 3.2.
+
+set -u
+
+REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+[ -n "$REPO_ROOT" ] || { echo "FATAL: not inside a git repo and ACFW_TRUNK_ROOT unset" >&2; exit 2; }
+
+# bd discovers .beads/ from cwd and its `-C` flag refuses a dir with no project yet
+# (so it can't be used for `init`). Instead we run every bd from the repo root, and
+# resolve caller-supplied paths (--file/--materialize) against the original cwd.
+ORIG_PWD="$PWD"
+cd "$REPO_ROOT" || { echo "FATAL: cannot cd to repo root: $REPO_ROOT" >&2; exit 2; }
+abspath() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$ORIG_PWD" "$1" ;; esac; }
+
+PREFIX="${ACFW_BEADS_PREFIX:-whip}"
+# The exact status.custom string doctor asserts and init writes. Order matters only
+# for the doctor string comparison, so both sides sort before comparing.
+STATUS_CUSTOM="draft:frozen,completed:wip,in_review:wip,accepted:done,rejected:active"
+CLEAN_CHECKOUT_TOKEN="| clean-checkout | ok |"
+
+SUB="${1:-}"
+[ -n "$SUB" ] && shift
+
+# ---- backend availability --------------------------------------------------
+
+BD="$(command -v bd 2>/dev/null || true)"
+if [ -z "$BD" ]; then
+  echo "FATAL: 'bd' (beads) not found on PATH — the beads backend is unavailable." >&2
+  echo "       Install beads or switch ACFW_STORE back to files." >&2
+  exit 5
+fi
+command -v jq >/dev/null 2>&1 || { echo "FATAL: 'jq' not found on PATH — required by the beads adapter." >&2; exit 5; }
+
+BD_ERRF="$(mktemp "${TMPDIR:-/tmp}/acfw-bd-err.XXXXXX")" || exit 2
+BD_OUT=""; BD_ERR=""
+cleanup() { rm -f "$BD_ERRF"; }
+trap cleanup EXIT
+
+# bd_run <args...> — run `bd -C <repo>` capturing stdout in $BD_OUT and stderr in
+# $BD_ERR. Retries transient "database is locked" writes 3x/1s, then exits 99.
+# Returns bd's exit code otherwise (caller maps it to the contract).
+bd_run() {
+  local tries=0 rc
+  while :; do
+    BD_OUT="$("$BD" "$@" 2>"$BD_ERRF")"; rc=$?
+    if [ "$rc" -ne 0 ] && grep -qi 'database is locked' "$BD_ERRF"; then
+      tries=$((tries + 1))
+      if [ "$tries" -ge 3 ]; then
+        cat "$BD_ERRF" >&2
+        echo "FATAL: bd database is locked after 3 retries" >&2
+        exit 99
+      fi
+      sleep 1
+      continue
+    fi
+    BD_ERR="$(cat "$BD_ERRF")"
+    return $rc
+  done
+}
+
+# ---- state / priority maps -------------------------------------------------
+
+whip_to_bd() {
+  case "$1" in
+    pending) echo open ;;      in-progress) echo in_progress ;; blocked) echo blocked ;;
+    completed) echo completed ;; in-review) echo in_review ;;   accepted) echo accepted ;;
+    rejected) echo rejected ;; draft) echo draft ;;             archive) echo closed ;;
+    *) return 1 ;;
+  esac
+}
+bd_to_whip() {
+  case "$1" in
+    open) echo pending ;;      in_progress) echo in-progress ;; blocked) echo blocked ;;
+    completed) echo completed ;; in_review) echo in-review ;;   accepted) echo accepted ;;
+    rejected) echo rejected ;; draft) echo draft ;;             closed) echo archive ;;
+    *) echo unknown ;;
+  esac
+}
+prio_to_bd() { # whip priority name (or Pn/int) -> bd int; unknown -> 2
+  case "$1" in
+    blocker|Blocker|P0|0) echo 0 ;; critical|Critical|P1|1) echo 1 ;;
+    high|High|P2|2) echo 2 ;;       medium|Medium|P3|3) echo 3 ;;
+    low|Low|P4|4) echo 4 ;;         *) echo 2 ;;
+  esac
+}
+
+valid_state() { case " draft pending in-progress completed in-review accepted rejected blocked archive " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+bd_id() { printf '%s-%s' "$PREFIX" "$1"; }
+
+now_ts() { date -u +"%Y-%m-%d %H:%M:%S"; }
+
+# ---- markdown helpers (mirror the files adapter) ---------------------------
+
+field() { grep -E "^- \*\*$2\*\*:" "$1" 2>/dev/null | head -1 | sed -E "s/.*$2\*\*:[[:space:]]*//" | sed -E 's/[[:space:]]+$//'; }
+
+# set_field <file> <Field> <Value> — replace the "- **Field**:" bullet in place;
+# if absent, insert after "- **Status**:" (the whip-move.sh / files-adapter pattern).
+set_field() {
+  local f="$1" name="$2" val="$3"
+  if grep -qE "^- \*\*$name\*\*:" "$f"; then
+    ACFW_SF_VAL="$val" ACFW_SF_NAME="$name" awk '
+      BEGIN { name=ENVIRON["ACFW_SF_NAME"]; val=ENVIRON["ACFW_SF_VAL"]; done=0 }
+      { if (!done && $0 ~ ("^- \\*\\*" name "\\*\\*:")) { printf "- **%s**: %s\n", name, val; done=1; next } print }
+    ' "$f" > "$f.acfwtmp" && mv "$f.acfwtmp" "$f"
+  else
+    ACFW_SF_VAL="$val" ACFW_SF_NAME="$name" awk '
+      BEGIN { name=ENVIRON["ACFW_SF_NAME"]; val=ENVIRON["ACFW_SF_VAL"]; done=0 }
+      { print; if (!done && $0 ~ /^- \*\*Status\*\*:/) { printf "- **%s**: %s\n", name, val; done=1 } }
+    ' "$f" > "$f.acfwtmp" && mv "$f.acfwtmp" "$f"
+  fi
+}
+
+# Shared jq helpers for snapshot/read: status/priority reverse maps, tolerant
+# numeric coercion (--set-metadata stores values as JSON strings, GH#4146), and a
+# comma-list splitter that drops empties and the literal "none".
+JQ_DEFS='
+def bd2whip: {"open":"pending","in_progress":"in-progress","blocked":"blocked","completed":"completed","in_review":"in-review","accepted":"accepted","rejected":"rejected","draft":"draft","closed":"archive"}[.] // "unknown";
+def prio2whip: {"0":"blocker","1":"critical","2":"high","3":"medium","4":"low"}[(.|tostring)] // "medium";
+def tonum(x): (x // 0) | if type=="string" then (try tonumber catch 0) else . end;
+def csv: (. // "") | tostring | split(",") | map(gsub("^ +| +$";"")) | map(select(. != "" and (ascii_downcase != "none")));
+'
+
+# show_task <id> — populate $BD_OUT with `bd show <id> --json`; exit 3 if absent.
+show_task() {
+  bd_run show "$1" --json || { echo "FATAL: no task matching '$1'" >&2; exit 3; }
+}
+
+# meta_num <show-json> <key> — extract a whip counter as an integer (0 default).
+meta_num() { printf '%s' "$1" | jq -r --arg k "$2" '.[0].metadata[$k] // 0 | if type=="string" then (try tonumber catch 0) else . end'; }
+meta_str() { printf '%s' "$1" | jq -r --arg k "$2" '.[0].metadata[$k] // ""'; }
+
+# ---- subcommands -----------------------------------------------------------
+
+cmd_capabilities() {
+  printf '{"backend":"beads","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition","update-field","update-body","log-event","comment","doctor","doctor-fix","init","sync"]}\n'
+}
+
+cmd_init() {
+  # Idempotent: only `bd init` when .beads/ is absent (re-init aborts non-zero).
+  if [ ! -d "$REPO_ROOT/.beads" ]; then
+    bd_run init --backend=sqlite --prefix "$PREFIX" -q || {
+      cat "$BD_ERRF" >&2; echo "FATAL: bd init failed" >&2; exit 5;
+    }
+  fi
+  # Silence the recurring "beads.role not configured" advisory on every write.
+  git -C "$REPO_ROOT" config beads.role maintainer >/dev/null 2>&1 || true
+  # Re-affirm the custom status vocabulary (idempotent; doctor asserts it exactly).
+  bd_run config set status.custom "$STATUS_CUSTOM" || {
+    cat "$BD_ERRF" >&2; echo "FATAL: bd config set status.custom failed" >&2; exit 5;
+  }
+  printf '{"backend":"beads","initialized":true,"prefix":"%s"}\n' "$PREFIX"
+}
+
+cmd_snapshot() {
+  # One export → one jq pass. --digest/--counts-only/--mode are hints; a full raw
+  # snapshot is always acceptable, so they are accepted and ignored.
+  bd_run export || { cat "$BD_ERRF" >&2; echo "FATAL: bd export failed" >&2; exit 5; }
+  printf '%s' "$BD_OUT" | jq -s "$JQ_DEFS"'
+    [ .[]
+      | select(._type=="issue")
+      | select(.metadata.whip_key != null)
+      | .metadata as $m
+      | {
+          stem: $m.whip_key,
+          id: .id,
+          folder: (.status | bd2whip),
+          status: (.status | bd2whip),
+          slug: ($m.whip_worktree // ""),
+          agent: (.assignee // ""),
+          priority: (.priority | prio2whip),
+          deps: ($m.whip_deps | csv),
+          touchesGlobs: ($m.whip_touches | csv),
+          rejectionCount: tonum($m.whip_rejections),
+          blockCount: tonum($m.whip_blocks),
+          lastTransitionTs: ($m.whip_last_transition_ts // ""),
+          hasCleanCheckoutToken: ((.comments // []) | map(.text // "") | any(contains($tok)))
+        }
+    ] as $tasks
+    | { raw: true,
+        generatedAt: $now,
+        counts: ($tasks | group_by(.folder) | map({(.[0].folder): length}) | add // {}),
+        tasks: $tasks }
+  ' --arg now "$(now_ts)" --arg tok "$CLEAN_CHECKOUT_TOKEN"
+}
+
+cmd_read() {
+  local body=0 mat="" key id
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --body) body=1; shift ;;
+      --materialize) mat="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown read flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  key="${1:-}"; [ -n "$key" ] || { echo "FATAL: usage: read [--body] [--materialize DIR] <key>" >&2; exit 2; }
+  id="$(bd_id "$key")"
+  show_task "$id"
+  local sj="$BD_OUT"
+
+  if [ -n "$mat" ]; then
+    # Render a files-style task document: the stored description IS the whole
+    # markdown doc; refresh its metadata bullets from live bd fields so specialists
+    # read a spec consistent with current state.
+    mat="$(abspath "$mat")"
+    mkdir -p "$mat" || { echo "FATAL: cannot create materialize dir: $mat" >&2; exit 2; }
+    local dest="$mat/$key.md"
+    printf '%s' "$(printf '%s' "$sj" | jq -r '.[0].description // ""')" > "$dest"
+    set_field "$dest" "Status"          "$(bd_to_whip "$(printf '%s' "$sj" | jq -r '.[0].status // ""')")"
+    set_field "$dest" "Priority"        "$(printf '%s' "$sj" | jq -r "$JQ_DEFS"'.[0].priority | prio2whip')"
+    set_field "$dest" "Assigned Agent"  "$(printf '%s' "$sj" | jq -r '.[0].assignee // ""')"
+    set_field "$dest" "Worktree"        "$(meta_str "$sj" whip_worktree)"
+    set_field "$dest" "PR Group"        "$(meta_str "$sj" whip_pr_group)"
+    set_field "$dest" "Touches Globs"   "$(meta_str "$sj" whip_touches)"
+    set_field "$dest" "Dependencies"    "$(meta_str "$sj" whip_deps)"
+    set_field "$dest" "Rejection Count" "$(meta_num "$sj" whip_rejections)"
+    set_field "$dest" "Block-Count"     "$(meta_num "$sj" whip_blocks)"
+    # Append the stored audit trail verbatim (oldest-first). Load-bearing: the
+    # quality-reviewer greps the refreshed doc for the `| clean-checkout | ok |`
+    # token that log-event recorded as a comment, and the whip-transition rows
+    # become visible history. `bd show` omits comments, so fetch them explicitly.
+    if bd_run comments "$id" --json; then
+      local trail
+      trail="$(printf '%s' "$BD_OUT" | jq -r '.[]?.text // empty')"
+      [ -n "$trail" ] && { printf '\n## Store Audit Trail\n\n'; printf '%s\n' "$trail"; } >> "$dest"
+    fi
+    printf '%s\n' "$dest"
+    return 0
+  fi
+
+  printf '%s' "$sj" | jq -c "$JQ_DEFS"'
+    .[0] | .metadata as $m | {
+      stem: ($m.whip_key // $key),
+      folder: (.status | bd2whip),
+      fields: {
+        id: .id,
+        status: (.status | bd2whip),
+        priority: (.priority | prio2whip),
+        agent: (.assignee // ""),
+        worktree: ($m.whip_worktree // ""),
+        pr_group: ($m.whip_pr_group // ""),
+        touches_globs: ($m.whip_touches // ""),
+        dependencies: ($m.whip_deps // ""),
+        rejection_count: tonum($m.whip_rejections),
+        block_count: tonum($m.whip_blocks)
+      }
+    } + (if $body=="1" then {body: (.description // "")} else {} end)
+  ' --arg key "$key" --arg body "$body"
+}
+
+cmd_create() {
+  local folder="pending" src="" stem="" tmp dest
+  local -a SETS
+  SETS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --folder) folder="${2:-}"; shift 2 ;;
+      --file) src="${2:-}"; shift 2 ;;
+      --stem) stem="${2:-}"; shift 2 ;;
+      --set) [ $# -ge 2 ] || { echo "FATAL: --set requires Field=Value" >&2; exit 2; }
+             SETS[${#SETS[@]}]="$2"; shift 2 ;;
+      --*) echo "FATAL: unknown create flag: $1" >&2; exit 2 ;;
+      *) echo "FATAL: unexpected argument: $1" >&2; exit 2 ;;
+    esac
+  done
+  valid_state "$folder" || { echo "FATAL: invalid folder '$folder'" >&2; exit 7; }
+  [ -n "$src" ] && src="$(abspath "$src")"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/acfw-bd-create.XXXXXX")" || exit 2
+  if [ -n "$src" ]; then
+    [ -f "$src" ] || { rm -f "$tmp"; echo "FATAL: --file not found: $src" >&2; exit 2; }
+    cat "$src" > "$tmp"
+    [ -n "$stem" ] || stem="$(basename "$src" .md)"
+  else
+    [ -n "$stem" ] || { rm -f "$tmp"; echo "FATAL: create from stdin requires --stem" >&2; exit 2; }
+    cat > "$tmp"
+  fi
+
+  # Parse the task document's metadata bullets (same field() as the files adapter).
+  local p_title p_prio p_agent p_worktree p_prgroup p_touches p_deps p_rej p_blk
+  p_title="$(grep -E '^# Task:' "$tmp" | head -1 | sed -E 's/^# Task:[[:space:]]*//')"
+  [ -n "$p_title" ] || p_title="$stem"
+  p_prio="$(field "$tmp" Priority)"
+  p_agent="$(field "$tmp" "Assigned Agent")"
+  p_worktree="$(field "$tmp" Worktree)"
+  p_prgroup="$(field "$tmp" "PR Group")"
+  p_touches="$(field "$tmp" "Touches Globs")"
+  p_deps="$(field "$tmp" Dependencies | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//')"
+  p_rej="$(field "$tmp" "Rejection Count" | tr -dc '0-9')"
+  p_blk="$(field "$tmp" Block-Count | tr -dc '0-9')"
+
+  # --set overrides win over parsed fields (contract: applied AFTER parse).
+  local kv name val
+  for kv in "${SETS[@]:-}"; do
+    [ -n "$kv" ] || continue
+    name="${kv%%=*}"; val="${kv#*=}"
+    case "$name" in
+      Priority) p_prio="$val" ;;
+      "Assigned Agent") p_agent="$val" ;;
+      Worktree) p_worktree="$val" ;;
+      "PR Group") p_prgroup="$val" ;;
+      "Touches Globs") p_touches="$val" ;;
+      Dependencies) p_deps="$(printf '%s' "$val" | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//')" ;;
+      "Rejection Count") p_rej="$(printf '%s' "$val" | tr -dc '0-9')" ;;
+      Block-Count) p_blk="$(printf '%s' "$val" | tr -dc '0-9')" ;;
+      Title) p_title="$val" ;;
+      Status|ID) : ;;  # state/id are adapter-owned; --set cannot move them
+      *) : ;;          # unknown fields have no native mapping — ignore (warn-free)
+    esac
+  done
+  [ -n "$p_rej" ] || p_rej=0
+  [ -n "$p_blk" ] || p_blk=0
+
+  local id; id="$(bd_id "$stem")"
+  # Duplicate key -> typed conflict. bd's `create --id` SILENTLY UPSERTS an existing
+  # id (verified against v1.1.0), so we must gate on an existence probe ourselves;
+  # never call create when show succeeds.
+  if bd_run show "$id" --json; then
+    echo "FATAL: task '$stem' already exists (id $id)" >&2; rm -f "$tmp"; exit 4
+  fi
+
+  local meta
+  meta="$(jq -n \
+    --arg k "$stem" --arg wt "$p_worktree" --arg pg "$p_prgroup" --arg tg "$p_touches" \
+    --arg dp "$p_deps" --arg rj "$p_rej" --arg bk "$p_blk" --arg lt "$(now_ts)" \
+    '{whip_key:$k, whip_worktree:$wt, whip_pr_group:$pg, whip_touches:$tg, whip_deps:$dp, whip_rejections:$rj, whip_blocks:$bk, whip_last_transition_ts:$lt}')"
+
+  local -a args
+  args=(create --id "$id" "$p_title" --body-file "$tmp" -p "$(prio_to_bd "$p_prio")" \
+        --status "$(whip_to_bd "$folder")" --metadata "$meta" --json)
+  [ -n "$p_agent" ] && args+=(--assignee "$p_agent")
+  bd_run "${args[@]}" || { cat "$BD_ERRF" >&2; echo "FATAL: bd create failed for $stem" >&2; rm -f "$tmp"; exit 5; }
+  rm -f "$tmp"
+
+  # Native dependency edges (best-effort secondary index; whip_deps metadata is the
+  # scheduler's source of truth). A cycle is a hard error (exit 7); a missing target
+  # (edge to a not-yet-created task, or the conformance's phantom dep) is tolerated.
+  local dep
+  IFS=',' read -r -a _deps <<EOF
+$p_deps
+EOF
+  for dep in "${_deps[@]:-}"; do
+    dep="$(printf '%s' "$dep" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [ -n "$dep" ] || continue
+    case "$(printf '%s' "$dep" | tr 'A-Z' 'a-z')" in none) continue ;; esac
+    if ! bd_run dep add "$id" "$(bd_id "$dep")"; then
+      if printf '%s' "$BD_ERR" | grep -qi cycle; then
+        echo "FATAL: dependency cycle creating $stem -> $dep" >&2; exit 7
+      fi
+      echo "warn: dependency target '$dep' not yet in store; recorded in whip_deps only" >&2
+    fi
+  done
+
+  printf '{"key":"%s","folder":"%s"}\n' "$stem" "$folder"
+}
+
+cmd_transition() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stage) echo "FATAL: beads backend does not declare 'stage'; dispatcher must commit deliverables to trunk itself" >&2; exit 2 ;;
+      --*) echo "FATAL: unknown transition flag: $1" >&2; exit 2 ;;
+      *) break ;;
+    esac
+  done
+  local key="${1:-}" to="${2:-}" agent="${3:-orchestrator}" notes="${4:-}" rinc="${5:-0}" binc="${6:-0}"
+  if [ -z "$key" ] || [ -z "$to" ]; then
+    echo "FATAL: usage: transition <key> <TO_STATE> [AGENT] [NOTES] [RINC] [BINC]" >&2; exit 2
+  fi
+  valid_state "$to" || { echo "FATAL: invalid TO_STATE '$to'" >&2; exit 7; }
+  local id; id="$(bd_id "$key")"
+  show_task "$id"
+  local sj="$BD_OUT" cur_bd cur_whip
+  cur_bd="$(printf '%s' "$sj" | jq -r '.[0].status // ""')"
+  cur_whip="$(bd_to_whip "$cur_bd")"
+
+  if [ "$cur_whip" = "$to" ]; then
+    echo "noop: $key.md already in $to"
+    exit 0
+  fi
+
+  local -a args
+  args=(update "$id" --status "$(whip_to_bd "$to")" --set-metadata "whip_last_transition_ts=$(now_ts)")
+  if [ "$rinc" = "1" ] && [ "$to" = "rejected" ]; then
+    args+=(--set-metadata "whip_rejections=$(( $(meta_num "$sj" whip_rejections) + 1 ))")
+  fi
+  if [ "$binc" = "1" ] && [ "$to" = "blocked" ]; then
+    args+=(--set-metadata "whip_blocks=$(( $(meta_num "$sj" whip_blocks) + 1 ))")
+  fi
+  bd_run "${args[@]}" --json || { cat "$BD_ERRF" >&2; echo "FATAL: bd update failed for $key" >&2; exit 7; }
+
+  # Audit row as a comment (mirrors the files Transition Log). Best-effort: the
+  # status change already committed; a failed note must not fail the transition.
+  bd_run comment "$id" "whip-transition | $(now_ts) | $cur_whip | $to | $agent | $notes" \
+    || echo "warn: could not append transition comment to $key" >&2
+
+  echo "ok: $key.md $cur_whip -> $to"
+  exit 0
+}
+
+cmd_update_field() {
+  local stem=""
+  local -a SETS ADDDEPS
+  SETS=(); ADDDEPS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set) [ $# -ge 2 ] || { echo "FATAL: --set requires Field=Value" >&2; exit 2; }
+             SETS[${#SETS[@]}]="$2"; shift 2 ;;
+      --add-dep) [ $# -ge 2 ] || { echo "FATAL: --add-dep requires an ID" >&2; exit 2; }
+                 ADDDEPS[${#ADDDEPS[@]}]="$2"; shift 2 ;;
+      --*) echo "FATAL: unknown update-field flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] || { echo "FATAL: usage: update-field <stem> [--set Field=Value]... [--add-dep ID]..." >&2; exit 2; }
+  local id; id="$(bd_id "$stem")"
+  show_task "$id"
+  local sj="$BD_OUT"
+
+  local -a args
+  args=(update "$id")
+  local edited=0 deps_new="" deps_changed=0
+  deps_new="$(meta_str "$sj" whip_deps)"
+
+  local kv name val
+  for kv in "${SETS[@]:-}"; do
+    [ -n "$kv" ] || continue
+    name="${kv%%=*}"; val="${kv#*=}"
+    case "$name" in
+      Status|Folder) echo "FATAL: state changes go through 'transition', not update-field" >&2; exit 2 ;;
+      Priority) args+=(--priority "$(prio_to_bd "$val")"); edited=1 ;;
+      "Assigned Agent") args+=(--assignee "$val"); edited=1 ;;
+      Title) args+=(--title "$val"); edited=1 ;;
+      Worktree) args+=(--set-metadata "whip_worktree=$val"); edited=1 ;;
+      "PR Group") args+=(--set-metadata "whip_pr_group=$val"); edited=1 ;;
+      "Touches Globs") args+=(--set-metadata "whip_touches=$val"); edited=1 ;;
+      "Rejection Count") args+=(--set-metadata "whip_rejections=$(printf '%s' "$val" | tr -dc '0-9')"); edited=1 ;;
+      Block-Count) args+=(--set-metadata "whip_blocks=$(printf '%s' "$val" | tr -dc '0-9')"); edited=1 ;;
+      Dependencies) deps_new="$(printf '%s' "$val" | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//')"; deps_changed=1 ;;
+      *) echo "warn: update-field ignoring unmapped field '$name'" >&2 ;;
+    esac
+  done
+
+  local dep
+  for dep in "${ADDDEPS[@]:-}"; do
+    [ -n "$dep" ] || continue
+    case "$deps_new" in
+      ""|none|\"none\") deps_new="$dep" ;;
+      *) deps_new="$deps_new, $dep" ;;
+    esac
+    deps_changed=1
+  done
+
+  if [ "$deps_changed" = "1" ]; then
+    args+=(--set-metadata "whip_deps=$deps_new"); edited=1
+  fi
+
+  if [ "$edited" = "1" ]; then
+    bd_run "${args[@]}" --json || { cat "$BD_ERRF" >&2; echo "FATAL: bd update failed for $stem" >&2; exit 7; }
+    # Resync native edges best-effort so `bd dep list` reflects whip_deps. Missing
+    # targets (phantom deps) are tolerated; whip_deps stays the source of truth.
+    if [ "$deps_changed" = "1" ]; then
+      local d
+      IFS=',' read -r -a _nd <<EOF
+$deps_new
+EOF
+      for d in "${_nd[@]:-}"; do
+        d="$(printf '%s' "$d" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+        [ -n "$d" ] || continue
+        case "$(printf '%s' "$d" | tr 'A-Z' 'a-z')" in none) continue ;; esac
+        bd_run dep add "$id" "$(bd_id "$d")" >/dev/null 2>&1 || true
+      done
+    fi
+    printf '{"key":"%s","edited":true}\n' "$stem"
+  else
+    printf '{"key":"%s","edited":false}\n' "$stem"
+  fi
+}
+
+cmd_update_body() {
+  local stem="${1:-}" tmp
+  [ -n "$stem" ] || { echo "FATAL: usage: update-body <stem>  (document on stdin)" >&2; exit 2; }
+  local id; id="$(bd_id "$stem")"
+  show_task "$id" >/dev/null
+  tmp="$(mktemp "${TMPDIR:-/tmp}/acfw-bd-body.XXXXXX")" || exit 2
+  cat > "$tmp"
+  [ -s "$tmp" ] || { rm -f "$tmp"; echo "FATAL: refusing to replace $stem with an empty document" >&2; exit 2; }
+  bd_run update "$id" --body-file "$tmp" --json || { cat "$BD_ERRF" >&2; rm -f "$tmp"; echo "FATAL: bd body update failed for $stem" >&2; exit 7; }
+  rm -f "$tmp"
+  printf '{"key":"%s","updated":true}\n' "$stem"
+}
+
+cmd_log_event() {
+  local stem="" row=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --row) row="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown log-event flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] && [ -n "$row" ] || { echo "FATAL: usage: log-event <stem> --row '| ... |'" >&2; exit 2; }
+  local id; id="$(bd_id "$stem")"
+  show_task "$id" >/dev/null
+  # The row rides verbatim into a comment so snapshot.hasCleanCheckoutToken (substring
+  # match on the clean-checkout token) surfaces it later.
+  bd_run comment "$id" "$row" || { cat "$BD_ERRF" >&2; echo "FATAL: bd comment failed for $stem" >&2; exit 7; }
+  printf '{"key":"%s","logged":true}\n' "$stem"
+}
+
+cmd_comment() {
+  local stem="" author=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --author) author="${2:-}"; shift 2 ;;
+      --*) echo "FATAL: unknown comment flag: $1" >&2; exit 2 ;;
+      *) stem="$1"; shift ;;
+    esac
+  done
+  [ -n "$stem" ] || { echo "FATAL: usage: comment <stem> [--author A]  (text on stdin)" >&2; exit 2; }
+  local id; id="$(bd_id "$stem")"
+  show_task "$id" >/dev/null
+  local text; text="$(cat)"
+  [ -n "$author" ] && text="[$author] $text"
+  bd_run comment "$id" "$text" || { cat "$BD_ERRF" >&2; echo "FATAL: bd comment failed for $stem" >&2; exit 7; }
+  printf '{"key":"%s","commented":true}\n' "$stem"
+}
+
+cmd_sync() {
+  # Durability flush: mirror the db to JSONL in the tree. Best-effort by contract.
+  bd_run export -o .beads/issues.jsonl >/dev/null 2>&1 || true
+  printf '{"backend":"beads","synced":true}\n'
+}
+
+cmd_doctor() {
+  # Store-native integrity findings + SUMMARY protocol. Exit 0 iff no FATAL.
+  local fatal=0 repairable=0 warn=0
+  # (flags --fix/--quiet/--active-only are accepted; there is no repairable class here)
+  while [ $# -gt 0 ]; do case "$1" in --fix|--quiet|--active-only) shift ;; --*) shift ;; *) shift ;; esac; done
+
+  [ -d "$REPO_ROOT/.beads" ] || { echo "FATAL|no-store|-|.beads/ missing under $REPO_ROOT (run: acfw-store-beads init)"; fatal=$((fatal+1)); }
+
+  # status.custom must match exactly (order-independent).
+  if bd_run statuses --json; then
+    local want got
+    want="$(printf '%s' "$STATUS_CUSTOM" | tr ',' '\n' | sort | paste -sd, -)"
+    got="$(printf '%s' "$BD_OUT" | jq -r '.custom_statuses // [] | map("\(.name):\(.category)") | .[]' | sort | paste -sd, -)"
+    if [ "$want" != "$got" ]; then
+      echo "FATAL|status-custom|-|status.custom mismatch: want [$want] got [$got] (run: acfw-store-beads init)"
+      fatal=$((fatal+1))
+    fi
+  else
+    echo "FATAL|backend|-|bd statuses failed; store unreadable"; fatal=$((fatal+1))
+  fi
+
+  # Per whip-issue checks: id<->key bijection and numeric counters.
+  if bd_run export; then
+    local report
+    report="$(printf '%s' "$BD_OUT" | jq -rs "$JQ_DEFS"'
+      .[] | select(._type=="issue") | select(.metadata.whip_key != null)
+      | .metadata as $m
+      | (if .id != ($prefix + "-" + $m.whip_key) then "FATAL|id-bijection|\($m.whip_key)|id \(.id) != \($prefix)-\($m.whip_key)" else empty end),
+        (if ($m.whip_rejections // "0" | tostring | test("^[0-9]+$") | not) then "WARN|rejection-count|\($m.whip_key)|non-numeric whip_rejections \($m.whip_rejections)" else empty end),
+        (if ($m.whip_blocks // "0" | tostring | test("^[0-9]+$") | not) then "WARN|block-count|\($m.whip_key)|non-numeric whip_blocks \($m.whip_blocks)" else empty end)
+    ' --arg prefix "$PREFIX")"
+    if [ -n "$report" ]; then
+      printf '%s\n' "$report"
+      fatal=$((fatal + $(printf '%s\n' "$report" | grep -c '^FATAL|')))
+      warn=$((warn + $(printf '%s\n' "$report" | grep -c '^WARN|')))
+    fi
+  fi
+
+  local ok=true; [ "$fatal" -eq 0 ] || ok=false
+  printf 'SUMMARY|fatal=%d|repairable=%d|warn=%d|ok=%s\n' "$fatal" "$repairable" "$warn" "$ok"
+  [ "$fatal" -eq 0 ]
+}
+
+# ---- dispatch --------------------------------------------------------------
+
+case "$SUB" in
+  capabilities) cmd_capabilities ;;
+  init)         cmd_init "$@" ;;
+  snapshot)     cmd_snapshot "$@" ;;
+  read)         cmd_read "$@" ;;
+  create)       cmd_create "$@" ;;
+  transition)   cmd_transition "$@" ;;
+  update-field) cmd_update_field "$@" ;;
+  update-body)  cmd_update_body "$@" ;;
+  log-event)    cmd_log_event "$@" ;;
+  comment)      cmd_comment "$@" ;;
+  doctor)       cmd_doctor "$@" ;;
+  sync)         cmd_sync "$@" ;;
+  "")           echo "FATAL: usage: acfw-store-beads <subcommand> [args]" >&2; exit 2 ;;
+  *)            echo "FATAL: unsupported subcommand: $SUB" >&2; exit 2 ;;
+esac

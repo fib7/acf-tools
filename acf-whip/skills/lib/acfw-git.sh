@@ -14,6 +14,10 @@
 # inside double quotes and silently corrupts the refspec. bash has no such syntax.
 # Brace form "${VAR}:..." is used at every adjacency as belt-and-suspenders.
 
+# Store-resolution helpers (config location, backend selection, adapter discovery)
+# live in the sibling lib so every acfw-git.sh consumer gets them for free.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/acfw-store.sh"
+
 # git_with_lock_backoff — run git, retrying only on .git/index.lock contention.
 # The lock file is NEVER removed; we sleep and let the holding process finish.
 # Backoff: 1s -> 2s -> 4s, three attempts (~7s worst case).
@@ -135,13 +139,16 @@ acfw_pending_code_commits() { # <C> <upstream-ref> <branch-ref>
 # .worktree/) — those must be invisible to the doctor's orphan reaper. The branch prefix is the
 # ownership signal; the dir is where new trees are placed.
 #
-# Precedence: .backlog/.acfw-config > inherited env var > built-in default. The committed config is
+# Precedence: committed config > inherited env var > built-in default. The committed config is
 # the source of truth (sourcing it overwrites any inherited env value); an env var only fills in a
 # key the config does not pin. This is order-independent — safe to call before OR after another code
-# path has already sourced .acfw-config (e.g. the timeout block in doctor.sh / scan-backlog.sh).
-# Idempotent.
+# path has already sourced the config (e.g. the timeout block in doctor.sh / scan-backlog.sh).
+# The config file location is resolved by acfw_resolve_config_file (.acfwhip/config, falling back
+# to the legacy .backlog/.acfw-config). Idempotent.
 acfw_load_namespace() { # <repo-root>
-  [ -n "${1:-}" ] && [ -f "$1/.backlog/.acfw-config" ] && . "$1/.backlog/.acfw-config" >/dev/null 2>&1
+  local _acfw_cfg=""
+  [ -n "${1:-}" ] && _acfw_cfg=$(acfw_resolve_config_file "$1")
+  [ -n "$_acfw_cfg" ] && . "$_acfw_cfg" >/dev/null 2>&1
   ACFW_WORKTREE_DIR="${ACFW_WORKTREE_DIR:-.worktree}"
   ACFW_BRANCH_PREFIX="${ACFW_BRANCH_PREFIX:-worktree}"
   # Strip any stray leading "./" or trailing "/" on the dir, and a trailing "/" on the prefix,

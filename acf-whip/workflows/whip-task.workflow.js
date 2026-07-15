@@ -21,8 +21,14 @@ if (!scope || !pluginRoot || !trunkRoot) {
 
 // ---- shell helpers (these strings land in agent prompts; agents run the bash) ----
 const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
-const DOCTOR = `${pluginRoot}/skills/whip-doctor/bin/doctor.sh`
-const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=${sq(trunkBranch)};`
+// Task-store backend (3.1.0): 'files' authors straight into .backlog/pending/ and commits (byte-
+// identical to 3.0.x); any other backend authors into a .acfwhip/staging/ scratch dir and the single
+// writer ingests each file into the store via `acfw-store create` (dep-stamp folded into --set).
+const store = (args && args.store) || 'files'
+const filesStore = store === 'files'
+const STORE = `${pluginRoot}/skills/lib/bin/acfw-store`
+const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=${sq(trunkBranch)}; export ACFW_STORE=${sq(store)};`
+const AUTHOR_DIR = filesStore ? `.backlog/pending` : `.acfwhip/staging`
 
 // ---- enums (mirror task-template.md / task-engineer-pattern.md) ----
 const SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/
@@ -194,7 +200,9 @@ SCOPE:
 ${scope}
 
 First, scan the existing backlog so you pick non-colliding ids and avoid duplicating work. Run:
-  cd ${sq(trunkRoot)} && grep -rhoE '^- \\*\\*ID\\*\\*: .*' .backlog 2>/dev/null | sort -u; ls .backlog/pending 2>/dev/null
+${filesStore
+    ? `  cd ${sq(trunkRoot)} && grep -rhoE '^- \\*\\*ID\\*\\*: .*' .backlog 2>/dev/null | sort -u; ls .backlog/pending 2>/dev/null`
+    : `  cd ${sq(trunkRoot)} && bash ${sq(STORE)} snapshot 2>/dev/null | jq -r '.tasks[]? | .id' 2>/dev/null | sort -u`}
 Also read, if present, ${sq(trunkRoot)}/docs/acf/style/task-descriptions.md and ${sq(trunkRoot)}/docs/acf/backlog/task-template.md for the house style (these constrain how you phrase WHAT/WHY).
 
 Then return a DecompositionPlan. Do NOT write any files — another stage does that. Return ONLY the structured plan.
@@ -235,7 +243,7 @@ log(`plan validated after ${attempts} attempt(s): ${tasks.length} task(s) — sl
 phase('Author')
 
 const TEMPLATE_CONTRACT = `
-Write the file at ${sq(trunkRoot)}/.backlog/pending/<filename> following docs/acf/backlog/task-template.md EXACTLY. Read that template first (path: ${sq(trunkRoot)}/docs/acf/backlog/task-template.md) — if it is absent, use this structure.
+Write the file at ${sq(trunkRoot)}/${AUTHOR_DIR}/<filename> (create the directory if missing) following docs/acf/backlog/task-template.md EXACTLY. Read that template first (path: ${sq(trunkRoot)}/docs/acf/backlog/task-template.md) — if it is absent, use this structure.
 
 The metadata block is NOT YAML — it is a "## Metadata" section of "- **Field**: value" bullets. Emit, in order:
   # Task: <title>
@@ -301,7 +309,24 @@ const writtenFiles = writtenTasks.map((t) => t.filename)
 phase('Write')
 
 let writeResult = { committed: false, commitSha: 'n/a', files: writtenFiles, note: 'no files to commit' }
-if (writtenFiles.length) {
+if (writtenFiles.length && !filesStore) {
+  // Non-files store: the single writer INGESTS each staged document into the task store. The
+  // validated dependency graph is stamped via --set (the same silent-loss defense as the sed
+  // stamp below — the store copy, not the authored line, is what /go schedules from).
+  const createLines = writtenTasks.map((t) => {
+    const deps = (Array.isArray(t.dependencies) ? t.dependencies : []).join(', ') || 'none'
+    return `  bash ${sq(STORE)} create --file ${sq(`${trunkRoot}/${AUTHOR_DIR}/${t.filename}`)} --folder pending --set ${sq(`Dependencies=${deps}`)} && rm -f ${sq(`${trunkRoot}/${AUTHOR_DIR}/${t.filename}`)}`
+  }).join('\n')
+  writeResult = await agent(
+    `You are the single backlog writer. ${ENV} Working at the trunk repo root ${sq(trunkRoot)}.
+
+These task documents were just authored under ${AUTHOR_DIR}/ and must be ingested into the '${store}' task store. Run these commands IN ORDER, one at a time (each creates one task in the store, then removes the staged file; a "already exists" failure with exit code 4 means a duplicate id — record it in note and continue):
+${createLines}
+
+Return the WriteResult: committed = true when every create succeeded, commitSha "n/a", files = the staged basenames, note = any failures.`,
+    { label: 'write:ingest', phase: 'Write', schema: WRITE_RESULT },
+  )
+} else if (writtenFiles.length) {
   // The dependency graph was validated in JS (in-plan, acyclic, no self-edges) and is authoritative.
   // The Dependencies LINE, though, was transcribed into markdown by an author agent from a prompt blob —
   // a silent-loss channel: a whole decomposition once emerged "Dependencies: none" and /go dispatched
@@ -339,7 +364,7 @@ phase('Verify')
 
 const doctor = await agent(
   `Run the acf-whip integrity doctor (report-only) and return its result. ${ENV}
-Run exactly:  bash ${sq(DOCTOR)} ${sq(trunkRoot)}
+Run exactly:  bash ${sq(STORE)} doctor
 Capture stdout. The last line is "SUMMARY|fatal=N|repairable=N|warn=N|ok=true|false". Lines beginning FATAL| are fatal; lines beginning WARN| or REPAIRABLE| are non-fatal. Return the DoctorReport with ok = (the SUMMARY ok field is true), summaryLine = the verbatim SUMMARY line, fatals = the verbatim FATAL lines, warns = the verbatim WARN+REPAIRABLE lines.`,
   { label: 'verify:doctor', phase: 'Verify', schema: DOCTOR_REPORT },
 )

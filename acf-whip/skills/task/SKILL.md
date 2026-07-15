@@ -38,7 +38,10 @@ script, not in your context.
    echo "PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT"
    echo "TRUNK_ROOT=$(git rev-parse --show-toplevel)"
    echo "TRUNK_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)"
+   bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info
    ```
+   The `acfw-store info` line reports the active task-store backend (`store`, default `files`) —
+   pass it through in step 2.
 2. Launch the workflow (runs in the background; intermediate state never enters your context):
    ```
    Workflow({
@@ -47,7 +50,8 @@ script, not in your context.
        scope: "<the full /task argument text, verbatim>",
        pluginRoot: "<PLUGIN_ROOT>",
        trunkRoot: "<TRUNK_ROOT>",
-       trunkBranch: "<TRUNK_BRANCH>"
+       trunkBranch: "<TRUNK_BRANCH>",
+       store: "<info.store>"
      }
    })
    ```
