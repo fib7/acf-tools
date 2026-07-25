@@ -31,12 +31,14 @@
 | **acf-challenger-mode** | Cognitive | Logic validation enforcer | 6 |
 | **acf-arazor-mode** | Cognitive | Production verification enforcer | 6 |
 | **acf-nitro** | Cognitive | Parallel execution enforcer | 6 |
-| **acf-mission-control** | Functional | Two-line status line HUD (1M-aware fuel gauge, cost, rate limits, cache warmth); themeable glyphs (sleek/emoji/nerd/text); self-upgrading | 6 |
+| **acf-mission-control** | Functional | Two-line status line HUD (1M-aware fuel gauge, self-priced cost, rate limits, cache warmth); themeable glyphs (sleek/emoji/nerd/text); self-upgrading | 6 |
 | **acf-librarian** | Functional | Convention enforcement | 9 |
 | **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe; LP-CAS integration; pluggable task stores: files/beads/multica/linear) | 87 |
 | **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 17 |
 
 **Total**: 137 plugin files + 11 project/docs files = 148 tracked files.
+
+**acf-mission-control** prices sessions itself as of **1.3.0**. Claude Code only knows rates for models it ships, so anything behind a gateway (`nebius/zai-org/GLM-5.2`, `zai-org/GLM-5.2`) reported `$0.00` no matter the spend. The HUD now sums transcript token usage — deduplicated by `requestId`, since Claude Code writes one record per content block and repeats the full usage in each, which inflates naive sums 3-4× — and multiplies it by LiteLLM's rate table, cached under `~/.cache/acf-mission-control/` and refreshed daily in a detached process so the status line never blocks on the network. Provider prefixes are routing, not identity: segments are stripped left to right until an entry matches, then the bare model name is looked up wherever it is published. Self-priced figures are marked `≈`, a trailing `?` flags tokens burned at unknown rates, and `--price-check <model-id>` shows the resolved entry. With no cached table the segment degrades to Claude Code's own figure.
 
 **acf-whip** is a workflow-native backlog automation engine. `/task` decomposes a scope into atomic, dependency-aware tasks. `/go` orchestrates them to completion — dispatching parallel specialists in isolated git worktrees (one per slug), running quality review, integrating accepted branches into the trunk in topological order, and looping until every task is accepted or blocked. It is concurrency-safe (the git-worktree branch registry is the parallelism lock), self-healing via `/whip-doctor`, and runs as deterministic dynamic workflows so Claude's context stays flat across long runs; worktree branches are code-only by construction. Integration is **LP-CAS** (Ledger-In-Tree Compare-And-Swap, 3.0.0): each accepted task's change is published as a single-parent candidate and `cherry-pick`ed onto the **live** trunk (no cached snapshot, no rebase, no replay — the keystone defect that froze every worktree's base on a rewritten trunk is gone by construction); the change and an in-tree ledger marker (`.acfwhip/integrated/<shard>/<key>.json`) are co-committed in one commit, union-gated, and landed by compare-and-swap. The marker's presence in the live-trunk tree is the **sole** integration oracle — no `Integrated-At` field, no folder-as-state — so metadata can never diverge from reality, same-file parallel writes surface as resolvable conflicts instead of silent losses, and a duplicate id or poison candidate quarantines that task alone instead of aborting the run. As of **3.1.0 the task store is pluggable** behind an executable adapter contract (`acf-whip/adapters/CONTRACT.md`; mechanics and authoring guide in `acf-whip/adapters/README.md`): `.backlog/` files remain the zero-config default, with shipped `beads` (bd), `multica`, and `linear` (Linear GraphQL, whip state in per-issue attachment metadata) adapters, and third-party backends dropping into `.acfwhip/adapters/` without forking; the LP-CAS ledger stays git-native on every backend. See `acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
 
@@ -352,6 +354,6 @@ The plugins themselves CREATE documentation when installed in user projects:
 ---
 
 **Repository Version**: v1.0
-**Last Updated**: 2026-06-18
+**Last Updated**: 2026-07-25
 **Marketplace Plugins**: 7
 **Total Files**: 148 (tracked)

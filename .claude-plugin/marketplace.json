@@ -89,8 +89,8 @@
     },
     {
       "name": "acf-mission-control",
-      "description": "Mission Control HUD for Claude Code - two-line status line with 1M-context-aware fuel gauge, per-model colors, session cost, 5h/7d rate limits, git dirty state, and a prompt-cache-warmth indicator. Sleek monochrome glyphs by default, themeable (sleek/emoji/nerd/text). Self-upgrading.",
-      "version": "1.2.0",
+      "description": "Mission Control HUD for Claude Code - two-line status line with 1M-context-aware fuel gauge, per-model colors, session cost, 5h/7d rate limits, git dirty state, and a prompt-cache-warmth indicator. Prices the session itself from transcript token usage against the LiteLLM rate table (refreshed daily, provider prefixes stripped), so proxied models Claude Code cannot price no longer read as $0.00. Sleek monochrome glyphs by default, themeable (sleek/emoji/nerd/text). Self-upgrading.",
+      "version": "1.3.0",
       "author": {
         "name": "ACF Project",
         "email": "acf@fib7.ai"

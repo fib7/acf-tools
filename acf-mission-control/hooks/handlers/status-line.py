@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# mission-control-version: 1.2.0
+# mission-control-version: 1.3.0
 """ACF Mission Control - Status Line HUD
 
 Two-line "Mission Control" status line for Claude Code.
@@ -7,10 +7,20 @@ Two-line "Mission Control" status line for Claude Code.
 Line 1 (identity): model · directory · git branch + dirty
 Line 2 (telemetry): fuel gauge · window · cost · duration · lines · cache · limits
 
-Driven entirely by the JSON Claude Code sends on stdin (no transcript parsing).
-See https://code.claude.com/docs/en/statusline for the field schema.
+Driven by the JSON Claude Code sends on stdin — see
+https://code.claude.com/docs/en/statusline for the field schema — plus a
+self-computed cost figure. Claude Code only prices models it ships rates for, so
+anything behind a proxy (`nebius/zai-org/GLM-5.2`, `zai-org/GLM-5.2`, ...) reads
+as ~$0.00. When the LiteLLM price map resolves the live model id, the HUD prices
+the session itself from transcript token usage and marks the figure `≈`.
 
-Requirements: Python 3.6+, standard library only (json, sys, os, subprocess, time).
+Extra modes (not the HUD):
+  --refresh-prices          fetch + distill the LiteLLM price map into the cache
+  --price-check <model-id>  show which price entry a model id maps onto
+
+Requirements: Python 3.6+, standard library only (json, sys, os, subprocess,
+time, urllib). Network is optional: with no cached price map the HUD falls back
+to Claude Code's own cost figure.
 """
 
 import json
@@ -43,7 +53,23 @@ CONFIG = {
     "ctx_crit": 90,        # context %: red at/above
     "cost_warn": 5.0,      # $: yellow at/above
     "cost_crit": 20.0,     # $: red at/above
+
+    # Cost accuracy — price the session from the LiteLLM map instead of trusting
+    # Claude Code's figure, which is ~$0.00 for any model it has no rates for.
+    "price_map": True,     # False -> always show Claude Code's own cost
+    "price_ttl": 86400,    # seconds before the cached price map is refreshed
+    "price_aliases": {},   # {"nebius/zai-org/GLM-5.2": "zai/glm-5.2"} — pin a mapping
 }
+
+# Upstream rate table. Keys are `provider/model` or bare model names; the leading
+# segments are routing, not identity, so `nebius/zai-org/GLM-5.2` prices as GLM-5.2.
+PRICE_URL = (
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+    "model_prices_and_context_window.json"
+)
+FETCH_TIMEOUT = 8      # seconds; the refresher runs detached, never the HUD
+LOCK_TTL = 600         # seconds a refresh may hold the fetch before others retry
+DEDUP_WINDOW = 64      # requestIds remembered; duplicate records are consecutive
 
 # --------------------------------------------------------------------------- #
 # ANSI palette                                                                 #
@@ -254,6 +280,332 @@ def cache_warmth(transcript_path, ttl):
     return "cold", RED
 
 
+# --------------------------------------------------------------------------- #
+# Price map — a distilled copy of LiteLLM's rate table on disk.                #
+# The raw file is 1.6MB of mostly capability flags; we keep the five rates      #
+# that bill tokens, which parses in single-digit milliseconds per render.       #
+# --------------------------------------------------------------------------- #
+RATE_FIELDS = (
+    ("i", "input_cost_per_token"),
+    ("o", "output_cost_per_token"),
+    ("r", "cache_read_input_token_cost"),
+    ("w", "cache_creation_input_token_cost"),
+    ("w1h", "cache_creation_input_token_cost_above_1hr"),
+)
+TOKEN_KEYS = ("i", "o", "r", "w5", "w1h", "ws")
+
+
+def price_cache_dir():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
+    return os.path.join(base, "acf-mission-control")
+
+
+def price_cache_path():
+    return os.path.join(price_cache_dir(), "prices.json")
+
+
+def distill_prices(raw):
+    """Strip the rate table down to the fields that bill tokens."""
+    out = {}
+    for key, spec in raw.items():
+        if key == "sample_spec" or not isinstance(spec, dict):
+            continue
+        entry = {}
+        for short, full in RATE_FIELDS:
+            val = spec.get(full)
+            if isinstance(val, (int, float)):
+                entry[short] = val
+        if "i" not in entry and "o" not in entry:
+            continue  # image/audio-only or unpriced entries can't price a session
+        search = spec.get("search_context_cost_per_query")
+        if isinstance(search, dict):
+            val = search.get("search_context_size_medium")
+            if isinstance(val, (int, float)):
+                entry["s"] = val
+        provider = spec.get("litellm_provider")
+        if isinstance(provider, str):
+            entry["p"] = provider
+        out[key] = entry
+    return out
+
+
+def refresh_prices():
+    """Fetch, distill and atomically install the price map. Never raises.
+
+    The lock file is a last-attempt timestamp, never cleared: concurrent sessions
+    cooperate, and an offline machine retries at most once per LOCK_TTL instead of
+    spawning a doomed fetch on every render.
+    """
+    import urllib.request
+
+    lock = os.path.join(price_cache_dir(), "prices.lock")
+    try:
+        os.makedirs(price_cache_dir(), exist_ok=True)
+        if os.path.exists(lock) and (time.time() - os.path.getmtime(lock)) < LOCK_TTL:
+            return False
+        with open(lock, "w") as fh:
+            fh.write(str(int(time.time())))
+    except OSError:
+        return False
+
+    try:
+        request = urllib.request.Request(
+            PRICE_URL, headers={"User-Agent": "acf-mission-control"}
+        )
+        raw = urllib.request.urlopen(request, timeout=FETCH_TIMEOUT).read()
+        models = distill_prices(json.loads(raw.decode("utf-8")))
+        if not models:
+            return False
+        tmp = price_cache_path() + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(
+                {"fetched": int(time.time()), "source": PRICE_URL, "models": models},
+                fh,
+                separators=(",", ":"),
+            )
+        os.replace(tmp, price_cache_path())
+        return True
+    except Exception:  # noqa: BLE001 - a stale map beats a broken status line
+        return False
+
+
+def load_prices():
+    try:
+        with open(price_cache_path()) as fh:
+            blob = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    models = blob.get("models")
+    return models if isinstance(models, dict) else None
+
+
+def prices_age():
+    """Seconds since the cached map was written, or None when there is none."""
+    try:
+        return time.time() - os.path.getmtime(price_cache_path())
+    except OSError:
+        return None
+
+
+def spawn_refresh():
+    """Kick off a detached refresh — the HUD must never wait on the network."""
+    try:
+        subprocess.Popen(
+            [sys.executable or "python3", os.path.abspath(__file__), "--refresh-prices"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:  # noqa: BLE001 - non-blocking by design
+        pass
+
+
+def price_index(models):
+    """Lookup tables built once per render: exact (lowercased) and by basename."""
+    lower, base = {}, {}
+    for key in models:
+        lower[key.lower()] = key
+        base.setdefault(key.rsplit("/", 1)[-1].lower(), []).append(key)
+    return {"models": models, "lower": lower, "base": base}
+
+
+def resolve_model(model_id, idx):
+    """Map a live model id onto a price-map key. Returns (key, how) or (None, None).
+
+    Provider prefixes are routing, not identity: `nebius/zai-org/GLM-5.2` is
+    GLM-5.2 served by nebius, so segments are dropped left to right until a rate
+    entry matches, then the bare model name is looked up wherever it is published.
+    """
+    if not model_id or not idx:
+        return None, None
+
+    aliases = CONFIG.get("price_aliases") or {}
+    alias = aliases.get(model_id) or aliases.get(model_id.lower())
+    if alias and alias in idx["models"]:
+        return alias, "alias"
+
+    segments = model_id.split("/")
+    for start in range(len(segments)):
+        hit = idx["lower"].get("/".join(segments[start:]).lower())
+        if hit:
+            return hit, "exact" if start == 0 else "suffix"
+
+    candidates = idx["base"].get(segments[-1].lower())
+    if not candidates:
+        return None, None
+
+    prefixes = set(seg.lower() for seg in segments[:-1])
+
+    def rank(key):
+        spec = idx["models"][key]
+        # Prefer the provider actually serving it, then the most complete rates,
+        # then alphabetical so the same id always resolves the same way.
+        return (0 if (spec.get("p") or "").lower() in prefixes else 1, -len(spec), key)
+
+    return sorted(candidates, key=rank)[0], "basename"
+
+
+def scan_usage(transcript_path, session_id):
+    """Per-model token totals from the transcript, parsing only what's new.
+
+    State lives in /tmp keyed by session — the same pattern git_info() uses — so
+    a long session re-reads only the bytes appended since the last render.
+
+    Claude Code writes one assistant record per content block and every record
+    repeats the whole request's usage, so totals are deduplicated on requestId;
+    summing raw records overstates cost by 3-4x.
+    """
+    if not transcript_path:
+        return None
+    try:
+        st = os.stat(transcript_path)
+    except OSError:
+        return None
+
+    state_file = "/tmp/mc-cost-{}".format(session_id or "nosess")
+    try:
+        with open(state_file) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    # A different/rotated/truncated transcript invalidates the incremental state.
+    if (
+        state.get("path") != transcript_path
+        or state.get("ino") != st.st_ino
+        or state.get("offset", 0) > st.st_size
+    ):
+        state = {}
+
+    offset = state.get("offset", 0)
+    totals = state.get("tok") or {}
+    recent = state.get("req") or []
+
+    if offset >= st.st_size:
+        return totals
+
+    try:
+        with open(transcript_path, "rb") as fh:
+            fh.seek(offset)
+            blob = fh.read()
+    except OSError:
+        return totals or None
+
+    # Stop at the last newline: the tail may be a half-written record, and byte
+    # offsets must be counted on bytes, not characters.
+    cut = blob.rfind(b"\n") + 1
+    if cut == 0:
+        return totals or None
+
+    for line in blob[:cut].decode("utf-8", "replace").splitlines():
+        if '"usage"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        message = record.get("message") or {}
+        usage = message.get("usage") or {}
+        if not usage:
+            continue
+
+        request_id = record.get("requestId") or message.get("id")
+        if request_id:
+            if request_id in recent:
+                continue
+            recent.append(request_id)
+            if len(recent) > DEDUP_WINDOW:
+                del recent[:-DEDUP_WINDOW]
+
+        creation = usage.get("cache_creation") or {}
+        if creation:
+            write_5m = creation.get("ephemeral_5m_input_tokens") or 0
+            write_1h = creation.get("ephemeral_1h_input_tokens") or 0
+        else:
+            write_5m = usage.get("cache_creation_input_tokens") or 0
+            write_1h = 0
+        server = usage.get("server_tool_use") or {}
+
+        # Sidechains (subagents) bill to the same session, so they count here too.
+        bucket = totals.setdefault(message.get("model") or "unknown", {})
+        for key, value in (
+            ("i", usage.get("input_tokens")),
+            ("o", usage.get("output_tokens")),
+            ("r", usage.get("cache_read_input_tokens")),
+            ("w5", write_5m),
+            ("w1h", write_1h),
+            ("ws", server.get("web_search_requests")),
+        ):
+            if value:
+                bucket[key] = bucket.get(key, 0) + value
+
+    try:
+        with open(state_file, "w") as fh:
+            json.dump(
+                {
+                    "path": transcript_path,
+                    "ino": st.st_ino,
+                    "offset": offset + cut,
+                    "req": recent,
+                    "tok": totals,
+                },
+                fh,
+            )
+    except OSError:
+        pass
+
+    return totals
+
+
+def price_tokens(tokens, spec):
+    """Dollar cost of one model's token totals under one rate entry."""
+    rate_in = spec.get("i", 0.0)
+    # Entries that list no cache pricing bill cached tokens as plain input.
+    rate_read = spec.get("r", rate_in)
+    rate_write = spec.get("w", rate_in)
+    return (
+        tokens.get("i", 0) * rate_in
+        + tokens.get("o", 0) * spec.get("o", 0.0)
+        + tokens.get("r", 0) * rate_read
+        + tokens.get("w5", 0) * rate_write
+        + tokens.get("w1h", 0) * spec.get("w1h", rate_write)
+        + tokens.get("ws", 0) * spec.get("s", 0.0)
+    )
+
+
+def session_cost(transcript_path, session_id):
+    """Session cost from transcript usage x LiteLLM rates.
+
+    Returns (cost, unpriced). cost is None when nothing could be priced — the
+    caller then falls back to Claude Code's own figure. unpriced flags that some
+    model burned tokens at rates we don't have, so the total reads low.
+    """
+    models = load_prices()
+    if not models:
+        return None, False
+    totals = scan_usage(transcript_path, session_id)
+    if not totals:
+        return None, False
+
+    idx = price_index(models)
+    cost, priced, unpriced = 0.0, False, False
+    for model_id, tokens in totals.items():
+        key, _ = resolve_model(model_id, idx)
+        if key is None:
+            if any(tokens.get(name) for name in TOKEN_KEYS):
+                unpriced = True
+            continue
+        cost += price_tokens(tokens, models[key])
+        priced = True
+    return (cost if priced else None), unpriced
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -306,13 +658,29 @@ def main():
     line2.append(paint(fmt_window(window_size), (CYAN + BOLD) if is_1m else DIM))
 
     if CONFIG["cost"]:
-        cost = g(data, "cost.total_cost_usd")
+        computed, unpriced = None, False
+        if CONFIG["price_map"]:
+            age = prices_age()
+            if age is None or age > CONFIG["price_ttl"]:
+                spawn_refresh()
+            computed, unpriced = session_cost(
+                g(data, "transcript_path"), g(data, "session_id", "")
+            )
+        # Claude Code's figure only covers models it ships rates for; ours covers
+        # whatever the price map resolves. Prefer ours, fall back to theirs.
+        cost = computed if computed is not None else g(data, "cost.total_cost_usd")
         if cost is not None:
             c_color = zone_color(cost, CONFIG["cost_warn"], CONFIG["cost_crit"])
             # Below warn threshold, keep it muted rather than green.
             if cost < CONFIG["cost_warn"]:
                 c_color = DIM
-            line2.append(paint(GLYPH["cost"] + "${:.2f}".format(cost), c_color))
+            text = "{}{}${:.2f}{}".format(
+                GLYPH["cost"],
+                "≈" if computed is not None else "",
+                cost,
+                "?" if unpriced else "",  # some tokens burned at unknown rates
+            )
+            line2.append(paint(text, c_color))
 
     if CONFIG["duration"]:
         dur = g(data, "cost.total_duration_ms")
@@ -355,5 +723,63 @@ def main():
         print(sep.join(line2))
 
 
+def fmt_age(seconds):
+    if seconds is None:
+        return "never fetched"
+    if seconds < 3600:
+        return "{:.0f}m old".format(seconds / 60)
+    if seconds < 86400:
+        return "{:.0f}h old".format(seconds / 3600)
+    return "{:.0f}d old".format(seconds / 86400)
+
+
+def price_check(model_id):
+    """Show how a model id maps onto the price map. Debug mode, not the HUD."""
+    if not model_id:
+        print("usage: status-line.py --price-check <model-id>")
+        return 2
+
+    models = load_prices()
+    if not models:
+        print("no price map cached at {}".format(price_cache_path()))
+        print("run: {} --refresh-prices".format(os.path.basename(__file__)))
+        return 1
+
+    print("price map     : {} entries, {}".format(len(models), fmt_age(prices_age())))
+    print("cache         : {}".format(price_cache_path()))
+    print("model id      : {}".format(model_id))
+
+    key, how = resolve_model(model_id, price_index(models))
+    if key is None:
+        print("matched key   : none — no entry for '{}'".format(model_id.split("/")[-1]))
+        print("               pin one via CONFIG['price_aliases']")
+        return 1
+
+    spec = models[key]
+    print("matched key   : {}  (via {})".format(key, how))
+    print("provider      : {}".format(spec.get("p", "?")))
+    for label, short in (
+        ("input", "i"),
+        ("output", "o"),
+        ("cache read", "r"),
+        ("cache write", "w"),
+        ("cache write 1h", "w1h"),
+    ):
+        val = spec.get(short)
+        rate = "${:.2f} / Mtok".format(val * 1e6) if val is not None else "n/a"
+        print("{:<14}: {}".format(label, rate))
+    if spec.get("s") is not None:
+        print("{:<14}: ${:.4f} / query".format("web search", spec["s"]))
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--refresh-prices":
+        ok = refresh_prices()
+        print("price map refreshed" if ok else "price map unchanged (locked or fetch failed)")
+        sys.exit(0 if ok else 1)
+    elif argv and argv[0] == "--price-check":
+        sys.exit(price_check(argv[1] if len(argv) > 1 else ""))
+    else:
+        main()

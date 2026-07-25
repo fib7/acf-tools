@@ -11,7 +11,7 @@ surfaces.
 
 ```
 ◆ Opus · ▸ acf-tools · ⎇ main ✎3 ⊕2
-▰▰▱▱▱▱▱▱▱▱ 18% · 200k · $0.42 · 12m · +156/-23 · ● warm · 5h 23% 7d 41%
+▰▰▱▱▱▱▱▱▱▱ 18% · 200k · ≈$0.42 · 12m · +156/-23 · ● warm · 5h 23% 7d 41%
 ```
 
 | Segment | Source | Notes |
@@ -21,7 +21,7 @@ surfaces.
 | ⎇ branch | `git` / `worktree.branch` | `✎N` modified, `⊕N` staged |
 | ▰▱ fuel bar | `context_window.used_percentage` | Pre-calculated by Claude Code (input-only); never parses the transcript |
 | window | `context_window.context_window_size` | `200k` or `1M` — auto-detected |
-| cost | `cost.total_cost_usd` | Session estimate |
+| cost | transcript usage × LiteLLM rates | `≈` marks a self-priced figure (see below); falls back to `cost.total_cost_usd` |
 | duration | `cost.total_duration_ms` | Session wall-clock |
 | +/- lines | `cost.total_lines_added/removed` | Lines changed this session |
 | ● cache | transcript mtime vs 5-min TTL | Warmth heuristic (see below) |
@@ -51,6 +51,46 @@ well above the old 70% red). **Cost**: dim `<$5` · yellow `≥$5` · red `≥$2
 Color is never the *only* signal — bar glyphs (`█`/`░`) and numbers carry the same
 information, so colorblind and no-color terminals lose nothing. Honors the
 `NO_COLOR` environment variable and a `CONFIG['color']` master switch.
+
+## Cost that survives a proxy
+
+Claude Code only prices models it ships rates for. Point it at a gateway —
+LiteLLM, OpenRouter, Bedrock, a self-hosted endpoint — and `cost.total_cost_usd`
+reads **$0.00** for the whole session no matter how much you spend.
+
+Mission Control prices the session itself instead:
+
+1. Rates come from [LiteLLM's model price table](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json)
+   (~2.5k models), distilled to the five token-billing fields and cached under
+   `~/.cache/acf-mission-control/`. Refreshed once a day, always detached — the
+   status line never waits on the network.
+2. Provider prefixes are treated as routing, not identity: `nebius/zai-org/GLM-5.2`
+   is GLM-5.2 served by nebius. Segments are dropped left to right until an entry
+   matches, then the bare model name is looked up wherever it's published.
+3. Tokens come from the session transcript, deduplicated by request — Claude Code
+   writes one record per content block and repeats the whole request's usage in
+   each, so naive summing overstates cost 3-4×. Cache reads and 5-minute vs 1-hour
+   cache writes are billed at their own rates, and subagent turns count too.
+
+| Reading | Meaning |
+|---------|---------|
+| `≈$4.18` | Self-priced from the rate table |
+| `≈$4.18?` | Self-priced, but some model burned tokens at rates we don't have — the figure reads low |
+| `$4.18` | No `≈`: Claude Code's own figure (price map absent, or `price_map: False`) |
+
+Diagnose a mapping without guessing:
+
+```bash
+.claude/scripts/status-line.py --price-check nebius/zai-org/GLM-5.2
+.claude/scripts/status-line.py --refresh-prices      # force a refresh now
+```
+
+If a model resolves to the wrong entry — or to none — pin it in
+`CONFIG["price_aliases"]`: `{"nebius/zai-org/GLM-5.2": "zai/glm-5.2"}`.
+
+Rates are list prices, so the figure is an estimate, not an invoice: it ignores
+negotiated discounts, subscription plans (where marginal cost is $0), and batch
+or priority tiers.
 
 ## Cache warmth — the unique signal
 
@@ -114,6 +154,7 @@ CONFIG = {
     "glyphs": "sleek", "color": True, "single_line": False, "bar_width": 10,
     "cache_ttl": 300, "ctx_warn": 70, "ctx_crit": 90,
     "cost_warn": 5.0, "cost_crit": 20.0,
+    "price_map": True, "price_ttl": 86400, "price_aliases": {},
 }
 ```
 
@@ -125,6 +166,8 @@ CONFIG = {
 - `single_line: True` collapses both rows into one.
 - Tune thresholds, bar width, or the cache TTL (set to `3600` if you use the
   1-hour extended cache).
+- `price_map: False` reverts the cost segment to Claude Code's own figure and
+  stops all network access; `price_aliases` pins a model id to a rate-table key.
 - Per-model colors live in the `MODEL_COLORS` dict.
 
 ## Uninstallation
@@ -146,6 +189,9 @@ rm .claude/scripts/status-line.py        # and the .bak if present
 | Rate limits missing | Only present for Pro/Max after the first API response; auto-hidden otherwise |
 | Cache always "cold" | The indicator needs `refreshInterval` (auto-injected) and a valid `transcript_path` |
 | Branch missing | Not in a git repo, or `git` not installed |
+| Cost shows `$0.00` (no `≈`) | The rate table isn't cached — run `--refresh-prices` and check network access to raw.githubusercontent.com |
+| Cost shows a trailing `?` | A model in this session has no rate entry — find it with `--price-check <model-id>`, then pin `price_aliases` |
+| Cost looks 3-4× too high | A stale pre-1.3.0 copy is installed; confirm `# mission-control-version:` is ≥1.3.0 |
 
 Test it directly with mock input:
 
@@ -155,10 +201,14 @@ echo '{"model":{"display_name":"Opus"},"workspace":{"current_dir":"/tmp/proj"},"
 
 ## Performance
 
-Negligible: no network, no transcript parsing. One optional `git` shell-out,
-cached per session for 5s (keyed on `session_id`, per Claude Code's recommended
-pattern). Runs after each assistant message (debounced 300ms) plus the 30s idle
-refresh for the cache indicator.
+Negligible. One optional `git` shell-out, cached per session for 5s (keyed on
+`session_id`, per Claude Code's recommended pattern). Cost pricing reads a 200KB
+distilled rate table and parses **only the transcript bytes appended since the
+last render** — state is kept in `/tmp` keyed by session, so a 3.8MB transcript
+costs ~50ms warm, ~100ms on the first cold scan. Network fetches always run in a
+detached process; the status line itself never blocks on one. Runs after each
+assistant message (debounced 300ms) plus the 30s idle refresh for the cache
+indicator.
 
 ## Support
 

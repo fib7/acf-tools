@@ -13,6 +13,8 @@ Runs on every SessionStart. Keeps the repo-local
 3. Ensures `.claude/settings.json` points statusLine at the local copy and, when
    the cache-warmth segment is in play, injects `refreshInterval` so the
    indicator stays live while the session is idle.
+4. Refreshes the cached LiteLLM model rate table when it is older than a day,
+   detached, so the status line can price models Claude Code has no rates for.
 
 Non-blocking: any failure exits 0 so a bad upgrade never breaks the session.
 """
@@ -21,10 +23,13 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 REFRESH_INTERVAL = 30  # seconds; keeps the cache-warmth indicator current when idle
+PRICE_TTL = 86400      # seconds; matches CONFIG["price_ttl"] in status-line.py
 
 
 def parse_version(text):
@@ -54,6 +59,39 @@ def read_text(path):
         return path.read_text()
     except OSError:
         return ""
+
+
+def price_cache_age():
+    """Seconds since the LiteLLM price map was cached, or None when absent."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
+    cache = Path(base) / "acf-mission-control" / "prices.json"
+    try:
+        return time.time() - cache.stat().st_mtime
+    except OSError:
+        return None
+
+
+def refresh_price_map(script_path):
+    """Refresh the model rate table in the background when it has gone stale.
+
+    Detached on purpose: session start never waits on the network, and the status
+    line keeps rendering off the previous cache while this runs.
+    """
+    age = price_cache_age()
+    if age is not None and age <= PRICE_TTL:
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable or "python3", str(script_path), "--refresh-prices"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:  # noqa: BLE001 - non-blocking
+        pass
 
 
 def main():
@@ -104,6 +142,8 @@ def main():
         except Exception as exc:  # noqa: BLE001 - non-blocking
             print("Mission Control upgrade failed: {}".format(exc), file=sys.stderr)
             sys.exit(0)
+
+    refresh_price_map(local_script)
 
     # ---- settings.json: ensure statusLine + refreshInterval ----------------
     settings = {}

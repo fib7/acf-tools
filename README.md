@@ -17,7 +17,7 @@ Specialized cognitive modes that enforce specific thinking patterns and validati
 - **acf-challenger-mode** - Reasoning validation mode with intellectually aggressive logic enforcement
 - **acf-arazor-mode** - Production verification mode with ruthless honesty and zero tolerance for false claims
 - **acf-nitro** - Parallel execution enforcement mode that catches sequential violations and enforces speed optimization
-- **acf-mission-control** - Status line HUD for tracking position, git branch, and context fuel with color-coded indicators
+- **acf-mission-control** - Status line HUD for tracking position, git branch, and context fuel with color-coded indicators. **Accurate cost** as of 1.3.0: prices the session from transcript token usage against the LiteLLM rate table, so models behind a gateway — which Claude Code reports as `$0.00` — bill correctly
 
 ### Workflow Tools (3 plugins)
 
@@ -115,7 +115,7 @@ claude plugin validate .
 | **acf-challenger-mode** | Cognitive | Logic validation | Attacks gaps in reasoning, finds contradictions, enforces consistency |
 | **acf-arazor-mode** | Cognitive | Production verification | Binary true/false only, ruthless honesty, deployment readiness checks |
 | **acf-nitro** | Cognitive | Parallel enforcement | Catches sequential execution, calculates time waste, enforces TodoWrite batching |
-| **acf-mission-control** | Functional | Status HUD | Color-coded context tracking (green→yellow→red), git branch display |
+| **acf-mission-control** | Functional | Status HUD | Color-coded context tracking (green→yellow→red), git branch display, self-priced session cost (LiteLLM rate table) |
 | **acf-librarian** | Functional | Conventions | Auto-initializes docs/acf/organization.md, audit command, naming enforcement |
 | **acf-whip** | Functional | Workflow automation | Task decomposition, backlog state machine, quality gates, agent generation |
 | **acf-advisor** | Functional | Second-opinion LLM client | OpenAI-compatible endpoint, env-var configured, thinking mode on by default |
