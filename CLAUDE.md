@@ -38,7 +38,7 @@
 
 **Total**: 137 plugin files + 11 project/docs files = 148 tracked files.
 
-**acf-mission-control** prices sessions itself as of **1.3.0**. Claude Code only knows rates for models it ships, so anything behind a gateway (`nebius/zai-org/GLM-5.2`, `zai-org/GLM-5.2`) reported `$0.00` no matter the spend. The HUD now sums transcript token usage — deduplicated by `requestId`, since Claude Code writes one record per content block and repeats the full usage in each, which inflates naive sums 3-4× — and multiplies it by LiteLLM's rate table, cached under `~/.cache/acf-mission-control/` and refreshed daily in a detached process so the status line never blocks on the network. Provider prefixes are routing, not identity: segments are stripped left to right until an entry matches, then the bare model name is looked up wherever it is published. Self-priced figures are marked `≈`, a trailing `?` flags tokens burned at unknown rates, and `--price-check <model-id>` shows the resolved entry. With no cached table the segment degrades to Claude Code's own figure.
+**acf-mission-control** prices sessions itself as of **1.3.0**. Claude Code only knows rates for models it ships, so anything behind a gateway (`nebius/zai-org/GLM-5.2`, `zai-org/GLM-5.2`) reported `$0.00` no matter the spend. The HUD now sums transcript token usage — deduplicated by `requestId`, since Claude Code writes one record per content block and repeats the full usage in each, which inflates naive sums 3-4× — and multiplies it by LiteLLM's rate table, cached under `~/.cache/acf-mission-control/` and refreshed daily in a detached process so the status line never blocks on the network. Provider prefixes are routing, not identity: segments are stripped left to right until an entry matches, then the bare model name is looked up wherever it is published. Self-priced figures are marked `≈`, a trailing `?` flags tokens the table could not price exactly, and `--price-check <model-id>` shows the resolved entry. With no cached table the segment degrades to Claude Code's own figure. **1.3.1** makes that figure the *whole* session: subagent and workflow conversations live in sibling transcripts under `<transcript>/subagents/` and were silently excluded, often most of the spend (a measured session read `≈$6.03` and actually cost `$25.71`). It also stops a zero-rate entry from producing a confident `≈$0.00` that suppressed the fallback, raises `?` when a missing cache rate forces tokens onto the input rate (~4× overstatement, reachable on gateway-served Claude ids), applies published speed multipliers (fast mode bills 2×), resolves context-window variants like `claude-opus-5[1m]`, and splits JSONL on newlines only — `splitlines()` also breaks on U+2028/U+2029/U+0085 and silently dropped those records' tokens.
 
 **acf-whip** is a workflow-native backlog automation engine. `/task` decomposes a scope into atomic, dependency-aware tasks. `/go` orchestrates them to completion — dispatching parallel specialists in isolated git worktrees (one per slug), running quality review, integrating accepted branches into the trunk in topological order, and looping until every task is accepted or blocked. It is concurrency-safe (the git-worktree branch registry is the parallelism lock), self-healing via `/whip-doctor`, and runs as deterministic dynamic workflows so Claude's context stays flat across long runs; worktree branches are code-only by construction. Integration is **LP-CAS** (Ledger-In-Tree Compare-And-Swap, 3.0.0): each accepted task's change is published as a single-parent candidate and `cherry-pick`ed onto the **live** trunk (no cached snapshot, no rebase, no replay — the keystone defect that froze every worktree's base on a rewritten trunk is gone by construction); the change and an in-tree ledger marker (`.acfwhip/integrated/<shard>/<key>.json`) are co-committed in one commit, union-gated, and landed by compare-and-swap. The marker's presence in the live-trunk tree is the **sole** integration oracle — no `Integrated-At` field, no folder-as-state — so metadata can never diverge from reality, same-file parallel writes surface as resolvable conflicts instead of silent losses, and a duplicate id or poison candidate quarantines that task alone instead of aborting the run. As of **3.1.0 the task store is pluggable** behind an executable adapter contract (`acf-whip/adapters/CONTRACT.md`; mechanics and authoring guide in `acf-whip/adapters/README.md`): `.backlog/` files remain the zero-config default, with shipped `beads` (bd), `multica`, and `linear` (Linear GraphQL, whip state in per-issue attachment metadata) adapters, and third-party backends dropping into `.acfwhip/adapters/` without forking; the LP-CAS ledger stays git-native on every backend. See `acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
 
@@ -168,11 +168,36 @@ cp -r acf-plugin-name ~/.config/claude/plugins/
 # Remove test installation
 ```
 
-### 5. Commit Changes
+### 5. Commit and Publish
+
 ```bash
 git add acf-plugin-name/ .claude-plugin/marketplace.json
 git commit -m "feat(acf-plugin-name): update to v1.x.x"
 git push
+```
+
+**Committing is not publishing, and pushing does not update your own machine.**
+Plugins load from the marketplace clone at `~/.claude/plugins/marketplaces/acf-tools`,
+not from this working tree, so a version that exists only here installs nowhere — including
+for you. Self-upgrading plugins compare against the *published* version, so an unpushed bump
+is a silent no-op that looks exactly like a broken feature. After pushing:
+
+```bash
+/plugin marketplace update acf-tools     # in Claude Code
+```
+
+If that fails to fast-forward (this repo's history has been rewritten before), reset the
+clone directly, then restart the session:
+
+```bash
+git -C ~/.claude/plugins/marketplaces/acf-tools fetch origin
+git -C ~/.claude/plugins/marketplaces/acf-tools reset --hard origin/main
+```
+
+Verify the version that actually landed, not the one you committed:
+
+```bash
+grep -m1 'version' ~/.claude/plugins/marketplaces/acf-tools/acf-plugin-name/.claude-plugin/plugin.json
 ```
 
 ---

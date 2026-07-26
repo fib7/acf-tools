@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# mission-control-version: 1.3.0
+# mission-control-version: 1.3.1
 """ACF Mission Control - Status Line HUD
 
 Two-line "Mission Control" status line for Claude Code.
@@ -12,7 +12,10 @@ https://code.claude.com/docs/en/statusline for the field schema — plus a
 self-computed cost figure. Claude Code only prices models it ships rates for, so
 anything behind a proxy (`nebius/zai-org/GLM-5.2`, `zai-org/GLM-5.2`, ...) reads
 as ~$0.00. When the LiteLLM price map resolves the live model id, the HUD prices
-the session itself from transcript token usage and marks the figure `≈`.
+the session itself from transcript token usage and marks the figure `≈`. That
+covers the whole session: subagent and workflow conversations are written to
+sibling transcripts under `<transcript>/subagents/` and often carry most of the
+spend. A trailing `?` marks a total the table could not price exactly.
 
 Extra modes (not the HUD):
   --refresh-prices          fetch + distill the LiteLLM price map into the cache
@@ -69,7 +72,7 @@ PRICE_URL = (
 )
 FETCH_TIMEOUT = 8      # seconds; the refresher runs detached, never the HUD
 LOCK_TTL = 600         # seconds a refresh may hold the fetch before others retry
-DEDUP_WINDOW = 64      # requestIds remembered; duplicate records are consecutive
+DEDUP_WINDOW = 20000   # cap on remembered requestIds; a bound, not a working set
 
 # --------------------------------------------------------------------------- #
 # ANSI palette                                                                 #
@@ -317,8 +320,12 @@ def distill_prices(raw):
             val = spec.get(full)
             if isinstance(val, (int, float)):
                 entry[short] = val
-        if "i" not in entry and "o" not in entry:
-            continue  # image/audio-only or unpriced entries can't price a session
+        # Presence isn't pricing: rerank/image tiers and free placeholders publish
+        # an explicit 0.0 per token. Keeping them lets a basename collision resolve
+        # a real model onto a $0 card and render a confident `≈$0.00` — the exact
+        # failure this whole segment exists to remove. Demand a non-zero rate.
+        if not entry.get("i") and not entry.get("o"):
+            continue
         search = spec.get("search_context_cost_per_query")
         if isinstance(search, dict):
             val = search.get("search_context_size_medium")
@@ -327,6 +334,15 @@ def distill_prices(raw):
         provider = spec.get("litellm_provider")
         if isinstance(provider, str):
             entry["p"] = provider
+        # Speed/region multipliers, e.g. {"us": 1.1, "fast": 2.0} — fast mode
+        # bills the same model at double rate, which is not a rounding error.
+        mult = spec.get("provider_specific_entry")
+        if isinstance(mult, dict):
+            keep = {
+                k: v for k, v in mult.items() if isinstance(v, (int, float)) and v > 0
+            }
+            if keep:
+                entry["m"] = keep
         out[key] = entry
     return out
 
@@ -418,6 +434,10 @@ def resolve_model(model_id, idx):
     Provider prefixes are routing, not identity: `nebius/zai-org/GLM-5.2` is
     GLM-5.2 served by nebius, so segments are dropped left to right until a rate
     entry matches, then the bare model name is looked up wherever it is published.
+
+    A trailing bracket is a context-window variant, not a different model:
+    `claude-opus-5[1m]` bills on the `claude-opus-5` card, so it is tried both
+    ways — as given first, in case a table ever publishes the decorated id.
     """
     if not model_id or not idx:
         return None, None
@@ -427,13 +447,25 @@ def resolve_model(model_id, idx):
     if alias and alias in idx["models"]:
         return alias, "alias"
 
-    segments = model_id.split("/")
-    for start in range(len(segments)):
-        hit = idx["lower"].get("/".join(segments[start:]).lower())
-        if hit:
-            return hit, "exact" if start == 0 else "suffix"
+    forms = [model_id]
+    if model_id.endswith("]") and "[" in model_id:
+        bare = model_id[: model_id.rindex("[")].strip()
+        if bare:
+            forms.append(bare)
 
-    candidates = idx["base"].get(segments[-1].lower())
+    for form in forms:
+        segments = form.split("/")
+        for start in range(len(segments)):
+            hit = idx["lower"].get("/".join(segments[start:]).lower())
+            if hit:
+                exact = start == 0 and form == model_id
+                return hit, "exact" if exact else "suffix"
+
+    for form in forms:
+        segments = form.split("/")
+        candidates = idx["base"].get(segments[-1].lower())
+        if candidates:
+            break
     if not candidates:
         return None, None
 
@@ -448,64 +480,65 @@ def resolve_model(model_id, idx):
     return sorted(candidates, key=rank)[0], "basename"
 
 
-def scan_usage(transcript_path, session_id):
-    """Per-model token totals from the transcript, parsing only what's new.
+def usage_files(transcript_path):
+    """The main transcript plus every subagent transcript billing to this session.
 
-    State lives in /tmp keyed by session — the same pattern git_info() uses — so
-    a long session re-reads only the bytes appended since the last render.
-
-    Claude Code writes one assistant record per content block and every record
-    repeats the whole request's usage, so totals are deduplicated on requestId;
-    summing raw records overstates cost by 3-4x.
+    Subagent and workflow conversations are written to sibling files under
+    `<transcript-stem>/subagents/`, not into the transcript itself. Their tokens
+    bill to the same account, and on a workflow-heavy session they can outweigh
+    the main thread several times over, so a total that skips them is not a
+    session cost at all.
     """
-    if not transcript_path:
-        return None
+    files = [transcript_path]
     try:
-        st = os.stat(transcript_path)
+        side = os.path.join(os.path.splitext(transcript_path)[0], "subagents")
+        for root, _dirs, names in os.walk(side):
+            for name in sorted(names):
+                if name.endswith(".jsonl"):
+                    files.append(os.path.join(root, name))
     except OSError:
-        return None
+        pass
+    return files
 
-    state_file = "/tmp/mc-cost-{}".format(session_id or "nosess")
+
+def scan_file(path, cursor, seen, totals):
+    """Fold one transcript's new bytes into totals. Returns the updated cursor.
+
+    `cursor` is {"ino", "offset"}; a rotated or truncated file resets it.
+    """
     try:
-        with open(state_file) as fh:
-            state = json.load(fh)
-    except (OSError, ValueError):
-        state = {}
-    if not isinstance(state, dict):
-        state = {}
-    # A different/rotated/truncated transcript invalidates the incremental state.
-    if (
-        state.get("path") != transcript_path
-        or state.get("ino") != st.st_ino
-        or state.get("offset", 0) > st.st_size
-    ):
-        state = {}
+        st = os.stat(path)
+    except OSError:
+        return cursor
 
-    offset = state.get("offset", 0)
-    totals = state.get("tok") or {}
-    recent = state.get("req") or []
-
+    offset = cursor.get("offset", 0)
+    if cursor.get("ino") != st.st_ino or offset > st.st_size:
+        offset = 0
     if offset >= st.st_size:
-        return totals
+        return {"ino": st.st_ino, "offset": offset}
 
     try:
-        with open(transcript_path, "rb") as fh:
+        with open(path, "rb") as fh:
             fh.seek(offset)
             blob = fh.read()
     except OSError:
-        return totals or None
+        return cursor
 
     # Stop at the last newline: the tail may be a half-written record, and byte
     # offsets must be counted on bytes, not characters.
     cut = blob.rfind(b"\n") + 1
     if cut == 0:
-        return totals or None
+        return {"ino": st.st_ino, "offset": offset}
 
-    for line in blob[:cut].decode("utf-8", "replace").splitlines():
-        if '"usage"' not in line:
+    # split(b"\n"), never splitlines(): the latter also breaks on U+2028/U+2029/
+    # U+0085, which JSON encoders emit raw inside strings. A record carrying one
+    # would be torn into fragments that fail to parse, and since the offset still
+    # advances past them that request's tokens would be lost for good.
+    for raw in blob[:cut].split(b"\n"):
+        if b'"usage"' not in raw:
             continue
         try:
-            record = json.loads(line)
+            record = json.loads(raw.decode("utf-8", "replace"))
         except ValueError:
             continue
         if not isinstance(record, dict) or record.get("type") != "assistant":
@@ -515,13 +548,14 @@ def scan_usage(transcript_path, session_id):
         if not usage:
             continue
 
+        # Claude Code writes one assistant record per content block and repeats
+        # the whole request's usage in each, so totals are deduplicated on
+        # requestId; summing raw records overstates cost by 3-4x.
         request_id = record.get("requestId") or message.get("id")
         if request_id:
-            if request_id in recent:
+            if request_id in seen:
                 continue
-            recent.append(request_id)
-            if len(recent) > DEDUP_WINDOW:
-                del recent[:-DEDUP_WINDOW]
+            seen.add(request_id)
 
         creation = usage.get("cache_creation") or {}
         if creation:
@@ -532,8 +566,14 @@ def scan_usage(transcript_path, session_id):
             write_1h = 0
         server = usage.get("server_tool_use") or {}
 
-        # Sidechains (subagents) bill to the same session, so they count here too.
-        bucket = totals.setdefault(message.get("model") or "unknown", {})
+        # Speed is a price multiplier, not a model: fast mode bills the same
+        # model at 2x. Bucket per (model, speed) so each is priced on its own.
+        bucket = totals.setdefault(
+            "{}\t{}".format(
+                message.get("model") or "unknown", usage.get("speed") or "standard"
+            ),
+            {},
+        )
         for key, value in (
             ("i", usage.get("input_tokens")),
             ("o", usage.get("output_tokens")),
@@ -545,14 +585,55 @@ def scan_usage(transcript_path, session_id):
             if value:
                 bucket[key] = bucket.get(key, 0) + value
 
+    return {"ino": st.st_ino, "offset": offset + cut}
+
+
+def scan_usage(transcript_path, session_id):
+    """Per-(model, speed) token totals across the session, parsing only what's new.
+
+    State lives in /tmp keyed by session — the same pattern git_info() uses — so
+    a long session re-reads only the bytes appended since the last render, per
+    file. Seen requestIds are persisted in full rather than in a short ring:
+    with many subagent transcripts folded in, an id can reappear far more than a
+    fixed window later, and a ring that has rolled past it double counts.
+    """
+    if not transcript_path:
+        return None
+
+    state_file = "/tmp/mc-cost-{}".format(session_id or "nosess")
+    try:
+        with open(state_file) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    # A different transcript entirely invalidates the incremental state.
+    if state.get("path") != transcript_path:
+        state = {}
+
+    cursors = state.get("files")
+    if not isinstance(cursors, dict):
+        cursors = {}
+    totals = state.get("tok") or {}
+    seen = set(state.get("req") or [])
+
+    for path in usage_files(transcript_path):
+        cursors[path] = scan_file(path, cursors.get(path) or {}, seen, totals)
+
+    # Bounded so a marathon session can't grow the state file without limit;
+    # far beyond any plausible in-flight duplicate distance.
+    req = list(seen)
+    if len(req) > DEDUP_WINDOW:
+        req = req[-DEDUP_WINDOW:]
+
     try:
         with open(state_file, "w") as fh:
             json.dump(
                 {
                     "path": transcript_path,
-                    "ino": st.st_ino,
-                    "offset": offset + cut,
-                    "req": recent,
+                    "files": cursors,
+                    "req": req,
                     "tok": totals,
                 },
                 fh,
@@ -563,13 +644,26 @@ def scan_usage(transcript_path, session_id):
     return totals
 
 
-def price_tokens(tokens, spec):
-    """Dollar cost of one model's token totals under one rate entry."""
+def price_tokens(tokens, spec, speed="standard"):
+    """Dollar cost of one model's token totals under one rate entry.
+
+    Returns (cost, partial). Most published entries carry no cache rates at all —
+    in a current table 1811 of 2521 have no cache-read price — while cache reads
+    are the great majority of a Claude Code session's tokens. Billing them at the
+    plain input rate is the only estimate available, but it overstates by ~3.5x,
+    so `partial` says the figure rests on a substituted rate rather than letting
+    it pass as fully priced.
+    """
     rate_in = spec.get("i", 0.0)
     # Entries that list no cache pricing bill cached tokens as plain input.
     rate_read = spec.get("r", rate_in)
     rate_write = spec.get("w", rate_in)
-    return (
+    partial = bool(
+        (tokens.get("r") and spec.get("r") is None)
+        or (tokens.get("w5") and spec.get("w") is None)
+        or (tokens.get("w1h") and spec.get("w1h") is None)
+    )
+    cost = (
         tokens.get("i", 0) * rate_in
         + tokens.get("o", 0) * spec.get("o", 0.0)
         + tokens.get("r", 0) * rate_read
@@ -577,6 +671,10 @@ def price_tokens(tokens, spec):
         + tokens.get("w1h", 0) * spec.get("w1h", rate_write)
         + tokens.get("ws", 0) * spec.get("s", 0.0)
     )
+    mults = spec.get("m")
+    if isinstance(mults, dict) and speed in mults:
+        cost *= mults[speed]
+    return cost, partial
 
 
 def session_cost(transcript_path, session_id):
@@ -584,7 +682,9 @@ def session_cost(transcript_path, session_id):
 
     Returns (cost, unpriced). cost is None when nothing could be priced — the
     caller then falls back to Claude Code's own figure. unpriced flags that some
-    model burned tokens at rates we don't have, so the total reads low.
+    model burned tokens the table couldn't price exactly, so the total is an
+    estimate: low when a model resolved to nothing, high when only a cache rate
+    was missing and those tokens got charged at the input rate.
     """
     models = load_prices()
     if not models:
@@ -595,14 +695,23 @@ def session_cost(transcript_path, session_id):
 
     idx = price_index(models)
     cost, priced, unpriced = 0.0, False, False
-    for model_id, tokens in totals.items():
+    for bucket_key, tokens in totals.items():
+        model_id, _, speed = bucket_key.partition("\t")
         key, _ = resolve_model(model_id, idx)
-        if key is None:
+        spec = models[key] if key is not None else None
+        # An entry with no non-zero rate prices nothing. Counting it as priced
+        # would publish a confident `≈$0.00` and suppress Claude Code's figure —
+        # worse than admitting we don't know. distill_prices drops these, but a
+        # cache distilled by an earlier build can still hold them.
+        if spec is None or not (spec.get("i") or spec.get("o")):
             if any(tokens.get(name) for name in TOKEN_KEYS):
                 unpriced = True
             continue
-        cost += price_tokens(tokens, models[key])
+        model_cost, partial = price_tokens(tokens, spec, speed or "standard")
+        cost += model_cost
         priced = True
+        if partial:
+            unpriced = True
     return (cost if priced else None), unpriced
 
 

@@ -70,13 +70,30 @@ Mission Control prices the session itself instead:
 3. Tokens come from the session transcript, deduplicated by request — Claude Code
    writes one record per content block and repeats the whole request's usage in
    each, so naive summing overstates cost 3-4×. Cache reads and 5-minute vs 1-hour
-   cache writes are billed at their own rates, and subagent turns count too.
+   cache writes are billed at their own rates.
+4. **Subagents count.** Subagent and workflow conversations are written to sibling
+   transcripts under `<transcript>/subagents/`, not into the transcript itself. On
+   a workflow-heavy session they routinely outweigh the main thread — one measured
+   session read `≈$6.03` from the main transcript alone and `$25.71` with its 24
+   subagent transcripts folded in. Every sibling is scanned, each with its own byte
+   cursor so the scan stays incremental.
+5. **Speed is a multiplier, not a model.** Rate tables publish
+   `provider_specific_entry` (e.g. `{"us": 1.1, "fast": 2.0}`) — fast mode bills the
+   same model at double. Totals bucket per `(model, speed)` and price accordingly.
 
 | Reading | Meaning |
 |---------|---------|
 | `≈$4.18` | Self-priced from the rate table |
-| `≈$4.18?` | Self-priced, but some model burned tokens at rates we don't have — the figure reads low |
+| `≈$4.18?` | Self-priced, but part of the session couldn't be priced exactly — reads **low** when a model resolved to no entry, **high** when only a cache rate was missing and those tokens fell back to the input rate |
 | `$4.18` | No `≈`: Claude Code's own figure (price map absent, or `price_map: False`) |
+
+A rate entry that publishes no cache-read price is the common case, not the
+exception — 72% of the table — while cache reads are ~90% of a session's tokens.
+Charging them at the input rate is the only estimate available, but it overstates
+by ~4×, so the `?` is raised rather than letting the figure pass as authoritative.
+This is reachable on gateway-served Claude ids (`databricks/databricks-claude-*`,
+`gmi/anthropic/claude-*`, `bedrock/*/anthropic.claude-*`), which resolve to
+themselves and so never fall through to a more complete entry.
 
 Diagnose a mapping without guessing:
 
@@ -189,9 +206,11 @@ rm .claude/scripts/status-line.py        # and the .bak if present
 | Rate limits missing | Only present for Pro/Max after the first API response; auto-hidden otherwise |
 | Cache always "cold" | The indicator needs `refreshInterval` (auto-injected) and a valid `transcript_path` |
 | Branch missing | Not in a git repo, or `git` not installed |
-| Cost shows `$0.00` (no `≈`) | The rate table isn't cached — run `--refresh-prices` and check network access to raw.githubusercontent.com |
-| Cost shows a trailing `?` | A model in this session has no rate entry — find it with `--price-check <model-id>`, then pin `price_aliases` |
+| Cost shows `$0.00` (no `≈`) | **Check the installed version first** — `grep '# mission-control-version:' .claude/scripts/status-line.py` must be ≥1.3.0. A pre-1.3.0 copy has no self-pricing at all and just echoes Claude Code's figure, which is `$0.00` for any model it can't price. Note the plugin upgrades from the *published* marketplace, so a version that exists only in your working tree will never install. If the version is fine, the rate table isn't cached — run `--refresh-prices` and check network access to raw.githubusercontent.com |
+| Cost shows `≈$0.00` | The model resolved to a zero-rate entry (a free or placeholder tier sharing its name). Confirm with `--price-check <model-id>` and pin the right key in `price_aliases`. Fixed in 1.3.1, which drops zero-rate entries — on an older cache, `--refresh-prices` clears it |
+| Cost shows a trailing `?` | Part of the session couldn't be priced exactly: either a model has no rate entry (figure reads low) or its entry publishes no cache rate, so those tokens billed at the input rate (reads high, up to ~4×). Find it with `--price-check <model-id>`, then pin `price_aliases` |
 | Cost looks 3-4× too high | A stale pre-1.3.0 copy is installed; confirm `# mission-control-version:` is ≥1.3.0 |
+| Cost looks far too low on a session that ran subagents | Pre-1.3.1 copies counted only the main transcript and skipped `<transcript>/subagents/`, which often carries most of the spend |
 
 Test it directly with mock input:
 

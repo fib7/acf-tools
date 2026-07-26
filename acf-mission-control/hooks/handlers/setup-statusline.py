@@ -78,6 +78,11 @@ def refresh_price_map(script_path):
 
     Detached on purpose: session start never waits on the network, and the status
     line keeps rendering off the previous cache while this runs.
+
+    Call this with the *plugin's* script, never the installed copy: a local copy
+    predating `--refresh-prices` treats the flag as no argument at all, falls
+    through to the status-line renderer, fails to parse stdin from DEVNULL and
+    exits — so the cache silently never refreshes.
     """
     age = price_cache_age()
     if age is not None and age <= PRICE_TTL:
@@ -143,7 +148,7 @@ def main():
             print("Mission Control upgrade failed: {}".format(exc), file=sys.stderr)
             sys.exit(0)
 
-    refresh_price_map(local_script)
+    refresh_price_map(source_script)
 
     # ---- settings.json: ensure statusLine + refreshInterval ----------------
     settings = {}
