@@ -3,7 +3,8 @@ export const meta = {
   description: 'Decompose a scope into atomic backlog task files with schema-enforced worktree slugs, a JS validation gate (acyclic deps, unique ids, kebab slugs), parallel authoring, a single committing writer, and a create-time doctor gate.',
   whenToUse: 'Launched by the acf-whip /task skill when dynamic workflows are available. Replaces the Claude-as-orchestrator decomposition loop with a deterministic script so slug/dependency enforcement happens before any file is written.',
   phases: [
-    { title: 'Decompose', detail: 'one planner agent splits scope into a validated task graph (bounded re-dispatch on defects)' },
+    { title: 'Recon', detail: 'parallel read-only agents map existing ids/slugs, the real code surface, and the project conventions' },
+    { title: 'Decompose', detail: 'competing planners split the scope; a judge picks or merges; a completeness critic attacks the winner (bounded re-dispatch on defects)' },
     { title: 'Author', detail: 'one task-engineer per task writes its file in parallel (no commit)' },
     { title: 'Write', detail: 'one writer stages + commits all new pending tasks' },
     { title: 'Verify', detail: 'create-time doctor integrity gate' },
@@ -28,6 +29,13 @@ const store = (args && args.store) || 'files'
 const filesStore = store === 'files'
 const STORE = `${pluginRoot}/skills/lib/bin/acfw-store`
 const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=${sq(trunkBranch)}; export ACFW_STORE=${sq(store)};`
+// Deterministic shell-runner model, same policy as /go: agents that only run a fixed command and copy
+// its stdout into a schema do zero reasoning. Planners, the judge and the critic stay on the session model.
+const SHELL_MODEL = (args && args.shellModel) || 'haiku'
+// How many independent planners compete. The slug partition and the dependency graph are genuine
+// judgement calls with several defensible answers, which is the one place in /task where
+// generate-then-judge beats one shot.
+const PLANNERS = (args && typeof args.planners === 'number') ? Math.max(1, Math.min(3, args.planners)) : 2
 const AUTHOR_DIR = filesStore ? `.backlog/pending` : `.acfwhip/staging`
 
 // ---- enums (mirror task-template.md / task-engineer-pattern.md) ----
@@ -149,8 +157,8 @@ function validatePlan(plan, registeredAgents) {
   return defects
 }
 
-// ============================ DECOMPOSE ============================
-phase('Decompose')
+// ============================ RECON ============================
+phase('Recon')
 
 // Discover the REAL agent registry so the layer-2 gate agrees with the doctor's unknown-agent check.
 const REGISTRY = { type: 'object', additionalProperties: false, required: ['agents'], properties: { agents: { type: 'array', items: { type: 'string' } } } }
@@ -177,6 +185,99 @@ const agentLine = registeredAgents.length
   ? `assignedAgent MUST be one of this project's installed agents: ${registeredAgents.join(', ')}.`
   : `assignedAgent should name an installed specialist agent (run /whip-init to generate them); no registry was found at .claude/agents/, so choose a sensible specialist name.`
 
+// ---- 3.2.0 recon: three read-only agents, in parallel, feeding the planners ----
+// The planner is the real bottleneck in /task: ONE agent, ONE shot, deciding the worktree slug
+// partition (which IS /go's only concurrency partition) and the dependency graph (which IS its
+// serialization order). validatePlan is purely STRUCTURAL — it proves the graph is acyclic and the
+// slugs are kebab-case, and it cannot see a missing task, an over-shared slug that silently serializes
+// half the run, a spurious ordering dep, or globs that overlap across distinct slugs.
+const RECON_BACKLOG = {
+  type: 'object', additionalProperties: false, required: ['ids', 'slugsInUse', 'liveBranches', 'note'],
+  properties: {
+    ids: { type: 'array', items: { type: 'string' } },
+    slugsInUse: { type: 'array', items: { type: 'string' }, description: 'Worktree slugs already claimed by existing tasks' },
+    liveBranches: { type: 'array', items: { type: 'string' }, description: 'worktree/<slug> branches that currently exist' },
+    note: { type: 'string' },
+  },
+}
+const RECON_SURFACE = {
+  type: 'object', additionalProperties: false, required: ['modules', 'testLayout', 'note'],
+  properties: {
+    modules: { type: 'array', items: { type: 'string' }, description: 'real repo paths/globs this scope actually touches, most specific first' },
+    testLayout: { type: 'string', description: 'where tests live and how they are named/run' },
+    note: { type: 'string' },
+  },
+}
+const RECON_CONVENTIONS = {
+  type: 'object', additionalProperties: false, required: ['agents', 'gateCommands', 'styleNotes', 'note'],
+  properties: {
+    agents: { type: 'array', items: { type: 'string' }, description: 'one line per installed agent: "<name>: <what it is actually for>"' },
+    gateCommands: { type: 'string', description: 'the literal quality-gate commands this repo uses' },
+    styleNotes: { type: 'string', description: 'house rules a task description must obey' },
+    note: { type: 'string' },
+  },
+}
+
+const [rBacklog, rSurface, rConv] = await parallel([
+  () => agent(`${ENV}
+Read-only reconnaissance of the EXISTING backlog. Change nothing.
+1. Every existing task id:
+${filesStore
+    ? `     cd ${sq(trunkRoot)} && grep -rhoE '^- \\*\\*ID\\*\\*: .*' .backlog 2>/dev/null | sed -E 's/^- \\*\\*ID\\*\\*: *//' | sort -u`
+    : `     cd ${sq(trunkRoot)} && bash ${sq(STORE)} snapshot 2>/dev/null | jq -r '.tasks[]? | .id' 2>/dev/null | sort -u`}
+2. Every Worktree slug ALREADY CLAIMED by an existing task:
+${filesStore
+    ? `     cd ${sq(trunkRoot)} && grep -rhoE '^- \\*\\*Worktree\\*\\*: .*' .backlog 2>/dev/null | sed -E 's/^- \\*\\*Worktree\\*\\*: *//' | tr -d ' ' | sort -u`
+    : `     cd ${sq(trunkRoot)} && bash ${sq(STORE)} snapshot 2>/dev/null | jq -r '.tasks[]? | .slug' 2>/dev/null | sort -u`}
+3. Live worktree branches:  git -C ${sq(trunkRoot)} worktree list --porcelain | sed -n 's#^branch refs/heads/##p'
+Return the ReconBacklog.`, { label: 'recon:backlog', phase: 'Recon', schema: RECON_BACKLOG, model: SHELL_MODEL }),
+
+  () => agent(`${ENV}
+Read-only reconnaissance of the CODE SURFACE this scope touches. Change nothing, write nothing.
+
+SCOPE:
+${scope}
+
+Explore ${sq(trunkRoot)} and report the REAL paths involved — the modules, packages or services this
+scope would actually modify, as concrete globs a task's "Touches Globs" field could use verbatim. Be
+specific: "services/user-api/**" not "the backend". Also report where the tests for those paths live
+and how they are named. If the scope spans several independent surfaces, list them separately and most
+specific first — that separation is what lets the planner give each one its own worktree slug and run
+them in parallel.
+Return the ReconSurface.`, { label: 'recon:surface', phase: 'Recon', schema: RECON_SURFACE }),
+
+  () => agent(`${ENV}
+Read-only reconnaissance of this project's CONVENTIONS. Change nothing.
+1. Read the BODY of each installed agent definition and summarize what it is actually for, one line each:
+     ${registeredAgents.map((a) => `${trunkRoot}/.claude/agents/${a}.md`).slice(0, 12).join('\n     ')}
+   (A bare list of names cannot tell a planner which specialist a task belongs to.)
+2. The literal quality-gate commands: docs/development/quality-gates-*.md, Makefile, package.json
+   scripts, pyproject.toml, .pre-commit-config.yaml, go.mod — whichever exist.
+3. House style for task descriptions: docs/acf/style/task-descriptions.md and
+   docs/acf/backlog/task-template.md if present, plus CLAUDE.md conventions.
+Return the ReconConventions.`, { label: 'recon:conventions', phase: 'Recon', schema: RECON_CONVENTIONS }),
+])
+
+const reconBundle = `
+════════════ RECON (read-only agents already gathered this for you) ════════════
+EXISTING TASK IDS (do not collide): ${((rBacklog && rBacklog.ids) || []).slice(0, 80).join(', ') || '(none)'}
+SLUGS ALREADY CLAIMED: ${((rBacklog && rBacklog.slugsInUse) || []).join(', ') || '(none)'}
+LIVE WORKTREE BRANCHES: ${((rBacklog && rBacklog.liveBranches) || []).join(', ') || '(none)'}
+  ^ A NEW task that claims a slug already owned by an in-flight branch will serialize behind it.
+    Reuse a slug ONLY when the new task genuinely writes the same files.
+REAL CODE SURFACE FOR THIS SCOPE:
+${((rSurface && rSurface.modules) || []).map((m) => `  - ${m}`).join('\n') || '  (recon found nothing — be conservative with touchesGlobs)'}
+  tests: ${(rSurface && rSurface.testLayout) || '(unknown)'}
+INSTALLED SPECIALISTS AND WHAT THEY ARE FOR:
+${((rConv && rConv.agents) || []).map((a) => `  - ${a}`).join('\n') || '  (no descriptions available)'}
+QUALITY GATES: ${(rConv && rConv.gateCommands) || '(unknown)'}
+HOUSE STYLE: ${(rConv && rConv.styleNotes) || '(none found)'}
+`
+log(`recon: ${((rBacklog && rBacklog.ids) || []).length} existing id(s), ${((rBacklog && rBacklog.slugsInUse) || []).length} slug(s) in use, ${((rSurface && rSurface.modules) || []).length} surface path(s)`)
+
+// ============================ DECOMPOSE ============================
+phase('Decompose')
+
 const PLAN_RULES = `
 RULES (these are enforced by an automatic gate AFTER you respond; violating them forces a re-run):
 - One logical feature = one task (NOT micro-tasks). A feature's API + validation + tests + docs are ONE task. Mixed-stack work for one feature (backend + frontend) is ONE task.
@@ -189,7 +290,15 @@ RULES (these are enforced by an automatic gate AFTER you respond; violating them
 - ${agentLine}
 `
 
-async function plan(extraDefects, prior) {
+// Each competing planner gets a different EMPHASIS. Identical prompts produce correlated plans and the
+// judge has nothing to choose between; the disagreements are the point.
+const PLANNER_ANGLES = [
+  'Bias toward MAXIMUM PARALLELISM: give every genuinely independent surface its own worktree slug, and declare a dependency only where one task truly consumes another\'s output. Then re-read your own graph and delete every dependency you cannot justify in one sentence.',
+  'Bias toward COHESION and correct sequencing: group work that touches the same files onto one slug so it cannot conflict, and make sure nothing is scheduled before the thing it actually needs. Then check you have not serialized two surfaces that never touch the same file.',
+  'Bias toward COMPLETENESS: start from the acceptance criteria the scope implies and work backwards. Make sure migration, tests, docs and rollback are represented wherever the scope needs them, without inventing work the scope does not ask for.',
+]
+
+async function plan(angle, idx, extraDefects, prior) {
   const fix = extraDefects && extraDefects.length
     ? `\n\nYOUR PREVIOUS PLAN FAILED VALIDATION. Fix exactly these defects and return a corrected FULL plan:\n- ${extraDefects.join('\n- ')}\n\nPrevious plan was:\n${JSON.stringify(prior, null, 0)}\n`
     : ''
@@ -198,26 +307,76 @@ async function plan(extraDefects, prior) {
 
 SCOPE:
 ${scope}
+${reconBundle}
+YOUR ANGLE: ${angle}
 
-First, scan the existing backlog so you pick non-colliding ids and avoid duplicating work. Run:
-${filesStore
-    ? `  cd ${sq(trunkRoot)} && grep -rhoE '^- \\*\\*ID\\*\\*: .*' .backlog 2>/dev/null | sort -u; ls .backlog/pending 2>/dev/null`
-    : `  cd ${sq(trunkRoot)} && bash ${sq(STORE)} snapshot 2>/dev/null | jq -r '.tasks[]? | .id' 2>/dev/null | sort -u`}
-Also read, if present, ${sq(trunkRoot)}/docs/acf/style/task-descriptions.md and ${sq(trunkRoot)}/docs/acf/backlog/task-template.md for the house style (these constrain how you phrase WHAT/WHY).
+Read, if present, ${sq(trunkRoot)}/docs/acf/style/task-descriptions.md and ${sq(trunkRoot)}/docs/acf/backlog/task-template.md for the house style (these constrain how you phrase WHAT/WHY). The recon above already gathered the existing ids and slugs — do not re-scan them.
 
 Then return a DecompositionPlan. Do NOT write any files — another stage does that. Return ONLY the structured plan.
 ${PLAN_RULES}${fix}`,
-    { label: extraDefects && extraDefects.length ? 'plan:retry' : 'plan', phase: 'Decompose', schema: DECOMPOSITION_PLAN, agentType: 'task-engineer' },
+    { label: extraDefects && extraDefects.length ? `plan:retry${idx}` : `plan:${idx}`, phase: 'Decompose', schema: DECOMPOSITION_PLAN, agentType: 'task-engineer' },
   )
 }
 
-let planResult = await plan()
+// ---- generate K competing plans, keep the structurally valid ones, judge ----
+const candidates = (await parallel(
+  PLANNER_ANGLES.slice(0, PLANNERS).map((angle, i) => () => plan(angle, i)),
+)).filter(Boolean)
+
+const scored = candidates.map((p, i) => ({ plan: p, idx: i, defects: validatePlan(p, registeredAgents) }))
+const valid = scored.filter((s) => !s.defects.length)
+log(`decompose: ${candidates.length} plan(s) proposed, ${valid.length} structurally valid`)
+
+let planResult = null
+if (valid.length === 1) {
+  planResult = valid[0].plan
+} else if (valid.length > 1) {
+  // The judge chooses between REAL alternatives, so it must state a reason — a judge that cannot say
+  // why is a judge that picked at random.
+  const JUDGE = {
+    type: 'object', additionalProperties: false, required: ['choice', 'reason'],
+    properties: {
+      choice: { type: 'integer', description: 'the index of the plan you are adopting' },
+      reason: { type: 'string', description: 'one line: what makes that partition better HERE' },
+    },
+  }
+  const j = await agent(
+    `Two or more independent planners decomposed the same scope. Adopt the better partition.
+
+SCOPE:
+${scope}
+${reconBundle}
+${valid.map((s, i) => `──────── PLAN ${i} (${s.plan.tasks.length} tasks) ────────\n${JSON.stringify(s.plan, null, 0)}`).join('\n\n')}
+
+JUDGE ON THESE, in order:
+1. THE WORKTREE SLUG PARTITION. In acf-whip the slug IS the parallelism lock: two tasks sharing a slug
+   run strictly sequentially on one branch. Over-sharing silently serializes work that could have run
+   concurrently; one-slug-per-task defeats batching of genuinely same-surface work and produces
+   conflicting branches. Which plan's partition matches the REAL code surface above?
+2. THE DEPENDENCY GRAPH. Every unnecessary edge serializes work. Which plan declares only genuine
+   producer/consumer edges?
+3. COMPLETENESS against the scope, without inventing work the scope does not ask for.
+4. Whether touchesGlobs are concrete real paths (from recon) rather than plausible-looking fiction —
+   the doctor's cross-slug overlap check is inert against invented globs.
+
+Return the index of the plan you adopt and one line on why.`,
+    { label: 'judge:plan', phase: 'Decompose', schema: JUDGE, agentType: 'task-engineer' },
+  )
+  const pick = (j && Number.isInteger(j.choice) && valid[j.choice]) ? valid[j.choice] : valid[0]
+  planResult = pick.plan
+  log(`decompose: adopted plan ${pick.idx}${j && j.reason ? ` — ${String(j.reason).slice(0, 160)}` : ''}`)
+} else {
+  // Nothing was structurally valid: fall back to the bounded repair loop on the least-broken plan.
+  scored.sort((a, b) => a.defects.length - b.defects.length)
+  planResult = scored.length ? scored[0].plan : null
+}
+
 let defects = validatePlan(planResult, registeredAgents)
 let attempts = 1
 const MAX_PLAN_ATTEMPTS = 3
 while (defects.length && attempts < MAX_PLAN_ATTEMPTS) {
   log(`plan attempt ${attempts}: ${defects.length} defect(s) — re-dispatching planner`)
-  planResult = await plan(defects, planResult)
+  planResult = await plan(PLANNER_ANGLES[0], 0, defects, planResult)
   defects = validatePlan(planResult, registeredAgents)
   attempts++
 }
@@ -229,6 +388,56 @@ if (defects.length) {
     attempts,
     defects,
     plan: planResult,
+  }
+}
+
+// ---- completeness critic: ADVISORY, never blocking ----
+// It emits defects in validatePlan's shape so it re-enters the SAME bounded repair loop with no new
+// machinery. But its findings are advisory by design: structural defects are objective and abort at
+// the cap, whereas "you forgot a task" is a judgement, and letting it abort would make /task refuse to
+// produce a structurally valid plan on subjective grounds.
+const CRITIC = {
+  type: 'object', additionalProperties: false, required: ['defects'],
+  properties: { defects: { type: 'array', items: { type: 'string' }, description: 'one line each; empty if the plan is sound' } },
+}
+let critique = []
+{
+  const c = await agent(
+    `Attack this decomposition. You are the last check before these tasks are written to disk and executed.
+
+SCOPE:
+${scope}
+${reconBundle}
+ADOPTED PLAN:
+${JSON.stringify(planResult, null, 0)}
+
+Report ONLY defects you can name concretely. Look for:
+  * a task the scope REQUIRES that is missing entirely (the most expensive defect — /go executes what
+    is written and nothing else)
+  * two tasks sharing a worktree slug that do NOT touch the same files (silently serialized)
+  * two tasks with DIFFERENT slugs whose touchesGlobs overlap (they will conflict at integration)
+  * a dependency edge with no real producer/consumer relationship (pure serialization)
+  * an acceptance criterion that cannot be verified from inside a single worktree
+  * a task assigned to a specialist whose stated purpose does not match the work
+  * HOW-level prescription in a description (banned: algorithms, code, library mandates)
+
+Return an empty array if the plan is sound. Do NOT invent defects to look thorough.`,
+    { label: 'critic:completeness', phase: 'Decompose', schema: CRITIC, agentType: 'task-engineer' },
+  )
+  critique = (c && Array.isArray(c.defects)) ? c.defects.filter((d) => typeof d === 'string' && d.trim()) : []
+  if (critique.length) {
+    log(`critic: ${critique.length} advisory defect(s) — one repair round`)
+    const repaired = await plan(PLANNER_ANGLES[0], 0, critique, planResult)
+    const repairedDefects = repaired ? validatePlan(repaired, registeredAgents) : ['critic repair produced no plan']
+    if (!repairedDefects.length) {
+      planResult = repaired
+      critique = []
+      log('critic: repair adopted')
+    } else {
+      // The repair broke something structural. Keep the structurally valid plan and surface the
+      // critique in the report rather than shipping a plan that cannot be dispatched.
+      log(`critic: repair failed structural validation (${repairedDefects.length} defect(s)) — keeping the original plan and surfacing the critique`)
+    }
   }
 }
 
@@ -374,10 +583,22 @@ return {
   phase: 'complete',
   scope,
   attempts,
+  plannersRun: candidates.length,
+  recon: {
+    existingIds: ((rBacklog && rBacklog.ids) || []).length,
+    slugsInUse: (rBacklog && rBacklog.slugsInUse) || [],
+    surface: (rSurface && rSurface.modules) || [],
+  },
+  // Advisory findings the critic raised that survived (the repair either was not attempted or would
+  // have broken structural validity). Surfaced, never silently dropped — a "missing task" defect is
+  // the most expensive kind, because /go executes what is written and nothing else.
+  critique,
   created: writtenTasks
     .map((t) => ({ id: t.id, slug: t.worktreeSlug, prGroup: t.prGroup, priority: t.priority, agent: t.assignedAgent, deps: t.dependencies })),
   failedAuthors: failedAuthors.map((a) => ({ id: a.id, note: a.note })),
   commit: { committed: writeResult.committed, sha: writeResult.commitSha, note: writeResult.note },
   doctor: { ok: doctor && doctor.ok, summary: doctor && doctor.summaryLine, fatals: (doctor && doctor.fatals) || [] },
-  nextStep: 'Run /go to execute the backlog.',
+  nextStep: critique.length
+    ? `Run /go to execute the backlog. NOTE: ${critique.length} advisory critique(s) were left unresolved — review them before running /go.`
+    : 'Run /go to execute the backlog.',
 }
