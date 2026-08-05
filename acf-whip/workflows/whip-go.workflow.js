@@ -1645,7 +1645,11 @@ Return the ScanResult.`
       r = coerceAcfwResult(es.raw, ['completed', 'blocked', 'none'])
       if (!r) log(`↷ ${d.t.stem}: harness returned no usable ACFW_RESULT — transient, retried next iteration`)
     } else {
-      await preserveBeforeLegacy(ctx, es.prior || await scout(ctx))
+      // Only preserve when a child could actually have left work behind. es.prior is set exactly on
+      // the paths where the escalation machinery ran and scouted; on 'escalation off' and on the
+      // DIRECT/CLOSE budget rungs no child ever existed, and scouting there would buy a wasted agent
+      // per task — the opposite of what those rungs are for.
+      if (es.prior) await preserveBeforeLegacy(ctx, es.prior)
       log(`↷ ${d.t.stem}: single-agent fallback — ${es.why}`)
       r = await agentC(prompt, opts) // 3.1.0 verbatim: throws on non-emit -> thunk -> null (transient)
     }
