@@ -82,6 +82,18 @@ legacy loop has). Prefer it.
              mode: "default" | "override", store: "<info.store>", runLockPath: "<info.runLock>" }
    })
    ```
+
+   **Optional args (3.2.0 per-task child workflows).** Every dispatched unit runs as its own nested
+   workflow by default; these tune or disable that:
+
+   | Arg | Default | Effect |
+   |-----|---------|--------|
+   | `escalate` | `true` | `false` reverts to byte-identical 3.1.0 single-agent dispatch. **Reach for this first if a run looks hung** — expect roughly 2-4× the per-iteration wall clock at the default depth. |
+   | `escalateReview` | `false` | Turns on the multi-lens review panel. Off by default because it is the only *subtractive* seam: it can reject work that would otherwise have shipped, against a hard 3-rejection terminal. |
+   | `maxAmend` | `2` | Repair rounds when an authored harness throws. Two convergence gates usually cut it to one. |
+   | `agentBudget` | `8` | Agent ceiling for one harness (enforced inside the child, not advisory). |
+   | `agentCap` | `1000` | The run's total agent budget. Drives the FULL → LEAN → DIRECT → CLOSE ladder. |
+   | `shellModel` | `haiku` | Model for the deterministic shell-runner agents. |
    The per-iteration scan runs `acfw-store snapshot --digest` (a small scheduling snapshot — counts +
    actionable tasks + a compact `satisfiedDeps` list, with terminal-accepted tasks collapsed) and
    `whip-doctor --active-only` (full integrity over active folders; accepted fed as cheap stubs), so a
@@ -93,6 +105,16 @@ legacy loop has). Prefer it.
    integrated[], stopReason). If it returns `aborted: true` (detached HEAD or an unrepairable FATAL),
    surface the reason + fatals and STOP. Re-running `/go` is the documented resume — git + the task
    store (`.backlog/` on the default files backend) are the only durable state.
+
+   Also surface `escalation{}` and `agentsUsed`/`agentCap`. They are how an operator tells a fully
+   escalated run from one that silently degraded to 3.1.0 dispatch — the two are otherwise
+   indistinguishable. In particular:
+   - `stopReason: 'agent-cap-reached'` is a **clean** stop, not a failure: in-flight work was finished
+     and integrated, every completed harness stage is on disk under the same attempt key, and
+     re-running `/go` replays them for free and continues.
+   - `escalation.authored === 0` with `escalation.fellBack > 0` means no harness was ever authored —
+     check that `skills/lib/bin/acfw-child-*` are executable and `.claude/agents/` is populated.
+   - `escalation.stagesReplayed` is work a re-run did **not** have to redo.
 5. Do **not** also run the legacy loop below — the workflow replaces it.
 
 **Only if the `Workflow` tool is NOT available** (dynamic workflows disabled, or older Claude Code):

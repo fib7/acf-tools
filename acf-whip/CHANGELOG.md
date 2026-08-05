@@ -2,6 +2,107 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.2.0 — per-task authored child workflows (locked skeleton, open body)
+
+Until now every dispatched unit — a one-line config bump and a cross-cutting refactor alike — was
+executed by **exactly one `agent()` call**. The orchestrator's loop was good; the leaf was not. There
+was no model, effort, depth or fan-out variation, and `specialistPrompt` did not even inject the task's
+description or acceptance criteria: it passed a file path and let a single agent read it.
+
+Each unit now runs as **its own nested workflow**, whose harness a **workflow-architect** agent authors
+for that specific task. `/go` calls `workflow({scriptPath})`; the child's return value is consumed
+exactly where a single specialist's return value used to be.
+
+**Locked skeleton, open body.** A shipped, unit-tested skeleton
+(`skills/lib/child-skeleton.js.tmpl`) owns everything that must not be authored away: the `meta` frame,
+the single `clean-checkout`, the `runStage`/`runWave` primitives, the progress ledger, the budget guard,
+the fault typer, the commit verifier, the review-panel arithmetic and the sole `return`. The architect
+fills exactly **four marked regions**, and a shipped validator byte-diffs every locked segment before
+`/go` will run the file.
+
+Free-form generated harnesses were designed and rejected. Their own premortem was fatal, and the
+keystone defect *inverted* the durability requirement: two competing resume mechanisms cancelled, the
+script skipped a stage and returned `null`, and the first `null` deref made every resumed harness
+return `'none'` forever — a counter-free infinite task cycle. Constraining the mutation surface to four
+regions collapses roughly fourteen generated-code throw classes to about one, which is what lets the
+repair loop converge.
+
+**Durability across a throw** (the binding requirement). Each stage's own agent appends to a stage
+ledger — the agent, because a workflow script has no filesystem, which is exactly why the record
+survives both the script throwing and the architect's repair edit. When a child throws, a scout
+reconciles that ledger against git and the architect is re-invoked with the completed-stage set; the
+amended run replays those stages in **zero agents**. Reconciliation trusts a commit-bearing entry ONLY
+when git confirms it with an `ACFW-Stage:` trailer, and every disagreement resolves toward an
+**informed re-run**, never toward a skip — double-applying a stage is worse than re-running one.
+
+Convergence is **measured, not counted**: another amend round is granted only if the last one moved the
+ledger or the branch, or changed the pre-flight error. `MAX_AMEND=2` is the ceiling, rarely the cost.
+
+**The default harness is deliberately shallow** — checkout, implement, a bounded gate loop, adversarial
+diff review, verify. Those five hold the only three mechanisms a script structurally buys over one
+strong agent: a schema-**observed** advance condition (one agent conflates "I ran the gates" with "the
+gates passed"), a fresh-context reviewer of the diff, and a durable ledger. The architect is told that
+keeping this shape and declaring `shallow: true` is a *correct* answer, and `escalation.shallow` is
+reported so you can see whether it takes the invitation.
+
+**The worktree contract**, forced by the code rather than chosen: `clean-checkout.sh` is not reentrant.
+Its exit-2 mutual exclusion fires only on worktree *creation*, so a second invocation against a live
+worktree sails past it into `git stash push -u … || true` and silently sweeps a sibling stage's
+in-flight work into the **shared** `refs/stash`. Therefore exactly ONE `clean-checkout` per (task,
+attempt), in the locked prologue, guarded by an **observation** (`git worktree list --porcelain`) rather
+than a ledger record — a lost ledger entry must never be able to trigger a second stash. Only one agent
+may write the tree at a time, and "write" includes running the build or test suite. `runWave` forces
+mutating stages sequential, so the rule is structural rather than a prompt request.
+
+**Seams.** Implementation and LP-CAS conflict resolution escalate by default. Conflict resolution fans
+out READ and fans in WRITE: analysts are read-only and never `git add` (staging clears a path's unmerged
+state regardless of content, and the integrator's completion oracle is exactly that state being empty),
+then one stager touches the enumerated paths. The resolver is **not** escalated inside
+`priorIntegratePass`, which runs concurrently with the dispatch wave. The **multi-lens review panel
+ships off** (`args.escalateReview`) — it is the only *subtractive* seam, and it runs against a hard
+3-rejection terminal. When enabled, aggregation is strict majority with **no veto**, and
+`rejectionIncrement` is clamped so a panel of any size costs at most one life per round.
+
+**Survivability.** The runtime caps total agents per run and children share the counter, so the parent
+keeps its own ledger and degrades FULL → LEAN → DIRECT → CLOSE. CLOSE trims new dispatch *before* the
+pre-move (a task moved to in-progress and then abandoned would sit there until the 8h sweep) and
+**breaks** rather than returns, so Drain and the unlock still run and the report is clean. The dispatch
+wave is chunked and try-wrapped: a cap exception is thrown at the top of `parallel()` itself and,
+uncaught, would escape the loop and the script — no report, no unlock, lock held 30 minutes.
+`LANES = max(2, POOL-2)` is safe under both readings of whether a parent thunk awaiting `workflow()`
+holds a concurrency slot; `floor(POOL/2)` was rejected because on 4 cores it serializes the whole
+backlog. **D2 is honoured as policy, not guaranteed as outcome**: above roughly 80 tasks the tail of a
+run executes as plain 3.1.0, and the report says so.
+
+**`/task`** gets recon (existing ids *and slugs already in use*, the real code surface, and the agent
+definitions' bodies), two competing planners judged, and an advisory completeness critic — but **no
+architect and no child workflow**: its pipeline is identical every invocation, so there is no shape to
+discover, and its per-unit authoring fan-out already existed.
+
+**Also fixed** (independent of the feature, landed first):
+- **Run-killer:** an unguarded `await priorIntegratePass`. `integrateOne` dispatched the conflict
+  resolver through a bare `agent()` and `serializeIntegrate` returns the un-swallowed promise, so a
+  resolver non-emit propagated out of the loop *and the script* — no report, no unlock, lock held.
+- **Livelock:** a reviewer that rejected without setting `rejectionIncrement` wrote `inc:0`, so
+  Rejection Count never advanced and the task cycled forever, caught only by the loose `NO_GAIN_LIMIT`.
+  `inc` is now derived from the transition, and `ACFW_RESULT` gains an optional
+  `faultClass: quality|mechanism` so "reject, and this is not the task's fault" stays expressible —
+  extending the mechanism-vs-quality budget separation 3.0.0 established for the integrator to review.
+- A deterministic parent-side clean-checkout AUTO-REJECT, typed: token missing with the branch present
+  means the token was lost, not the work (mechanism, retried); no branch at all is a real reject.
+- `whip-init` gitignores `.acfwhip/run/` and `.acfwhip/specs/` unconditionally. **Never `.acfwhip/`
+  wholesale** — `.acfwhip/config` is committed and its values overwrite inherited env.
+- `task-template.md` said Rejection Count max 5 while the cap has been 3.
+
+**Adapters, `CONTRACT.md`, `scan-backlog.sh` and the task template are UNCHANGED** — no new scanned
+field was needed, which is the payoff of gating on budget rather than on complexity.
+
+New: `skills/lib/child-skeleton.js.tmpl`, `skills/lib/bin/acfw-child-{scaffold,validate,ledger}`,
+`acfw-child-validate.mjs`, and five test files. Suite: **645 assertions**, green on stock macOS bash 3.2
+with BSD sed/awk, plus `tests/run-all.sh` so a new suite cannot silently stop being run.
+
+Kill switch: `args.escalate: false` reverts to byte-identical 3.1.0 dispatch.
+
 ## 3.1.1 — the beads adapter uses Dolt, the engine `bd` actually ships
 
 - **`ACFW_STORE=beads` could not initialize at all.** The adapter ran

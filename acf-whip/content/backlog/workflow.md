@@ -89,6 +89,18 @@ The lock is git itself: `git worktree add <repo>/.worktree/<slug> -b worktree/<s
 
 **Ownership scope.** acf-whip owns exactly one branch namespace — `worktree/<slug>` — and only ever creates, inspects, or removes worktrees on it. The doctor's orphan reaper and wrong-branch check are scoped to that namespace, so the `/go` bootstrap `--fix` never touches a worktree you keep in the same repo for your own research/benchmarking, even one parked under `.worktree/` — a foreign branch, a detached worktree (mid-rebase), or a plain directory there is left completely alone. The directory and branch prefix are configurable per project via `.backlog/.acfw-config` (`ACFW_WORKTREE_DIR`, default `.worktree`; `ACFW_BRANCH_PREFIX`, default `worktree`); change them only on a fresh backlog, since existing worktrees are pinned to the namespace they were created under.
 
+## Per-task child workflows (3.2.0)
+
+Each dispatched unit runs as its **own nested workflow**, not as a single agent. A **workflow-architect** agent authors a harness for that specific task by filling four marked regions of a locked, shipped skeleton (`skills/lib/child-skeleton.js.tmpl`); a validator byte-diffs every locked segment before `/go` will run the file. The skeleton owns the single `clean-checkout`, the stage primitives, the progress ledger, the budget guard, the commit verifier, the review-panel arithmetic and the sole return path — none of it can be authored away.
+
+**Seams.** Implementation and LP-CAS conflict resolution escalate by default. The multi-lens review panel is opt-in (`args.escalateReview`) because it is the only *subtractive* seam: it can reject work that would otherwise have shipped, against a hard 3-rejection terminal. Aggregation is strict majority with **no veto**, and a panel of any size can cost at most one rejection per round.
+
+**Durability.** Each stage's own agent appends its result to a ledger under `.acfwhip/run/child/<stem>/<attempt>/<kind>/` (gitignored), because a workflow script has no filesystem — which is exactly why the record survives the script throwing *and* the architect's repair edit. When a harness throws, a scout reconciles that ledger against git and the architect amends with the completed-stage set in hand; the amended run replays those stages in **zero agents**. A commit-bearing entry is trusted only when git confirms it with an `ACFW-Stage:` trailer; every disagreement resolves toward an **informed re-run**, never a skip.
+
+The attempt key is `a<RejectionCount>-b<BlockCount>`: stable across amends, re-dispatches and `/go` crashes (so progress survives them), and **new** on an external rejection — a retry harness that replayed everything as done would produce nothing.
+
+**Degradation.** The runtime caps total agents per run and children share the counter, so `/go` degrades FULL → LEAN → DIRECT → CLOSE as its budget depletes, falling back to verbatim 3.1.0 single-agent dispatch. Escalation is therefore a **policy, not a guarantee**: on a large backlog the tail of a run is 3.1.0, and the report says so (`escalation{}`, `agentsUsed`, `stopReason: agent-cap-reached`). Every exhaustion path — architect non-emit, pre-flight rejection, amend budget, `workflow()` unavailable — lands on the same fallback. `args.escalate: false` disables the whole feature.
+
 ### Step 0: clean-checkout-before-task
 
 Every implementer specialist and `quality-reviewer` invokes the `clean-checkout-before-task` skill as Step 0, before reading the task body. The skill:
@@ -99,7 +111,11 @@ Every implementer specialist and `quality-reviewer` invokes the `clean-checkout-
 4. Stashes unrelated working-tree changes.
 5. Logs `clean-checkout: ok` to the task transition log.
 
-Quality-reviewer rejects any task in `.backlog/in-review/` whose transition log lacks the `clean-checkout: ok` token.
+Quality-reviewer rejects any task in `.backlog/in-review/` whose transition log lacks the `clean-checkout: ok` token. As of 3.2.0 `/go` also checks this **deterministically** before dispatching a reviewer, and types the result: a missing token with the worktree branch **present** means the token was lost rather than the work (a mechanism fault — retried, no rejection charged), while no branch at all is a genuine quality rejection.
+
+**Exactly one clean-checkout per (task, attempt) — 3.2.0, WT-1.** The skill is *not* reentrant: its exit-2 mutual exclusion fires only when the worktree is **created**, so a second invocation against a live worktree passes the branch check and proceeds to step 4, whose `git stash push -u … || true` silently sweeps another stage's in-flight work into the **shared** `refs/stash`. Inside a child workflow the checkout therefore happens once, in the locked prologue, guarded by an **observation** (`git worktree list --porcelain` shows the branch) rather than by a ledger record — a lost ledger entry must never be able to trigger a second stash. No authored stage may invoke it, and the validator rejects a harness that names it.
+
+**One writer at a time.** Within a task, "write" includes editing files, `git add`/`git commit`, **and running the build or test suite** (which produces build output, caches, coverage and formatter rewrites). Read-only work — recon, call-site census, review lenses, adversarial judging — is the parallel lane. The stage runner forces mutating stages sequential, so this is structural rather than a request.
 
 All subsequent state moves, edits, and commits happen inside the worktree on `worktree/<slug>`. **No commits land on the trunk branch from a specialist.**
 
