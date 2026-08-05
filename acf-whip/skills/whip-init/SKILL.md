@@ -96,8 +96,9 @@ non-files store:
    adapter **refuses with exit 8 when anything is staged** — commit or unstash first. It
    passes `--skip-hooks --skip-agents`, so bd will not set `core.hooksPath` or write
    `AGENTS.md`/`CLAUDE.md` into the repo.
-3. **Skip Step 3 entirely** (there is no `.backlog/` on a non-files store) and in Step 3.5a
-   gitignore `.acfwhip/run/` and `.acfwhip/specs/` instead of `.backlog/.acfw-run.json`.
+3. **Skip Step 3 entirely** (there is no `.backlog/` on a non-files store) and in Step 3.5a drop
+   the `.backlog/.acfw-run.json` line — the `.acfwhip/run/` and `.acfwhip/specs/` entries are
+   unconditional and already cover the run state on every backend.
    Everything else (agents, quality gates, docs) proceeds unchanged.
 
 ### Step 3: Create .backlog/ Structure (files store only)
@@ -130,9 +131,10 @@ ls -1 .backlog/ | grep -v README.md | xargs -I {} echo "  - {}"
 ### Step 3.5: Configure Worktree Concurrency, Env Hydration, and Doctor Config
 
 **3.5a — gitignore entries.** Add the per-task worktree dir (default `.worktree/`, or the
-`ACFW_WORKTREE_DIR` you set in 3.5c) and `.backlog/.acfw-run.json` (the `/go` run heartbeat)
-to `.gitignore`. ACF convention: per-task worktrees live at `<repo-root>/.worktree/` and are
-gitignored (see `docs/acf/organization.md` → "Per-Task Worktree Directory").
+`ACFW_WORKTREE_DIR` you set in 3.5c), `.backlog/.acfw-run.json` (the `/go` run heartbeat), and the
+`/go` run-state directories to `.gitignore`. ACF convention: per-task worktrees live at
+`<repo-root>/.worktree/` and are gitignored (see `docs/acf/organization.md` → "Per-Task Worktree
+Directory").
 
 ```bash
 WT_DIR="${ACFW_WORKTREE_DIR:-.worktree}"   # honor a custom dir if .acfw-config sets one
@@ -143,7 +145,15 @@ ensure_gitignore() { # <pattern> <comment>
 }
 ensure_gitignore "${WT_DIR%/}/" 'ACF Whip per-task worktrees (clean-checkout-before-task)'
 ensure_gitignore '.backlog/.acfw-run.json' 'ACF Whip /go run heartbeat'
+ensure_gitignore '.acfwhip/run/' 'ACF Whip /go run state (per-task harness scripts and stage ledgers)'
+ensure_gitignore '.acfwhip/specs/' 'ACF Whip materialized task specs (non-files stores)'
 ```
+
+> **Never gitignore `.acfwhip/` wholesale.** `.acfwhip/config` is a COMMITTED file and is the
+> namespace source of truth whose values *overwrite* inherited env (`ACFW_STORE`,
+> `ACFW_WORKTREE_DIR`, `ACFW_BRANCH_PREFIX`). Ignoring the whole directory would silently revert
+> those settings on a fresh clone. Ignore only `run/` and `specs/`. The LP-CAS ledger at
+> `.acfwhip/integrated/` is likewise committed by design — it is the integration oracle.
 
 **3.5b — `.worktreeinclude` manifest.** Scaffold a starter manifest (if missing) listing
 untracked dev files to copy/symlink into each fresh worktree so specialists can run a full

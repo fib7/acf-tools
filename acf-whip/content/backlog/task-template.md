@@ -17,7 +17,7 @@
 - **Touches Globs**: [comma-separated file globs this task will modify, e.g. `services/user-api/**, go.mod`] or "none" (used by the doctor to WARN when two different-slug pending tasks overlap — a mis-partition signal)
 - **Dependencies**: [task-id-1, task-id-2] or "none"
 - **Integrated-At**: (INERT as of 3.0.0 / LP-CAS — kept only for display. Integration truth is the in-tree ledger marker `.acfwhip/integrated/<shard>/<key>.json` on trunk, written by `integrate-lpcas`; nothing reads this field.)
-- **Rejection Count**: 0 (max 5; quality-reviewer increments on reject; after 5th rejection, task-engineer redesigns)
+- **Rejection Count**: 0 (max 3; quality-reviewer increments on reject; at the cap the task is blocked for task-engineer redesign. A review reporting `faultClass: mechanism` — a broken environment, a lost clean-checkout token — does NOT increment it.)
 - **Block-Count**: 0 (per-task re-block counter; `/go` increments when a specialist re-blocks a dispatched task and stops re-dispatching once it reaches the cap, parking the task for an operator)
 - **Created By**: task-engineer
 - **Created At**: $(date +"%Y-%m-%d %H:%M:%S") UTC

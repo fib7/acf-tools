@@ -141,6 +141,7 @@ const ACFW_RESULT = {
     blockedReason: { type: 'string', enum: ['dependency-missing', 'environment', 'unrecoverable', 'none'], description: 'ONLY meaningful when transition=blocked. "dependency-missing" = the REAL blocker is unmodeled work that should be its own task (name it in needsTask) — the orchestrator then PARKS this task for an operator instead of re-dispatching it (re-running /go will not help). Omit or "none" for an ordinary block.' },
     needsTask: { type: 'string', description: 'when blockedReason=dependency-missing: a one-line description of the missing task an operator should create; else "".' },
     deliverableFiles: { type: 'array', items: { type: 'string' }, description: 'NON-CODE (Worktree: none) tasks ONLY: every standalone file you created or modified outside .backlog/, repo-relative (e.g. "docs/research/20260709-foo.md"). The single writer commits these with the state move — list them or they are LOST. Empty when the deliverable lives inside the task file itself.' },
+    faultClass: { type: 'string', enum: ['quality', 'mechanism'], description: 'OPTIONAL (absent => quality). Set "mechanism" to say "this failed, and it is NOT the task\'s fault" — a broken environment, a missing worktree, a lost clean-checkout token, a harness defect. A mechanism fault is TRANSIENT: it never charges the task\'s Rejection Count or Block-Count, and the task is retried unchanged. Use "quality" (or omit) when the WORK is what is wrong.' },
   },
 }
 const INTEGRATE_RESULT = {
@@ -289,6 +290,25 @@ function resultToState(from, transition) {
   if (from === 'in-review' && transition === 'accepted') return 'accepted'
   if (from === 'in-review' && transition === 'rejected') return 'rejected'
   return null
+}
+
+// reviewVerdict — the review call site's whole decision, made pure and testable.
+//
+// Fixes a livelock: the old call site wrote `inc: (toState === 'rejected' && rr.rejectionIncrement === 1)
+// ? 1 : 0`, so a reviewer that returned transition 'rejected' WITHOUT setting rejectionIncrement wrote
+// inc:0. Rejection Count then never advanced, MAX_REJECT_RETRY never bound, and the task cycled
+// in-review -> rejected -> pending -> in-review forever, caught only by the loose NO_GAIN_LIMIT.
+// Deriving inc from toState makes the increment structural — a rejection ALWAYS costs one life.
+//
+// But rejectionIncrement was also the only channel a reviewer had for "reject, and this is not the
+// task's fault". That is now the explicit faultClass field: a mechanism fault is transient (no move, no
+// increment), which keeps mechanism faults out of the quality budget — the separation the 3.0.0 LP-CAS
+// design established for the integrator and that review never had.
+function reviewVerdict(rr) {
+  if (!rr) return { toState: null, inc: 0, mechanism: false }
+  if (rr.transition === 'rejected' && rr.faultClass === 'mechanism') return { toState: null, inc: 0, mechanism: true }
+  const toState = resultToState('in-review', rr.transition)
+  return { toState, inc: toState === 'rejected' ? 1 : 0, mechanism: false }
 }
 
 // reconcileIntegrationTallies — WS5 / retro #9: the in-loop integrate accumulators are optimistic. A
@@ -787,7 +807,16 @@ Return the ScanResult.`
       const ropts = { label: `resolve:${t.slug}`, phase: 'Iterate' }
       const ragent = r.resolverAgent || t.agent
       if (ragent && ragent !== 'none') ropts.agentType = ragent
-      await agent(resolverPrompt(t, r), ropts)
+      // try-wrapped: this is the ONLY un-safeAgent'd agent() inside integrateOne, and integrateOne runs
+      // on the serializeIntegrate chain whose promise is awaited bare at the end of the iteration. An
+      // unhandled non-emit here used to abort the whole run. A failed resolver just means the conflict
+      // is unresolved: fall through to --post-resolver, which re-detects the unmerged paths and returns
+      // a typed transient, leaving the task accepted/ for the next iteration.
+      try {
+        await agent(resolverPrompt(t, r), ropts)
+      } catch (e) {
+        log(`WARN resolve ${t.slug}: resolver agent non-emit (${String((e && e.message) || e).slice(0, 160)}) — conflict left unresolved, retried next iteration`)
+      }
       r = await safeAgent(integratePrompt(t, true), { label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
     }
     if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); integratedThisIter++; log(`✓ integrated ${t.stem}`) }
@@ -818,14 +847,34 @@ Return the ScanResult.`
   // thunk -> parallel maps it to null; the task is left committed in in-review/ and re-reviewed next scan.
   async function runReviewAndIntegrate(t) {
     const isNone = t.slug === 'none'
+    // Deterministic clean-checkout AUTO-REJECT, decided HERE rather than by a reasoning prompt.
+    // hasCleanCheckoutToken is an adapter-owned snapshot field on every backend (CONTRACT.md), so this
+    // costs nothing and cannot be forgotten mid-review the way the prose rule in reviewerPrompt can.
+    // It is TYPED, because the token's most common cause of loss is mechanical, not a missing worktree:
+    // append_log_row is a read-modify-write with no lock, and clean-checkout's store log-event fallback
+    // fails with only a WARN. So: branch exists + token missing => the token was lost, not the work
+    // => mechanism, retried. No branch at all => nothing was ever checked out => a real quality reject.
+    if (!isNone && t.hasCleanCheckoutToken === false) {
+      if (t.hasWorktreeBranch) {
+        log(`↷ ${t.stem}: clean-checkout token missing but ${branchPrefix}/${t.slug} exists — mechanism, left in-review/ for re-review`)
+        return
+      }
+      await streamWrite([{ stem: t.stem, toState: 'rejected', agent: 'orchestrator', notes: 'AUTO-REJECT: no clean-checkout token and no worktree branch — the implementation never entered a worktree', inc: 1 }], `review#${iter}:${t.stem}`)
+      productiveDispatch = true
+      return
+    }
     const rprompt = isNone ? directReviewPrompt(t) : reviewerPrompt(t)
     // Reviewers ALWAYS run as quality-reviewer (independent review — never the implementer's agent).
     const rr = await agent(rprompt, { label: `review:${isNone ? t.stem : t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' })
-    const toState = resultToState('in-review', rr && rr.transition)
-    if (!toState) return // none/mismatched -> transient, leave in in-review/
-    await streamWrite([{ stem: t.stem, toState, agent: t.agent || 'orchestrator', notes: (rr.notes || '').slice(0, 200), inc: (toState === 'rejected' && rr.rejectionIncrement === 1) ? 1 : 0 }], `review#${iter}:${t.stem}`)
+    const rv = reviewVerdict(rr)
+    if (rv.mechanism) { log(`↷ ${t.stem}: review reported a MECHANISM fault (${(rr.notes || '').slice(0, 120)}) — left in-review/, no rejection charged`); return }
+    if (!rv.toState) return // none/mismatched -> transient, leave in in-review/
+    // notes capped at 400, not 200: review feedback is the single most valuable input a retry has, and a
+    // folded multi-lens critique truncated to 200 chars is LESS actionable than one reviewer's 200 —
+    // which would make retry quality go down rather than up.
+    await streamWrite([{ stem: t.stem, toState: rv.toState, agent: t.agent || 'orchestrator', notes: (rr.notes || '').slice(0, 400), inc: rv.inc }], `review#${iter}:${t.stem}`)
     productiveDispatch = true
-    if (toState === 'accepted' && mode === 'default' && codeSlug(t)) await serializeIntegrate(() => integrateOne(t))
+    if (rv.toState === 'accepted' && mode === 'default' && codeSlug(t)) await serializeIntegrate(() => integrateOne(t))
   }
 
   // Run one specialist/direct unit, then stream it through review (+integration) on completion.
@@ -896,7 +945,13 @@ Return the ScanResult.`
     log(`iter ${iter}: dispatching ${specialistQ.length} specialist + ${directQ.length} direct + ${reviewQ.length} review — ${dispatch.map((d) => `${d.kind}:${d.t.slug === 'none' ? d.t.stem : d.t.slug}`).join(', ')}`)
     await parallel(dispatch.map((d) => () => processUnit(d)))
   }
-  await priorIntegratePass // ensure leftover integration finished before progress accounting
+  // MUST stay guarded. integrateOne dispatches the conflict resolver through a bare agent(), so a
+  // resolver non-emit REJECTS this promise; serializeIntegrate returns the un-swallowed promise, and a
+  // bare `await` here propagates out of the while loop AND out of the script — no report, no unlock,
+  // run lock held for LOCK_FRESH_MIN. That is exactly the "hours of work, no report" failure 3.0.1 was
+  // written to eliminate. Swallowing is strictly safe: a leftover stays accepted/ and is retried next
+  // iteration and again by the drain pass.
+  await priorIntegratePass.catch((e) => log(`WARN prior-integrate pass failed: ${String((e && e.message) || e).slice(0, 200)} — leftovers stay accepted, retried next iteration`))
 
   // ---- progress accounting (computed from THIS iteration's work) ----
   // didWork drives the idle guard (break at 3). A pre-move (unblock/timeout/dispatch/reject), an
