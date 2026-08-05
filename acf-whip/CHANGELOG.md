@@ -103,6 +103,25 @@ with BSD sed/awk, plus `tests/run-all.sh` so a new suite cannot silently stop be
 
 Kill switch: `args.escalate: false` reverts to byte-identical 3.1.0 dispatch.
 
+**Runtime facts verified against a live nested run** (recorded so the next author does not re-derive them):
+
+| Question | Answer |
+|---|---|
+| Does `workflow({scriptPath}, args)` run a child? | Yes. |
+| Can the child dispatch its own agents? | Yes. |
+| Does the second argument arrive as a real **object**? | Yes — `args.foo` is readable in the child. The skeleton's whole `const A = args \|\| {}` unpacking depends on this. |
+| Does the child's return value reach the parent? | Yes, verbatim. |
+| Do the child's agents count against the **parent's** run? | Yes — the parent run reported the child's agent count as its own. This is exactly the premise the CAP_RESERVE ladder rests on. |
+| Message when the path is unreadable | `Workflow script file not found: <path>` — deliberately does NOT match the kill-switch pattern, so it becomes one repairable amend round rather than disabling escalation for the whole run. |
+| Message when the ref is malformed | `workflow() expects a workflow name (string) or {scriptPath: string}` — also not a kill-switch match. |
+
+Still **unverified, and deliberately not depended on**: whether a parent thunk awaiting `workflow()`
+holds a concurrency slot. `LANES = max(2, POOL-2)` is correct under both readings, so the open question
+is a throughput one, not a correctness one. Do not probe it from inside `/go` — under the pessimistic
+reading the probe *is* the deadlock. Runtime resume across the nesting boundary is likewise unused: the
+stage ledger is the durability mechanism, and if resume does reach into children the only effect is that
+some replays come from the journal instead of `args.priorStages` — same values, strictly faster.
+
 ## 3.1.1 — the beads adapter uses Dolt, the engine `bd` actually ships
 
 - **`ACFW_STORE=beads` could not initialize at all.** The adapter ran
