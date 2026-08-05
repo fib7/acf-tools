@@ -68,7 +68,7 @@ Adapters **without** `snapshot-enriched` emit `"raw":true` and omit git-derived 
 ```json
 {"stem":"...","folder":"<whip-state>","fields":{"id":"...","status":"...","priority":"...","agent":"...","worktree":"...","pr_group":"...","touches_globs":"...","dependencies":"...","rejection_count":0,"block_count":0},"body":"..."}
 ```
-`body` only with `--body`. `--materialize DIR` writes a full task document to `DIR/<key>.md` and prints that path instead of JSON — this is how specialists and `clean-checkout` get a spec file on non-files backends (files prints the real root path). A materialized document MUST contain: the current metadata bullets, the body, **and the stored audit trail** (every `log-event` row and `comment`, verbatim, oldest-first — e.g. under a `## Store Audit Trail` heading). The audit trail is load-bearing: the quality-reviewer's auto-reject greps the refreshed materialized document for the `| clean-checkout | ok |` token that `log-event` recorded.
+`body` only with `--body`. `--materialize DIR` writes a full task document to `DIR/<key>.md` and prints that path instead of JSON — this is how specialists and `clean-checkout` get a spec file on non-files backends (files prints the real root path). A materialized document MUST contain: the current metadata bullets, the body, **and the stored audit trail** — every `log-event` row and `comment`, verbatim. Rows an adapter already keeps in the document (files, multica) satisfy this inline via the `## Transition Log` table; anything held out-of-document is appended oldest-first under a heading of the adapter's choosing (`## Store Comments`, `## Store Audit Trail`). The audit trail is load-bearing: the quality-reviewer's auto-reject greps the refreshed materialized document for the `| clean-checkout | ok |` token that `log-event` recorded — from wherever it lives.
 
 ### `create [--folder pending] [--file PATH | stdin] [--stem KEY] [--set Field=Value]...`
 Ingest one task document. Key = `--stem` or the `--file` basename. Duplicate key → exit 4 (never upsert). `--set` overrides a metadata field after parse (e.g. `--set 'Dependencies=a, b'`). Optional fields honored where native: `parent_key`, `stage` (multica `--parent/--stage`, beads `--parent`; files ignores). Returns `{"key":"..."}`.
@@ -76,7 +76,7 @@ Ingest one task document. Key = `--stem` or the `--file` basename. Duplicate key
 ### `transition [--stage PATH]... <key> <TO_STATE> [AGENT] [NOTES] [RINC] [BINC]`
 The positional tail mirrors `apply-transition.sh` argument-for-argument. Semantics:
 - **Idempotent**: already in `TO_STATE` → `noop:` line, exit 0, no counter bumps.
-- Appends an audit/transition-log row (files: Transition Log table; beads/multica: comment).
+- Appends an audit/transition-log row. **Where** is the adapter's choice: files and multica splice it into the task document's `## Transition Log` table (shared `append_log_row` — newest-first, capped, appended at EOF when the document has no table); beads and linear post it as an issue comment. Prefer the document when the backend's comment stream is an agent-facing channel.
 - `RINC=1` + `TO_STATE=rejected` bumps rejection count; `BINC=1` + `TO_STATE=blocked` bumps block count.
 - `archive` is a legal target. Invalid state → exit 7. Unknown key → exit 3.
 - `--stage PATH` (capability `stage`): co-commit repo-relative deliverable files with the state change. Refuse empty/absolute/`..`/`.backlog/`/`.acfwhip/` paths (exit 2). Adapters without `stage` never see the flag — the dispatcher commits deliverables to trunk itself first.

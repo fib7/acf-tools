@@ -26,6 +26,7 @@ phase9-store-conformance
 phase9-dispatcher
 phase10-validate-child
 phase11-checkout-reentrancy
+phase12-multica-transition-log
 $OPTIONAL
 "
 SUITES_MJS="
@@ -104,6 +105,15 @@ for b in skills/lib/bin/acfw-child-scaffold skills/lib/bin/acfw-child-validate s
     printf '  %-34s ok    (syntax + executable)\n' "$(basename "$b")"
   else
     printf '  %-34s FAIL  (syntax error or not chmod +x)\n' "$(basename "$b")"; STATIC_FAIL=1
+  fi
+done
+# Adapters were outside every static gate: a syntax error in one is invisible until a run
+# hits that backend, and three of the four have no offline suite at all.
+for a in adapters/*/acfw-store-*; do
+  if [ -x "$a" ] && bash -n "$a" 2>/dev/null; then
+    printf '  %-34s ok    (syntax + executable)\n' "$(basename "$a")"
+  else
+    printf '  %-34s FAIL  (syntax error or not chmod +x)\n' "$(basename "$a")"; STATIC_FAIL=1
   fi
 done
 if node --check skills/lib/bin/acfw-child-validate.mjs 2>/dev/null; then

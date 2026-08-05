@@ -122,6 +122,42 @@ reading the probe *is* the deadlock. Runtime resume across the nesting boundary 
 stage ledger is the durability mechanism, and if resume does reach into children the only effect is that
 some replays come from the journal instead of `args.priorStages` — same values, strictly faster.
 
+### multica: the audit trail moves out of the comment thread and into the task document
+
+`acfw-store-multica` posted every state change as an issue comment
+(`whip-transition | ts | from | to | agent | notes`), and the `clean-checkout` token with it. On this
+backend that is the wrong surface: **a comment thread is a live agent channel** — an assigned agent
+reads it and comment activity triggers comment-scoped tasks — so orchestrator bookkeeping landed inside
+a conversation an agent is expected to act on.
+
+Transitions and `log-event` rows now splice into the stored document's `## Transition Log` table via the
+*shared* `append_log_row`, in the files-adapter row shape. A multica-backed task document reads exactly
+like a files-backed one, and inherits that helper's cap and never-drop-a-row fallback for free. The
+`comment` subcommand still writes a real comment — that is now all comments are.
+
+Three things simplify as a consequence: `snapshot.hasCleanCheckoutToken` stops paying a
+`comment list --full` per in-review task (it reads the description `issue list` already returned, then
+`issue get`, then the comment scan); `read --materialize` no longer synthesizes an audit section, and
+renders genuine comments under `## Store Comments`; and the stored `description` stops carrying an
+empty Transition Log table forever.
+
+- **Upgrading mid-flight is safe.** The comment scan survives as the token scan's last step and
+  `--materialize` still renders comments, so a task that entered review *before* this change keeps
+  resolving instead of being auto-rejected.
+- **`NOTES` is escaped** (newlines/tabs → spaces, `|` → `\|`) before entering the table. This backend
+  re-reads its own rows, so a newline would corrupt the splice and a bare pipe would add phantom
+  columns. `apply-transition.sh` does neither and has the same latent hazard — worth backporting.
+- **Failure handling is asymmetric by design**: `transition` writes its row last and best-effort (the
+  `whip_state` write is the commit point; a lost row must not report a completed move as failed) but
+  now WARNs instead of swallowing the error, while `log-event` stays strict.
+- `beads` and `linear` are **unchanged** — they keep the comment behavior. `CONTRACT.md` now states the
+  audit-row location as a per-adapter choice rather than implying one rule.
+- New offline gate `tests/phase12-multica-transition-log.test.sh` (33 assertions) drives the adapter
+  through a fake `multica` CLI it builds itself; the same fake runs the frozen 36-assertion
+  store-conformance suite green. `tests/run-all.sh` also gained a `bash -n` static gate over every
+  adapter — they were outside every gate, so a syntax error in one was invisible until a run hit that
+  backend.
+
 ## 3.1.1 — the beads adapter uses Dolt, the engine `bd` actually ships
 
 - **`ACFW_STORE=beads` could not initialize at all.** The adapter ran

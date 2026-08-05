@@ -27,11 +27,11 @@ the native Multica issue `status` is a lossy display projection of it.**
   projection the scheduler reads.
 - `read --materialize` writes the stored document, **refreshes its metadata
   bullets in place from the current `whip_*` metadata** (so the spec reflects live
-  state, not the values frozen at create time), and then appends a
-  **`## Store Audit Trail`** section with every stored comment verbatim
-  (oldest-first). Transition rows and — crucially — the `clean-checkout` token
-  (which rides a comment on this backend) live there, so the quality-reviewer's
-  re-run of `read --materialize | grep '| clean-checkout | ok |'` sees the token.
+  state, not the values frozen at create time), and appends any issue comments
+  verbatim (oldest-first) under **`## Store Comments`**. The audit trail itself needs
+  no synthesis — it already rides the document (see below), so the quality-reviewer's
+  re-run of `read --materialize | grep '| clean-checkout | ok |'` reads the same
+  `## Transition Log` table it would on a files-backed task.
 
 ### State projection (`whip_state` → native `status`)
 
@@ -61,10 +61,48 @@ source of truth.
 under Multica's 50-key / 8 KB per-issue limits.
 
 Multica has **no dependency API**; `whip_deps` is a plain comma list of dependency
-stems, and whip's scheduler computes readiness from the snapshot. State
-transitions and counter bumps are recorded as issue **comments**
-(`whip-transition | ts | from | to | agent | notes`), and the `clean-checkout`
-token rides a comment too — `snapshot` greps in-review issues' comments for it.
+stems, and whip's scheduler computes readiness from the snapshot.
+
+## Audit trail: the document, not the comment thread
+
+**Transitions and `log-event` rows splice into the stored document's `## Transition
+Log` table — they are not comments.** The row is built in the files-adapter shape
+(`| ts | from | to | agent | notes |`) and spliced by the *shared* `append_log_row`
+from `skills/lib/acfw-git.sh`, so it inherits that helper's newest-first ordering,
+its `ACFW_LOG_ROW_CAP` bound (default 80 rows) and its never-drop-a-row EOF fallback.
+A multica-backed task document therefore reads exactly like a files-backed one.
+
+Why not comments: on this backend **a comment thread is a live agent channel**. An
+assigned agent reads it, and comment activity is what triggers comment-scoped tasks.
+Orchestrator bookkeeping posted there mixes whip's audit trail into a conversation
+an agent is expected to act on. The `comment` subcommand still writes a real comment
+— that is what comments are now for.
+
+Three consequences follow, all of them simplifications:
+
+| | Before | Now |
+|---|---|---|
+| `snapshot.hasCleanCheckoutToken` | one `issue comment list --full` per in-review task | reads the description already returned by `issue list`; falls back to `issue get`, then to the comment scan |
+| `read --materialize` | synthesized a `## Store Audit Trail` section out of comments | the document is already complete; comments append under `## Store Comments` |
+| stored `description` | carried an empty `## Transition Log` table forever | carries the live log |
+
+**Upgrading mid-flight is safe.** The token scan's last step is still the comment
+scan, and `--materialize` still renders comments, so a task that entered review
+*before* this change — with its `clean-checkout` token in a comment — keeps resolving
+and is not auto-rejected. That fallback costs nothing once a task has been through
+the new write path.
+
+**Failure handling is asymmetric on purpose**: `transition` writes its row last and
+best-effort (the `whip_state` write above it is the commit point, so a lost row must
+not report a completed move as failed) but WARNs on stderr rather than swallowing the
+error; `log-event` is strict and exits non-zero, because losing the clean-checkout
+token costs the task an entire review round.
+
+**Concurrency**: splicing is a read-modify-write (`issue get` → splice → `issue update
+--description-stdin`) with no lock, so two simultaneous writers on one task could lose
+a row. This is identical to the files adapter — `append_log_row` there has the same
+unguarded shape — and whip serializes writes per task. The multica CLI exposes no
+ETag/`If-Match`, so there is no cheaper guarantee available.
 
 ## Environment
 
@@ -119,16 +157,36 @@ retry could create a duplicate issue); idempotent writes (metadata/status/PUT) a
   truth.** The stored document keeps its original `- **Status**: …` / counter
   bullets while the authoritative values move into `whip_*` metadata. `snapshot`
   and `read`'s `fields` always read metadata, so scheduling is never affected —
-  and `read --body` returns the frozen document verbatim, whereas `read
-  --materialize` refreshes the bullets from live metadata before writing the spec
-  (see the materialize note above).
+  and `read --body` returns the stored document verbatim (bullets frozen, Transition
+  Log live), whereas `read --materialize` refreshes the bullets from live metadata
+  before writing the spec (see the materialize note above).
+- **`NOTES` is escaped before it enters the table.** Newlines and tabs collapse to
+  spaces and a literal `|` becomes `\|`, because this backend re-reads its own rows:
+  a newline would corrupt the splice and a bare pipe would add phantom columns.
+  `apply-transition.sh` does neither — worth backporting to the files adapter, which
+  has the same latent hazard.
 
 ## Testing
 
-Offline, the adapter is validated by: `bash -n`; confirming every CLI invocation
-shape against the built `multica --help`; and running the full store-conformance
-suite against the adapter through a **local JSON-backed fake CLI** (a scratchpad
-emulator of the subcommands used — *not* an HTTP server, and not shipped).
+Offline, `tests/phase12-multica-transition-log.test.sh` drives the adapter through a
+**fake `multica` CLI** (JSON files + `jq`) it builds in its own temp dir, and covers
+the audit-trail contract: rows splice into the table and not into comments, `NOTES`
+containing a pipe or newline cannot break the table, the token resolves from the
+description with zero comments present *and* from a legacy comment, the cap holds, a
+table-less document still keeps its row, and `transition`/`log-event` fail
+asymmetrically. That fake also runs the frozen store-conformance suite:
+
+```sh
+FAKE_STORE=$(mktemp -d) ACFW_MULTICA_BIN=<extracted-fake> \
+  ADAPTER="$PWD/adapters/multica/acfw-store-multica" bash tests/phase9-store-conformance.test.sh
+```
+
+The fake is deliberately **not** a general emulator — it covers only the invocation
+shapes the adapter uses, so the live wrapper below stays the authority on real CLI
+behavior. Two things remain unverified offline and are not assumed anywhere: whether
+`issue list --output json` includes `description` (hence the `issue get` fallback in
+the token scan), and Multica's description size limit (bounded by `ACFW_LOG_ROW_CAP`).
+The adapter is additionally gated by `bash -n` in `tests/run-all.sh`'s static gates.
 
 Against a live server, the shipped wrapper drives the real conformance suite:
 

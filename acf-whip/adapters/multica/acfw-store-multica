@@ -23,6 +23,16 @@
 #   whip priority -> native priority: blocker=urgent critical=high high=high
 #     medium=medium low=low
 #
+# AUDIT TRAIL
+#   Transition rows and log-event rows splice into the stored document's
+#   `## Transition Log` table (shared append_log_row: newest-first, capped, EOF
+#   fallback) — NOT into issue comments. On this backend a comment thread is a live
+#   agent channel: an assigned agent reads it and comment activity triggers
+#   comment-scoped tasks, so orchestrator bookkeeping does not belong there. The
+#   `comment` subcommand still writes a real comment (human/agent discussion), and
+#   reads prefer the document but fall back to comments, so a task whose token was
+#   written as a comment BEFORE this change still resolves.
+#
 # ENV (native multica vars, passed through by the dispatcher untouched):
 #   MULTICA_SERVER_URL, MULTICA_TOKEN (a `mul_` PAT → member identity),
 #   MULTICA_WORKSPACE_ID; optional ACFW_MULTICA_PROJECT (scope issues to a project);
@@ -35,8 +45,18 @@
 
 set -u
 
+# append_log_row (the shared Transition Log splicer) comes from the plugin lib rather
+# than being re-implemented here, so this backend's audit rows are byte-identical to the
+# files adapter's and inherit its cap and never-drop-a-row fallback. Sourcing is guarded
+# rather than mandatory: `capabilities` must stay answerable with no dependencies at all,
+# so a missing lib is reported at the point of USE (splice_row), not at load.
+ADAPTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ACFW_LIB="${ACFW_PLUGIN_LIB:-$ADAPTER_DIR/../../skills/lib}"
+[ -f "$ACFW_LIB/acfw-git.sh" ] && . "$ACFW_LIB/acfw-git.sh"
+
 MULTICA_BIN="${ACFW_MULTICA_BIN:-multica}"
 ALL_STATES="draft pending in-progress completed in-review accepted rejected blocked archive"
+CLEAN_CHECKOUT_TOKEN='| clean-checkout | ok |'
 
 SUB="${1:-}"
 [ -n "$SUB" ] && shift
@@ -64,6 +84,22 @@ set_field() {
       { print; if (!done && $0 ~ /^- \*\*Status\*\*:/) { printf "- **%s**: %s\n", name, val; done=1 } }
     ' "$f" > "$f.acfwtmp" && mv "$f.acfwtmp" "$f"
   fi
+}
+
+# logcell <text> — make one value safe inside a markdown table cell. Newlines and tabs
+# collapse to spaces (a newline would corrupt append_log_row's row-oriented splice) and a
+# literal '|' is escaped (a bare pipe would split the row into extra columns). The files
+# adapter does neither; this backend re-reads its own rows, so it must.
+logcell() {
+  printf '%s' "${1:-}" | tr '\n\r\t' '   ' | sed -e 's/|/\\|/g' -e 's/  */ /g' -e 's/^ *//' -e 's/ *$//'
+}
+
+# log_row <TS> <FROM> <TO> <AGENT> <NOTES> — the files-adapter transition-log row shape
+# (apply-transition.sh), so a multica-backed task document reads identically to a
+# files-backed one and the same greps work against both.
+log_row() {
+  printf '| %s | %s | %s | %s | %s |' \
+    "$(logcell "$1")" "$(logcell "$2")" "$(logcell "$3")" "$(logcell "$4")" "$(logcell "$5")"
 }
 
 valid_state() { case " $ALL_STATES " in *" $1 "*) return 0;; *) return 1;; esac; }
@@ -213,6 +249,35 @@ mget_num() {
   [ -n "$v" ] && printf '%s' "$v" || printf '0'
 }
 
+# splice_row <uuid> <row> — put ROW into the issue document's `## Transition Log` table.
+# Read-modify-write on the description: `issue get` -> append_log_row -> `issue update
+# --description-stdin`. Prints nothing; returns the classified contract code.
+#
+# UNLOCKED, exactly like the files adapter's append_log_row (whip-go.workflow.js records
+# the same hazard): two concurrent writers on ONE task could lose a row. whip serializes
+# writes per task and the multica CLI exposes no If-Match, so this is parity with files,
+# not a new risk.
+splice_row() {
+  local uuid="$1" row="$2" rc desc
+  command -v append_log_row >/dev/null 2>&1 || {
+    echo "FATAL: append_log_row unavailable — acf-whip lib not found at '$ACFW_LIB' (set ACFW_PLUGIN_LIB)" >&2
+    return 5
+  }
+  multica_call issue get "$uuid" --output json
+  rc=$(mc_classify)
+  [ "$rc" -eq 0 ] || { echo "FATAL: issue get failed before log splice: $MC_ERR" >&2; return "$rc"; }
+  desc=$(mc_tmp)
+  printf '%s' "$MC_OUT" | jq -r '.description // ""' > "$desc"
+  append_log_row "$desc" "$row"
+  # append_log_row prints the row even when the document has no table, so an empty result
+  # can only mean the document itself vanished. Refuse rather than blank the description.
+  [ -s "$desc" ] || { echo "FATAL: refusing to write an empty description while logging '$row'" >&2; return 7; }
+  MC_STDIN="$desc"; multica_call issue update "$uuid" --description-stdin --output json
+  rc=$(mc_classify)
+  [ "$rc" -eq 0 ] || { echo "FATAL: description update failed while logging: $MC_ERR" >&2; return "$rc"; }
+  return 0
+}
+
 # proj_args — append `--project $ACFW_MULTICA_PROJECT` to the named array var
 # when the project scope is set. Bash-3.2 safe (index assignment, no `declare -A`).
 # usage: build an array then `add_proj arrname`.
@@ -302,14 +367,15 @@ cmd_read() {
     set_field "$out" "Dependencies"    "$(printf '%s' "$issue" | jq -r '.metadata.whip_deps // ""')"
     set_field "$out" "Rejection Count" "$(printf '%s' "$issue" | jq -r '(.metadata.whip_rejections // 0) | tostring')"
     set_field "$out" "Block-Count"     "$(printf '%s' "$issue" | jq -r '(.metadata.whip_blocks // 0) | tostring')"
-    # Append the stored audit trail verbatim, oldest-first. Both the whip-transition
-    # rows AND the clean-checkout token live as issue comments on this backend; the
-    # quality-reviewer greps the refreshed doc for `| clean-checkout | ok |`, so
-    # without this every review would auto-reject.
+    # The Transition Log now rides the document itself, so the spec written above is
+    # already complete. Comments are still appended, for two reasons: they are genuine
+    # discussion (cmd_comment), which the files adapter also writes INTO the task file;
+    # and on a project upgraded mid-flight they may still hold a pre-3.2.0 clean-checkout
+    # token, which the quality-reviewer greps for and would otherwise auto-reject over.
     multica_call issue comment list "$uuid" --full --output json
-    rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: materialize could not read audit comments: $MC_ERR" >&2; exit "$rc"; }
+    rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: materialize could not read comments: $MC_ERR" >&2; exit "$rc"; }
     local trail; trail=$(printf '%s' "$MC_OUT" | jq -r 'sort_by(.created_at // "") | .[].content // empty')
-    [ -n "$trail" ] && printf '\n## Store Audit Trail\n\n%s\n' "$trail" >> "$out"
+    [ -n "$trail" ] && printf '\n## Store Comments\n\n%s\n' "$trail" >> "$out"
     printf '%s\n' "$out"
     return 0
   fi
@@ -489,9 +555,11 @@ cmd_transition() {
   mset "$uuid" whip_last_transition_ts "$now" string || exit $?
   mset "$uuid" whip_state "$to" string || exit $?
 
-  local cf; cf=$(mc_tmp)
-  printf 'whip-transition | %s | %s | %s | %s | %s\n' "$now" "$from" "$to" "$agent" "$notes" > "$cf"
-  MC_STDIN="$cf"; multica_call issue comment add "$uuid" --content-stdin --output json >/dev/null 2>&1 || true
+  # Audit row LAST and best-effort: the whip_state write above is the commit point, so a
+  # lost row must not turn a completed move into a reported failure. But it is a WARN, not
+  # silence — a missing row is exactly what a later reviewer would misread as a missing step.
+  splice_row "$uuid" "$(log_row "$now" "$from" "$to" "$agent" "$notes")" \
+    || echo "WARN: $stem moved $from -> $to but its Transition Log row was not written" >&2
 
   echo "ok: $stem $from -> $to"
   exit 0
@@ -568,7 +636,7 @@ cmd_update_body() {
 }
 
 cmd_log_event() {
-  local stem="" row="" uuid rc tmp
+  local stem="" row="" uuid
   while [ $# -gt 0 ]; do
     case "$1" in
       --row) row="${2:-}"; shift 2 ;;
@@ -578,11 +646,11 @@ cmd_log_event() {
   done
   [ -n "$stem" ] && [ -n "$row" ] || { echo "FATAL: usage: log-event <stem> --row '| ... |'" >&2; exit 2; }
   uuid=$(resolve_key "$stem") || exit $?
-  # The event row rides an issue comment; snapshot's clean-checkout token scan
-  # greps in-review issues' comments for it.
-  tmp=$(mc_tmp); printf '%s\n' "$row" > "$tmp"
-  MC_STDIN="$tmp"; multica_call issue comment add "$uuid" --content-stdin --output json
-  rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: log-event comment failed: $MC_ERR" >&2; exit "$rc"; }
+  # The row splices into the document's Transition Log — the same place the files adapter
+  # puts it, and where both snapshot's token scan and the reviewer's grep look. STRICT
+  # (unlike transition's best-effort row): losing the clean-checkout token costs the task
+  # an entire review round.
+  splice_row "$uuid" "$row" || exit $?
   printf '{"key":"%s","logged":true}\n' "$(jesc "$stem")"
 }
 
@@ -610,12 +678,25 @@ cmd_snapshot() {
   local jsonl; jsonl=$(mc_tmp)
   collect_whip_issues "$jsonl"
 
-  # clean-checkout token: bounded N+1 over ONLY in-review tasks (their comments
-  # persist from when clean-checkout logged the token). All others are false.
-  local toks="" id
+  # clean-checkout token, over ONLY in-review tasks, cheapest source first:
+  #   1. the description already in hand from `issue list` — zero extra calls;
+  #   2. `issue get` for that one issue, if list omits description;
+  #   3. the legacy comment scan — a task that entered review BEFORE the log moved into
+  #      the document has its token in a comment, and dropping that would auto-reject it
+  #      on upgrade. Costs nothing once a task has been through the new write path.
+  local toks="" id desc
   for id in $(jq -rs 'map(select(.metadata.whip_state == "in-review") | .id) | .[]' "$jsonl"); do
+    desc=$(jq -rs --arg id "$id" 'map(select(.id == $id)) | .[0].description // ""' "$jsonl")
+    if [ -z "$desc" ]; then
+      multica_call issue get "$id" --output json
+      [ "$MC_RC" -eq 0 ] && desc=$(printf '%s' "$MC_OUT" | jq -r '.description // ""' 2>/dev/null)
+    fi
+    if printf '%s' "$desc" | grep -qF "$CLEAN_CHECKOUT_TOKEN"; then
+      toks="$toks$id"$'\n'
+      continue
+    fi
     multica_call issue comment list "$id" --full --output json
-    if [ "$MC_RC" -eq 0 ] && printf '%s' "$MC_OUT" | jq -r '.[].content // ""' 2>/dev/null | grep -qE '\| clean-checkout \| ok \|'; then
+    if [ "$MC_RC" -eq 0 ] && printf '%s' "$MC_OUT" | jq -r '.[].content // ""' 2>/dev/null | grep -qF "$CLEAN_CHECKOUT_TOKEN"; then
       toks="$toks$id"$'\n'
     fi
   done
