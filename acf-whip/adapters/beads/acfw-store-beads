@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # acfw-store-beads — the `beads` task-store adapter (acf-whip store contract v1).
 #
-# Task state lives in a beads (`bd`) SQLite database under <repo>/.beads/, NOT in
-# git-tracked markdown. whip's scheduler owns scheduling, so this adapter bypasses
+# Task state lives in a beads (`bd`) embedded-Dolt database under <repo>/.beads/,
+# NOT in git-tracked markdown. Dolt has been bd's default (and for a long stretch,
+# only) backend since v0.50.0; `--backend=sqlite` is rejected by every released bd,
+# so `--backend=dolt` is the one value v1.0.4, v1.1.0 and main all accept.
+# whip's scheduler owns scheduling, so this adapter bypasses
 # bd's native ready/claim machinery and drives beads purely through custom statuses:
 # a whip-canonical state maps 1:1 onto a bd status (built-in or custom). The bd
 # issue id is a deterministic bijection of the whip key — `<prefix>-<key>` — so key
@@ -11,7 +14,7 @@
 # ride in issue metadata under `whip_*` keys; the task's whole markdown document is
 # the issue description.
 #
-# commitsToGit is FALSE: state writes land in the SQLite db, not in trunk commits.
+# commitsToGit is FALSE: state writes land in the Dolt db, not in trunk commits.
 # The LP-CAS ledger (.acfwhip/integrated/) stays git-native and is NOT this
 # adapter's business; the dispatcher enriches snapshots with the git-derived facts.
 #
@@ -24,7 +27,14 @@
 # (duplicate key) · 5 backend unavailable · 7 invalid state/value · 8 policy refusal
 # · 99 transient (database locked past retries).
 #
-# Dependencies: bash 3.2 (no `declare -A`), `bd` on PATH, `jq`. macOS ships bash 3.2.
+# Dependencies: bash 3.2 (no `declare -A`), `bd` >= 1.0.4 on PATH (cgo-enabled —
+# the embedded Dolt engine is behind a cgo build tag), `jq`. macOS ships bash 3.2.
+#
+# CONCURRENCY CAVEAT: embedded Dolt is single-writer, guarded by a file lock, and
+# bd waits for it with UNBOUNDED backoff against a context with no timeout. A
+# contended second bd process therefore blocks indefinitely rather than erroring,
+# so the "database is locked" retry below never fires for that case. See the
+# Concurrency section of README.md.
 
 set -u
 
@@ -63,13 +73,19 @@ cleanup() { rm -f "$BD_ERRF"; }
 trap cleanup EXIT
 
 # bd_run <args...> — run `bd -C <repo>` capturing stdout in $BD_OUT and stderr in
-# $BD_ERR. Retries transient "database is locked" writes 3x/1s, then exits 99.
+# $BD_ERR. Retries transient lock failures 3x/1s, then exits 99.
 # Returns bd's exit code otherwise (caller maps it to the contract).
+#
+# The matcher mirrors bd's own isLockError (internal/storage/dolt/store.go) plus
+# the MySQL codes server mode surfaces. Dolt's server-mode string is
+# `database "<name>" is locked by another dolt process` — the db name sits in the
+# middle, so a plain 'database is locked' substring test misses it.
+BD_LOCK_RE='database is locked|locked by another dolt process|noms lock|lock file|deadlock found|lock wait timeout exceeded'
 bd_run() {
   local tries=0 rc
   while :; do
     BD_OUT="$("$BD" "$@" 2>"$BD_ERRF")"; rc=$?
-    if [ "$rc" -ne 0 ] && grep -qi 'database is locked' "$BD_ERRF"; then
+    if [ "$rc" -ne 0 ] && grep -qiE "$BD_LOCK_RE" "$BD_ERRF"; then
       tries=$((tries + 1))
       if [ "$tries" -ge 3 ]; then
         cat "$BD_ERRF" >&2
@@ -165,7 +181,31 @@ cmd_capabilities() {
 cmd_init() {
   # Idempotent: only `bd init` when .beads/ is absent (re-init aborts non-zero).
   if [ ! -d "$REPO_ROOT/.beads" ]; then
-    bd_run init --backend=sqlite --prefix "$PREFIX" -q || {
+    # `bd init` ends with a bare `git commit --no-verify` (no pathspec), which
+    # commits the WHOLE index — anything the operator has staged would be swept
+    # into a "bd init:" commit. Refuse rather than silently hijack the commit.
+    if ! git -C "$REPO_ROOT" diff --cached --quiet 2>/dev/null; then
+      echo "FATAL: you have staged changes, and 'bd init' creates a commit that would include them." >&2
+      echo "       Commit or unstage them first, then re-run: acfw-store init" >&2
+      exit 8
+    fi
+    # --skip-hooks is load-bearing, not hygiene: bd installs hooks into
+    # .beads/hooks/ and sets repo-wide core.hooksPath, which lives in .git/config
+    # and is therefore SHARED BY EVERY WORKTREE. Every commit whip makes would
+    # then spawn a bd hook contending for the same single-writer Dolt lock, and
+    # the hook can stage .beads/issues.jsonl into a pending commit — which would
+    # make LP-CAS candidates depend on the environment. --skip-agents stops bd
+    # writing AGENTS.md / CLAUDE.md / .claude/settings.json into the host repo.
+    # All three flags exist in bd v1.0.4 through main, so no version probe.
+    bd_run init --backend=dolt --prefix "$PREFIX" -q --non-interactive --skip-hooks --skip-agents || {
+      if grep -qi 'requires CGO' "$BD_ERRF"; then
+        cat "$BD_ERRF" >&2
+        echo "FATAL: this 'bd' was built without cgo, so the embedded Dolt engine is unavailable." >&2
+        echo "       Install an official release binary (cgo-enabled except windows-arm64," >&2
+        echo "       freebsd-amd64 and android-arm64), or build with:" >&2
+        echo "         CGO_ENABLED=1 go build -tags gms_pure_go ./cmd/bd" >&2
+        exit 5
+      fi
       cat "$BD_ERRF" >&2; echo "FATAL: bd init failed" >&2; exit 5;
     }
   fi

@@ -2,6 +2,51 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.1.1 — the beads adapter uses Dolt, the engine `bd` actually ships
+
+- **`ACFW_STORE=beads` could not initialize at all.** The adapter ran
+  `bd init --backend=sqlite`, and **every released `bd` rejects that flag**: v1.0.4 errors after a
+  deprecation notice, v1.1.0 returns `--backend=sqlite is no longer supported`. Beads removed the
+  SQLite backend in v0.58.0 and has defaulted to **Dolt** since v0.50.0; SQLite exists again only on
+  unreleased `main`. The adapter now passes `--backend=dolt` — the one value v1.0.4, v1.1.0 and
+  `main` all accept — so task state lives in an embedded Dolt database under `.beads/`. No migration
+  is possible or needed: a sqlite-backed store created by this adapter never existed.
+- **`bd init`'s repo side effects are now suppressed, and one of them was a run-killer.** init passes
+  `--skip-hooks --skip-agents --non-interactive`. Without `--skip-hooks`, bd installs hooks into
+  `.beads/hooks/` and sets repo-wide `core.hooksPath` — which lives in `.git/config` and is therefore
+  **shared by every git worktree**. Every commit whip makes (specialists, `apply-transition.sh`,
+  `integrate-lpcas.sh`, `whip-move.sh`) would spawn a `bd` hook contending for the same single-writer
+  Dolt lock, and the hook can stage `.beads/issues.jsonl` into a pending commit — making LP-CAS
+  candidates a function of the environment instead of the branch tree. `--skip-agents` stops bd
+  writing `AGENTS.md`/`CLAUDE.md`/`.claude/settings.json` into the host repo.
+- **`init` refuses a dirty index (exit 8).** `bd init` ends in a bare `git commit --no-verify` with
+  no pathspec, so it commits the *whole* index — anything staged would be swept into a `bd init:`
+  commit. A non-cgo `bd` now also fails with a typed exit 5 naming the build fix, instead of a raw
+  engine error.
+- **Lock matcher widened to Dolt's vocabulary.** Retries now key on `locked by another dolt process`,
+  `noms lock`, `lock file`, `deadlock found` and `lock wait timeout exceeded` alongside
+  `database is locked`. Dolt's server-mode string is `database "<name>" is locked by another dolt
+  process` — the db name sits mid-string, so the old substring test missed it.
+- **The contract's concurrency note was wrong, and is corrected.** `adapters/CONTRACT.md` told
+  adapter authors they see a "single sequential writer". Only *transitions* are serialized: `/go`
+  dispatches specialists with `parallel()`, and each independently runs `read --materialize` and
+  `log-event`. Adapters must be concurrency-safe on those verbs and **must never block
+  indefinitely** — exit 99 instead. Exit 99's gloss now covers "timed out waiting for the backend".
+- **Known limitation, documented not fixed:** embedded Dolt is single-writer by file lock and `bd`
+  waits for it with unbounded backoff against a context with no timeout, so a contended `bd` process
+  *hangs* rather than erroring — the retry cannot fire, and `clean-checkout.sh`'s `|| WARN` catches
+  a non-zero exit but not a hang. Recovery and the planned fix (an adapter-side wall clock → exit 99)
+  are written up in `adapters/beads/README.md`.
+- **Version floor is now honest: the beads adapter needs a `bd` built from beads `main`.** Not
+  because of Dolt, but because `bd create --status` landed 2026-07-05 and is in no release. Documented
+  in `adapters/beads/README.md`.
+- Regression tests: `tests/phase9-adapter-beads.test.sh` **had been skipping unconditionally** — its
+  capability probe required the same `--backend=sqlite` no released `bd` has, and its build recipe was
+  `CGO_ENABLED=0`, which produces a binary that cannot open embedded Dolt at all. Both fixed, the
+  hardcoded personal `BEADS_SRC` path dropped, and six assertions added (backend is dolt, no `*.db`,
+  `core.hooksPath` unset, no `.beads/hooks/`, no agent files, dirty-index refusal). Now green:
+  36 conformance + 12 beads-specific.
+
 ## 3.1.0 — pluggable task stores (files / beads / multica / linear behind an executable adapter contract)
 
 `.backlog/` is now ONE task-store backend among several. Task state routes through a dispatcher

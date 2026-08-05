@@ -81,8 +81,9 @@ non-files store:
    mkdir -p .acfwhip
    printf 'ACFW_STORE=%s\n' "$task_store" >> .acfwhip/config
    ```
-   Backend env goes to the operator's shell, never into the repo: beads needs `bd` on PATH
-   (optional `ACFW_BEADS_PREFIX`); multica needs `MULTICA_SERVER_URL`, `MULTICA_TOKEN`,
+   Backend env goes to the operator's shell, never into the repo: beads needs a **cgo-enabled
+   `bd`** on PATH, currently built from beads `main` (optional `ACFW_BEADS_PREFIX`) — see
+   `adapters/beads/README.md` for the version floor; multica needs `MULTICA_SERVER_URL`, `MULTICA_TOKEN`,
    `MULTICA_WORKSPACE_ID` (optional `ACFW_MULTICA_PROJECT`); linear needs `LINEAR_API_KEY` and
    `ACFW_LINEAR_TEAM` (team key, e.g. `ENG`; optional `ACFW_LINEAR_PROJECT`, `ACFW_LINEAR_LABEL`).
 2. Initialize the store and verify it:
@@ -90,6 +91,11 @@ non-files store:
    bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" init
    bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info
    ```
+   On **beads**, `init` runs `bd init`, which creates one commit of its own and appends a
+   beads section to the project `.gitignore`. Because `bd init` commits the whole index, the
+   adapter **refuses with exit 8 when anything is staged** — commit or unstash first. It
+   passes `--skip-hooks --skip-agents`, so bd will not set `core.hooksPath` or write
+   `AGENTS.md`/`CLAUDE.md` into the repo.
 3. **Skip Step 3 entirely** (there is no `.backlog/` on a non-files store) and in Step 3.5a
    gitignore `.acfwhip/run/` and `.acfwhip/specs/` instead of `.backlog/.acfw-run.json`.
    Everything else (agents, quality gates, docs) proceeds unchanged.

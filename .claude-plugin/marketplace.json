@@ -49,8 +49,8 @@
     },
     {
       "name": "acf-whip",
-      "description": "Workflow-native backlog automation with pluggable task stores. /task decomposes a scope into atomic, dependency-aware tasks; /go runs parallel specialists in isolated git worktrees (one per slug), reviews their work, and integrates accepted branches into the trunk via LP-CAS \u2014 looping until every task is accepted or blocked. Task state lives behind an executable adapter contract: .backlog/ files (default), beads (bd), multica, or Linear \u2014 third-party backends drop in without forking. Integration is a compare-and-swap of a single-parent candidate onto the live trunk with an in-tree ledger marker as the sole oracle: no cached snapshot, no rebase, convergent on rewritten/high-churn trunks. Concurrency-safe and self-healing via /whip-doctor.",
-      "version": "3.1.0",
+      "description": "Workflow-native backlog automation with pluggable task stores. /task decomposes a scope into atomic, dependency-aware tasks; /go runs parallel specialists in isolated git worktrees (one per slug), reviews their work, and integrates accepted branches into the trunk via LP-CAS — looping until every task is accepted or blocked. Task state lives behind an executable adapter contract: .backlog/ files (default), beads (bd, embedded Dolt), multica, or Linear — third-party backends drop in without forking. Integration is a compare-and-swap of a single-parent candidate onto the live trunk with an in-tree ledger marker as the sole oracle: no cached snapshot, no rebase, convergent on rewritten/high-churn trunks. Concurrency-safe and self-healing via /whip-doctor.",
+      "version": "3.1.1",
       "author": {
         "name": "ACF Tools Team",
         "email": "acf@fib7.ai"

@@ -56,7 +56,7 @@ The `acfw-store` dispatcher resolves the configured backend and routes every rea
 | Backend | State lives in | Select with |
 |---|---|---|
 | `files` (default) | `.backlog/<state>/*.md` committed on trunk | nothing — zero-config default |
-| `beads` | [beads](https://github.com/gastownhall/beads) (`bd`, sqlite) | `ACFW_STORE=beads` in `.acfwhip/config` |
+| `beads` | [beads](https://github.com/gastownhall/beads) (`bd`, embedded Dolt) | `ACFW_STORE=beads` in `.acfwhip/config` |
 | `multica` | [multica](https://github.com/multica-ai/multica) server | `ACFW_STORE=multica` + `MULTICA_*` env |
 | `linear` | [Linear](https://linear.app) issues (attachment metadata) | `ACFW_STORE=linear` + `LINEAR_API_KEY`/`ACFW_LINEAR_TEAM` env |
 

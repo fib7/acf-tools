@@ -42,7 +42,7 @@ JSON results on stdout (exactly one object), diagnostics on stderr. Non-JSON lin
 
 Backend-specific env (`BD_*`, `ACFW_BEADS_*`, `MULTICA_*`, …) passes through untouched.
 
-**Exit codes**: `0` ok / idempotent no-op · `2` usage · `3` not found / ambiguous · `4` conflict (duplicate key) · `5` backend unavailable · `6` auth · `7` invalid state or value · `8` policy refusal · `99` transient (caller may retry).
+**Exit codes**: `0` ok / idempotent no-op · `2` usage · `3` not found / ambiguous · `4` conflict (duplicate key) · `5` backend unavailable · `6` auth · `7` invalid state or value · `8` policy refusal · `99` transient — backend locked, or timed out waiting for it (caller may retry).
 
 ## Task model
 
@@ -93,10 +93,19 @@ Output: `ok:`/`noop:`/`warn:` lines (echoed verbatim into run reports).
 | `log-event <key> --row "\| ... \|"` | Append one machine-greppable event row (the `clean-checkout \| ok` token). Must surface in later `snapshot.hasCleanCheckoutToken`. |
 | `comment <key> [--author A]` | Free-form evidence/review note from stdin. |
 | `doctor [--fix] [--quiet] [--active-only]` | Store-native integrity findings: `SEV\|code\|task\|detail` lines + `SUMMARY\|fatal=N\|repairable=N\|warn=N\|ok=bool`. Exit 0 iff no FATAL. `doctor-complete` = covers the full battery (files); without it the dispatcher merges in the generic graph/git checks. |
-| `sync` | Durability flush (beads: `bd export` JSONL). Best-effort; dispatcher never fails on it. |
+| `sync` | Durability flush (beads: `bd export` JSONL — bd's own `export.auto` defaults to false, so this is the only thing that refreshes the mirror). Best-effort; dispatcher never fails on it. |
 
 ## Conformance
 
 `tests/phase9-store-conformance.test.sh` is the executable spec: capabilities → idempotent init → create + duplicate-conflict → snapshot field fidelity → full lifecycle with reject loop (counter bumps, re-apply no-op) → block → read/body/materialize round-trips → update-field → typed errors → doctor protocol. An adapter that passes it (and, for `stage`, the dispatcher test) conforms.
 
-Concurrency note: acf-whip has a **single sequential writer** (the /go orchestrator). Adapters may rely on that — read-modify-write counter bumps are acceptable; `atomic-claim` is an optional capability for future parallel writers.
+### Concurrency
+
+**State transitions are serialized**: only the /go orchestrator moves tasks between states, so read-modify-write counter bumps inside `transition` are acceptable, and `atomic-claim` remains an optional capability for future parallel *writers*.
+
+**Everything else is not.** /go dispatches specialists with `parallel()`, and each one independently runs `read --materialize` and — via `clean-checkout.sh` — `log-event`. So `read`, `log-event` and `comment` **are invoked concurrently, by design**. An adapter must therefore:
+
+- be safe under concurrent invocation of those subcommands, and
+- **never block indefinitely** waiting for a backend lock. Bound the wait and exit `99` (transient); a caller can retry an error, but it cannot recover from a hang, and one stuck adapter process stalls the whole run.
+
+A backend whose client library waits forever on lock contention (embedded Dolt behind `bd` is one) needs the adapter to impose its own wall clock.

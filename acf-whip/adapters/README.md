@@ -15,7 +15,7 @@ skills/lib/bin/acfw-store                     ← dispatcher
   compensate: enrich raw snapshots · commit --stage deliverables · merge doctor reports
         │
         ├── adapters/files/acfw-store-files       (default; shim over the 3.0.x engines)
-        ├── adapters/beads/acfw-store-beads       (bd issue tracker, sqlite)
+        ├── adapters/beads/acfw-store-beads       (bd issue tracker, embedded Dolt)
         ├── adapters/multica/acfw-store-multica   (multica server, via CLI)
         ├── adapters/linear/acfw-store-linear     (Linear workspace, GraphQL)
         └── <repo>/.acfwhip/adapters/acfw-store-<x>   (your backend — no fork)
@@ -93,13 +93,13 @@ authors new tasks into `.acfwhip/staging/` and the single writer ingests them vi
 
 | | `files` (default) | `beads` | `multica` | `linear` |
 |---|---|---|---|---|
-| State lives in | `.backlog/<state>/*.md` on trunk | `bd` sqlite, whip states as custom statuses | `whip_state` issue metadata (native status = display projection) | `whip_*` metadata on one attachment per issue (native status = display projection) |
+| State lives in | `.backlog/<state>/*.md` on trunk | `bd` embedded Dolt, whip states as custom statuses | `whip_state` issue metadata (native status = display projection) | `whip_*` metadata on one attachment per issue (native status = display projection) |
 | Key resolution | filename stem | deterministic id `whip-<stem>` | server-side `whip_key` metadata filter | attachment URL `https://acfw.fib7.ai/<ns>/<stem>` via `attachmentsForURL` |
 | Task document | the file itself | issue description | issue description | issue description |
 | Audit trail | Transition Log table in-file | `bd` comments | comments | comments |
 | Dependencies | `Dependencies:` field | `whip_deps` + native edges (cycle-checked) | `whip_deps` (no dependency API) | `whip_deps` + best-effort native `blocks` relations |
 | `commitsToGit` | true (`stage`, `doctor-complete`, `snapshot-enriched`) | false | false | false |
-| Prerequisites | none | `bd` on PATH | `multica` CLI + `MULTICA_SERVER_URL`/`MULTICA_TOKEN`/`MULTICA_WORKSPACE_ID` | `curl`+`jq` + `LINEAR_API_KEY`/`ACFW_LINEAR_TEAM` |
+| Prerequisites | none | cgo-enabled `bd` on PATH (see [beads/README.md](./beads/README.md) — currently needs a build from beads `main`) | `multica` CLI + `MULTICA_SERVER_URL`/`MULTICA_TOKEN`/`MULTICA_WORKSPACE_ID` | `curl`+`jq` + `LINEAR_API_KEY`/`ACFW_LINEAR_TEAM` |
 
 Details per backend: [`files/`](./files/) · [`beads/README.md`](./beads/README.md) ·
 [`multica/README.md`](./multica/README.md) · [`linear/README.md`](./linear/README.md).

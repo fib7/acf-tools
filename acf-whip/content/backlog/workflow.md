@@ -12,7 +12,7 @@ primitive), `read`/`create`/`update-field`, `doctor`.
 | Backend | State lives in | Notes |
 |---|---|---|
 | `files` (default) | `.backlog/<state>/*.md` on trunk | reference backend; everything below describes it literally |
-| `beads` | `bd` issue tracker (`.beads/`, sqlite) | custom statuses mirror the whip states; deps native |
+| `beads` | `bd` issue tracker (`.beads/`, embedded Dolt) | custom statuses mirror the whip states; deps native |
 | `multica` | multica server (Postgres, via CLI) | `whip_state` metadata is canonical; comments are the audit trail |
 | `linear` | Linear workspace (GraphQL API) | `whip_*` state in per-issue attachment metadata; native status is a display projection; comments are the audit trail |
 
