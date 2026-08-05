@@ -34,7 +34,9 @@ const block = text.slice(start, end)
 // Build a factory that closes over an injected `mode` and returns the functions.
 function load(mode) {
   // eslint-disable-next-line no-new-func
-  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, resultToState, reconcileIntegrationTallies, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H };`)
+  // Every pure function must be named here. Omitting one does NOT fail the test — it silently stops
+  // testing that function, which is the same false-green class this suite exists to prevent.
+  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, resultToState, reconcileIntegrationTallies, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H, reviewVerdict, attemptKeyOf, coerceAcfwResult, coerceResolveResult, reconcileChildProgress, escalationTier, chunkList, improved };`)
   return factory(mode)
 }
 const Sdef = load('default')
@@ -314,6 +316,101 @@ const T = (o) => ({
     check('recon: accepted-in-snapshot stem stays integrated (not demoted)', JSON.stringify(r.integrated) === JSON.stringify(['k']))
   }
 }
+
+// ============================ 3.2.0 pure helpers ============================
+
+// reviewVerdict — the :826 livelock fix. A reviewer that rejects WITHOUT setting rejectionIncrement
+// used to write inc:0, so Rejection Count never advanced, the retry cap never bound, and the task
+// cycled in-review -> rejected -> pending forever.
+check('reviewVerdict: rejection ALWAYS costs one life, even without rejectionIncrement',
+  (() => { const v = Sdef.reviewVerdict({ transition: 'rejected' }); return v.toState === 'rejected' && v.inc === 1 })())
+check('reviewVerdict: accept costs nothing',
+  (() => { const v = Sdef.reviewVerdict({ transition: 'accepted' }); return v.toState === 'accepted' && v.inc === 0 })())
+check('reviewVerdict: a MECHANISM fault is transient — no move, no rejection charged',
+  (() => { const v = Sdef.reviewVerdict({ transition: 'rejected', faultClass: 'mechanism' }); return v.toState === null && v.inc === 0 && v.mechanism === true })())
+check('reviewVerdict: a missing result is transient, not a rejection',
+  (() => { const v = Sdef.reviewVerdict(null); return v.toState === null && v.inc === 0 })())
+check('reviewVerdict: an out-of-vocabulary transition is transient',
+  Sdef.reviewVerdict({ transition: 'completed' }).toState === null)
+
+// attemptKeyOf — the ledger GENERATION. Stable across amends; NEW on an external rejection.
+check('attemptKeyOf: derived from the retry counters', Sdef.attemptKeyOf({ rejectionCount: 0, blockCount: 0 }) === 'a0-b0')
+check('attemptKeyOf: a rejection rolls the generation (a retry must not replay everything as done)',
+  Sdef.attemptKeyOf({ rejectionCount: 1, blockCount: 0 }) !== Sdef.attemptKeyOf({ rejectionCount: 0, blockCount: 0 }))
+check('attemptKeyOf: absent counters default to zero', Sdef.attemptKeyOf({}) === 'a0-b0')
+
+// coerceAcfwResult — workflow() enforces no schema, so the parent validates. null must reproduce
+// today's non-emit semantics exactly.
+check('coerceAcfwResult: garbage -> null (transient, byte-identical to a non-emit)', Sdef.coerceAcfwResult('nope', ['completed']) === null)
+check('coerceAcfwResult: null -> null', Sdef.coerceAcfwResult(null, ['completed']) === null)
+check('coerceAcfwResult: an out-of-vocabulary transition -> null',
+  Sdef.coerceAcfwResult({ transition: 'accepted' }, ['completed', 'blocked', 'none']) === null)
+check('coerceAcfwResult: a valid result keeps its fields', (() => {
+  const r = Sdef.coerceAcfwResult({ transition: 'completed', commitSha: 'abc', rejectionIncrement: 0, notes: 'n', deliverableFiles: ['a.md', 5] }, ['completed'])
+  return r && r.transition === 'completed' && r.commitSha === 'abc' && r.deliverableFiles.length === 1
+})())
+check('coerceAcfwResult: faultClass defaults to quality', Sdef.coerceAcfwResult({ transition: 'none' }, ['none']).faultClass === 'quality')
+check('coerceAcfwResult: rejectionIncrement is clamped to 0/1 (a panel can never multiply it)',
+  Sdef.coerceAcfwResult({ transition: 'none', rejectionIncrement: 7 }, ['none']).rejectionIncrement === 0)
+check('coerceAcfwResult: blockedReason/needsTask survive (the park path depends on them)', (() => {
+  const r = Sdef.coerceAcfwResult({ transition: 'blocked', blockedReason: 'dependency-missing', needsTask: 'build X' }, ['blocked'])
+  return r.blockedReason === 'dependency-missing' && r.needsTask === 'build X'
+})())
+
+// coerceResolveResult — the locked probe is the authority; staged:0 is NOT resolved.
+check('coerceResolveResult: resolved requires staged > 0',
+  Sdef.coerceResolveResult({ resolved: true, staged: 0 }).resolved === false)
+check('coerceResolveResult: a real resolution passes', Sdef.coerceResolveResult({ resolved: true, staged: 3 }).resolved === true)
+check('coerceResolveResult: nothing usable -> not resolved', Sdef.coerceResolveResult(null).resolved === false)
+
+// escalationTier — the degradation ladder.
+check('escalationTier: fresh run is FULL', Sdef.escalationTier(0, 1000, 150) === 'FULL')
+check('escalationTier: half spent is LEAN', Sdef.escalationTier(500, 1000, 150) === 'LEAN')
+check('escalationTier: 70% spent stops escalating', Sdef.escalationTier(700, 1000, 150) === 'DIRECT')
+check('escalationTier: inside the reserve is CLOSE', Sdef.escalationTier(860, 1000, 150) === 'CLOSE')
+check('escalationTier: cap<=0 does NOT silently disable the feature (a NaN compare would read DIRECT)',
+  Sdef.escalationTier(5, 0, 150) === 'FULL')
+
+check('chunkList: splits to the cap', Sdef.chunkList([1, 2, 3, 4, 5], 2).length === 3)
+check('chunkList: an empty list yields no chunks', Sdef.chunkList([], 512).length === 0)
+
+check('improved: an unchanged error is NOT progress (stop paying for rounds)', Sdef.improved('x', 'x') === false)
+check('improved: a changed error is progress', Sdef.improved('x', 'y') === true)
+
+// reconcileChildProgress — every disagreement must resolve toward RE-RUN, never toward skip.
+const RCP = Sdef.reconcileChildProgress
+check('reconcile: a commit-bearing stage git confirms is replayed', (() => {
+  const r = RCP([{ name: 'implement', status: 'ok', commit: true, result: { a: 1 } }], ['implement'], { worktreeExists: true })
+  return r.names.includes('implement') && r.priorStages.implement.result.a === 1
+})())
+check('reconcile: a commit-bearing stage git CANNOT confirm is dropped (the commit never landed)', (() => {
+  const r = RCP([{ name: 'implement', status: 'ok', commit: true, result: { a: 1 } }], [], { worktreeExists: true })
+  return r.names.length === 0 && r.dropped.includes('implement')
+})())
+check('reconcile: a read-only stage needs no trailer', (() => {
+  const r = RCP([{ name: 'recon', status: 'ok', commit: false, result: { a: 1 } }], [], { worktreeExists: true })
+  return r.names.includes('recon')
+})())
+check('reconcile: a trailer with NO ledger entry still counts as done (git is the durable proof)', (() => {
+  const r = RCP([], ['implement'], { worktreeExists: true })
+  return r.names.includes('implement') && r.priorStages.implement.result.__fromTrailer === true
+})())
+check('reconcile: a missing worktree drops every commit-bearing stage', (() => {
+  const r = RCP([{ name: 'implement', status: 'ok', commit: true, result: { a: 1 } }], ['implement'], { worktreeExists: false })
+  return r.names.length === 0
+})())
+check('reconcile: a failed stage is never replayed', (() => {
+  const r = RCP([{ name: 'x', status: 'fail', commit: false, result: { a: 1 } }], [], { worktreeExists: true })
+  return r.names.length === 0
+})())
+check('reconcile: an unparseable recorded result is dropped rather than replayed as null', (() => {
+  const r = RCP([{ name: 'x', status: 'ok', commit: false, result: undefined }], [], { worktreeExists: true })
+  return r.names.length === 0 && r.dropped.includes('x')
+})())
+check('reconcile: a named-but-absent payload drops the stage', (() => {
+  const r = RCP([{ name: 'x', status: 'ok', commit: false, result: { a: 1 }, payloadPath: 'payload/x.md', payloadMissing: true }], [], { worktreeExists: true })
+  return r.names.length === 0
+})())
 
 console.log(`\nphase2-scheduler: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL === 0 ? 0 : 1)

@@ -76,7 +76,7 @@ RUN-LOCK HEARTBEAT (first, best effort, ignore failure):  mkdir -p ${sq(LEDGER)}
 PROGRESS LEDGER for stage '${key}':${KIND === 'direct' ? '' : resume}${trailer}
   LAST ACTION, exactly once, only AFTER your work is durable (committed, or the file written):
     write your structured result to a temp JSON file, then run
-    bash ${sq(LBIN)} append ${sq(LEDGER)} ${sq(key)} --status ok --result-file <tmp.json> --heartbeat ${sq(LOCK)}
+    bash ${sq(LBIN)} append ${sq(LEDGER)} ${sq(key)} --status ok --result-file <tmp.json>${spec.producesCommit === true ? ' --commit-stage' : ''} --heartbeat ${sq(LOCK)}
     (add  --payload <long-form .md>  when your result would exceed a few hundred bytes; put the payload
     PATH in your result, never the prose itself)
   If you could not finish, use  --status fail --note '<one line>'  instead. Never claim work you did not

@@ -72,10 +72,69 @@ const phase = () => {}
 const parallel = (thunks) => Promise.all(thunks.map((f) => Promise.resolve().then(f).catch(() => null)))
 const pipeline = async () => { throw new Error('pipeline not expected in this test') }
 
+// ---- 3.2.0: the nested child workflow ----
+// Records every invocation, THROWS ONCE for the 'fast' task (so the scout -> amend -> re-run repair
+// loop is genuinely exercised rather than merely present), and honours args.priorStages so the replay
+// path is observable. The gating that used to live in the specialist mock lives here now, because with
+// escalation on the implementation runs inside the child, not in a direct agent() call.
+const architectCalls = [], validateCalls = [], workflowCalls = []
+// Per-slug scout state. `trailers` is git truth and `stages` is the ledger's claim; the reconciler
+// trusts a commit-bearing ledger entry ONLY when git confirms it with an ACFW-Stage trailer, so the
+// two must move together or the mock is lying about the world.
+const scoutState = {}
+let fastThrewOnce = false
+const workflow = async (ref, wargs) => {
+  workflowCalls.push({ scriptPath: ref && ref.scriptPath, stem: wargs.stem, round: wargs.round, priorStages: wargs.priorStages })
+  const stem = wargs.stem
+  if (stem === 'fast' && !fastThrewOnce) {
+    // Real work LANDED before the throw — committed, with its trailer. The amended run must not redo it.
+    fastThrewOnce = true
+    scoutState.sf = {
+      stages: [
+        { name: 'implement', status: 'ok', commit: true, resultJson: '{"transition":"completed","notes":"landed"}', payloadPath: '', payloadMissing: false },
+        // A commit-bearing claim git CANNOT confirm (no trailer) must be dropped and re-run: trusting
+        // it would skip work that never happened.
+        { name: 'gate-fix#0', status: 'ok', commit: true, resultJson: '{"ok":true}', payloadPath: '', payloadMissing: false },
+      ],
+      trailers: ['implement'],
+      commits: ['abc1234 implement the thing'],
+    }
+    throw new TypeError("Cannot read properties of undefined (reading 'passed')")
+  }
+  if (stem === 'slow') {
+    events.push({ tick: tick++, kind: 'slow-specialist-start' })
+    await slowGate
+    slowSpecialistDone = true
+    events.push({ tick: tick++, kind: 'slow-specialist-return' })
+  } else {
+    events.push({ tick: tick++, kind: 'fast-specialist-return' })
+  }
+  return { ok: true, transition: 'completed', commitSha: 'deadbeef', rejectionIncrement: 0, faultClass: 'quality', notes: 'done', deliverableFiles: [], stagesRan: ['implement'], stagesReplayed: Object.keys(wargs.priorStages || {}), agentsUsed: 4 }
+}
+
 async function agent(prompt, opts) {
   const label = (opts && opts.label) || ''
   // bootstrap
-  if (/Bootstrap the acf-whip/.test(prompt)) return { detached: false, doctorOk: true, doctorSummary: 'SUMMARY|ok=true', fatals: [] }
+  // cpuCores/agents/scaffoldOk are LOAD-BEARING for 3.2.0: an empty agent registry or a failed
+  // scaffold probe disables escalation, and this test would then pass VACUOUSLY by exercising the
+  // 3.1.0 path while every escalation assertion below silently checked nothing.
+  if (/Bootstrap the acf-whip/.test(prompt)) return { detached: false, doctorOk: true, doctorSummary: 'SUMMARY|ok=true', fatals: [], cpuCores: 8, agents: ['go-engineer', 'quality-reviewer'], scaffoldOk: true }
+  // scout (3.2.0) — round 0 sees an empty worktree and no ledger
+  if (/Read-only reconnaissance/.test(prompt)) {
+    const slug = (prompt.match(/branch refs\/heads\/worktree\/(\w+)/) || [])[1] || ''
+    const st = scoutState[slug] || { stages: [], trailers: [], commits: [] }
+    return { worktree: `/r/.worktree/${slug}`, worktreeExists: true, commits: st.commits, stageTrailers: st.trailers, dirty: [], stashes: [], stages: st.stages, note: '' }
+  }
+  // workflow-architect (3.2.0)
+  if (/WORKFLOW ARCHITECT/.test(prompt)) {
+    architectCalls.push({ label, amend: /THIS IS AN AMEND/.test(prompt), prompt })
+    return { wrote: true, scriptPath: '/r/.acfwhip/run/child/x/a0-b0/impl/harness.workflow.js', planKeys: ['implement'], preservedStages: [], maxAgents: 5, shallow: true, summary: 'default shape fits', refuse: 'none', needsTask: '' }
+  }
+  // pre-flight validator (3.2.0)
+  if (/acfw-child-validate/.test(prompt)) {
+    validateCalls.push(label)
+    return { ok: true, parser: 'node', errors: [], warnings: [], stageCount: 5, mutatingStages: 3 }
+  }
   // scan / drain scan (verbatim digest echo)
   if (/acfw-store' snapshot/.test(prompt)) return { snapshotJson: JSON.stringify(buildSnapshot()), doctorOk: true, doctorSummary: 'SUMMARY|ok=true', doctorFatals: [] }
   // single writer
@@ -126,11 +185,13 @@ const run = new Function('agent', 'parallel', 'pipeline', 'phase', 'log', 'args'
 
 const args = { pluginRoot: '/p', trunkRoot: '/r', trunkBranch: 'trunk', mode: 'default' }
 
-const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('TIMEOUT — likely a barrier deadlock (BUG-3 regression)')), 8000))
+const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('TIMEOUT — likely a barrier deadlock (BUG-3 regression)')), 20000))
 
+// `budget` stays undefined, matching the runtime when no token target is set: any budget.* access in
+// the workflow body must be typeof-guarded or this throws.
 let report
 try {
-  report = await Promise.race([run(agent, parallel, pipeline, phase, log, args, undefined, undefined), timeout])
+  report = await Promise.race([run(agent, parallel, pipeline, phase, log, args, undefined, workflow), timeout])
 } catch (e) {
   bad(`workflow did not converge: ${e.message}`)
   console.log(`\nphase5-streaming: ${PASS} passed, ${FAIL} failed`)
@@ -142,6 +203,28 @@ const idx = (pred) => events.findIndex(pred)
 const iFastIntegrate = idx((e) => e.kind === 'integrate' && e.stem === 'fast')
 const iSlowStart = idx((e) => e.kind === 'slow-specialist-start')
 const iSlowReturn = idx((e) => e.kind === 'slow-specialist-return')
+
+// FIRST, before anything else: if escalation quietly disabled itself, every assertion below would be
+// checking the 3.1.0 path and passing for the wrong reason.
+check('escalation was ENABLED (not silently disabled — the vacuous-pass guard)', !!report && report.escalation && report.escalation.enabled === true)
+check('every dispatched unit ran as a nested child workflow', workflowCalls.length >= 2)
+check('an architect authored each harness', architectCalls.length >= 2)
+check('each harness passed pre-flight before it ran', validateCalls.length >= 2)
+check('the report distinguishes authored units from fallbacks', report.escalation.authored >= 2)
+
+// The throw-repair loop, end to end.
+const fastRuns = workflowCalls.filter((c) => c.stem === 'fast')
+check('a harness that threw was re-run after an amend', fastRuns.length === 2)
+check('the amend architect was told it was an amend', architectCalls.some((c) => c.amend))
+check('the amended run received the pre-throw stage as ALREADY DONE (progress not lost)',
+  fastRuns.length === 2 && fastRuns[1].priorStages && fastRuns[1].priorStages.implement !== undefined)
+check('the replayed stage carries its RECORDED value, not null',
+  fastRuns.length === 2 && fastRuns[1].priorStages.implement && fastRuns[1].priorStages.implement.result
+  && fastRuns[1].priorStages.implement.result.transition === 'completed')
+check('a commit-bearing stage git could NOT confirm is dropped, so it re-runs rather than being skipped',
+  fastRuns.length === 2 && fastRuns[1].priorStages['gate-fix#0'] === undefined)
+check('the amend was counted', report.escalation.amended >= 1)
+check('the agent ledger advanced (the CLOSE rung has something to read)', report.agentsUsed > 0)
 
 check('run converged (no barrier deadlock)', !!report)
 check('run reported complete', report && report.completed === true && report.stopReason === 'complete')

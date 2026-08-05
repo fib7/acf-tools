@@ -82,6 +82,37 @@ const NO_GAIN_LIMIT = 15 // iterations with no terminal gain (perpetual-retry gu
 // (set it to roll back to the session model if a model ever mis-handles the digest echo).
 const SHELL_MODEL = (args && args.shellModel) || 'haiku'
 
+// ============================ 3.2.0: per-task authored child workflows ============================
+// Every dispatched unit runs as its OWN nested workflow — a bespoke harness a workflow-architect agent
+// fills into a locked, shipped skeleton — instead of one opaque agent() call. Everything in this block
+// is mutable or path-bearing, so it MUST stay outside <scheduler-pure>: that block is extracted and
+// eval'd in isolation by tests/phase2-scheduler.test.mjs, and a closure over these would break it.
+//
+// Escalation is a POLICY, never a guarantee: the tier ladder below degrades to verbatim 3.1.0 dispatch
+// as the run's agent budget depletes, so a large backlog still drains instead of dying mid-run.
+let ESCALATE = (args && args.escalate) !== false                  // default ON
+const ESCALATE_REVIEW = (args && args.escalateReview) === true    // default OFF — the only SUBTRACTIVE seam
+const MAX_AMEND = (args && typeof args.maxAmend === 'number') ? args.maxAmend : 2
+const LEAN_BUDGET = 5
+const FULL_BUDGET = (args && typeof args.agentBudget === 'number') ? args.agentBudget : 8
+const SKELETON = `${pluginRoot}/skills/lib/child-skeleton.js.tmpl`
+const SCAFFOLD = `${pluginRoot}/skills/lib/bin/acfw-child-scaffold`
+const VALIDATE_BIN = `${pluginRoot}/skills/lib/bin/acfw-child-validate`
+const LEDGER_BIN = `${pluginRoot}/skills/lib/bin/acfw-child-ledger`
+const CHILD_DIR = `${trunkRoot}/.acfwhip/run/child`
+// The runtime caps TOTAL agents across a workflow's lifetime, and a /go run is ONE invocation whose
+// children share the counter. There is no script-visible runtime counter, so the parent keeps its own.
+const AGENT_CAP = (args && args.agentCap) || 1000
+const CAP_RESERVE = 150
+const DISPATCH_CHUNK = 512
+let agentsUsed = 0
+let REGISTRY = []
+const registryHas = (n) => REGISTRY.indexOf(n) >= 0
+const esc = { authored: 0, amended: 0, preflight: 0, fellBack: 0, refused: 0, shallow: 0, replayed: 0, faults: [] }
+// Every agent() in this script routes through agentC (or safeAgent, which charges its own retries) so
+// the ledger cannot drift low and let the CLOSE rung fire too late.
+async function agentC(p, o) { agentsUsed++; return agent(p, o) }
+
 // <scheduler-pure> ===========================================================================
 // Everything between these markers is PURE (no agent/parallel/phase/log/clock, no closures except
 // the module-level `mode`). tests/phase2-scheduler.test.mjs extracts this block verbatim, injects
@@ -100,13 +131,16 @@ const byPriorityThenStem = (a, b) => (prank(a.priority) - prank(b.priority)) || 
 // ============================ schemas ============================
 const BOOTSTRAP = {
   type: 'object', additionalProperties: false,
-  required: ['detached', 'lockFresh', 'doctorOk', 'doctorSummary', 'fatals'],
+  required: ['detached', 'lockFresh', 'doctorOk', 'doctorSummary', 'fatals', 'cpuCores', 'agents', 'scaffoldOk'],
   properties: {
     detached: { type: 'boolean', description: 'true if HEAD is detached at the trunk root' },
     lockFresh: { type: 'boolean', description: 'true if the run-lock heartbeat file exists AND was modified within the freshness window (another /go is live)' },
     doctorOk: { type: 'boolean', description: 'true if doctor reported ok=true after --fix' },
     doctorSummary: { type: 'string', description: 'verbatim SUMMARY|... line from the report-only doctor run' },
     fatals: { type: 'array', items: { type: 'string' }, description: 'verbatim FATAL|... lines remaining after --fix' },
+    cpuCores: { type: 'integer', description: 'core count from the sysctl/nproc step; 0 if it could not be determined' },
+    agents: { type: 'array', items: { type: 'string' }, description: 'the project\'s INSTALLED agent names from .claude/agents/*.md, without the .md suffix' },
+    scaffoldOk: { type: 'boolean', description: 'true if the child-workflow scaffold probe printed a skeleton' },
   },
 }
 const SCAN_RESULT = {
@@ -311,6 +345,103 @@ function reviewVerdict(rr) {
   return { toState, inc: toState === 'rejected' ? 1 : 0, mechanism: false }
 }
 
+// ============================ 3.2.0 pure helpers (child workflows) ============================
+
+// attemptKeyOf — the ledger GENERATION for one task. The SAME key across amend rounds, re-dispatches
+// and /go crashes, which is what makes progress survive them. A NEW key the moment an external review
+// rejects: a retry harness that replayed every stage as already-done would produce nothing at all.
+function attemptKeyOf(t) { return `a${t.rejectionCount || 0}-b${t.blockCount || 0}` }
+
+// coerceAcfwResult — workflow() enforces NO schema (only agent({schema}) does), so a child's return
+// value has to be validated here before resultToState sees it. Returning null reproduces today's
+// non-emit semantics EXACTLY: resultToState(from, null) === null, so the task stays where it is and
+// is retried next iteration with nothing corrupted.
+function coerceAcfwResult(raw, allowVocab) {
+  if (!raw || typeof raw !== 'object') return null
+  const tr = String(raw.transition || '')
+  if ((allowVocab || []).indexOf(tr) < 0) return null
+  const out = {
+    transition: tr,
+    commitSha: typeof raw.commitSha === 'string' ? raw.commitSha : 'n/a',
+    rejectionIncrement: raw.rejectionIncrement === 1 ? 1 : 0,
+    notes: typeof raw.notes === 'string' ? raw.notes : '',
+    faultClass: raw.faultClass === 'mechanism' ? 'mechanism' : 'quality',
+  }
+  if (typeof raw.blockedReason === 'string') out.blockedReason = raw.blockedReason
+  if (typeof raw.needsTask === 'string') out.needsTask = raw.needsTask
+  if (Array.isArray(raw.deliverableFiles)) out.deliverableFiles = raw.deliverableFiles.filter((f) => typeof f === 'string')
+  return out
+}
+
+// coerceResolveResult — the resolve child's locked verify-resolve probe is the AUTHORITY on whether a
+// conflict is actually resolved. resolved:false means the parent SKIPS --post-resolver entirely, which
+// would otherwise only re-detect the unmerged paths and burn a round trip.
+function coerceResolveResult(raw) {
+  if (!raw || typeof raw !== 'object') return { resolved: false, staged: 0, note: 'resolve child returned nothing usable' }
+  return {
+    resolved: raw.resolved === true && Number(raw.staged || 0) > 0,
+    staged: Number(raw.staged || 0),
+    note: typeof raw.notes === 'string' ? raw.notes : '',
+  }
+}
+
+// escalationTier — how much of the run's agent budget remains decides how deep this unit may go.
+// Guarded against cap<=0: a NaN comparison would silently read DIRECT and disable the whole feature.
+// Evaluated per unit AFTER a lane is acquired — before the lane every unit in a wave samples the same
+// pre-wave counter, and the ladder could never fire mid-wave.
+function escalationTier(used, cap, reserve) {
+  if (!cap || cap <= 0) return 'FULL'
+  if (used >= cap - reserve) return 'CLOSE'
+  const frac = used / cap
+  if (frac < 0.50) return 'FULL'
+  if (frac < 0.70) return 'LEAN'
+  return 'DIRECT'
+}
+
+function chunkList(a, n) {
+  const out = []
+  for (let i = 0; i < (a || []).length; i += n) out.push(a.slice(i, i + n))
+  return out
+}
+
+// improved — a repair round is only worth paying for if the error actually CHANGED. A blind round
+// count pays for rounds that provably accomplish nothing.
+function improved(prevErr, nextErr) { return String(prevErr || '') !== String(nextErr || '') }
+
+// reconcileChildProgress — merge the scout's ledger view with git truth into the replay set.
+// EVERY disagreement resolves toward RE-RUN (informed by the RESUME clause), never toward skip:
+//   * commit-bearing ledger entry with no matching ACFW-Stage trailer -> dropped (the commit never landed)
+//   * trailer present with no ledger entry                            -> done, payload unavailable
+//   * worktree gone                                                   -> drop everything (nothing is verifiable)
+//   * unparseable or missing recorded result                          -> dropped
+// Double-applying a stage is worse than re-running one, and re-running is always safe.
+function reconcileChildProgress(stages, trailers, git) {
+  const trailerSet = {}
+  for (const t of (trailers || [])) trailerSet[t] = true
+  const wtMissing = !(git && git.worktreeExists)
+  const priorStages = {}
+  const names = [], dropped = []
+  for (const s of (stages || [])) {
+    if (!s || !s.name) continue
+    if (s.status !== 'ok') { dropped.push(s.name); continue }
+    if (wtMissing && s.commit) { dropped.push(s.name); continue }
+    if (s.commit && !trailerSet[s.name]) { dropped.push(s.name); continue }
+    if (s.payloadPath && s.payloadMissing) { dropped.push(s.name); continue }
+    if (s.result === undefined || s.result === null) { dropped.push(s.name); continue }
+    priorStages[s.name] = { status: 'ok', result: s.result }
+    names.push(s.name)
+  }
+  // A trailer git can see but the ledger cannot is still DONE — the commit is the durable proof.
+  // Its recorded payload is gone, so it replays as a minimal marker and the architect is told.
+  for (const t of (trailers || [])) {
+    if (priorStages[t] === undefined && !wtMissing) {
+      priorStages[t] = { status: 'ok', result: { __fromTrailer: true } }
+      names.push(t)
+    }
+  }
+  return { priorStages, names, dropped }
+}
+
 // reconcileIntegrationTallies — WS5 / retro #9: the in-loop integrate accumulators are optimistic. A
 // post-resolver integrate agent that fails to emit returns 'transient', so the rejection that
 // integrate-worktree ALREADY wrote to disk (task moved to rejected/, exit 6) is recorded nowhere — the
@@ -499,6 +630,9 @@ async function safeAgent(prompt, opts, onGiveUp) {
   const tries = 3
   for (let k = 1; k <= tries; k++) {
     try {
+      // Charged per ATTEMPT: a retry costs a real agent, and an undercounted ledger would let the
+      // CLOSE rung fire too late to matter.
+      agentsUsed++
       return await agent(prompt, k === 1 ? opts : { ...opts, label: `${opts.label}:retry${k - 1}` })
     } catch (e) {
       log(`agent ${opts.label} non-emit/error (attempt ${k}/${tries}): ${String((e && e.message) || e).slice(0, 160)}`)
@@ -527,7 +661,7 @@ function extractJson(text) {
 async function textScanFallback(label) {
   let txt = null
   try {
-    txt = await agent(
+    txt = await agentC(
       `${ENV}
 Run EXACTLY:  bash ${sq(STORE)} snapshot --digest --mode ${mode}
 Output its stdout — a single JSON object — as your ENTIRE final message. No prose, no markdown fences, nothing else.`,
@@ -578,6 +712,509 @@ Capture each transition call's stdout (an "ok:", "noop:" or "warn:" line) into a
   )
 }
 
+// ==================== per-task authored child workflows (3.2.0) ====================
+// runAuthoredUnit NEVER throws on the escalation path. Every exhaustion returns {via:'legacy'} and the
+// caller makes the VERBATIM 3.1.0 agent() call, whose throw maps to null in the parallel thunk exactly
+// as today. This feature can be slower than 3.1.0; it cannot be less correct.
+
+const ARCHITECT = {
+  type: 'object', additionalProperties: false,
+  required: ['wrote', 'scriptPath', 'planKeys', 'preservedStages', 'maxAgents', 'shallow', 'summary', 'refuse', 'needsTask'],
+  properties: {
+    wrote: { type: 'boolean', description: 'true ONLY if you ran the scaffold AND wrote the four regions' },
+    scriptPath: { type: 'string', description: 'must equal the path you were given, exactly' },
+    planKeys: { type: 'array', items: { type: 'string' }, description: 'every PLANNED[].key you authored, in execution order' },
+    preservedStages: { type: 'array', items: { type: 'string' }, description: 'AMEND ONLY: the completed stage keys you were handed, copied VERBATIM. Every one must also appear in planKeys. Empty on a first authoring. Never guess, never rename.' },
+    maxAgents: { type: 'integer', description: 'worst-case agent() calls of ONE run of your script, loop iterations included' },
+    shallow: { type: 'boolean', description: 'true if you deliberately kept the default 5-stage shape because depth would be ceremony for this task' },
+    summary: { type: 'string', description: 'one line: the shape you chose and why THIS task deserves that depth' },
+    refuse: { type: 'string', enum: ['none', 'dependency-missing', 'unrepairable'] },
+    needsTask: { type: 'string', description: 'when refuse=dependency-missing: the missing prerequisite task an operator should create' },
+  },
+}
+const VALIDATE = {
+  type: 'object', additionalProperties: false,
+  required: ['ok', 'errors', 'warnings', 'stageCount', 'mutatingStages', 'parser'],
+  properties: {
+    ok: { type: 'boolean' }, parser: { type: 'string' },
+    errors: { type: 'array', items: { type: 'string' } },
+    warnings: { type: 'array', items: { type: 'string' } },
+    stageCount: { type: 'integer' }, mutatingStages: { type: 'integer' },
+  },
+}
+const SCOUT = {
+  type: 'object', additionalProperties: false,
+  required: ['worktree', 'worktreeExists', 'commits', 'stageTrailers', 'dirty', 'stashes', 'stages', 'note'],
+  properties: {
+    worktree: { type: 'string', description: 'absolute worktree path resolved BY QUERY, or "" if none exists' },
+    worktreeExists: { type: 'boolean' },
+    commits: { type: 'array', items: { type: 'string' }, description: 'one-line log entries on the branch since its fork-base' },
+    stageTrailers: { type: 'array', items: { type: 'string' }, description: 'every ACFW-Stage: value found in the branch commit messages' },
+    dirty: { type: 'array', items: { type: 'string' }, description: 'uncommitted paths (porcelain), path only' },
+    stashes: { type: 'array', items: { type: 'string' }, description: 'git stash list entries (SHARED across worktrees — never auto-pop)' },
+    stages: {
+      type: 'array',
+      description: 'one entry per ledger line, in order',
+      items: {
+        type: 'object', additionalProperties: false,
+        required: ['name', 'status'],
+        properties: {
+          name: { type: 'string' }, status: { type: 'string' },
+          commit: { type: 'boolean', description: 'true when the ledger line carried "commit":true' },
+          resultJson: { type: 'string', description: 'the VERBATIM "result" value of that line as JSON text, or ""' },
+          payloadPath: { type: 'string' }, payloadMissing: { type: 'boolean' },
+        },
+      },
+    },
+    note: { type: 'string' },
+  },
+}
+const WIPRESULT = {
+  type: 'object', additionalProperties: false,
+  required: ['porcelain'], properties: { porcelain: { type: 'string' } },
+}
+
+const childDirFor = (ctx) => `${CHILD_DIR}/${ctx.stem}/${ctx.attemptKey}/${ctx.kind}`
+const scriptPathFor = (ctx) => `${childDirFor(ctx)}/harness.workflow.js`
+
+// The child inherits the VERBATIM 3.1.x seam prompt as `BASE`, prepended to every stage — so a stage
+// agent is told exactly what a 3.1.0 specialist was told, plus the ledger discipline. Nothing is retyped.
+function childPreamble(t, kind, basePrompt) {
+  return `${basePrompt}
+
+──────────── acf-whip child-harness stage rules (3.2.0) ────────────
+You are ONE STAGE of a multi-stage harness for this task. ${NO_BACKLOG_WRITES}
+The worktree ALREADY EXISTS and its path was given to you as text. Do NOT run clean-checkout — exactly
+one checkout happens per task, in the harness prologue, and a second one silently stashes another
+stage's in-flight work into the shared refs/stash.
+FORBIDDEN in the worktree: git merge, git rebase, git pull, git reset, git stash, deleting the worktree
+or branch, switching branches, and any write to .backlog/ or .acfwhip/. You may only ADD commits to
+this task's own branch — the integrator rebuilds the candidate from the branch tree, so rewriting
+history or merging trunk corrupts it.
+Best effort FIRST, ignore failure:  mkdir -p ${sq(RUN_LOCK_DIR)} && touch ${sq(RUN_LOCK)}
+`
+}
+
+function scoutPrompt(ctx) {
+  return `${ENV}
+Read-only reconnaissance for one acf-whip task's harness. Change NOTHING.
+
+1. Resolve the worktree BY QUERY (never by constructing a path — the worktree dir is config-driven and
+   the constructed path can differ from the real one):
+     WT=$(git -C ${sq(trunkRoot)} worktree list --porcelain | awk -v b="branch refs/heads/${ctx.branch}" '/^worktree /{p=$2} $0==b{print p; exit}')
+   Report it as worktree, and worktreeExists=true only if it is non-empty and the directory exists.
+2. If it exists, report:
+     git -C "$WT" log --oneline ${sq(ctx.forkbaseRef)}..HEAD | head -40          -> commits
+     git -C "$WT" log --format=%B ${sq(ctx.forkbaseRef)}..HEAD | sed -n 's/^ACFW-Stage: *//p'  -> stageTrailers
+     git -C "$WT" status --porcelain | head -60                                   -> dirty (paths only)
+     git -C "$WT" stash list | head -10                                           -> stashes
+   If the fork-base ref does not resolve, use the branch's full log instead and say so in note.
+3. Read the stage ledger (absent is normal — that means round 0):
+     bash ${sq(LEDGER_BIN)} read ${sq(ctx.ledgerDir)} 2>/dev/null || true
+   Each output line is one JSON object. For each, report name (its "stage"), status, commit (true only
+   if the line contains "commit":true), resultJson (the VERBATIM text of its "result" value, or ""),
+   payloadPath (its "payload" value, or ""), and payloadMissing (true if payloadPath is set but
+   ${sq(ctx.ledgerDir)}/<that path> does not exist).
+
+Copy values EXACTLY. Do not summarize, repair, or pretty-print any JSON. Return the ScoutResult.`
+}
+
+async function scout(ctx) {
+  const r = await safeAgent(scoutPrompt(ctx), { label: `scout:${ctx.kind}:${ctx.key}`, phase: ctx.phase, schema: SCOUT, model: SHELL_MODEL }, () => null)
+  const empty = { worktree: '', worktreeExists: false, commits: [], trailers: [], dirty: [], stashes: [], stages: [], names: [], priorStages: {}, dropped: [], note: 'scout non-emit' }
+  if (!r) return empty
+  const stages = (r.stages || []).map((s) => {
+    let result
+    if (s.resultJson) { try { result = JSON.parse(s.resultJson) } catch (e) { result = undefined } }
+    return { name: s.name, status: s.status, commit: s.commit === true, result, payloadPath: s.payloadPath || '', payloadMissing: s.payloadMissing === true }
+  })
+  const git = { worktreeExists: r.worktreeExists === true }
+  const rec = reconcileChildProgress(stages, r.stageTrailers || [], git)
+  return {
+    worktree: r.worktree || '', worktreeExists: r.worktreeExists === true,
+    commits: r.commits || [], trailers: r.stageTrailers || [], dirty: r.dirty || [], stashes: r.stashes || [],
+    stages, names: rec.names, priorStages: rec.priorStages, dropped: rec.dropped, note: r.note || '',
+  }
+}
+
+// The harness MENU — what a script structurally buys over one strong agent, and when each pays.
+const HARNESS_MENU = `
+  A. PARALLEL RECON (fan, read-only) — N agents each mapping a different facet, merged into one brief.
+     PAYS: unfamiliar or large surface; Touches Globs spanning more than one module; a first attempt.
+     SKIP: a single-file change; a retry where the surface is already understood — spend on G instead.
+  B. COMPETING PLANS, JUDGED — 2-3 agents read READ-ONLY and each propose an approach; one judge picks
+     or merges; ONE implementer executes the winner.
+     HARD CONSTRAINT: you may NOT run competing IMPLEMENTATIONS. Only one agent can hold this task's
+     worktree — the slug IS the branch and the branch IS the lock. Compete on PLANS, never on code.
+     PAYS: a real architectural fork; high blast radius; a retry rejected on DESIGN grounds.
+  C. TEST-FIRST SPLIT — a stage that writes tests which FAIL and encode the Acceptance Criteria, then a
+     stage that makes them pass without weakening them. SEQUENTIAL: one worktree, one writer.
+     PAYS: crisp binary criteria (this backlog mandates them); category bug; category test.
+  D. ADVERSARIAL DIFF REVIEW — a FRESH agent reads the branch diff against the Acceptance Criteria and
+     TRIES TO REJECT it; the implementer fixes; at most two rounds. IN THE DEFAULT BODY ALREADY.
+     HIGHEST ROI on this menu, for an acf-whip-specific reason: it converts EXTERNAL rejections —
+     expensive, capped, terminal at the cap — into INTERNAL ones that cost one agent and are uncapped.
+  E. LOOP-UNTIL-GATES-GREEN — a bounded loop over a schema'd {passed, failingOutput} gate stage; on
+     failure a fixer stage gets the verbatim output. IN THE DEFAULT BODY ALREADY.
+     This is the thing one agent structurally cannot do: the advance condition is an OBSERVED FIELD,
+     not a self-report. One agent conflates "I ran the gates" with "the gates passed".
+     LOOPS ARE SPECIAL — read THE ITERATION RULE below or your loop will silently freeze.
+  F. MULTI-MODAL CALL-SITE FAN (read-only) — parallel agents each using a DIFFERENT modality: exact
+     grep, symbol references, tests and fixtures, docs+config+string literals, generated code. Union
+     the results in plain JS.
+     PAYS: category refactor; renaming or moving a public symbol; broad globs. Any single modality
+     misses call sites, and a missed one either fails the gates or passes them and breaks at runtime.
+  G. DIAGNOSIS-FIRST — stage 1 writes NO code: it reads the prior review comments, the Transition Log
+     and the existing diff and states WHY this was rejected and what specifically must change. Every
+     later stage receives that diagnosis.
+  H. CHUNKED PIPELINE — independently verifiable chunks with a gate between them, so a late failure
+     does not discard early verified work (each chunk is separately ledgered and replays for free).
+     PAYS: large tasks; 6+ acceptance criteria.`
+
+function architectPrompt(ctx, budget, round, lastErr, prior) {
+  const amend = round > 0
+  const preserved = prior.names.length ? prior.names.join(', ') : '(none)'
+  const amendBlock = amend ? `
+════════════════════════ THIS IS AN AMEND (round ${round}/${MAX_AMEND}) ════════════════════════
+Your previous harness did NOT complete. The error:
+${String(lastErr || '(unknown)').slice(0, 1200)}
+
+WORK THAT IS ALREADY DONE AND MUST NOT BE REDONE:
+  completed stages ... ${preserved}
+  commits on branch . ${prior.commits.length ? prior.commits.slice(0, 12).join(' | ') : '(none)'}
+  uncommitted paths . ${prior.dirty.length ? prior.dirty.slice(0, 12).join(' ') : '(none)'}
+  ${prior.dropped.length ? `dropped (git could not confirm them; they WILL re-run): ${prior.dropped.join(', ')}` : ''}
+  ${prior.stashes.length ? `⚠ this worktree has ${prior.stashes.length} stash entry/entries — inspect before proceeding; refs/stash is SHARED across worktrees, so never blindly pop.` : ''}
+
+Every completed stage key above MUST appear in your PLANNED and in a runStage call in the body, spelled
+EXACTLY as given, and must be listed in preservedStages. The harness replays their recorded results in
+ZERO agents. Renaming or dropping one is rejected by pre-flight before a single agent spawns, because
+it would redo finished work.
+
+Fix the CAUSE of the error. Do not rewrite the harness from scratch.
+` : ''
+  return `${ENV}
+You are the WORKFLOW ARCHITECT for one acf-whip ${ctx.kindLabel}. You do NOT do the work. You COPY a
+committed skeleton, fill in four marked regions, and stop. /go then runs your file and consumes its
+return value exactly as it used to consume a single specialist agent's return value.
+
+Your product is ONE FILE. Its quality is the only thing that matters.
+${amendBlock}
+════════════════════════ WHAT YOU ARE GIVEN ════════════════════════
+  kind ................ ${ctx.kind}
+  skeleton ............ ${sq(SKELETON)}            <- READ THIS FIRST, IN FULL
+  scaffold command .... bash ${sq(SCAFFOLD)} ${sq(ctx.scriptPath)} --kind ${ctx.kind} --stem ${sq(ctx.stem)} --meta-name ${sq(ctx.metaName)} --trunk-root ${sq(trunkRoot)}
+  write your file to .. ${sq(ctx.scriptPath)}
+  task document ....... ${sq(ctx.taskPath)}${ctx.materialize ? `   (run this FIRST: ${ctx.materialize})` : ''}
+  assigned agent ...... ${ctx.agent || '(none)'}
+  worktree slug ....... ${ctx.slug}       branch: ${ctx.branch}
+  installed agentTypes  ${REGISTRY.join(', ') || '(none)'}
+      ^ the COMPLETE set your script may dispatch. There are no others. Read any of
+        ${trunkRoot}/.claude/agents/<name>.md to learn what a specialist is actually for.
+  attempt history ..... rejectionCount=${ctx.rejectionCount}/${MAX_REJECT_RETRY}   blockCount=${ctx.blockCount}/${MAX_BLOCK_RETRY}
+  ledger generation ... ${ctx.attemptKey}       (NEVER derive your own)
+  your ceiling ........ ${budget} agent() calls TOTAL, at most ${ctx.fanoutMax} per fan-out
+
+════════════════════════ STEP 1 — READ BEFORE YOU DESIGN ════════════════════════
+1. The skeleton. You cannot author correctly without knowing what it already does for you.
+2. The task document. Its Acceptance Criteria are your harness's TERMINATION CONDITION; its Touches
+   Globs are your surface; its Out of Scope is your boundary.
+3. **The task's Transition Log and every review comment in the document.** If rejectionCount or
+   blockCount is above zero, THIS TASK HAS ALREADY FAILED and a reviewer wrote down WHY, right there.
+   That text is the most valuable input you have. A retry harness that does not begin by consuming it
+   is negligent — there are only ${MAX_REJECT_RETRY} rejections before this task is blocked permanently.
+4. The real code in ${trunkRoot} that the Touches Globs actually name — how the neighbouring code is
+   structured and how it is tested.
+5. The project's quality gates: docs/development/quality-gates-*.md plus the repo's own config
+   (Makefile, package.json scripts, pyproject.toml, .pre-commit-config.yaml, go.mod).
+   RESOLVE THE GATE COMMANDS NOW and bake the LITERAL commands into the stage prompts you write. Do not
+   make your stages rediscover them. A wrong gate command costs this task a third of its life.
+6. CLAUDE.md and docs/acf/ for conventions the implementation must obey.
+
+════════════════════════ STEP 2 — CHOOSE THE HARNESS ════════════════════════
+The scaffold's DEFAULT BODY is already a correct five-stage harness:
+    checkout -> implement -> bounded gate loop -> adversarial diff review -> verify
+Those five hold the only three mechanisms a script structurally buys over one strong agent: a
+schema-OBSERVED advance condition, a fresh-context reviewer of the diff, and a durable ledger.
+KEEPING IT — and setting shallow=true with a one-line reason — IS A CORRECT ANSWER for a config bump,
+a version bump, a single-file doc edit, or anything whose surface you already understand. Do not pad.
+Do NOT under-build a task that has already been rejected.
+
+Add from this menu when the task shape calls for it. Depth is YOUR judgement within the ceiling.
+${HARNESS_MENU}
+${ctx.rejectionCount >= 1 || ctx.blockCount >= 1 ? '\n  ⚠ MENU ITEM G IS MANDATORY FOR THIS TASK: it has already failed ' + (ctx.rejectionCount + ctx.blockCount) + ' time(s).\n' : ''}
+════════════════════════ STEP 3 — FILL EXACTLY FOUR REGIONS ════════════════════════
+Run the scaffold command FIRST. Then edit ONLY between these marker pairs. Every locked segment is
+byte-diffed against the shipped skeleton and /go REFUSES to run a file whose locked segments differ.
+
+  // <acfw-meta> ... // </acfw-meta>
+      name / description / phases. PURE LITERALS — no template literals, no interpolation, no
+      concatenation, no function calls. The runtime parses this BEFORE your code exists.
+      Write  name: '${ctx.metaName}'  exactly, as a quoted literal. It MUST contain the stem: the
+      runtime groups your child's agents under "▸ <meta.name>", and if every harness is named the same
+      a supervisor watching seven concurrent harnesses cannot tell them apart.
+
+  // <acfw-plan> ... // </acfw-plan>
+      PLANNED = [ { key, label, agentType, producesCommit, mutates, maxAgents }, ... ]  — a pure literal.
+      SHALLOW = '<one line why shallow>'  or  SHALLOW = ''
+      Keys unique, lowercase-kebab, STABLE across amendments. agentType from the installed list or ''.
+      Sum of maxAgents <= ${budget}. producesCommit:true on any stage whose agent commits.
+      mutates:true on any stage that edits files, runs git add/commit, OR RUNS THE BUILD OR TEST SUITE
+      (that writes target/, __pycache__, coverage, formatter rewrites).
+
+  // <acfw-pre> ... // </acfw-pre>
+      OPTIONAL read-only stages that must precede the checkout. Usually EMPTY.
+
+  // <acfw-body> ... // </acfw-body>
+      Your stages, and the plain-JS control flow between them.
+
+INSIDE A REGION YOU MAY WRITE:
+    await runStage(spec) · await runWave([spec, ...]) · log(...) · ordinary JS control flow
+    reads of results / WT / BASE / RESULT / LENS / GIT / A.* · assignment to the declared outputs:
+    want, finalNote, blockedReason, needsTask, deliverableFiles, lensVerdicts, resolveOk, resolveStaged
+
+YOU MAY NOT WRITE — each is checked before your file runs, and each is a hard pre-flight failure:
+  • a bare  agent(  ·  parallel(  ·  pipeline(  ·  workflow(  — everything goes through runStage/runWave.
+    workflow() in particular: nesting is ONE LEVEL ONLY and YOU ARE that level.
+  • a top-level  return   (except  return finish(...)  , allowed on an error path)
+  • Date.now() · Math.random() · argless new Date()  — the runtime throws on these.
+    Need a timestamp? Have an AGENT run  date -u +%FT%TZ  in its shell command.
+  • import / require / fs / path / process / child_process / eval — a workflow script has NO filesystem
+    and NO Node API. Agents do ALL I/O.
+  • TypeScript of any kind: type annotations, interfaces, generics, \`as\`, enums.
+  • isolation: on any spec — acf-whip provides its OWN worktree isolation.
+  • while (true) · for (;;) — you have no clock and no timer, so an unbounded loop hangs the whole /go
+    iteration. Every loop gets a literal integer bound.
+  • the literal text  clean-checkout  anywhere in your regions (see the WORKTREE CONTRACT).
+  • a  .worktree/  path literal — the worktree path is not knowable at authoring time; it is the locked
+    checkout stage's stdout, already bound to the variable WT.
+  • an agentType that is not in the installed list, or a COMPUTED agentType (it must be a literal).
+  • .acfwhip/integrated — that is the LP-CAS ledger; writing it QUARANTINES this task.
+
+════════════════════════ THE ITERATION RULE (read this twice) ════════════════════════
+A stage key is a DURABLE LEDGER KEY. runStage returns the RECORDED result for any key that already
+completed, WITHOUT dispatching an agent. That is what makes a throw cost one stage instead of the task.
+It also means a loop that reuses ONE key runs its agent exactly once and then spins on a frozen result.
+
+  WRONG — the gate runs once and iterations 2 and 3 replay its failure:
+    for (let i = 0; i < 3; i++) { const g = await runStage({ key: 'gate', ... }) ; ... }
+
+  RIGHT — every iteration is its own durable stage:
+    for (let i = 0; i < 3; i++) {
+      const g = await runStage({ key: 'gate', iteration: i, ... })
+      if (g.__failed || g.passed) break
+      const f = await runStage({ key: 'gate-fix', iteration: i, ... })
+      if (f.__failed) break
+    }
+
+Pass  iteration:  on EVERY runStage/runWave call inside any for/while body. Pre-flight rejects a loop
+without it.
+
+════════════════════════ RESULTS ARE ALWAYS OBJECTS ════════════════════════
+runStage NEVER returns null. On agent flakiness (a StructuredOutput non-emit after its two internal
+tries) or an exhausted budget it returns  { __failed: true } . So  r.field  is always safe;
+r.field.sub  is NOT. Test  if (r.__failed) ...  and use  ?.  for anything deeper than one level.
+runWave returns an array the same length as its input, with __failed entries in place.
+Agent flakiness is TRANSIENT — /go retries the task next iteration. It is not a defect to repair.
+
+════════════════════════ WORKTREE CONTRACT (violating this destroys work) ════════════════════════
+${ctx.worktreeContract}
+
+════════════════════════ ${ctx.kindNote} ════════════════════════
+${ctx.kindGuidance}
+
+Now do Step 1, then Step 2, then run the scaffold and write the four regions. Return the
+ArchitectResult: scriptPath, planKeys in execution order, preservedStages copied verbatim from the
+completed list, maxAgents (worst case, loops included), shallow, one line on why this depth, refuse.`
+}
+
+function validatePrompt(ctx, requireStages) {
+  return `Run EXACTLY this command and copy its output into the ValidateResult:
+  bash ${sq(VALIDATE_BIN)} ${sq(ctx.scriptPath)} ${sq(trunkRoot)} --kind ${sq(ctx.kind)} --require-stages ${sq((requireStages || []).join(','))} --fanout ${ctx.fanoutMax} --budget ${ctx.agentBudget} --registry ${sq(REGISTRY.join(','))} --stem ${sq(ctx.stem)}
+It prints ONE JSON line. Copy its fields into the ValidateResult VERBATIM. Add nothing. Judge nothing.
+Do not fix the script. Do not run it.`
+}
+
+const WORKTREE_CONTRACT_CODE = `Exactly ONE agent may write in this task's worktree at a time, and "write" includes editing files,
+running git add or git commit, AND RUNNING THE BUILD OR TEST SUITE (which produces target/,
+__pycache__, node_modules/.cache, coverage output, generated code and formatter rewrites).
+  * The locked checkout stage is the ONLY clean-checkout. Every other stage receives WT as text.
+  * Mark every writing stage mutates:true. runWave FORCES mutating specs sequential after its
+    read-only chunk, so a mislabelled mutates costs throughput but never correctness.
+  * Read-only is the parallel lane: recon, call-site census, dependency mapping, review lenses,
+    adversarial judging, per-file analysis. Those may fan out freely.
+  * Commit before you finish. The locked verify stage refuses to report completed on a dirty tree,
+    because the REVIEWER's own checkout would stash your uncommitted work away and the task would then
+    be rejected for having no implementation.
+  * NEVER merge, rebase, pull, reset, stash, switch branches, or delete the worktree. The integrator
+    rebuilds this task's candidate from the branch TREE, so N ordinary commits are fine and any history
+    rewriting or trunk merge corrupts it.`
+
+function childCtx(kind, t, basePrompt, folder, waveWidth) {
+  const key = t.slug === 'none' ? t.stem : t.slug
+  const attemptKey = attemptKeyOf(t)
+  const ctx = {
+    kind, t, stem: t.stem, slug: t.slug, key, attemptKey,
+    agent: t.agent, branch: `${branchPrefix}/${t.slug}`,
+    forkbaseRef: `refs/acfw/forkbase/${t.slug}`,
+    taskPath: taskLoc(t, folder),
+    materialize: filesStore ? '' : materializeCmd(t),
+    rejectionCount: t.rejectionCount || 0, blockCount: t.blockCount || 0,
+    basePrompt, phase: 'Iterate',
+    metaName: `whip-${kind}-${t.stem}`.slice(0, 90),
+    agentBudget: FULL_BUDGET, fanoutMax: fanoutFor(waveWidth),
+    enabled: true, worktreeContract: WORKTREE_CONTRACT_CODE,
+  }
+  ctx.ledgerDir = childDirFor(ctx)
+  ctx.scriptPath = scriptPathFor(ctx)
+  if (kind === 'impl') {
+    ctx.kindLabel = 'implementation task'
+    ctx.kindNote = 'SINGLE-MUTATOR RULE'
+    ctx.kindGuidance = 'Parallelize recon, localization, per-module analysis, call-site census and design critique. Serialize everything that touches the tree.'
+  } else if (kind === 'direct') {
+    ctx.kindLabel = 'non-code task'
+    ctx.kindNote = 'NON-CODE TASK — NO WORKTREE'
+    ctx.kindGuidance = 'You work in the trunk root and COMMIT NOTHING. Every file you create or modify outside .backlog/ must be assigned to deliverableFiles — the orchestrator\'s single writer stages exactly those paths in the same commit as the state move. A file you do not list is never committed and the next checkout DESTROYS it. This has permanently lost finished work.'
+    ctx.worktreeContract = 'This task has NO worktree and NO branch. Do not run clean-checkout. Do not commit. Report every file you touched in deliverableFiles.'
+  } else if (kind === 'review') {
+    ctx.kindLabel = 'quality review'
+    ctx.kindNote = 'REVIEW LENSES ARE READ-ONLY'
+    ctx.kindGuidance = 'The locked gate stage has already attached to the worktree and run the quality gates; its output is in gate.gateOutput. Your lenses are STRICTLY READ-ONLY: no writes, no git add, no test runs. Author 3-5 lenses appropriate to THIS diff (acceptance-criteria conformance, call-site completeness, security, error and edge paths, test adequacy, public-API stability, docs). Each returns {lens, verdict, severity, findings, evidence} and you assign the array to lensVerdicts. THE VERDICT IS NOT YOURS — the locked epilogue folds the lenses in pure JS, by strict majority, with no veto.'
+  } else {
+    ctx.kindLabel = 'merge-conflict resolution'
+    ctx.kindNote = 'MID-CHERRY-PICK TREE'
+    ctx.kindGuidance = 'The integration worktree is MID-CHERRY-PICK. Author ONE READ-ONLY analyst per conflicted file (mutates:false; they may git show / git log / read files and they NEVER run git add — staging a path clears its unmerged state regardless of content, and the integrator\'s completion oracle is exactly that state being empty). Then exactly ONE mutates:true stager that edits and stages the ENUMERATED conflicted paths — never git add -A, because the integrator already does add -A afterwards and any stray file you leave rides onto trunk. Never run cherry-pick --continue/--commit/--abort/--quit, never git reset, never run the build in that tree, never leave a scratch file.'
+    ctx.worktreeContract = 'This tree is MID-CHERRY-PICK and belongs to the integrator. You may edit conflicted files and git add exactly those paths. Nothing else.'
+  }
+  return ctx
+}
+
+function childArgs(ctx, budget, prior, round) {
+  return {
+    stem: ctx.stem, slug: ctx.slug, branch: ctx.branch, forkbaseRef: ctx.forkbaseRef,
+    taskPath: ctx.taskPath, ledgerDir: ctx.ledgerDir, ledgerBin: LEDGER_BIN, runLock: RUN_LOCK,
+    basePrompt: ctx.basePrompt, resultSchema: ACFW_RESULT, lensSchema: REVIEW_LENS,
+    shellModel: SHELL_MODEL, agentBudget: budget, fanoutMax: ctx.fanoutMax,
+    registry: REGISTRY, agentType: ctx.agent && ctx.agent !== 'none' ? ctx.agent : '',
+    git: { commits: prior.commits, dirty: prior.dirty, worktree: prior.worktree },
+    trunkRoot, cleanCheckout: CLEAN_CHECKOUT, priorStages: prior.priorStages,
+    shallow: ctx.shallow === true, conflictedFiles: ctx.conflictedFiles || '',
+    resolverWorktree: ctx.resolverWorktree || '', round,
+  }
+}
+
+const REVIEW_LENS = {
+  type: 'object', additionalProperties: false,
+  required: ['lens', 'verdict', 'findings'],
+  properties: {
+    lens: { type: 'string' },
+    verdict: { type: 'string', enum: ['accept', 'reject'] },
+    severity: { type: 'string' },
+    findings: { type: 'string', description: 'specific, with file:line evidence' },
+    evidence: { type: 'string' },
+  },
+}
+
+// Preserve the harness's uncommitted work before the LEGACY path re-runs clean-checkout, whose Step 6
+// does `git stash push -u ... || true` on ANY dirty state, silently, into the SHARED refs/stash.
+// Without this the fallback destroys exactly what the durability design exists to protect.
+async function preserveBeforeLegacy(ctx, prior) {
+  if (ctx.slug === 'none' || !prior || !prior.dirty.length || !prior.worktree) return
+  await safeAgent(`${ENV}
+Preserve in-flight work before a fallback dispatch. In ${sq(prior.worktree)} run EXACTLY:
+  git -C ${sq(prior.worktree)} add -A -- . ':(exclude).backlog' ':(exclude).acfwhip'
+  git -C ${sq(prior.worktree)} commit -q -m 'wip: harness partial (acf-whip fallback)' || true
+  git -C ${sq(prior.worktree)} status --porcelain
+Report the final porcelain output. Change nothing else. Never run clean-checkout, stash, reset or rebase.`,
+    { label: `wip:${ctx.key}`, phase: ctx.phase, schema: WIPRESULT, model: SHELL_MODEL }, () => null)
+  log(`  ${ctx.stem}: committed ${prior.dirty.length} in-flight path(s) as WIP before the fallback dispatch`)
+}
+
+async function runAuthoredUnit(ctx) {
+  if (!ESCALATE) return { via: 'legacy', why: 'escalation off' }
+  if (!ctx.enabled) return { via: 'legacy', why: `${ctx.kind} escalation disabled` }
+
+  // Lane FIRST, then tier. The tier check must be on the far side of the lane or every unit in a wave
+  // samples the same pre-wave agentsUsed, all read FULL, and the ladder can never fire mid-wave.
+  await acquireLane()
+  try {
+    const tier = escalationTier(agentsUsed, AGENT_CAP, CAP_RESERVE)
+    if (tier === 'DIRECT' || tier === 'CLOSE') { esc.fellBack++; return { via: 'legacy', why: `agent-budget tier ${tier}` } }
+    const budget = tier === 'LEAN' ? LEAN_BUDGET : ctx.agentBudget
+    ctx.agentBudget = budget
+
+    let prior = await scout(ctx)   // before round 0 too: a re-dispatch may already have progress
+    let lastErr = '', round = 0
+
+    while (round <= MAX_AMEND) {
+      // ---- 1. AUTHOR / AMEND. Real design work => NO model option (session model), like specialists.
+      const aopts = { label: `arch:${ctx.kind}:${ctx.key}${round ? `:amend${round}` : ''}`, phase: ctx.phase, schema: ARCHITECT }
+      if (registryHas('workflow-architect')) aopts.agentType = 'workflow-architect'
+      const a = await safeAgent(architectPrompt(ctx, budget, round, lastErr, prior), aopts, () => null)
+      if (!a || a.wrote !== true) { esc.fellBack++; return { via: 'legacy', why: 'architect wrote no script', prior } }
+      if (a.refuse === 'unrepairable') { esc.fellBack++; return { via: 'legacy', why: `architect declined: ${a.summary}`, prior } }
+      if (a.refuse === 'dependency-missing') { esc.refused++; return { via: 'refuse', needsTask: a.needsTask || '' } }
+      ctx.shallow = a.shallow === true
+      log(`▸ ${ctx.stem}: harness ${round ? `amended (round ${round}/${MAX_AMEND})` : 'authored'} — ${(a.planKeys || []).length} stage(s), <=${a.maxAgents} agents${a.shallow ? ' [shallow]' : ''} — ${String(a.summary || '').slice(0, 140)}`)
+      if (a.shallow) esc.shallow++
+
+      // ---- 2. PRE-FLIGHT. The parent has no filesystem and cannot compile the child itself, so an
+      //         agent runs the validator binary. Most throw classes never become throws.
+      const v = await safeAgent(validatePrompt(ctx, prior.names),
+        { label: `val:${ctx.kind}:${ctx.key}:${round}`, phase: ctx.phase, schema: VALIDATE, model: SHELL_MODEL },
+        () => ({ ok: false, parser: 'none', errors: ['validator agent non-emit'], warnings: [], stageCount: 0, mutatingStages: 0 }))
+      if (!v.ok) {
+        esc.preflight++
+        const nextErr = `pre-flight: ${(v.errors || []).slice(0, 6).join('; ')}`
+        log(`✗ ${ctx.stem}: pre-flight rejected the harness — ${nextErr.slice(0, 240)}`)
+        // Convergence: if the errors are not a strict improvement, stop paying for rounds.
+        if (round >= 1 && !improved(lastErr, nextErr)) { esc.fellBack++; return { via: 'legacy', why: 'pre-flight not converging', prior } }
+        lastErr = nextErr; round++; esc.amended++; continue
+      }
+      if ((v.warnings || []).length) log(`  ${ctx.stem}: pre-flight warnings — ${v.warnings.slice(0, 3).join('; ').slice(0, 200)}`)
+
+      // ---- 3. RUN. The ONE workflow() call site in acf-whip.
+      //         Pre-charge the ENFORCED ceiling (runStage hard-guards used >= BUDGET), not a promise.
+      agentsUsed += budget
+      let out = null, threw = null
+      try { out = await workflow({ scriptPath: ctx.scriptPath }, childArgs(ctx, budget, prior, round)) }
+      catch (e) { threw = e }
+      const reported = (out && typeof out.agentsUsed === 'number') ? out.agentsUsed : budget
+      agentsUsed -= Math.max(0, budget - Math.min(budget, reported))   // true up DOWNWARD only
+      if (out && Array.isArray(out.stagesReplayed)) esc.replayed += out.stagesReplayed.length
+
+      if (!threw && out && out.ok !== false) { esc.authored++; return { via: 'workflow', raw: out, prior } }
+
+      if (threw) {
+        const msg = String((threw && threw.message) || threw)
+        // Environment kill switch (an older runtime, a name-only workflow policy, no workflow hook):
+        // probe by DOING — one throw, then verbatim 3.1.0 for the rest of the run.
+        if (/named bundled workflows|nesting is limited|is not a function|not available in this build|unknown workflow/i.test(msg)) {
+          ESCALATE = false
+          log(`↷ escalation disabled for this run — workflow() unavailable here (${msg.slice(0, 140)})`)
+          esc.fellBack++; return { via: 'legacy', why: 'workflow() unavailable', prior }
+        }
+        lastErr = msg.slice(0, 400)
+      } else {
+        lastErr = `child stage '${(out && out.stage) || '?'}': ${(out && out.error) || 'returned ok:false'}`.slice(0, 400)
+      }
+
+      // ---- 4. SCOUT, ALWAYS, BEFORE AMENDING. Three failure paths, one uniformly-shaped `prior`.
+      const before = prior.names.length, beforeCommits = prior.commits.length
+      prior = await scout(ctx)
+      const advanced = prior.names.length > before || prior.commits.length > beforeCommits
+      log(`✗ ${ctx.stem}: harness threw — ${lastErr.slice(0, 160)}; progress: ${prior.names.length} stage(s) ledgered, ${prior.commits.length} commit(s), ${prior.dirty.length} dirty${advanced ? '' : ' (NO advance since last round)'}`)
+      // The ledger makes convergence MEASURABLE: another round is granted only if the last one moved something.
+      if (round >= 1 && !advanced) { esc.fellBack++; return { via: 'legacy', why: 'amend not converging', prior } }
+      if (round >= MAX_AMEND) break
+      round++; esc.amended++
+    }
+    esc.fellBack++
+    esc.faults.push({ stem: ctx.stem, kind: ctx.kind, rounds: round, lastError: lastErr.slice(0, 200) })
+    return { via: 'legacy', why: `amend budget exhausted: ${lastErr.slice(0, 160)}`, prior }
+  } finally { releaseLane() }
+}
+
 // ============================ BOOTSTRAP (hard gate) ============================
 phase('Bootstrap')
 const boot = await safeAgent(
@@ -589,6 +1226,9 @@ Bootstrap the acf-whip orchestrator at trunk root ${sq(trunkRoot)}.
      bash ${sq(STORE)} doctor --fix >/dev/null 2>&1 || true
      bash ${sq(STORE)} doctor --quiet
    From the second run capture: doctorOk (SUMMARY ok=true), doctorSummary (the verbatim SUMMARY line), fatals (verbatim FATAL| lines).
+4. Core count (for the child-workflow concurrency bound):  sysctl -n hw.ncpu 2>/dev/null || nproc  -> cpuCores (0 if neither works).
+5. Installed agent registry:  ls -1 ${sq(trunkRoot)}/.claude/agents/*.md 2>/dev/null | sed -E 's#.*/##; s#\\.md$##'  -> agents (an empty list is not an error).
+6. Child-workflow tooling probe:  bash ${sq(SCAFFOLD)} --stdout --kind impl --stem probe --meta-name probe >/dev/null 2>&1 && echo yes || echo no  -> scaffoldOk.
 Return the BootstrapResult.`,
   { label: 'bootstrap', phase: 'Bootstrap', schema: BOOTSTRAP, model: SHELL_MODEL },
   () => null,
@@ -607,6 +1247,54 @@ if (!boot.doctorOk) {
   return { aborted: true, reason: 'backlog integrity gate failed; will not dispatch against an inconsistent backlog', mode, doctorSummary: boot.doctorSummary, fatals: boot.fatals }
 }
 log(`bootstrap ok — ${boot.doctorSummary}`)
+
+// ---- concurrency bound for nested child workflows (3.2.0) ----
+// The runtime caps CONCURRENT agent() calls at min(16, cores-2) per workflow, and a child shares its
+// parent's pool. Whether a parent thunk awaiting workflow() itself holds a slot is NOT documented, so
+// the bound must be safe under BOTH readings:
+//   * if it holds no slot, LANES is harmless admission control that bounds iteration wall clock;
+//   * if it DOES hold one, LANES <= POOL-2 leaves >=2 slots free, so every admitted child can always
+//     schedule an agent — progress is guaranteed and deadlock is impossible.
+// floor(POOL/2) is deliberately NOT used: on a 4-core box it gives LANES=1 and serializes the entire
+// backlog, violating the PARALLELISM INVARIANT above, while buying nothing POOL-2 does not.
+const POOL = Math.min(16, Math.max(1, (Number(boot.cpuCores) > 0 ? Math.min(128, Math.max(2, Number(boot.cpuCores))) : 8) - 2))
+const LANES = Math.max(2, POOL - 2)
+// Within a task, parallelism only pays when there is no parallelism ACROSS tasks to be had.
+function fanoutFor(waveWidth) {
+  const w = Math.max(1, Math.min(LANES, Number(waveWidth) || 1))
+  return Math.max(1, Math.floor((POOL - 2) / w))
+}
+
+// A unit holds AT MOST ONE lane at a time, released in `finally` before the next acquire (impl child ->
+// release -> review -> release -> integrate). If a unit ever held its impl lane while requesting a
+// review lane, LANES units would deadlock against each other. Never acquire a lane inside the
+// serializeIntegrate chain either: the chain head would wait for a lane while every lane was held by a
+// unit waiting for the chain.
+let lanesFree = LANES
+const laneQ = []
+function acquireLane() {
+  if (lanesFree > 0) { lanesFree--; return Promise.resolve() }
+  return new Promise((res) => laneQ.push(res))
+}
+function releaseLane() {
+  const next = laneQ.shift()
+  if (next) next()
+  else lanesFree++
+}
+
+REGISTRY = Array.isArray(boot.agents) ? boot.agents.filter((s) => typeof s === 'string' && s) : []
+if (ESCALATE && !REGISTRY.length) {
+  ESCALATE = false
+  log('⚑ escalation off — .claude/agents/ is empty, so an authored harness would have no specialist to dispatch. Run /whip-add-agents.')
+}
+if (ESCALATE && boot.scaffoldOk === false) {
+  // A missed chmod +x would otherwise degrade 100% of escalations SILENTLY, with esc.fellBack as the
+  // only signal. Fail loudly once instead.
+  ESCALATE = false
+  log('⚑ escalation off — the child-workflow scaffold did not run. Check that skills/lib/bin/acfw-child-* are executable.')
+}
+if (ESCALATE) log(`escalation on — per-task authored harnesses (lanes=${LANES} pool=${POOL} cap=${AGENT_CAP} review=${ESCALATE_REVIEW ? 'on' : 'off'})`)
+let capReached = false
 
 // ============================ ITERATE ============================
 phase('Iterate')
@@ -763,6 +1451,22 @@ Return the ScanResult.`
 
   if (warnings.length) for (const w of warnings) log(`WARN ${w}`)
 
+  // ---- CLOSE rung: stop opening NEW work when the run's agent budget is nearly spent ----
+  // Trimmed BEFORE the pre-move, deliberately: moving a task to in-progress and then never dispatching
+  // it would leave it stranded there until the 8h timeout sweeps it on some later run. In-flight review
+  // and integration still run to completion, so nothing already started is abandoned.
+  if (escalationTier(agentsUsed, AGENT_CAP, CAP_RESERVE) === 'CLOSE') {
+    const trimmed = specialistQ.length + directQ.length
+    if (trimmed) log(`iter ${iter}: agent ledger ${agentsUsed}/${AGENT_CAP} — no new dispatch (${trimmed} unit(s) deferred); finishing in-flight work and draining`)
+    specialistQ.length = 0
+    directQ.length = 0
+    capReached = true
+  }
+
+  // Wave width feeds the per-task fan-out ceiling: parallelism WITHIN a task only pays when there is
+  // no parallelism ACROSS tasks left to be had.
+  const waveWidth = specialistQ.length + directQ.length + reviewQ.length
+
   // ---- pre-move (single writer, sequential) ----
   // Unblock + timeout first (they change what is dispatchable next iteration), then dispatch pre-moves.
   const preActions = [
@@ -798,7 +1502,8 @@ Return the ScanResult.`
   const integTransient = (note) => () => ({ outcome: 'transient', note })
 
   // Fold ONE accepted task's worktree branch into trunk (resolver hoisted). Updates integration tallies.
-  async function integrateOne(t) {
+  async function integrateOne(t, opts) {
+    const noEscalate = !!(opts && opts.noEscalate)
     attemptedIntegrate.add(t.stem)
     let r = await safeAgent(integratePrompt(t, false), { label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate agent non-emit — left accepted, retry next iteration'))
     if (r && r.outcome === 'resolver-needed') {
@@ -807,15 +1512,35 @@ Return the ScanResult.`
       const ropts = { label: `resolve:${t.slug}`, phase: 'Iterate' }
       const ragent = r.resolverAgent || t.agent
       if (ragent && ragent !== 'none') ropts.agentType = ragent
-      // try-wrapped: this is the ONLY un-safeAgent'd agent() inside integrateOne, and integrateOne runs
-      // on the serializeIntegrate chain whose promise is awaited bare at the end of the iteration. An
-      // unhandled non-emit here used to abort the whole run. A failed resolver just means the conflict
-      // is unresolved: fall through to --post-resolver, which re-detects the unmerged paths and returns
-      // a typed transient, leaving the task accepted/ for the next iteration.
-      try {
-        await agent(resolverPrompt(t, r), ropts)
-      } catch (e) {
-        log(`WARN resolve ${t.slug}: resolver agent non-emit (${String((e && e.message) || e).slice(0, 160)}) — conflict left unresolved, retried next iteration`)
+      // SEAM (iii): fan out READ, fan in WRITE. Multiple agents may NOT write a mid-cherry-pick tree —
+      // shared unwrapped index.lock, last-writer-wins on a file, and N chances to run a forbidden
+      // cherry-pick --continue the integrator cannot recover from. There is also no throughput argument:
+      // this whole seam already runs inside serializeIntegrate, which is why it needs no lane.
+      let resolved = null
+      if (ESCALATE && !noEscalate) {
+        const rctx = childCtx('resolve', t, resolverPrompt(t, r), 'accepted', 1)
+        rctx.conflictedFiles = r.resolverConflictedFiles || ''
+        rctx.resolverWorktree = r.resolverWorktree || ''
+        const res = await runAuthoredUnit(rctx)
+        if (res.via === 'workflow') resolved = coerceResolveResult(res.raw)
+      }
+      if (!resolved) {
+        // try-wrapped: this was the ONLY un-safeAgent'd agent() inside integrateOne, and integrateOne
+        // runs on the serializeIntegrate chain whose promise is awaited at the end of the iteration.
+        // An unhandled non-emit here used to abort the whole run.
+        try {
+          await agentC(resolverPrompt(t, r), ropts)
+        } catch (e) {
+          log(`WARN resolve ${t.slug}: resolver agent non-emit (${String((e && e.message) || e).slice(0, 160)}) — conflict left unresolved, retried next iteration`)
+        }
+      } else if (!resolved.resolved) {
+        // The locked verify-resolve probe is the AUTHORITY. Unresolved means --post-resolver would only
+        // re-detect the unmerged paths and burn an exit-9 round trip: skip it and leave the task
+        // accepted/ for the next iteration's fresh trunk observation.
+        log(`⚠ resolve ${t.slug}: not resolved (${resolved.note.slice(0, 140)}) — skipping --post-resolver, retried next iteration`)
+        return
+      } else {
+        log(`  resolve ${t.slug}: ${resolved.staged} path(s) staged by the harness`)
       }
       r = await safeAgent(integratePrompt(t, true), { label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
     }
@@ -864,8 +1589,21 @@ Return the ScanResult.`
       return
     }
     const rprompt = isNone ? directReviewPrompt(t) : reviewerPrompt(t)
-    // Reviewers ALWAYS run as quality-reviewer (independent review — never the implementer's agent).
-    const rr = await agent(rprompt, { label: `review:${isNone ? t.stem : t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' })
+    // SEAM (ii): the multi-lens review panel. OFF by default (args.escalateReview) because this is the
+    // only SUBTRACTIVE seam — escalating it can destroy work that would otherwise have shipped, and it
+    // runs against a hard 3-rejection terminal. When on, the child's LOCKED aggregate() folds the
+    // lenses by strict majority with NO veto and clamps rejectionIncrement to 1, so a panel of any
+    // size costs at most one life per round.
+    let rr = null
+    if (ESCALATE && ESCALATE_REVIEW && !isNone) {
+      const rctx = childCtx('review', t, rprompt, 'in-review', 1)
+      const res = await runAuthoredUnit(rctx)
+      if (res.via === 'workflow') rr = coerceAcfwResult(res.raw, ['accepted', 'rejected', 'none'])
+      if (!rr) rr = await agentC(rprompt, { label: `review:${t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' })
+    } else {
+      // Reviewers ALWAYS run as quality-reviewer (independent review — never the implementer's agent).
+      rr = await agentC(rprompt, { label: `review:${isNone ? t.stem : t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' })
+    }
     const rv = reviewVerdict(rr)
     if (rv.mechanism) { log(`↷ ${t.stem}: review reported a MECHANISM fault (${(rr.notes || '').slice(0, 120)}) — left in-review/, no rejection charged`); return }
     if (!rv.toState) return // none/mismatched -> transient, leave in in-review/
@@ -886,7 +1624,31 @@ Return the ScanResult.`
     const opts = { label: `${d.kind}:${d.t.slug === 'none' ? d.t.stem : d.t.slug}`, phase: 'Iterate', schema: ACFW_RESULT }
     const at = d.t.agent
     if (at && at !== 'none') opts.agentType = at
-    const r = await agent(prompt, opts) // throws on non-emit -> parallel thunk -> null (transient)
+
+    // SEAM (i): the task runs as its OWN authored child workflow. runAuthoredUnit never throws; on any
+    // exhaustion it returns via:'legacy' and we make the EXACT 3.1.0 call below, whose throw maps to
+    // null in the parallel thunk — byte-identical degradation to 3.1.0.
+    const ctx = childCtx(d.kind === 'direct' ? 'direct' : 'impl', d.t, prompt, 'in-progress', waveWidth)
+    const es = await runAuthoredUnit(ctx)
+    if (es.via === 'refuse') {
+      // The architect found unmodeled work before running anything. Park WITHOUT charging Block-Count:
+      // an agent that attempted nothing must not spend one of the task's three lives.
+      parkedThisRun.add(d.t.stem)
+      if (es.needsTask) parkedNeeds.set(d.t.stem, es.needsTask.slice(0, 200))
+      log(`⚑ ${d.t.stem}: architect refused — unmodeled prerequisite: ${es.needsTask || '(unspecified)'} — parked`)
+      await streamWrite([{ stem: d.t.stem, toState: 'blocked', agent: 'orchestrator', notes: (es.needsTask || 'unmodeled prerequisite').slice(0, 200), inc: 0, binc: 0 }], `block#${iter}:${d.t.stem}`)
+      productiveDispatch = true
+      return
+    }
+    let r
+    if (es.via === 'workflow') {
+      r = coerceAcfwResult(es.raw, ['completed', 'blocked', 'none'])
+      if (!r) log(`↷ ${d.t.stem}: harness returned no usable ACFW_RESULT — transient, retried next iteration`)
+    } else {
+      await preserveBeforeLegacy(ctx, es.prior || await scout(ctx))
+      log(`↷ ${d.t.stem}: single-agent fallback — ${es.why}`)
+      r = await agentC(prompt, opts) // 3.1.0 verbatim: throws on non-emit -> thunk -> null (transient)
+    }
     const toState = resultToState('in-progress', r && r.transition)
     if (!toState) return // none/mismatched -> leave in in-progress/, retry next iteration
     if (toState === 'blocked') {
@@ -930,7 +1692,10 @@ Return the ScanResult.`
     }
     if (candidates.length) {
       const ordered = topoIntegrationOrder(candidates, idx, () => log('WARN integrate: dependency cycle among integration candidates — using input order; run /whip-doctor'))
-      priorIntegratePass = serializeIntegrate(async () => { for (const t of ordered) await integrateOne(t) })
+      // noEscalate: this pass runs CONCURRENTLY with the dispatch wave, and every unit that reaches
+      // accepted queues behind it on serializeIntegrate. A multi-stage resolve harness here would turn
+      // one leftover conflict into a wave-wide throughput collapse.
+      priorIntegratePass = serializeIntegrate(async () => { for (const t of ordered) await integrateOne(t, { noEscalate: true }) })
     }
   }
 
@@ -942,8 +1707,24 @@ Return the ScanResult.`
   ]
   if (dispatch.length) {
     // BUG-5: name what this wave is running so a supervisor can see WHAT is in flight without polling.
-    log(`iter ${iter}: dispatching ${specialistQ.length} specialist + ${directQ.length} direct + ${reviewQ.length} review — ${dispatch.map((d) => `${d.kind}:${d.t.slug === 'none' ? d.t.stem : d.t.slug}`).join(', ')}`)
-    await parallel(dispatch.map((d) => () => processUnit(d)))
+    // Each entry is now a whole sub-workflow, so publish the tier/lane/budget state too — otherwise a
+    // run that has silently degraded to 3.1.0 everywhere looks identical to a fully escalated one.
+    const tierNow = ESCALATE ? escalationTier(agentsUsed, AGENT_CAP, CAP_RESERVE) : 'off'
+    log(`iter ${iter}: dispatching ${specialistQ.length} specialist + ${directQ.length} direct + ${reviewQ.length} review [tier=${tierNow} lanes=${LANES} fanout=${fanoutFor(dispatch.length)} agents≈${agentsUsed}/${AGENT_CAP}] — ${dispatch.map((d) => `${d.kind}:${d.t.slug === 'none' ? d.t.stem : d.t.slug}`).join(', ')}`)
+    // Chunked AND try-wrapped. A runtime agent-cap exception is thrown at the top of parallel() itself,
+    // so an uncaught throw here escapes the while loop AND the script: no report, no unlock, run lock
+    // held for LOCK_FRESH_MIN. That is the "hours of work, no report" mode 3.0.1 eliminated. Chunking
+    // also guards the 4096-item parallel() limit, which is reachable because slug==='none' tasks are
+    // unpartitioned.
+    for (const part of chunkList(dispatch, DISPATCH_CHUNK)) {
+      try {
+        await parallel(part.map((d) => () => processUnit(d)))
+      } catch (e) {
+        capReached = true
+        log(`WARN dispatch wave aborted: ${String((e && e.message) || e).slice(0, 200)} — finishing in-flight work and draining`)
+        break
+      }
+    }
   }
   // MUST stay guarded. integrateOne dispatches the conflict resolver through a bare agent(), so a
   // resolver non-emit REJECTS this promise; serializeIntegrate returns the un-swallowed promise, and a
@@ -962,6 +1743,9 @@ Return the ScanResult.`
   idle = didWork ? 0 : idle + 1
   noGain = terminal > prevTerminal ? 0 : noGain + 1
   prevTerminal = terminal
+  // BREAK, never return: the run must fall through to Drain and the unlock, or a finished run holds its
+  // own lock for LOCK_FRESH_MIN while its report tells the operator to re-run.
+  if (capReached) { stopReason = 'agent-cap-reached'; break }
   if (idle >= 3) { stopReason = 'no-progress'; break } // nothing left to do but not complete -> stuck (e.g. unsatisfiable deps)
   if (noGain >= NO_GAIN_LIMIT) { stopReason = 'no-progress'; break } // perpetual futile retry guard
 }
@@ -1007,7 +1791,7 @@ Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}
 // a state an operator should look at before relaunching. Best-effort by construction (the lock is a
 // guardrail): if this never runs, the freshness window releases it anyway.
 try {
-  await agent(`Run exactly this command and report nothing else:  rm -f ${sq(RUN_LOCK)}`, { label: 'unlock', phase: 'Drain', model: SHELL_MODEL })
+  await agentC(`Run exactly this command and report nothing else:  rm -f ${sq(RUN_LOCK)}`, { label: 'unlock', phase: 'Drain', model: SHELL_MODEL })
 } catch (e) { /* lock expires on its own */ }
 
 // ============================ REPORT ============================
@@ -1031,7 +1815,7 @@ const depParked = [...parkedThisRun].filter((s) => !capParkedStems.has(s)).map((
 const needsOperator = [...capParked, ...depParked]
 return {
   completed: stopReason === 'complete',
-  stopReason, // complete | no-progress | max-iterations | scan-degraded | (aborts return earlier)
+  stopReason, // complete | no-progress | max-iterations | scan-degraded | agent-cap-reached | (aborts return earlier)
   mode,
   iterations: iter,
   finalCounts,
@@ -1039,13 +1823,35 @@ return {
   rejectedAtIntegration,
   drainedPostLoop: drained,
   needsOperator,
+  // Without these a run that silently degraded to 3.1.0 dispatch everywhere is indistinguishable from
+  // a fully escalated one — the single most misleading way this feature could fail.
+  agentsUsed,
+  agentCap: AGENT_CAP,
+  lanes: LANES,
+  escalation: {
+    enabled: ESCALATE,
+    reviewEnabled: ESCALATE_REVIEW,
+    authored: esc.authored,
+    amended: esc.amended,
+    preflightRejected: esc.preflight,
+    fellBack: esc.fellBack,
+    refused: esc.refused,
+    shallow: esc.shallow,
+    stagesReplayed: esc.replayed,
+    faults: esc.faults,
+  },
   note: (stopReason === 'complete'
     ? 'Backlog 100% terminal.'
     : stopReason === 'no-progress'
       ? 'No progress for 3 iterations — user intervention needed (check blocked/ and rejected/).'
-      : stopReason === 'scan-degraded'
-        ? 'Scan could not emit a snapshot after retries + schema-less text fallback; stopped the loop and drained integratable work. Nothing lost (git + .backlog/ are durable) — re-run /go to continue.'
-        : 'Hit the iteration cap.')
+      : stopReason === 'agent-cap-reached'
+        ? `Stopped at the run's agent ceiling (${agentsUsed}/${AGENT_CAP}) with in-flight work finished and integrated. Nothing lost — every completed harness stage is on disk under the same attempt key, so re-running /go replays them for free and continues.`
+        : stopReason === 'scan-degraded'
+          ? 'Scan could not emit a snapshot after retries + schema-less text fallback; stopped the loop and drained integratable work. Nothing lost (git + .backlog/ are durable) — re-run /go to continue.'
+          : 'Hit the iteration cap.')
+    + (ESCALATE && esc.authored === 0 && esc.fellBack > 0
+      ? ` ⚑ NO harness was authored this run (${esc.fellBack} fell back to single-agent dispatch) — check that acf-whip/skills/lib/bin/acfw-child-* are executable and that .claude/agents/ is populated.`
+      : '')
     + (needsOperator.length ? ` ${needsOperator.length} task(s) parked for an operator (re-block/rejection cap reached): ${needsOperator.map((n) => n.stem).join(', ')}.` : '')
     + (reconciled ? ' (integration tallies reconciled against final on-disk state).' : ''),
 }

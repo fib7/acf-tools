@@ -56,14 +56,18 @@ case "$CMD" in
     DIR="${1:-}"; STAGE="${2:-}"
     [ -n "$DIR" ] && [ -n "$STAGE" ] || usage
     shift 2 || true
-    STATUS=""; RESULT_FILE=""; PAYLOAD=""; NOTE=""; HEARTBEAT=""
+    STATUS=""; RESULT_FILE=""; PAYLOAD=""; NOTE=""; HEARTBEAT=""; COMMIT_STAGE=0
     while [ $# -gt 0 ]; do
       case "$1" in
-        --status)      STATUS="${2:-}"; shift 2 ;;
-        --result-file) RESULT_FILE="${2:-}"; shift 2 ;;
-        --payload)     PAYLOAD="${2:-}"; shift 2 ;;
-        --note)        NOTE="${2:-}"; shift 2 ;;
-        --heartbeat)   HEARTBEAT="${2:-}"; shift 2 ;;
+        --status)       STATUS="${2:-}"; shift 2 ;;
+        --result-file)  RESULT_FILE="${2:-}"; shift 2 ;;
+        --payload)      PAYLOAD="${2:-}"; shift 2 ;;
+        --note)         NOTE="${2:-}"; shift 2 ;;
+        --heartbeat)    HEARTBEAT="${2:-}"; shift 2 ;;
+        # Marks a stage whose work lands as a COMMIT. The reconciler cross-checks these against the
+        # ACFW-Stage git trailers and drops any that git cannot confirm, so a stage that claimed 'ok'
+        # without its commit landing is re-run (informed) rather than skipped.
+        --commit-stage) COMMIT_STAGE=1; shift ;;
         *) echo "FATAL: unknown flag '$1'" >&2; usage ;;
       esac
     done
@@ -107,6 +111,7 @@ case "$CMD" in
 
     AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     LINE="{\"stage\":\"$(jesc "$STAGE")\",\"status\":\"$(jesc "$STATUS")\",\"at\":\"$AT\""
+    [ "$COMMIT_STAGE" = "1" ] && LINE="$LINE,\"commit\":true"
     [ -n "$NOTE" ] && LINE="$LINE,\"note\":\"$(jesc "$NOTE")\""
     [ -n "$PAYLOAD_REL" ] && LINE="$LINE,\"payload\":\"$(jesc "$PAYLOAD_REL")\""
     LINE="$LINE,\"result\":$RESULT_JSON}"
