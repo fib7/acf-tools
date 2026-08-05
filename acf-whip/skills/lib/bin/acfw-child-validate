@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# acfw-child-validate — pre-flight gate for an architect-authored acf-whip child workflow.
+#
+# /go refuses to run a harness this rejects, so every check here is a throw class that never becomes a
+# throw. Emits ONE JSON line on stdout and ALWAYS exits 0 — the verdict lives in the JSON, so a non-zero
+# exit can never be mistaken for "the validator itself broke".
+#
+# Division of labour:
+#   * V-SKEL (locked-segment byte-diff) and the literal-token battery run HERE, in portable shell, so
+#     the most important check never degrades.
+#   * Parse-level checks (compile, PLANNED, loop keying, deep deref, schema shape) need a JS runtime
+#     and live in acfw-child-validate.mjs. Without node/bun/deno they are skipped and `parser` says so.
+#
+# Usage:
+#   acfw-child-validate <scriptPath> <trunkRoot> --kind K [--require-stages a,b] [--fanout N]
+#                       [--budget M] [--registry a,b,c] [--stem S]
+#
+# Output: {"ok":bool,"parser":"node|grep","errors":[],"warnings":[],"plan":[],"stageCount":n,
+#          "mutatingStages":n,"contract":"v1|skew"}
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MJS="$SCRIPT_DIR/acfw-child-validate.mjs"
+SCAFFOLD="$SCRIPT_DIR/acfw-child-scaffold"
+CONTRACT='acfw-child-contract: v1'
+MAX_BYTES=524288
+
+TARGET="${1:-}"; TRUNK="${2:-}"
+[ -n "$TARGET" ] || { printf '{"ok":false,"parser":"grep","errors":["usage: acfw-child-validate <scriptPath> <trunkRoot> --kind K ..."],"warnings":[],"plan":[],"stageCount":0,"mutatingStages":0,"contract":""}\n'; exit 0; }
+shift 2 2>/dev/null || shift $#
+
+KIND=impl; REQ=""; FANOUT=1; BUDGET=8; REGISTRY=""; STEM=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --kind)           KIND="${2:-impl}"; shift 2 ;;
+    --require-stages) REQ="${2:-}"; shift 2 ;;
+    --fanout)         FANOUT="${2:-1}"; shift 2 ;;
+    --budget)         BUDGET="${2:-8}"; shift 2 ;;
+    --registry)       REGISTRY="${2:-}"; shift 2 ;;
+    --stem)           STEM="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+ERRS=""   # newline-separated
+WARNS=""
+adderr()  { ERRS="$ERRS$1
+"; }
+addwarn() { WARNS="$WARNS$1
+"; }
+
+jesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
+# newline-separated list -> JSON array
+jlist() {
+  local out="" first=1 line
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    if [ "$first" -eq 1 ]; then first=0; else out="$out,"; fi
+    out="$out\"$(jesc "$line")\""
+  done <<EOF
+$1
+EOF
+  printf '[%s]' "$out"
+}
+
+emit_grep() { # <contract>
+  printf '{"ok":%s,"parser":"grep","errors":%s,"warnings":%s,"plan":[],"stageCount":0,"mutatingStages":0,"contract":"%s"}\n' \
+    "$([ -z "$ERRS" ] && echo true || echo false)" "$(jlist "$ERRS")" "$(jlist "$WARNS")" "$(jesc "${1:-}")"
+  exit 0
+}
+
+# ---- V-SIZE ----
+if [ ! -f "$TARGET" ]; then adderr "V-SIZE: '$TARGET' is not a regular file"; emit_grep ""; fi
+SIZE=$(wc -c < "$TARGET" | tr -d ' ')
+if [ "$SIZE" -gt "$MAX_BYTES" ]; then adderr "V-SIZE: $SIZE bytes exceeds the ${MAX_BYTES}-byte limit"; emit_grep ""; fi
+
+# ---- V-CONTRACT ----
+if ! grep -qF "$CONTRACT" "$TARGET"; then
+  adderr "V-CONTRACT: skeleton-version-skew — the file does not carry '$CONTRACT'. Re-scaffold from the current template instead of amending."
+  emit_grep "skew"
+fi
+
+# ---- marker presence ----
+for r in meta plan pre body; do
+  grep -qF "// <acfw-$r>"  "$TARGET" || adderr "V-SKEL: missing opening marker // <acfw-$r>"
+  grep -qF "// </acfw-$r>" "$TARGET" || adderr "V-SKEL: missing closing marker // </acfw-$r>"
+done
+[ -z "$ERRS" ] || emit_grep "v1"
+
+# ---- V-SKEL: byte-diff every LOCKED segment against the pristine scaffold ----
+# Locked segments are everything OUTSIDE the four marker pairs. Trailing whitespace and CRLF are
+# normalised on BOTH sides (an editor stripping a trailing space is not a tampering event); leading
+# whitespace is significant and is NOT normalised.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/acfw-val.XXXXXX") || emit_grep "v1"
+trap 'rm -rf "$WORK"' EXIT
+
+locked_only() { # <file> -> the file with every free region's CONTENT removed
+  awk '
+    /\/\/ <acfw-(meta|plan|pre|body)>/ { print; skip = 1; next }
+    /\/\/ <\/acfw-(meta|plan|pre|body)>/ { skip = 0 }
+    !skip { print }
+  ' "$1" | sed -e 's/[[:space:]]*$//' | tr -d '\r'
+}
+
+if [ -x "$SCAFFOLD" ] || [ -f "$SCAFFOLD" ]; then
+  if bash "$SCAFFOLD" --stdout --kind "$KIND" --stem x --meta-name x > "$WORK/ref" 2>/dev/null; then
+    locked_only "$TARGET"   > "$WORK/a"
+    locked_only "$WORK/ref" > "$WORK/b"
+    if ! cmp -s "$WORK/a" "$WORK/b"; then
+      FIRST=$(diff "$WORK/b" "$WORK/a" 2>/dev/null | head -4 | tr '\n' ' ' | cut -c1-200)
+      adderr "V-SKEL: locked-region-modified — a locked segment differs from the shipped skeleton. You may only edit inside the four // <acfw-*> regions. First difference: $FIRST"
+    fi
+  else
+    addwarn "V-SKEL: could not render the reference skeleton — locked segments NOT verified"
+  fi
+else
+  addwarn "V-SKEL: acfw-child-scaffold not found — locked segments NOT verified"
+fi
+
+# ---- delegate the parse-level checks ----
+JSRT=""
+for c in node bun deno; do
+  if command -v "$c" >/dev/null 2>&1; then JSRT="$c"; break; fi
+done
+
+# ---- DEGRADED PATH ONLY: the literal-token battery ----
+#
+# This runs ONLY when there is no JS runtime. It is a blunt fixed-string grep with no lexer, so it
+# cannot tell code from prose: a prompt that legitimately tells an agent to "report the Date.now
+# equivalent" would be rejected as a forbidden global. When node/bun/deno IS present, the .mjs's
+# offset-preserving lexer makes exactly these checks prose-aware, and running both would let the blunt
+# one veto the precise one — defeating the lexer entirely.
+#
+# Everything ABOVE this point (V-SIZE, V-CONTRACT, markers, V-SKEL) is prose-insensitive and always runs.
+if [ -z "$JSRT" ] || [ ! -f "$MJS" ]; then
+  # Free-region text only, so a token inside the LOCKED skeleton (which legitimately contains, for
+  # example, the string 'clean-checkout') is never reported against the architect.
+  awk '
+    /\/\/ <acfw-(meta|plan|pre|body)>/ { on = 1; next }
+    /\/\/ <\/acfw-(meta|plan|pre|body)>/ { on = 0; next }
+    on { print }
+  ' "$TARGET" > "$WORK/free"
+
+  flag_tok() { # <fixed-string> <code> <why>
+    if grep -qF -- "$1" "$WORK/free"; then
+      LN=$(grep -nF -- "$1" "$WORK/free" | head -1 | cut -d: -f1)
+      adderr "$2: (free region, first at free-line $LN) '$1' — $3"
+    fi
+  }
+  flag_tok 'Date.now'        'V-GLOBALS'  'Date.now() throws at the runtime (it would break resume). Have an AGENT shell out to `date -u +%FT%TZ`.'
+  flag_tok 'Math.random'     'V-GLOBALS'  'Math.random() throws at the runtime. Vary behaviour by stage index instead.'
+  flag_tok 'new Date()'      'V-GLOBALS'  'argless new Date() throws at the runtime.'
+  flag_tok 'workflow('       'V-GLOBALS'  'workflow() is FORBIDDEN: nesting is one level only and YOU ARE that level.'
+  flag_tok 'require('        'V-GLOBALS'  'require() — a workflow script has no Node API. Agents do all I/O.'
+  flag_tok 'child_process'   'V-GLOBALS'  'child_process — a workflow script cannot spawn. Agents run commands.'
+  flag_tok 'eval('           'V-GLOBALS'  'eval() is forbidden.'
+  flag_tok 'isolation:'      'V-WORKTREE' 'acf-whip provides its OWN worktree isolation; a runtime worktree lands where clean-checkout does not resolve.'
+  flag_tok 'clean-checkout'  'V-WORKTREE' 'exactly ONE clean-checkout runs per task, in the locked prologue. A second silently stashes a sibling stage'"'"'s work into the shared refs/stash.'
+  flag_tok '.worktree/'      'V-WORKTREE' 'the worktree path is not knowable at authoring time — it is the locked checkout stage'"'"'s stdout, already bound to WT.'
+  flag_tok '.acfwhip/integrated' 'V-GIT'  'that is the LP-CAS ledger; writing it QUARANTINES this task.'
+  grep -qE 'while[[:space:]]*\([[:space:]]*true[[:space:]]*\)|for[[:space:]]*\([[:space:]]*;[[:space:]]*;[[:space:]]*\)' "$WORK/free" \
+    && adderr "V-BOUND: an unbounded loop. You have no clock and no timer, so it hangs the whole /go iteration. Use a literal integer bound."
+
+  addwarn "parser=grep: no JS runtime (node/bun/deno) found — V-COMPILE, V-PLAN, V-LOOP, V-DEREF, V-SCHEMA and V-AGENTS were NOT run, and the forbidden-token checks above are fixed-string greps that cannot tell code from prompt prose. Those defect classes surface as amend rounds instead of pre-flight errors."
+  emit_grep "v1"
+fi
+
+# Hand our shell-side findings to the .mjs via FILES and let it emit the single merged verdict.
+# (The findings are arbitrary prose containing quotes and backslashes; files avoid both an argv
+# escaping problem and a JSON-splicing-in-awk problem — the latter also tripped over BSD awk
+# reserving `close` as a builtin.)
+printf '%s' "$ERRS"  > "$WORK/shell-errors"
+printf '%s' "$WARNS" > "$WORK/shell-warnings"
+DEEP=$("$JSRT" "$MJS" "$TARGET" "$TRUNK" --kind "$KIND" --require-stages "$REQ" --fanout "$FANOUT" \
+       --budget "$BUDGET" --registry "$REGISTRY" --stem "$STEM" --scaffold "" \
+       --shell-errors "$WORK/shell-errors" --shell-warnings "$WORK/shell-warnings" 2>/dev/null)
+
+if [ -z "$DEEP" ]; then
+  addwarn "parser=grep: the deep validator produced no output — parse-level checks were NOT run."
+  emit_grep "v1"
+fi
+
+printf '%s' "$DEEP"
+exit 0

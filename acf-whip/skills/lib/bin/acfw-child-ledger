@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# acfw-child-ledger — the durable stage ledger for acf-whip per-task child workflows (3.2.0).
+#
+# WHY THIS IS A BINARY AND NOT SCRIPT STATE
+# A workflow script has NO filesystem and NO Node API, so it cannot record its own progress. The stage's
+# own AGENT writes the ledger entry, driven by the locked prompt rule the skeleton prepends to every
+# stage. That indirection is exactly what makes the record survive (a) the child script throwing, and
+# (b) the architect rewriting that script during an amend — native workflow resume caches only an
+# UNCHANGED agent prefix, so an edited script would replay nothing.
+#
+# ORDERING GUARANTEE (payload before marker)
+# The payload file is copied BEFORE the ledger line is appended. A crash between the two therefore
+# leaves a payload with no marker -> the stage is re-run (cheap, correct). The reverse order would leave
+# a marker pointing at a truncated or absent payload -> a stage skipped on the strength of a file that
+# is not there. Always fail toward re-running.
+#
+# ATOMICITY
+# One `printf ... >> file` of a single line. POSIX guarantees writes under PIPE_BUF (512 minimum,
+# 4096 on Linux, 512 on macOS for pipes but regular-file appends with O_APPEND are atomic per write)
+# are not interleaved, so a read-only stage completing concurrently in the same wave cannot corrupt the
+# line. The 2000-byte result cap keeps a line comfortably inside that budget; a bigger result MUST go
+# to --payload, and the cap is enforced HERE, at write time, so round 0 and round N observe an
+# identical value (a reader-side truncation would make replay a different code path from first-run).
+#
+# Usage:
+#   acfw-child-ledger append <dir> <stage> --status ok|fail --result-file F [--payload P] [--note N] [--heartbeat L]
+#   acfw-child-ledger read   <dir>
+#
+# read prints the last-wins compaction (one JSON object per line, keyed on stage) so a re-run of a
+# stage supersedes its earlier entry without rewriting history.
+#
+# Exit codes: 0 ok · 1 usage · 2 result too large (actionable: use --payload) · 3 unreadable input
+
+set -u
+
+RESULT_MAX=2000
+
+usage() {
+  echo "usage: acfw-child-ledger append <dir> <stage> --status ok|fail --result-file F [--payload P] [--note N] [--heartbeat L]" >&2
+  echo "       acfw-child-ledger read   <dir>" >&2
+  exit 1
+}
+
+# JSON string escaper — same idiom as scan-backlog.sh:82 (backslash, quote, strip control bytes).
+jesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
+
+# A stage key is [a-z0-9-]+ optionally suffixed '#<iteration>'. Sanitize anyway before it becomes a
+# filename: a '/' would silently create a subdirectory and orphan the payload.
+safe_name() { printf '%s' "${1:-}" | tr '/' '_' | tr -d '\000-\037'; }
+
+CMD="${1:-}"; [ -n "$CMD" ] || usage
+shift || true
+
+case "$CMD" in
+  append)
+    DIR="${1:-}"; STAGE="${2:-}"
+    [ -n "$DIR" ] && [ -n "$STAGE" ] || usage
+    shift 2 || true
+    STATUS=""; RESULT_FILE=""; PAYLOAD=""; NOTE=""; HEARTBEAT=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --status)      STATUS="${2:-}"; shift 2 ;;
+        --result-file) RESULT_FILE="${2:-}"; shift 2 ;;
+        --payload)     PAYLOAD="${2:-}"; shift 2 ;;
+        --note)        NOTE="${2:-}"; shift 2 ;;
+        --heartbeat)   HEARTBEAT="${2:-}"; shift 2 ;;
+        *) echo "FATAL: unknown flag '$1'" >&2; usage ;;
+      esac
+    done
+    case "$STATUS" in
+      ok|fail) : ;;
+      *) echo "FATAL: --status must be 'ok' or 'fail' (got '${STATUS}')" >&2; exit 1 ;;
+    esac
+
+    mkdir -p "$DIR/payload" 2>/dev/null || { echo "FATAL: cannot create ledger dir $DIR" >&2; exit 3; }
+    SN=$(safe_name "$STAGE")
+
+    # ---- 1. payload FIRST (see ORDERING GUARANTEE above) ----
+    PAYLOAD_REL=""
+    if [ -n "$PAYLOAD" ]; then
+      if [ ! -f "$PAYLOAD" ]; then
+        echo "FATAL: --payload '$PAYLOAD' does not exist" >&2; exit 3
+      fi
+      cp "$PAYLOAD" "$DIR/payload/$SN.md" 2>/dev/null || { echo "FATAL: cannot write payload for '$STAGE'" >&2; exit 3; }
+      PAYLOAD_REL="payload/$SN.md"
+    fi
+
+    # ---- 2. the result value, spliced RAW as a JSON value (never as a string) ----
+    RESULT_JSON="null"
+    if [ -n "$RESULT_FILE" ]; then
+      if [ ! -f "$RESULT_FILE" ]; then
+        echo "FATAL: --result-file '$RESULT_FILE' does not exist" >&2; exit 3
+      fi
+      SIZE=$(wc -c < "$RESULT_FILE" | tr -d ' ')
+      if [ "$SIZE" -gt "$RESULT_MAX" ]; then
+        echo "FATAL: result is ${SIZE} bytes, over the ${RESULT_MAX}-byte ledger cap." >&2
+        echo "       Write the long-form output to a file and pass it as --payload, then put only that" >&2
+        echo "       path (plus a short summary) in your structured result. Do NOT truncate by hand:" >&2
+        echo "       the cap is enforced here so a replayed stage returns EXACTLY the recorded value." >&2
+        exit 2
+      fi
+      # Collapse to one physical line. The content is agent-produced JSON; if it is malformed the
+      # scout's parse drops this stage and it re-runs (informed) — the safe direction.
+      RESULT_JSON=$(tr '\n\r' '  ' < "$RESULT_FILE" | tr -d '\000-\037')
+      [ -n "$RESULT_JSON" ] || RESULT_JSON="null"
+    fi
+
+    AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    LINE="{\"stage\":\"$(jesc "$STAGE")\",\"status\":\"$(jesc "$STATUS")\",\"at\":\"$AT\""
+    [ -n "$NOTE" ] && LINE="$LINE,\"note\":\"$(jesc "$NOTE")\""
+    [ -n "$PAYLOAD_REL" ] && LINE="$LINE,\"payload\":\"$(jesc "$PAYLOAD_REL")\""
+    LINE="$LINE,\"result\":$RESULT_JSON}"
+
+    # ---- 3. ONE atomic append ----
+    printf '%s\n' "$LINE" >> "$DIR/ledger.jsonl" || { echo "FATAL: cannot append to $DIR/ledger.jsonl" >&2; exit 3; }
+
+    # ---- 4. refresh the /go run-lock heartbeat ----
+    # Every stage completion counts as run liveness. Without this a long harness lets the 30-minute
+    # freshness window lapse mid-wave and a second /go could start against the same slugs.
+    if [ -n "$HEARTBEAT" ]; then
+      HB_DIR=$(dirname "$HEARTBEAT")
+      mkdir -p "$HB_DIR" 2>/dev/null && touch "$HEARTBEAT" 2>/dev/null || true
+    fi
+    echo "ok: ledgered '$STAGE' ($STATUS)"
+    ;;
+
+  read)
+    DIR="${1:-}"; [ -n "$DIR" ] || usage
+    LEDGER="$DIR/ledger.jsonl"
+    [ -f "$LEDGER" ] || exit 0   # no ledger yet is not an error — it is round 0
+    # Last-wins compaction keyed on the stage name, preserving first-seen order so the output reads
+    # as an execution trace. Extracts the key with a plain substring scan (no jq dependency).
+    awk '
+      {
+        line = $0
+        k = ""
+        i = index(line, "\"stage\":\"")
+        if (i > 0) {
+          rest = substr(line, i + 9)
+          j = index(rest, "\"")
+          if (j > 0) k = substr(rest, 1, j - 1)
+        }
+        if (k == "") next
+        if (!(k in seen)) { order[++n] = k; seen[k] = 1 }
+        last[k] = line
+      }
+      END { for (i = 1; i <= n; i++) print last[order[i]] }
+    ' "$LEDGER"
+    ;;
+
+  *) usage ;;
+esac

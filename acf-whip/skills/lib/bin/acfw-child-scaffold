@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# acfw-child-scaffold — stamp the acf-whip child-workflow skeleton for one (task, kind).
+#
+# The architect runs this FIRST, then fills the four marked regions. acfw-child-validate byte-diffs the
+# LOCKED segments of the architect's file against `--stdout` output from this same script, so this is
+# the single source of truth for what "unmodified skeleton" means. Keep them in lockstep: any change
+# here changes what every previously-authored harness validates against, which is why the contract
+# stamp (acfw-child-contract: vN) exists — a stale generated file reports skeleton-version-skew and is
+# re-authored from scratch rather than amended.
+#
+# Usage:
+#   acfw-child-scaffold <scriptPath> --kind impl|direct|review|resolve --stem S --meta-name N
+#                       [--gate 'CMD'] [--trunk-root DIR]
+#   acfw-child-scaffold --stdout --kind K --stem S --meta-name N [--gate 'CMD']
+#
+# Exit codes: 0 ok · 1 usage · 3 template unreadable / cannot write
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TMPL="$SCRIPT_DIR/../child-skeleton.js.tmpl"
+
+usage() {
+  echo "usage: acfw-child-scaffold <scriptPath> --kind impl|direct|review|resolve --stem S --meta-name N [--gate CMD] [--trunk-root DIR]" >&2
+  echo "       acfw-child-scaffold --stdout --kind K --stem S --meta-name N [--gate CMD]" >&2
+  exit 1
+}
+
+OUT=""; STDOUT=0; KIND=""; STEM=""; METANAME=""; GATE=""; TRUNK_ROOT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --stdout)     STDOUT=1; shift ;;
+    --kind)       KIND="${2:-}"; shift 2 ;;
+    --stem)       STEM="${2:-}"; shift 2 ;;
+    --meta-name)  METANAME="${2:-}"; shift 2 ;;
+    --gate)       GATE="${2:-}"; shift 2 ;;
+    --trunk-root) TRUNK_ROOT="${2:-}"; shift 2 ;;
+    -*)           echo "FATAL: unknown flag '$1'" >&2; usage ;;
+    *)            [ -z "$OUT" ] && OUT="$1" || { echo "FATAL: unexpected argument '$1'" >&2; usage; }; shift ;;
+  esac
+done
+
+case "$KIND" in
+  impl|direct|review|resolve) : ;;
+  *) echo "FATAL: --kind must be one of impl|direct|review|resolve (got '${KIND}')" >&2; usage ;;
+esac
+[ "$STDOUT" = "1" ] || [ -n "$OUT" ] || usage
+[ -f "$TMPL" ] || { echo "FATAL: skeleton template not found at $TMPL" >&2; exit 3; }
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/acfw-scaffold.XXXXXX") || exit 3
+trap 'rm -rf "$WORK"' EXIT
+
+# ---- 1. main body = everything before the PARTS separator ----
+awk '/^\/\/ ==== PARTS —/{exit} {print}' "$TMPL" > "$WORK/main"
+# Drop the trailing separator comment line that precedes PARTS.
+awk 'BEGIN{n=0} {lines[++n]=$0} END{ last=n; while (last>0 && lines[last] ~ /^\/\/ =+$/) last--; for(i=1;i<=last;i++) print lines[i] }' "$WORK/main" > "$WORK/main2"
+mv "$WORK/main2" "$WORK/main"
+
+# ---- 2. extract one part by name ----
+extract_part() { # <name> -> file
+  awk -v want="// <<<part:$1>>>" '
+    $0 == want { on = 1; next }
+    on && $0 == "// <<<end>>>" { exit }
+    on { print }
+  ' "$TMPL"
+}
+extract_part "$KIND.prologue" > "$WORK/prologue"
+extract_part "$KIND.epilogue" > "$WORK/epilogue"
+extract_part "$KIND.body"     > "$WORK/body"
+[ -s "$WORK/prologue" ] || { echo "FATAL: template has no part '$KIND.prologue'" >&2; exit 3; }
+[ -s "$WORK/epilogue" ] || { echo "FATAL: template has no part '$KIND.epilogue'" >&2; exit 3; }
+[ -s "$WORK/body" ]     || { echo "FATAL: template has no part '$KIND.body'" >&2; exit 3; }
+
+# ---- 3. splice the parts into their placeholder lines ----
+# Inserting a FILE at a marker line (never a sed substitution — the parts contain &, \, / and newlines).
+# Markers are matched after trimming leading whitespace, so re-indenting the template can never
+# silently stop a splice (which is how the default body first went missing: a bodiless harness that
+# still contained runStage from the locked section passed a naive guard).
+awk -v pro="$WORK/prologue" -v epi="$WORK/epilogue" -v bod="$WORK/body" '
+  function dump(f,   line) { while ((getline line < f) > 0) print line; close(f) }
+  { t = $0; sub(/^[ \t]+/, "", t) }
+  t == "// --- ACFW_PROLOGUE ---" { dump(pro); next }
+  t == "// --- ACFW_EPILOGUE ---" { dump(epi); next }
+  t == "// </acfw-body>"          { dump(bod); print; next }
+  { print }
+' "$WORK/main" > "$WORK/spliced"
+
+# Each splice is verified by a token that exists ONLY in the part it came from.
+grep -q '<acfw-body>' "$WORK/spliced"       || { echo "FATAL: body markers vanished during splice" >&2; exit 3; }
+grep -q 'DEFAULT BODY' "$WORK/spliced"      || { echo "FATAL: default body was not spliced (check '// </acfw-body>' in the template)" >&2; exit 3; }
+grep -q 'ACFW CHILD SKELETON' "$WORK/spliced" || { echo "FATAL: skeleton header lost" >&2; exit 3; }
+grep -q 'function finish' "$WORK/spliced"   || { echo "FATAL: locked return constructor lost" >&2; exit 3; }
+
+# ---- 4. token substitution, index-based (never sed/gsub: the values are arbitrary text) ----
+# Single quotes in a gate command would terminate the JS string literal it lands in, so escape them
+# the JS way. Backslashes first, or the escape we add would itself be re-escaped.
+GATE_JS=$(printf '%s' "$GATE" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
+KIND="$KIND" GATE_JS="$GATE_JS" awk '
+  function subst1(line, tok, val,   i) {
+    i = index(line, tok)
+    if (i == 0) return line
+    return substr(line, 1, i - 1) val substr(line, i + length(tok))
+  }
+  {
+    $0 = subst1($0, "ACFW_GATE_PLACEHOLDER", ENVIRON["GATE_JS"])
+    $0 = subst1($0, "ACFW_KIND", ENVIRON["KIND"])
+    print
+  }
+' "$WORK/spliced" > "$WORK/final"
+
+# ---- 5. emit ----
+if [ "$STDOUT" = "1" ]; then
+  cat "$WORK/final"
+  exit 0
+fi
+
+OUT_DIR=$(dirname "$OUT")
+mkdir -p "$OUT_DIR" 2>/dev/null || { echo "FATAL: cannot create $OUT_DIR" >&2; exit 3; }
+cat "$WORK/final" > "$OUT" || { echo "FATAL: cannot write $OUT" >&2; exit 3; }
+
+# ---- 6. self-heal the gitignore for the run-state directory we just wrote into ----
+# whip-init adds these for new projects; this covers every repo initialized before 3.2.0, at the exact
+# moment the directory first comes into existence. NEVER '.acfwhip/' wholesale: .acfwhip/config is a
+# COMMITTED file whose values overwrite inherited env, and .acfwhip/integrated/ is the LP-CAS oracle.
+if [ -n "$TRUNK_ROOT" ] && [ -d "$TRUNK_ROOT" ]; then
+  for pat in '.acfwhip/run/' '.acfwhip/specs/'; do
+    if [ -f "$TRUNK_ROOT/.gitignore" ] && grep -qxF "$pat" "$TRUNK_ROOT/.gitignore"; then continue; fi
+    printf '\n# ACF Whip /go run state\n%s\n' "$pat" >> "$TRUNK_ROOT/.gitignore" 2>/dev/null || true
+  done
+fi
+
+echo "$OUT"

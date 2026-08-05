@@ -1,0 +1,442 @@
+// ==== ACFW CHILD SKELETON — acfw-child-contract: v1 ====
+// Written by acfw-child-scaffold. Edit ONLY between the // <acfw-*> ... // </acfw-*> marker pairs.
+// acfw-child-validate byte-diffs every locked segment against the shipped template; /go REFUSES to run
+// a file whose locked segments differ. The durability machinery below cannot be authored away.
+export const meta = {
+  // <acfw-meta>
+  // </acfw-meta>
+}
+
+// ==== LOCKED L1 ====
+const A = args || {}
+const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
+const KIND = 'ACFW_KIND'
+const STEM = A.stem || '', SLUG = A.slug || 'none', BRANCH = A.branch || ''
+const FORKBASE = A.forkbaseRef || '', TASKPATH = A.taskPath || ''
+const LEDGER = A.ledgerDir || '', LBIN = A.ledgerBin || '', LOCK = A.runLock || ''
+const BASE = A.basePrompt || ''            // the verbatim 3.1.x seam prompt — inherited, never retyped
+const RESULT = A.resultSchema || null      // ACFW_RESULT, passed as data (a child cannot import)
+const LENS = A.lensSchema || null
+const SHELL = A.shellModel || 'haiku'
+const BUDGET = (typeof A.agentBudget === 'number' && A.agentBudget > 0) ? A.agentBudget : 8
+const FANOUT = (typeof A.fanoutMax === 'number' && A.fanoutMax > 0) ? A.fanoutMax : 1
+const REGISTRY = Array.isArray(A.registry) ? A.registry : []
+const GIT = A.git || { commits: [], dirty: [], worktree: '' }
+
+// ---- REPLAY. The parent hands us the VERIFIED-complete stage keys and their RECORDED results, so a
+// replayed stage returns exactly the value the first execution returned. There is ONE guard, here.
+// A second, agent-side "if done, echo it" instruction competing with this script-level skip is the
+// defect that made free-form authoring unshippable: the script skipped first and returned null, and
+// the first null deref turned every resumed harness into a permanent 'none'.
+const results = {}
+const PRIOR = A.priorStages || {}
+for (const k of Object.keys(PRIOR)) { if (PRIOR[k] && PRIOR[k].status === 'ok') results[k] = PRIOR[k].result }
+const ran = [], replayed = []
+let used = 0, lastStage = 'prologue', fanDefect = null, WT = GIT.worktree || ''
+
+// ---- THE BODY'S ONLY OUTPUTS ----
+let want = 'completed', finalNote = '', blockedReason = '', needsTask = ''
+let deliverableFiles = [], lensVerdicts = [], gate = null
+let resolveOk = false, resolveStaged = 0
+
+const FAILED = { __failed: true }   // runStage NEVER returns null: `r.field` must never throw
+
+// ---- FAULT TYPING. A SCRIPT DEFECT is repairable by editing this file, so it must reach /go's amend
+// loop as a throw. Everything else (agent non-emit, budget, agent cap, abort) is TRANSIENT and degrades
+// to a well-formed 'none' result — /go retries the task next iteration exactly as it does today.
+const DEFECT_NAMES = ['TypeError', 'ReferenceError', 'RangeError', 'SyntaxError', 'EvalError']
+const DEFECT_TEXT = /Date\.now|Math\.random|new Date|nesting is limited to one level|agent type|not available in this build|Invalid JSON Schema|exceeds the maximum of 4096|cannot be a function/
+function isDefect(e) {
+  if (!e) return false
+  if (DEFECT_NAMES.indexOf(String(e.name || '')) >= 0) return true
+  return DEFECT_TEXT.test(String((e && e.message) || e))
+}
+
+const skey = (spec) => (spec.iteration === undefined ? String(spec.key) : `${spec.key}#${spec.iteration}`)
+
+// ---- LEDGER + HEARTBEAT + RESUME, prepended to EVERY stage prompt. The AGENT writes it, because a
+// workflow script has no filesystem — which is exactly why the record survives this script throwing
+// AND survives the architect's own repair edit (native resume caches only an UNCHANGED agent prefix).
+function rule(spec, key) {
+  const trailer = spec.producesCommit === true
+    ? `
+  COMMIT TRAILER (mandatory for this stage): every commit you make on ${BRANCH} must end with the line
+    ACFW-Stage: ${key}
+  Git cannot half-write a commit, so this trailer — not the ledger file — is the durable proof that this
+  stage's work landed. Use:  git -C ${sq(WT || '<WT>')} commit -m '<subject>' -m 'ACFW-Stage: ${key}'`
+    : ''
+  const resume = `
+  RESUME: this stage may have ALREADY PARTIALLY RUN. Before doing anything, run
+  git -C ${sq(WT || '<WT>')} log --oneline ${sq(FORKBASE)}..HEAD  and  git -C ${sq(WT || '<WT>')} status --porcelain
+  and complete ONLY what is missing. Never re-apply a change that is already there.${GIT.commits.length ? `
+  Commits already on this branch: ${GIT.commits.slice(0, 20).join(' | ')}` : ''}${GIT.dirty.length ? `
+  Uncommitted paths already present: ${GIT.dirty.slice(0, 20).join(' ')}` : ''}`
+  return `
+RUN-LOCK HEARTBEAT (first, best effort, ignore failure):  mkdir -p ${sq(LEDGER)} && touch ${sq(LOCK)}
+PROGRESS LEDGER for stage '${key}':${KIND === 'direct' ? '' : resume}${trailer}
+  LAST ACTION, exactly once, only AFTER your work is durable (committed, or the file written):
+    write your structured result to a temp JSON file, then run
+    bash ${sq(LBIN)} append ${sq(LEDGER)} ${sq(key)} --status ok --result-file <tmp.json> --heartbeat ${sq(LOCK)}
+    (add  --payload <long-form .md>  when your result would exceed a few hundred bytes; put the payload
+    PATH in your result, never the prose itself)
+  If you could not finish, use  --status fail --note '<one line>'  instead. Never claim work you did not
+  do: a false 'ok' is the only way this system can skip real work. Never stage or commit .acfwhip/.
+`
+}
+
+// ---- THE AGENT PRIMITIVE. Guarded, budgeted, ledgered, labelled, BASE-prefixed, defect-typed.
+async function runStage(spec) {
+  const key = skey(spec)
+  if (results[key] !== undefined) { replayed.push(key); log(`↺ ${STEM}/${key} — replayed from ledger (not re-run)`); return results[key] }
+  lastStage = key
+  if (used >= BUDGET) { log(`⚠ ${STEM}/${key} — agent budget ${BUDGET} exhausted, degrading`); return FAILED }
+  used++
+  const o = { label: `${STEM}:${key}`, phase: 'Stages' }
+  if (spec.schema) o.schema = spec.schema
+  if (spec.effort) o.effort = spec.effort
+  if (spec.model) o.model = spec.model
+  // An unknown agentType throws "agent type 'X' not found" at the runtime, and the architect cannot fix
+  // a value the PARENT injected. Drop it with a log instead of turning it into a repairable defect.
+  if (spec.agentType && spec.agentType !== 'none') {
+    if (REGISTRY.indexOf(spec.agentType) >= 0) o.agentType = spec.agentType
+    else log(`⚠ ${STEM}/${key} — agentType '${spec.agentType}' is not installed; running without it`)
+  }
+  let out = null
+  for (let k = 1; k <= 2; k++) {
+    try { out = await agent(`${BASE}\n${rule(spec, key)}\n${spec.prompt}`, k === 1 ? o : { ...o, label: `${o.label}:retry` }); break }
+    catch (e) {
+      if (isDefect(e)) throw e
+      log(`${STEM}/${key} non-emit (${k}/2): ${String((e && e.message) || e).slice(0, 160)}`)
+    }
+  }
+  if (out === null || out === undefined) { log(`✗ ${STEM}/${key} — no result (transient)`); return FAILED }
+  results[key] = out; ran.push(key)
+  log(`✓ ${STEM}/${key} (${used}/${BUDGET} agents)`)
+  return out
+}
+
+// ---- BOUNDED FAN-OUT. Read-only specs run concurrently, sliced to FANOUT; mutating specs are FORCED
+// SEQUENTIAL after them. This runtime coercion is what makes the single-mutator rule STRUCTURAL rather
+// than a prompt request — a mislabelled `mutates` costs throughput, never correctness.
+async function runWave(specs) {
+  const list = Array.isArray(specs) ? specs.filter(Boolean) : []
+  const ro = list.filter((s) => s.mutates !== true), mut = list.filter((s) => s.mutates === true)
+  const pend = ro.filter((s) => results[skey(s)] === undefined)
+  for (let i = 0; i < pend.length; i += FANOUT) {
+    const chunk = pend.slice(i, i + FANOUT)
+    await parallel(chunk.map((s) => async () => {
+      // parallel() maps a thrown thunk to null, which would SWALLOW a script defect. Capture it.
+      try { return await runStage(s) } catch (e) { if (isDefect(e)) fanDefect = fanDefect || e; return FAILED }
+    }))
+  }
+  for (const s of mut) await runStage(s)
+  return list.map((s) => (results[skey(s)] === undefined ? FAILED : results[skey(s)]))
+}
+
+// ---- REVIEW PANEL ARITHMETIC — LOCKED. No veto: a lone lens can never push a task toward its
+// 3-rejection terminal on its own. Strict majority. Fewer than 3 live lenses is not a panel.
+// rejectionIncrement is 0 or 1, never a count, so a panel of any size costs at most one life per round.
+function aggregate() {
+  const g = gate || {}
+  if (g.checkoutOk === false) return finish('none', 'n/a', `clean-checkout exit ${g.checkoutExit} — ${g.note || ''}`, 'mechanism')
+  if (g.deliverablesChecked === true && g.deliverablesCommitted === false)
+    return finish('rejected', 'n/a', `AUTO-REJECT: an Acceptance-Criteria deliverable exists but is NOT committed. ${g.note || ''}`, 'quality')
+  const live = (Array.isArray(lensVerdicts) ? lensVerdicts : []).filter((l) => l && !l.__failed && (l.verdict === 'accept' || l.verdict === 'reject'))
+  if (!live.length) return finish('none', 'n/a', 'every review lens abstained (non-emit) — re-review next iteration', 'mechanism')
+  const rej = live.filter((l) => l.verdict === 'reject')
+  if (live.length < 3) {
+    if (rej.length === live.length && live.length === 2) {
+      const why2 = rej.map((l) => `[${l.lens || '?'}] ${l.findings || ''}`).join(' | ')
+      return finish('rejected', 'n/a', `2/2 lenses reject: ${why2}`, 'quality')
+    }
+    return finish('accepted', 'n/a', `${live.length}-lens panel: insufficient concurrence to reject (${rej.length} reject)`, 'quality')
+  }
+  const reject = (2 * rej.length) > live.length            // STRICT majority. No veto.
+  const why = rej.map((l) => `[${l.lens || '?'}/${l.severity || 'major'}] ${l.findings || ''}`).join(' | ')
+  return finish(reject ? 'rejected' : 'accepted', 'n/a',
+    reject ? `${rej.length}/${live.length} lenses reject: ${why}` : `${live.length}-lens panel accepted${rej.length ? ` (${rej.length} minority reject: ${why})` : ''}`,
+    'quality')
+}
+
+// ---- THE ONLY RETURN CONSTRUCTOR.
+function finish(tr, sha, note, faultClass) {
+  return {
+    ok: true, transition: tr, commitSha: sha || 'n/a',
+    rejectionIncrement: tr === 'rejected' ? 1 : 0,
+    faultClass: faultClass || 'quality',
+    notes: String(note || '').slice(0, 400),
+    blockedReason: tr === 'blocked' ? (blockedReason || 'unrecoverable') : undefined,
+    needsTask: needsTask || undefined,
+    deliverableFiles: Array.isArray(deliverableFiles) ? deliverableFiles : [],
+    resolved: resolveOk && resolveStaged > 0, staged: resolveStaged,
+    stagesRan: ran, stagesReplayed: replayed, agentsUsed: used, shallow: !!A.shallow,
+  }
+}
+
+// ---- Best-effort throw record. Itself try-wrapped: if the agent cap is what killed the child this
+// call throws too, and the per-stage entries already on disk are the primary record anyway.
+async function recordThrow(msg) {
+  try {
+    await agent(`Run exactly this command and report nothing else:
+  bash ${sq(LBIN)} append ${sq(LEDGER)} __throw --status fail --note ${sq(String(msg).slice(0, 300))} --heartbeat ${sq(LOCK)}`,
+      { label: `${STEM}:__throw`, phase: 'Stages', model: SHELL })
+  } catch (e) { /* the stage entries are the primary record */ }
+}
+
+try {
+// ==== LOCKED L2: kind-dispatched preflight ====
+// <acfw-plan>
+// </acfw-plan>
+// <acfw-pre>
+// </acfw-pre>
+// --- ACFW_PROLOGUE ---
+// <acfw-body>
+// </acfw-body>
+// --- ACFW_EPILOGUE ---
+} catch (e) {
+  // Only SCRIPT DEFECTS reach here — runStage never throws on agent flakiness.
+  await recordThrow(String((e && e.message) || e).slice(0, 400))
+  if (isDefect(e)) throw e
+  return finish('none', 'n/a', `child degraded at stage '${lastStage}': ${String((e && e.message) || e).slice(0, 200)}`, 'mechanism')
+}
+
+// ============================================================================================
+// ==== PARTS — everything below this line is STRIPPED by acfw-child-scaffold. It is the
+// ==== per-kind prologue/epilogue library, kept in one file so the skeleton reads top to bottom.
+// ============================================================================================
+
+// <<<part:impl.prologue>>>
+phase('Checkout')
+const CO = { type: 'object', additionalProperties: false, required: ['exitCode', 'worktreePath'],
+  properties: { exitCode: { type: 'integer' }, worktreePath: { type: 'string' } } }
+// EXACTLY ONE clean-checkout per (task, attemptKey), here, never in an authored stage. Its result is
+// LEDGERED and thereafter REPLAYED, so an amended script physically cannot re-invoke it — which matters
+// because clean-checkout.sh does `git stash push -u ... || true` on ANY dirty state, silently, into the
+// SHARED refs/stash. The guard below is an OBSERVATION, not a record: a lost ledger entry can never
+// trigger a second stash. It also resolves the path by QUERY, because ACFW_WORKTREE_DIR is config-driven
+// and the constructed path can differ from the real one (symlinked TMPDIR, for instance).
+const co = await runStage({ key: 'checkout', mutates: true, schema: CO, model: SHELL, prompt: `
+If a worktree for this task ALREADY EXISTS and is on the right branch, do NOT create it again:
+  WT=$(git -C ${sq(A.trunkRoot)} worktree list --porcelain | awk -v b="branch refs/heads/${BRANCH}" '/^worktree /{p=$2} $0==b{print p; exit}')
+  if [ -n "$WT" ]; then echo "$WT"; else bash ${sq(A.cleanCheckout)} ${sq(TASKPATH)}; fi
+Report exitCode (0 when a path was printed) and worktreePath (that absolute path, exactly as printed).
+Do NOTHING else — do not implement anything, do not edit, do not commit.` })
+if (co.__failed || co.exitCode !== 0 || !co.worktreePath)
+  return finish('none', 'n/a', `clean-checkout exit ${co.__failed ? 'no-emit' : co.exitCode} — worktree unavailable`, 'mechanism')
+WT = co.worktreePath
+log(`${STEM}: preflight — worktree ${WT} on ${BRANCH}`)
+// <<<end>>>
+
+// <<<part:impl.epilogue>>>
+if (fanDefect) { await recordThrow(String(fanDefect.message || fanDefect)); throw fanDefect }
+phase('Verify')
+const VER = { type: 'object', additionalProperties: false,
+  required: ['commits', 'dirty', 'headSha', 'impure'],
+  properties: { commits: { type: 'integer' }, dirty: { type: 'integer' }, headSha: { type: 'string' },
+    impure: { type: 'integer', description: 'count of .backlog/ or .acfwhip/ paths in the candidate diff' } } }
+if (want === 'completed') {
+  const v = await runStage({ key: 'verify', mutates: true, schema: VER, model: SHELL, prompt: `
+In ${sq(WT)}: commit any remaining CODE to ${sq(BRANCH)} (never .backlog/, never .acfwhip/), then report
+  git -C ${sq(WT)} log --oneline ${sq(FORKBASE)}..HEAD | wc -l                            -> commits
+  git -C ${sq(WT)} status --porcelain | wc -l                                             -> dirty
+  git -C ${sq(WT)} rev-parse HEAD                                                          -> headSha
+  git -C ${sq(WT)} diff --name-only ${sq(FORKBASE)}..HEAD | grep -cE '^\\.backlog/|^\\.acfwhip/'  -> impure` })
+  if (v.__failed) return finish('none', 'n/a', 'could not verify the worktree — retrying next iteration', 'mechanism')
+  // An uncommitted tree is stashed away by the REVIEWER's own clean-checkout, and the task is then
+  // rejected for having no implementation. Never report completed on a dirty tree.
+  if (v.dirty > 0) return finish('none', 'n/a', `${v.dirty} uncommitted path(s) on ${BRANCH} — not reporting completed`, 'mechanism')
+  // An empty candidate still LANDS: the co-committed marker makes the integration commit non-empty, so
+  // the integrator's empty-commit guard never fires and the task is marked integrated with ZERO code on
+  // trunk. The marker is the sole oracle, so that state is unrecoverable.
+  if (v.commits < 1) return finish('none', 'n/a', `no commit on ${BRANCH} — an empty candidate would mark this integrated with zero code`, 'mechanism')
+  // Trunk content in the tip tree puts .acfwhip/integrated/** into the candidate diff -> the integrator
+  // quarantines it as a poison ledger write and the task is parked permanently.
+  if (v.impure > 0) return finish('none', 'n/a', `candidate diff touches ${v.impure} .backlog//.acfwhip/ path(s) — did a stage merge or reset trunk?`, 'mechanism')
+  return finish('completed', v.headSha, finalNote || 'implemented', 'quality')
+}
+return finish(want, 'n/a', finalNote, 'quality')
+// <<<end>>>
+
+// <<<part:direct.prologue>>>
+// A non-code task (Worktree: none) has NO worktree and commits NOTHING. It works in the trunk root and
+// reports its files through deliverableFiles, which the orchestrator's single writer stages in the same
+// commit as the state move. There is no checkout stage and no branch.
+log(`${STEM}: non-code task — trunk root, no worktree, deliverables reported for staging`)
+// <<<end>>>
+
+// <<<part:direct.epilogue>>>
+if (fanDefect) { await recordThrow(String(fanDefect.message || fanDefect)); throw fanDefect }
+return finish(want, 'n/a', finalNote || 'completed', 'quality')
+// <<<end>>>
+
+// <<<part:review.prologue>>>
+phase('Gate')
+// The deterministic half of review, run ONCE before any lens reasons about anything. It attaches to the
+// worktree and reports facts; the lenses are strictly read-only and never touch git state.
+const RG = { type: 'object', additionalProperties: false,
+  required: ['checkoutOk', 'checkoutExit', 'worktreePath', 'gateOutput', 'note'],
+  properties: { checkoutOk: { type: 'boolean' }, checkoutExit: { type: 'integer' },
+    worktreePath: { type: 'string' }, gateOutput: { type: 'string' }, note: { type: 'string' },
+    deliverablesChecked: { type: 'boolean' }, deliverablesCommitted: { type: 'boolean' } } }
+const rg = await runStage({ key: 'review-gate', mutates: true, schema: RG, model: SHELL, prompt: `
+Attach to this task's worktree and report facts. Do NOT review anything and do NOT edit anything.
+  WT=$(git -C ${sq(A.trunkRoot)} worktree list --porcelain | awk -v b="branch refs/heads/${BRANCH}" '/^worktree /{p=$2} $0==b{print p; exit}')
+  if [ -n "$WT" ]; then echo "$WT"; else bash ${sq(A.cleanCheckout)} ${sq(TASKPATH)}; fi
+Report checkoutOk/checkoutExit/worktreePath from that. Then run the project's quality gates once in the
+worktree and put the last 60 lines of their output verbatim in gateOutput.` })
+if (rg.__failed) return finish('none', 'n/a', 'review gate did not emit — re-review next iteration', 'mechanism')
+gate = rg
+WT = rg.worktreePath || WT
+if (gate.checkoutOk === false) return aggregate()
+log(`${STEM}: review gate ok — worktree ${WT}`)
+// <<<end>>>
+
+// <<<part:review.epilogue>>>
+if (fanDefect) { await recordThrow(String(fanDefect.message || fanDefect)); throw fanDefect }
+phase('Verdict')
+// THE VERDICT IS NOT THE ARCHITECT'S. The body assigns lensVerdicts; the fold is locked arithmetic.
+return aggregate()
+// <<<end>>>
+
+// <<<part:resolve.prologue>>>
+// The integration worktree is MID-CHERRY-PICK and was handed to us by the LP-CAS integrator. There is
+// no checkout stage: attaching would be wrong and `clean-checkout` here would be catastrophic.
+WT = A.resolverWorktree || WT
+if (!WT) return finish('none', 'n/a', 'no resolver worktree supplied', 'mechanism')
+log(`${STEM}: resolving conflicts in ${WT} (mid-cherry-pick)`)
+// <<<end>>>
+
+// <<<part:resolve.epilogue>>>
+if (fanDefect) { await recordThrow(String(fanDefect.message || fanDefect)); throw fanDefect }
+phase('Verify')
+// The locked probe is the AUTHORITY on whether the conflict is resolved — never an authored stage's
+// self-report. cherryPickHead proves nobody ran --continue/--abort/reset behind the integrator's back.
+const RV = { type: 'object', additionalProperties: false,
+  required: ['unmerged', 'staged', 'cherryPickHead', 'markers', 'untracked'],
+  properties: { unmerged: { type: 'integer' }, staged: { type: 'integer' }, cherryPickHead: { type: 'boolean' },
+    markers: { type: 'integer' }, untracked: { type: 'integer' } } }
+const vr = await runStage({ key: 'verify-resolve', schema: RV, model: SHELL, prompt: `
+Read-only probe in ${sq(WT)}. Report:
+  git -C ${sq(WT)} diff --name-only --diff-filter=U | wc -l                    -> unmerged   (must be 0)
+  git -C ${sq(WT)} diff --cached --name-only | wc -l                           -> staged     (must be > 0)
+  git -C ${sq(WT)} rev-parse --verify CHERRY_PICK_HEAD >/dev/null 2>&1 && echo true || echo false -> cherryPickHead (must be true)
+  git -C ${sq(WT)} grep -l -e '<<<<<<<' -e '>>>>>>>' --cached | wc -l          -> markers    (must be 0)
+  git -C ${sq(WT)} status --porcelain | grep -c '^??'                          -> untracked  (must be 0)
+Change NOTHING. Never run cherry-pick, reset, checkout, add, or the build.` })
+resolveOk = !vr.__failed && vr.unmerged === 0 && vr.staged > 0 && vr.cherryPickHead === true && vr.markers === 0 && vr.untracked === 0
+resolveStaged = vr.__failed ? 0 : vr.staged
+return finish('none', 'n/a', resolveOk ? `resolved, ${resolveStaged} staged` : `not resolved (unmerged=${vr.__failed ? '?' : vr.unmerged} staged=${vr.__failed ? '?' : vr.staged} cpHead=${vr.__failed ? '?' : vr.cherryPickHead} markers=${vr.__failed ? '?' : vr.markers} untracked=${vr.__failed ? '?' : vr.untracked})`, 'mechanism')
+// <<<end>>>
+
+// <<<part:impl.body>>>
+  // ---- DEFAULT BODY (shallow). A strict superset of 3.1.0 single-agent dispatch.
+  // These five stages contain the only three mechanisms a script structurally buys over one strong
+  // agent: a schema-OBSERVED advance condition, a fresh-context reviewer of the diff, and a durable
+  // ledger. Keeping this shape and setting shallow=true is a CORRECT answer for a small task.
+  const GATECMD = 'ACFW_GATE_PLACEHOLDER'
+  const ST = { type: 'object', additionalProperties: false, required: ['ok', 'summary'],
+    properties: { ok: { type: 'boolean' }, summary: { type: 'string' } } }
+  const GT = { type: 'object', additionalProperties: false, required: ['passed', 'failingOutput'],
+    properties: { passed: { type: 'boolean' }, failingOutput: { type: 'string' } } }
+  const VD = { type: 'object', additionalProperties: false, required: ['verdict', 'findings'],
+    properties: { verdict: { type: 'string', enum: ['accept', 'reject'] }, findings: { type: 'string' } } }
+
+  const im = await runStage({ key: 'implement', mutates: true, producesCommit: true, schema: RESULT,
+    agentType: A.agentType, prompt: `Do the implementation in ${sq(WT)} on ${sq(BRANCH)} and commit it.` })
+  if (im.__failed) { want = 'none'; finalNote = 'implementer did not emit' }
+  else {
+    want = im.transition || 'none'; finalNote = im.notes || ''; blockedReason = im.blockedReason || ''
+    needsTask = im.needsTask || ''; deliverableFiles = im.deliverableFiles || []
+  }
+
+  for (let i = 0; i < 2 && want === 'completed'; i++) {
+    const g = await runStage({ key: 'gate', iteration: i, schema: GT, model: SHELL, prompt: GATECMD
+      ? `Read-only except for the command itself. Run EXACTLY:  cd ${sq(WT)} && ${GATECMD}
+Report passed=true ONLY if it exits 0; on failure put the last 60 lines verbatim in failingOutput.`
+      : `Resolve this project's quality gates (Makefile / package.json scripts / pyproject.toml /
+.pre-commit-config.yaml / go.mod) and run them in ${sq(WT)}. Change no source files.
+Report passed=true ONLY if every gate exits 0; on failure put the last 60 lines verbatim in failingOutput.` })
+    if (g.__failed || g.passed) break
+    const f = await runStage({ key: 'gate-fix', iteration: i, mutates: true, producesCommit: true, schema: ST,
+      agentType: A.agentType, prompt: `The quality gates FAILED:
+${(g.failingOutput || '').slice(0, 4000)}
+Fix the CAUSE without weakening or deleting any test. Commit to ${sq(BRANCH)}.` })
+    if (f.__failed) { want = 'none'; finalNote = 'gate fixer did not emit'; break }
+  }
+
+  if (want === 'completed') {
+    const adv = await runStage({ key: 'adversarial', schema: VD, agentType: 'quality-reviewer', prompt: `
+You did NOT write this change. STRICTLY READ-ONLY: no edits, no git add, no build, no test run.
+Read  git -C ${sq(WT)} diff ${sq(FORKBASE)}..HEAD  against the Acceptance Criteria in ${sq(TASKPATH)}
+and TRY TO REJECT IT. Cite file:line for every finding, or accept.` })
+    if (!adv.__failed && adv.verdict === 'reject') {
+      const fx = await runStage({ key: 'adversarial-fix', mutates: true, producesCommit: true, schema: ST,
+        agentType: A.agentType, prompt: `An independent in-harness reviewer rejected this diff:
+${(adv.findings || '').slice(0, 3000)}
+Address every finding, re-run the gates, and commit to ${sq(BRANCH)}.` })
+      if (fx.__failed) { want = 'none'; finalNote = 'adversarial fix did not emit' }
+    }
+  }
+// <<<end>>>
+
+// <<<part:direct.body>>>
+  // ---- DEFAULT BODY (shallow), non-code task.
+  const dm = await runStage({ key: 'produce', mutates: true, schema: RESULT, agentType: A.agentType,
+    prompt: `Do the work for this task in the trunk root. Commit NOTHING.` })
+  if (dm.__failed) { want = 'none'; finalNote = 'agent did not emit' }
+  else {
+    want = dm.transition || 'none'; finalNote = dm.notes || ''; blockedReason = dm.blockedReason || ''
+    needsTask = dm.needsTask || ''; deliverableFiles = dm.deliverableFiles || []
+  }
+// <<<end>>>
+
+// <<<part:review.body>>>
+  // ---- DEFAULT BODY (shallow), review. One lens is not a panel: aggregate() will accept unless a
+  // genuine majority rejects, which is deliberate — this seam is the only SUBTRACTIVE one.
+  const LV = LENS || { type: 'object', additionalProperties: false, required: ['lens', 'verdict', 'findings'],
+    properties: { lens: { type: 'string' }, verdict: { type: 'string', enum: ['accept', 'reject'] },
+      severity: { type: 'string' }, findings: { type: 'string' }, evidence: { type: 'string' } } }
+  const lensSpecs = [
+    { key: 'lens-acceptance', schema: LV, agentType: 'quality-reviewer', prompt: `
+LENS: acceptance-criteria conformance. STRICTLY READ-ONLY.
+Read  git -C ${sq(WT)} diff ${sq(FORKBASE)}..HEAD  against every Acceptance Criterion in ${sq(TASKPATH)}.
+Set lens="acceptance". Reject only if a criterion is demonstrably unmet; cite file:line.` },
+    { key: 'lens-regression', schema: LV, agentType: 'quality-reviewer', prompt: `
+LENS: regression risk. STRICTLY READ-ONLY.
+Read the same diff and look for behaviour this change breaks outside its own scope: changed call sites,
+altered public shapes, removed or weakened tests. Set lens="regression". Cite file:line.
+Quality-gate output from the locked gate stage:
+${(gate && gate.gateOutput ? String(gate.gateOutput) : '(none)').slice(0, 3000)}` },
+    { key: 'lens-conventions', schema: LV, agentType: 'quality-reviewer', prompt: `
+LENS: project conventions. STRICTLY READ-ONLY.
+Read the same diff against CLAUDE.md, docs/acf/ and the surrounding code's idiom. Set
+lens="conventions". Reject only for a real convention violation, never for taste. Cite file:line.` },
+  ]
+  lensVerdicts = await runWave(lensSpecs)
+// <<<end>>>
+
+// <<<part:resolve.body>>>
+  // ---- DEFAULT BODY (shallow), conflict resolution. Fan out READ, fan in WRITE.
+  const AN = { type: 'object', additionalProperties: false, required: ['file', 'resolution'],
+    properties: { file: { type: 'string' }, resolution: { type: 'string' } } }
+  const files = String(A.conflictedFiles || '').split('\n').map((s) => s.trim()).filter(Boolean).slice(0, 12)
+  const analyses = files.length
+    ? await runWave(files.map((f, i) => ({
+        key: 'analyze', iteration: i, schema: AN, model: SHELL, prompt: `
+STRICTLY READ-ONLY analysis of ONE conflicted file: ${f}
+In ${sq(WT)} inspect it with git show / git log / reading the file. Explain precisely how BOTH sides
+should be combined. You may NOT edit, and you may NOT run 'git add' — staging a path clears its unmerged
+state regardless of content, and the integrator's completion oracle is exactly that state being empty.` })))
+    : []
+  const plan = analyses.filter((a) => a && !a.__failed).map((a) => `--- ${a.file}\n${a.resolution}`).join('\n\n')
+  await runStage({ key: 'stage-resolution', mutates: true, model: SHELL, schema: { type: 'object',
+    additionalProperties: false, required: ['staged'], properties: { staged: { type: 'integer' } } },
+    prompt: `Apply these resolutions in ${sq(WT)} and stage ONLY the enumerated conflicted paths.
+${plan || '(no analysis available — resolve the conflicts on their merits)'}
+
+FORBIDDEN: git add -A, git add . (the integrator already does add -A afterwards, so any stray file you
+leave rides onto trunk); cherry-pick --continue/--commit/--abort/--quit; git reset; git checkout of
+another ref; running the build or test suite; creating scratch files.
+ALLOWED: editing the conflicted files and  git add <the exact conflicted paths>.
+Report how many paths you staged.` })
+// <<<end>>>
