@@ -57,6 +57,25 @@ acfw_resolve_store() { # <repo-root>
   printf '%s' "$store"
 }
 
+# acfw_resolve_integration_mode <repo-root> — print the pinned integration mode, or nothing.
+# Resolution mirrors acfw_resolve_store: ACFW_INTEGRATION_MODE env > ACFW_INTEGRATION_MODE key
+# in config > "" (unpinned).
+#   override  stop at accepted; the operator integrates (e.g. a PR per PR Group)
+#   default   LP-CAS folds every accepted task into the local trunk (Step 4.5)
+#   ""        no machine pin — the orchestrator decides by reading project instructions,
+#             exactly as before this key existed
+# An unrecognized value resolves to "" with a stderr warning, i.e. to the pre-existing
+# prose-fallback behavior: a typo must never silently flip delivery semantics in EITHER
+# direction (silently enabling local trunk folds is as bad as silently disabling them).
+acfw_resolve_integration_mode() { # <repo-root>
+  local m="${ACFW_INTEGRATION_MODE:-}"
+  [ -n "$m" ] || m=$(acfw_config_get "${1:-}" ACFW_INTEGRATION_MODE)
+  case "$m" in
+    override|default|"") printf '%s' "$m" ;;
+    *) echo "WARN: unrecognized ACFW_INTEGRATION_MODE='$m' — ignoring; the orchestrator falls back to reading project instructions" >&2 ;;
+  esac
+}
+
 # acfw_run_lock_path <repo-root> [store] — print the /go run-lock (heartbeat) path.
 # files keeps the historical .backlog/.acfw-run.json (already gitignored by whip-init);
 # every other backend has no .backlog/, so the lock lives under .acfwhip/run/ (gitignored,
