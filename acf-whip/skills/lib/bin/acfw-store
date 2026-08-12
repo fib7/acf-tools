@@ -14,7 +14,7 @@
 #     with the generic battery (acfw-doctor-generic.sh) into one report
 #
 # Usage: acfw-store <subcommand> [args...]
-#   info           dispatcher-implemented: {"store","configFile","adapter","runLock",...}
+#   info           dispatcher-implemented: {"store","configFile","adapter","runLock","integrationMode",...}
 #   anything else  forwarded to the adapter (see adapters/CONTRACT.md)
 #
 # Backend resolution:  ACFW_STORE env > ACFW_STORE key in config > "files"
@@ -43,8 +43,9 @@ jesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\00
 
 if [ "$SUB" = "info" ]; then
   ADAPTER=$(acfw_locate_adapter "$STORE" "$REPO_ROOT" || true)
-  printf '{"store":"%s","configFile":"%s","adapter":"%s","runLock":"%s","contractVersion":%s}\n' \
-    "$(jesc "$STORE")" "$(jesc "$CFG")" "$(jesc "$ADAPTER")" "$(jesc "$RUN_LOCK")" "$ACFW_CONTRACT_VERSION"
+  MODE=$(acfw_resolve_integration_mode "$REPO_ROOT")
+  printf '{"store":"%s","configFile":"%s","adapter":"%s","runLock":"%s","integrationMode":"%s","contractVersion":%s}\n' \
+    "$(jesc "$STORE")" "$(jesc "$CFG")" "$(jesc "$ADAPTER")" "$(jesc "$RUN_LOCK")" "$(jesc "$MODE")" "$ACFW_CONTRACT_VERSION"
   exit 0
 fi
 
