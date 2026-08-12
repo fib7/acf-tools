@@ -2,6 +2,63 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.2.1 — the integration mode is a setting, and override mode survives a run
+
+Override (PR) mode was documented since 2.x and reachable in practice by almost nobody. Selecting it
+was an LLM judgement made per run from `CLAUDE.md` — `skills/go/SKILL.md` said so outright ("no plugin
+code special-cases the override") — and the legacy loop's `ACFW_INTEGRATION_OVERRIDE` switch was read
+in three places and **assigned nowhere in the tree**. For a team with a protected trunk and review-gated
+merges, one misread of project instructions folded accepted work into trunk past review. Reported by
+@golb, who found the read-with-no-writer by grepping the full tarball; the pin below is their design.
+
+**`ACFW_INTEGRATION_MODE` pins the mode** — env var or a key in the committed config, resolved exactly
+like `ACFW_STORE` (env > config > unpinned) and reported by `acfw-store info` as `integrationMode`.
+Unpinned keeps the prose fallback, so existing projects behave identically.
+
+Pinning it, though, only made a **broken** mode reliably reachable. Three defects meant override mode
+had probably never completed a multi-task run:
+
+- **The legacy loop still auto-integrated.** `ACFW_INTEGRATION_OVERRIDE` gated the terminal counts and
+  the post-loop drain, but *not* Step 4.5 — the pass that actually cherry-picks. Its skip was prose
+  addressed to Claude. So a correctly-pinned override run changed how tasks were counted and nothing
+  about where the code went. The guard is now executable.
+- **The run aborted on the first cross-slug dependency.** In override mode the scheduler deliberately
+  dispatches a task whose cross-slug dep is accepted-but-unintegrated (`depsSatisfied` blocks only in
+  default mode), but the doctor was mode-blind and called exactly that `FATAL|cross-slug-dep-not-
+  integrated` — and a mid-run FATAL aborts before dispatch. Scheduler and doctor disagreed by
+  construction: the same defect class the 3.0.1 `integGate` fix closed for default mode. Both doctors
+  now take `--mode` (defaulting to the resolved pin) and relax the gate in lockstep.
+- **`doctor --fix` deleted the branch you were going to PR from.** `accepted` was excluded from
+  `LIVE_SLUGS`, so an accepted task's worktree was an orphan and `--fix` ran `worktree remove --force`
+  + `branch -D` on it — unpushed, at every `/go` bootstrap. Harmless in default mode (the change is
+  already on trunk); in override mode it destroyed the deliverable's only home. Darkly, it was also
+  what "healed" the FATAL above. Accepted slugs now stay live while the operator owns integration.
+
+An **unrecognized value is FATAL** (`acfw-store` exits 2 on every subcommand, not just `info`) rather
+than degrading to unpinned with a warning. Degrading flips delivery semantics anyway — back to the
+model judgement the pin exists to replace — and the warning lands on a shell-runner agent's stderr
+inside an unattended run where nobody reads it. This is not a corner case: the config parser strips
+quotes and trailing whitespace but **not** a trailing comment, so `ACFW_INTEGRATION_MODE=override
+# PR per group` was an unrecognized value that read as a pin.
+
+Also: the mode is exported through the adapter env contract and the workflow's agent `ENV` prefix, so
+every doctor/scan/integrate call resolves the same value the orchestrator is scheduling under (additive
+— `ACFW_CONTRACT_VERSION` stays `1`); `/whip-init` scaffolds the key, commented, in both config homes;
+the pre-loop switch derivation moved after the detached-HEAD refusal and became `if/fi` rather than
+`[ ... ] && export`, which evaluates to exit 1 whenever the mode is not override; and
+`content/backlog/README.sample.md` no longer tells projects that integration is "project-decided",
+which has been false since 3.0.0 and is the likeliest source of the original expectation.
+
+**Deliberately not done:** pushing, `gh pr create`, PR-state-aware terminal checks, and reading
+`PR Group` (still stored, still drives nothing). Override mode stops at accepted and gets out of the
+way. Also unchanged: `.backlog/` state transitions are committed on the trunk branch in **both** modes
+(`apply-transition.sh` refuses to run off-trunk), so a files-backed run puts bookkeeping commits on
+local trunk regardless of mode — the answer there is a non-files task store, where task state lives
+outside git entirely.
+
+`tests/phase13-integration-mode` covers the precedence chain, the FATAL classes including the
+trailing-comment case, and a fixture-level regression for each of the three defects above (28 checks).
+
 ## 3.2.0 — per-task authored child workflows (locked skeleton, open body)
 
 Until now every dispatched unit — a one-line config bump and a cross-cutting refactor alike — was
