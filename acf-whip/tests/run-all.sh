@@ -27,6 +27,7 @@ phase9-dispatcher
 phase10-validate-child
 phase11-checkout-reentrancy
 phase12-multica-transition-log
+phase13-integration-mode
 $OPTIONAL
 "
 SUITES_MJS="
