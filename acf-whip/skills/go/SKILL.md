@@ -45,7 +45,7 @@ Execute backlog continuously:
 
 **Override**: if the project's `CLAUDE.md` (or any other persistent agent instructions) directs a different integration strategy — for example "open a PR per PR Group via `gh pr create` instead of merging locally" — follow those instructions and skip Step 4.5. In that mode, the loop reverts to the 1.2.0 terminal check (`accepted ∪ blocked`); operator handles integration.
 
-The orchestrator decides which mode to use by reading project instructions (already loaded into Claude's context); no plugin code special-cases the override.
+The mode can be **pinned machine-readably**: `ACFW_INTEGRATION_MODE=override|default` — env var, or a key in `.acfwhip/config` (committed, so the repo's delivery discipline travels with the repo). `acfw-store info` reports the pinned value as `integrationMode`, empty when unpinned. When it is empty, the orchestrator decides by reading project instructions (already loaded into Claude's context), exactly as before; an unrecognized value warns and counts as unpinned, so a typo can never silently flip delivery semantics in either direction.
 
 ---
 
@@ -60,9 +60,11 @@ legacy loop has). Prefer it.
 
 **If the `Workflow` tool is available to you** (dynamic workflows enabled, Claude Code ≥ 2.1.154):
 
-1. Decide the integration mode by reading the project's `CLAUDE.md`/`AGENTS.md` (already in your
-   context): `override` if they direct PR-per-group / non-local-merge integration, otherwise
-   `default` (auto-merge into local trunk).
+1. Decide the integration mode. First check the machine pin: step 2's `acfw-store info` output
+   carries `integrationMode` — if it is non-empty, use it **verbatim** as `args.mode`, no further
+   reasoning. Only when it is empty, decide by reading the project's `CLAUDE.md`/`AGENTS.md`
+   (already in your context): `override` if they direct PR-per-group / non-local-merge
+   integration, otherwise `default` (auto-merge into local trunk).
 2. Resolve the environment with one bash call. **Refuse on detached HEAD** (empty branch):
    ```bash
    echo "PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT"
@@ -159,6 +161,11 @@ Before iteration begins, snapshot the branch checked out at the repo root and ex
 export ACFW_TRUNK_ROOT=$(git rev-parse --show-toplevel)
 export ACFW_TRUNK_BRANCH=$(git -C "$ACFW_TRUNK_ROOT" symbolic-ref --short HEAD 2>/dev/null)
 export ACFW_TRUNK_SHA_AT_START=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
+
+# Give the loop's PR-mode switch its machine source. When the mode is pinned (env or committed
+# config — see "Integration mode"), the pin wins; when unpinned, the orchestrator's prose
+# decision (made in step 1 above) stands and this line changes nothing.
+[ "$(bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info | sed -E 's/.*"integrationMode":"([^"]*)".*/\1/')" = "override" ] && export ACFW_INTEGRATION_OVERRIDE=1
 
 if [ -z "$ACFW_TRUNK_BRANCH" ]; then
   echo "❌ FATAL: HEAD is detached at $ACFW_TRUNK_ROOT. /go requires a branch checked out at the repo root." >&2
