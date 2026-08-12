@@ -27,6 +27,10 @@ command -v jq >/dev/null 2>&1 || { echo "FATAL: acfw-doctor-generic.sh requires 
 
 REPO_ROOT="${1:-${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}}"
 [ -n "$REPO_ROOT" ] || { echo "FATAL: repo root unknown" >&2; exit 2; }
+# Integration mode, resolved BEFORE acfw_load_namespace (which sources the config and would clobber an
+# inherited ACFW_INTEGRATION_MODE, inverting env > config). The dispatcher exports it, so this is
+# normally just a read-back. Mirrors doctor.sh: "" and "default" behave alike, only "override" relaxes.
+MODE=$(acfw_resolve_integration_mode "$REPO_ROOT") || exit 2
 acfw_load_namespace "$REPO_ROOT"
 
 SNAP=$(cat)
@@ -95,7 +99,7 @@ printf '%s' "$SNAP" | jq -r '.tasks[]? |
    (.rejectionCount // 0 | tostring),
    (if (.hasWorktreeBranch // false) then "1" else "0" end)] | @tsv' > "$TSV"
 
-awk -F'\t' '
+awk -F'\t' -v mode="$MODE" '
 function resolve(d,   s){ if(d in stems) return d; for(s in stems){ if(index(s,d)==1) return s } return "" }
 {
   stem=$1; folder=$2; id=$3; slug=$5; deps=$7; integ=$8; globs=$9; hasBranch=$11;
@@ -113,7 +117,12 @@ END{
       r=resolve(d);
       if(r==""){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|dangling-dep|" s "|depends on " d " which has no task"; continue }
       adj[s]=adj[s]" "r; indeg[r]++;
-      if((state[s]=="in-progress"||state[s]=="completed"||state[s]=="in-review") && slugOf[s]!="" && slugOf[r]!=slugOf[s])
+      # mode!="override": in override mode the operator integrates, so no marker is ever written and
+      # accepted-but-unintegrated is the normal end state of every task. The scheduler already relaxes
+      # this same gate there and dispatches the dependent, so firing here would abort the run on a
+      # disagreement rather than a defect. Mirrors doctor.sh — one vocabulary, one oracle.
+      # (No apostrophes in this block: it lives inside a single-quoted awk program.)
+      if(mode!="override" && (state[s]=="in-progress"||state[s]=="completed"||state[s]=="in-review") && slugOf[s]!="" && slugOf[r]!=slugOf[s])
         if(state[r]!="accepted" || (integOf[r]=="" && hasBranchOf[r]=="1"))
           print "FATAL|cross-slug-dep-not-integrated|" s "|dispatched (" state[s] ") but cross-slug dep " r " is not accepted+integrated";
     }
@@ -137,8 +146,12 @@ END{
 }' "$TSV" >> "$FINDINGS"
 
 # ---- worktree registry checks (report-only: mutation is never generic) ----
-LIVE_SLUGS=$(printf '%s' "$SNAP" | jq -r '.tasks[]? |
-  select(.folder=="pending" or .folder=="in-progress" or .folder=="completed" or .folder=="in-review") | .slug // ""' | sort -u)
+# In override mode an accepted task's worktree branch is the operator's only copy of the deliverable
+# (nothing landed, nothing was pushed), so it is live, not orphaned. This script never reaps, so the
+# stake here is only a spurious WARN — but it must read the same as doctor.sh, which does reap.
+LIVE_SLUGS=$(printf '%s' "$SNAP" | jq -r --arg mode "$MODE" '.tasks[]? |
+  select(.folder=="pending" or .folder=="in-progress" or .folder=="completed" or .folder=="in-review"
+         or ($mode=="override" and .folder=="accepted")) | .slug // ""' | sort -u)
 if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
   while IFS= read -r wt; do
     [ -z "$wt" ] && continue

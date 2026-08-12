@@ -2,8 +2,16 @@
 # doctor.sh — backlog integrity battery for acf-whip.
 #
 # Usage:
-#   doctor.sh [--fix] [--quiet] [--active-only] [REPO_ROOT]
+#   doctor.sh [--fix] [--quiet] [--active-only] [--mode override|default] [REPO_ROOT]
 #     --fix      apply the REPAIRABLE class, then re-scan (default: report only)
+#     --mode     integration mode this backlog is being run under; defaults to the resolved
+#                ACFW_INTEGRATION_MODE pin (env > config > unpinned). In `override` mode the
+#                operator integrates (PR per group), so accepted-but-unintegrated is a NORMAL
+#                resting state rather than a defect: the cross-slug dep gate stops firing and an
+#                accepted task's worktree stops counting as an orphan. Both changes exist to keep
+#                this battery agreeing with the scheduler (whip-go.workflow.js isTerminal/
+#                depsSatisfied) — when they disagree, the run aborts on a FATAL the scheduler
+#                deliberately allowed, or --fix deletes a branch the scheduler still needs.
 #     --quiet    print only FATAL findings + BREAKDOWN + SUMMARY (suppress the per-finding dump);
 #                bounds output to O(fatals + codes) so hundreds of historical advisories don't have
 #                to flow through the /go scan agent. The interactive /whip-doctor stays verbose.
@@ -33,16 +41,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIX=0
 QUIET=0
 ACTIVE_ONLY=0
+MODE_ARG=""
 while [ $# -gt 0 ]; do
   case "${1:-}" in
     --fix) FIX=1; shift;;
     --quiet) QUIET=1; shift;;
     --active-only) ACTIVE_ONLY=1; shift;;
+    # `shift 2` with only one arg left FAILS and shifts nothing, which spins this loop forever.
+    # Demand the value explicitly (same guard acfw-store uses for --stage).
+    --mode) [ $# -ge 2 ] || { echo "FATAL: --mode requires a value (override|default)" >&2; exit 2; }
+            MODE_ARG="$2"; shift 2;;
+    --mode=*) MODE_ARG="${1#--mode=}"; shift;;
     *) break;;
   esac
 done
+case "$MODE_ARG" in
+  override|default|"") ;;
+  *) echo "FATAL: --mode must be 'override' or 'default', got '$MODE_ARG'" >&2; exit 2;;
+esac
 REPO_ROOT="${1:-${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}}"
 BL="$REPO_ROOT/.backlog"
+# Integration mode: --mode (explicit caller intent) > ACFW_INTEGRATION_MODE env > config key > unpinned.
+# Resolved BEFORE acfw_load_namespace because that helper SOURCES the config file, which would
+# overwrite an inherited ACFW_INTEGRATION_MODE with the config's own value and silently invert the
+# documented env > config precedence. "" and "default" are equivalent here — only "override" relaxes.
+MODE=$(acfw_resolve_integration_mode "$REPO_ROOT") || exit 2
+[ -n "$MODE_ARG" ] && MODE="$MODE_ARG"
 acfw_load_namespace "$REPO_ROOT"   # sets ACFW_WORKTREE_DIR / ACFW_BRANCH_PREFIX (worktree ownership)
 ACTIVE="pending in-progress completed in-review blocked rejected accepted"
 # Non-accepted active folders: in --active-only mode the full per-file pass runs only over these
@@ -330,7 +354,7 @@ done
 [ "$ACTIVE_ONLY" = "1" ] && emit_accepted_stub_tsv >> "$TSV"
 
 # ---- Cross-task analysis in awk (portable associative arrays) ----
-awk -F'\t' '
+awk -F'\t' -v mode="$MODE" '
 function resolve(d,   s){ if(d in stems) return d; for(s in stems){ if(index(s,d)==1) return s } return "" }
 {
   stem=$1; folder=$2; id=$3; slug=$5; deps=$7; integ=$8; globs=$9; hasBranch=$11;
@@ -357,7 +381,15 @@ END{
       # Branch-aware: a cross-slug dep that is accepted-but-unintegrated only blocks when it still
       # has a live worktree branch (genuinely pending integration). A branchless historical accepted
       # dep is already on trunk -> satisfied (matches the workflow runtime-terminal model).
-      if((state[s]=="in-progress"||state[s]=="completed"||state[s]=="in-review") && slugOf[s]!="" && slugOf[r]!=slugOf[s])
+      # Mode-aware: in override mode NO ledger marker is ever written and Integrated-At is only ever
+      # set by hand, so "accepted but not integrated" is the normal end state of every task, not a
+      # defect. The scheduler already relaxes this exact gate there (whip-go.workflow.js depsSatisfied
+      # blocks only when mode is default) and dispatches the dependent; if this battery kept firing,
+      # the per-iteration recheck would FATAL on that dispatch and abort the whole run. Same lesson as
+      # integGate above: the scheduler and the doctor must ask the same oracle, or the run dies on a
+      # disagreement rather than on a real defect.
+      # (No apostrophes in this block: it lives inside a single-quoted awk program.)
+      if(mode!="override" && (state[s]=="in-progress"||state[s]=="completed"||state[s]=="in-review") && slugOf[s]!="" && slugOf[r]!=slugOf[s])
         if(state[r]!="accepted" || (integOf[r]=="" && hasBranchOf[r]=="1"))
           print "FATAL|cross-slug-dep-not-integrated|" s "|dispatched (" state[s] ") but cross-slug dep " r " is not accepted+integrated";
     }
@@ -394,7 +426,14 @@ if [ "$FIX" = "1" ]; then
 fi
 
 # ---- Worktree registry checks ----
-LIVE_SLUGS=$(awk -F'\t' '$2=="pending"||$2=="in-progress"||$2=="completed"||$2=="in-review"{print $5}' "$TSV" | sort -u)
+# `accepted` is deliberately absent in default mode: the task's change is already on trunk, so its
+# worktree is spent and reaping it is the point. In OVERRIDE mode it is the opposite — nothing has
+# landed anywhere, nothing was ever pushed, and worktree/<slug> is the ONLY copy of the deliverable
+# the operator still has to open a PR from. Reaping it there (--fix runs `worktree remove --force` +
+# `branch -D` below) destroys unreviewed work whose sole home is that branch, and it happens on the
+# next /go bootstrap, i.e. before anyone notices. Keep accepted slugs live while the operator owns
+# integration; they stop being live when the task leaves accepted/.
+LIVE_SLUGS=$(awk -F'\t' -v mode="$MODE" '$2=="pending"||$2=="in-progress"||$2=="completed"||$2=="in-review"||(mode=="override"&&$2=="accepted"){print $5}' "$TSV" | sort -u)
 if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
   while IFS= read -r wt; do
     [ -z "$wt" ] && continue
