@@ -30,7 +30,13 @@ if (!pluginRoot || !trunkRoot) {
 
 // ============================ shell + bin paths ============================
 const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
-const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=${sq(trunkBranch)}; export ACFW_STORE=${sq(store)};`
+// ACFW_INTEGRATION_MODE is exported so every shell-runner agent's doctor/scan/integrate call resolves
+// the SAME mode this script is scheduling under. Without it the doctors fall back to the config pin (or
+// unpinned) and can contradict `mode` here: in override mode depsSatisfied deliberately dispatches a
+// task whose cross-slug dep is accepted-but-unintegrated, a mode-blind doctor calls that
+// FATAL|cross-slug-dep-not-integrated, and the per-iteration recheck aborts the run on a state this
+// script chose. Passing args.mode (not the pin) also keeps an explicit caller override authoritative.
+const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=${sq(trunkBranch)}; export ACFW_STORE=${sq(store)}; export ACFW_INTEGRATION_MODE=${sq(mode)};`
 // The store dispatcher (3.1.0) is the single entry point for task state: snapshot (scan), transition
 // (the writer primitive), doctor, read/materialize. For the files backend it routes to the same
 // engines as 3.0.x (scan-backlog.sh / apply-transition.sh / doctor.sh) with identical output.

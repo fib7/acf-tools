@@ -64,15 +64,25 @@ acfw_resolve_store() { # <repo-root>
 #   default   LP-CAS folds every accepted task into the local trunk (Step 4.5)
 #   ""        no machine pin — the orchestrator decides by reading project instructions,
 #             exactly as before this key existed
-# An unrecognized value resolves to "" with a stderr warning, i.e. to the pre-existing
-# prose-fallback behavior: a typo must never silently flip delivery semantics in EITHER
-# direction (silently enabling local trunk folds is as bad as silently disabling them).
+# An unrecognized value is a FATAL (exit 2), not a warning that degrades to "". The instinct behind
+# the warning was right — a typo must never silently flip delivery semantics in EITHER direction,
+# because silently enabling local-trunk folds is as bad as silently disabling them — but degrading to
+# "" flips them anyway: it hands the decision back to the model, which is the thing the pin exists to
+# stop depending on, and the warning that says so lands on a shell-runner agent's stderr inside an
+# unattended /go where nobody reads it. Refusing to run is the only outcome that cannot be missed.
+# This is NOT a corner case. acfw_config_get strips surrounding quotes and trailing whitespace but
+# NOT a trailing comment, so the natural
+#     ACFW_INTEGRATION_MODE=override   # PR per group, never fold to trunk
+# resolves to the literal 'override   # PR per group, never fold to trunk'. Under the old rule that
+# config reads "pinned to override" and behaves as unpinned. Compare ACFW_STORE, where a bogus value
+# already fails loud at adapter lookup (bin/acfw-store, exit 5); this closes the same gap here.
 acfw_resolve_integration_mode() { # <repo-root>
   local m="${ACFW_INTEGRATION_MODE:-}"
   [ -n "$m" ] || m=$(acfw_config_get "${1:-}" ACFW_INTEGRATION_MODE)
   case "$m" in
     override|default|"") printf '%s' "$m" ;;
-    *) echo "WARN: unrecognized ACFW_INTEGRATION_MODE='$m' — ignoring; the orchestrator falls back to reading project instructions" >&2 ;;
+    *) echo "FATAL: unrecognized ACFW_INTEGRATION_MODE='$m' (expected 'override', 'default', or unset). Refusing to guess: this key decides whether accepted work folds into the local trunk. Note a trailing '# comment' is part of the value." >&2
+       return 2 ;;
   esac
 }
 

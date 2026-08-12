@@ -45,7 +45,18 @@ Execute backlog continuously:
 
 **Override**: if the project's `CLAUDE.md` (or any other persistent agent instructions) directs a different integration strategy — for example "open a PR per PR Group via `gh pr create` instead of merging locally" — follow those instructions and skip Step 4.5. In that mode, the loop reverts to the 1.2.0 terminal check (`accepted ∪ blocked`); operator handles integration.
 
-The mode can be **pinned machine-readably**: `ACFW_INTEGRATION_MODE=override|default` — env var, or a key in `.acfwhip/config` (committed, so the repo's delivery discipline travels with the repo). `acfw-store info` reports the pinned value as `integrationMode`, empty when unpinned. When it is empty, the orchestrator decides by reading project instructions (already loaded into Claude's context), exactly as before; an unrecognized value warns and counts as unpinned, so a typo can never silently flip delivery semantics in either direction.
+The mode can be **pinned machine-readably**: `ACFW_INTEGRATION_MODE=override|default` — env var, or a key in `.acfwhip/config` (committed, so the repo's delivery discipline travels with the repo). `acfw-store info` reports the pinned value as `integrationMode`, empty when unpinned. When it is empty, the orchestrator decides by reading project instructions (already loaded into Claude's context), exactly as before.
+
+An **unrecognized value is FATAL** (`acfw-store` exits 2) — it does not degrade to unpinned. This key decides whether accepted work folds into a branch a human may never review, so guessing is not an option, and degrading to unpinned would hand the decision back to the model that the pin exists to stop depending on. Note the config parser strips quotes and trailing whitespace but **not a trailing comment**, so `ACFW_INTEGRATION_MODE=override  # PR per group` is an unrecognized value, not a pin. Put comments on their own line.
+
+### What override mode does and does not do
+
+| | |
+|---|---|
+| **Does** | Skips Step 4.5, so nothing is cherry-picked onto trunk and no ledger marker is written. Treats `accepted` as terminal (`accepted ∪ blocked`). Keeps each accepted task's `worktree/<slug>` branch and worktree alive instead of reaping them, so the deliverable has a home to PR from. Relaxes the cross-slug dependency gate — acceptance alone satisfies a dep, and **ordering becomes yours**. |
+| **Does not** | Push anything. Run `gh pr create`. Read or set `PR Group` (it is authored, validated and stored, but drives no behavior). Check whether trunk is protected, has a remote, or is behind `origin`. Integration is entirely the operator's — acf-whip stops at accepted and gets out of the way. |
+
+**If a clean trunk matters as much as review gating, use a non-files task store.** `/go` commits `.backlog/` state transitions onto the trunk branch in **both** modes, and the writer refuses to run anywhere else (`skills/go/bin/apply-transition.sh`), so a files-backed run puts a stream of `task: <stem> pending -> in-progress` commits on local trunk regardless of integration mode. With `beads`, `multica`, or `linear` (see `adapters/`), task state lives outside git entirely and trunk sees only deliverables. The LP-CAS ledger stays git-native on every backend.
 
 ---
 
@@ -162,14 +173,21 @@ export ACFW_TRUNK_ROOT=$(git rev-parse --show-toplevel)
 export ACFW_TRUNK_BRANCH=$(git -C "$ACFW_TRUNK_ROOT" symbolic-ref --short HEAD 2>/dev/null)
 export ACFW_TRUNK_SHA_AT_START=$(git -C "$ACFW_TRUNK_ROOT" rev-parse HEAD)
 
-# Give the loop's PR-mode switch its machine source. When the mode is pinned (env or committed
-# config — see "Integration mode"), the pin wins; when unpinned, the orchestrator's prose
-# decision (made in step 1 above) stands and this line changes nothing.
-[ "$(bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info | sed -E 's/.*"integrationMode":"([^"]*)".*/\1/')" = "override" ] && export ACFW_INTEGRATION_OVERRIDE=1
-
 if [ -z "$ACFW_TRUNK_BRANCH" ]; then
   echo "❌ FATAL: HEAD is detached at $ACFW_TRUNK_ROOT. /go requires a branch checked out at the repo root." >&2
   exit 1
+fi
+
+# Give the loop's PR-mode switch its machine source. When the mode is pinned (env or committed
+# config — see "Integration mode"), the pin wins; when unpinned, the orchestrator's prose
+# decision (made in step 1 above) stands and this leaves the switch unset.
+# Runs AFTER the detached-HEAD refusal (no subprocess on a run that is about to abort), and as an
+# if/fi rather than `[ ... ] && export`: that idiom evaluates to exit 1 whenever the mode is not
+# override, which is a landmine the day this line ends up last in a block or under `set -e`.
+ACFW_MODE_PIN=$(bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info | sed -E 's/.*"integrationMode":"([^"]*)".*/\1/')
+if [ "$ACFW_MODE_PIN" = "override" ]; then
+  export ACFW_INTEGRATION_OVERRIDE=1
+  echo "🔒 Integration mode: override (pinned) — accepted tasks are terminal; you integrate."
 fi
 echo "🌳 Trunk: $ACFW_TRUNK_BRANCH @ $ACFW_TRUNK_SHA_AT_START"
 ```
@@ -478,7 +496,7 @@ A task may dispatch only from a codebase that already contains all its dependenc
 - **Same-slug dep** (dep's `Worktree:` equals this task's `Worktree:`): satisfied as soon as `dep` is in `.backlog/accepted/`. Its commits already live on the shared `worktree/<slug>` branch and will be present in the worktree when the within-slug serializer picks the next task.
 - **Cross-slug dep** (different `Worktree:` slug): `dep` must be in `.backlog/accepted/` **AND** its commits must already be on the local trunk — i.e. its **ledger marker is on trunk**, **or** it is a historical task with no `worktree/<slug>` branch (already merged the old way; nothing left to integrate). A cross-slug dep blocks only while it is genuinely pending integration (accepted, a live branch, no marker). A non-code (`none`) dep never integrates, so it is satisfied on acceptance.
 
-In override (PR) mode no marker is ever written, so treat acceptance as sufficient for cross-slug deps too (operator is responsible for ordering).
+In override (PR) mode no marker is ever written, so treat acceptance as sufficient for cross-slug deps too (operator is responsible for ordering). The doctor's `cross-slug-dep-not-integrated` FATAL is relaxed in lockstep (`--mode override`, or the resolved pin) — **the scheduler and the doctor must agree here**. When they did not, this gate dispatched the dependent and the next per-iteration doctor recheck aborted the run on the state the scheduler had just chosen.
 
 ```javascript
 {
@@ -680,7 +698,19 @@ If no specialist assigned, use task-engineer for guidance.
 
 After dispatch returns and specialists have moved their tasks to `.backlog/accepted/`, land every newly-accepted task onto the live trunk with the **LP-CAS integrator**, one task at a time. The orchestrator (this skill, running as the parent agent) is the **only writer of trunk's `.git/index`**; no parallelism here.
 
-**Skip this step entirely if project instructions (CLAUDE.md, AGENTS.md, etc.) direct a different integration strategy** (e.g. "open a PR per PR Group via `gh pr create` instead"). In that case no ledger marker is ever written, the operator handles integration, and the loop's terminal check falls back to `accepted ∪ blocked`.
+**Skip this step entirely in override mode** — pinned via `ACFW_INTEGRATION_MODE=override`, or directed by project instructions (CLAUDE.md, AGENTS.md, etc.) when unpinned. In that case no ledger marker is ever written, the operator handles integration, and the loop's terminal check falls back to `accepted ∪ blocked`.
+
+The skip is **executable, not advisory**. Until 3.2.1 it was prose only: `ACFW_INTEGRATION_OVERRIDE` gated the terminal counts and the post-loop drain but *not* this step, so a correctly-pinned override run still cherry-picked every accepted task onto the local trunk — the pin changed how tasks were counted and nothing about where the code went.
+
+**Run this check before Step 4.5a.** If it prints the skip line, do not run 4.5a or 4.5b at all — go straight to Step 5:
+
+```bash
+if [ "${ACFW_INTEGRATION_OVERRIDE:-}" = "1" ]; then
+  echo "⏭️  Step 4.5 skipped (override mode) — accepted tasks stay on worktree/<slug> for you to PR."
+fi
+```
+
+**If the mode is unpinned and you decided `override` by reading project instructions**, then `export ACFW_INTEGRATION_OVERRIDE=1` yourself during Pre-Loop. That one switch is what the terminal counts (Step 5), the post-loop drain, and this guard all read — set it and they agree; leave it unset while acting as if in override mode and the loop will still fold every accepted task into trunk.
 
 The integrator mutates **only git** (the trunk ref + a disposable integration worktree). It never moves a task file — `.backlog/` moves stay the orchestrator's job (see exit 6 below).
 

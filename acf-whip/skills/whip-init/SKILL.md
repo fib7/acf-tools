@@ -80,7 +80,21 @@ non-files store:
    ```bash
    mkdir -p .acfwhip
    printf 'ACFW_STORE=%s\n' "$task_store" >> .acfwhip/config
+   cat >> .acfwhip/config <<'EOF'
+
+   # Integration mode. Unset = /go decides per run by reading CLAUDE.md/AGENTS.md.
+   #   default   accepted work is folded into the LOCAL trunk by LP-CAS (no push, no PR)
+   #   override  /go stops at accepted and leaves worktree/<slug> intact; YOU push and open PRs
+   # Pin it if the repo has a delivery discipline that must not depend on a per-run judgement —
+   # a protected trunk with review-gated merges is the usual reason to pin `override`.
+   # An unrecognized value is FATAL, and a trailing "# comment" is part of the value, so keep
+   # comments on their own line.
+   # ACFW_INTEGRATION_MODE=override
+   EOF
    ```
+   Note `acfw_resolve_config_file` takes the **first existing** file — `.acfwhip/config`, then the
+   legacy `.backlog/.acfw-config`. A project with both only ever reads `.acfwhip/config`, so the pin
+   belongs in whichever one that project actually has.
    Backend env goes to the operator's shell, never into the repo: beads needs a **cgo-enabled
    `bd`** on PATH, currently built from beads `main` (optional `ACFW_BEADS_PREFIX`) — see
    `adapters/beads/README.md` for the version floor; multica needs `MULTICA_SERVER_URL`, `MULTICA_TOKEN`,
@@ -202,6 +216,14 @@ if [ ! -f .backlog/.acfw-config ]; then
 
 # Hours before an in-progress task is flagged stale / timed out to blocked.
 ACFW_INPROGRESS_TIMEOUT_HOURS=8
+
+# Integration mode. Unset = /go decides per run by reading CLAUDE.md/AGENTS.md.
+#   default   accepted work is folded into the LOCAL trunk by LP-CAS (no push, no PR)
+#   override  /go stops at accepted and leaves worktree/<slug> intact; YOU push and open PRs
+# Pin it if the repo has a delivery discipline that must not depend on a per-run judgement — a
+# protected trunk with review-gated merges is the usual reason to pin `override`. An unrecognized
+# value is FATAL, and a trailing "# comment" is part of the value, so keep comments on their own line.
+# ACFW_INTEGRATION_MODE=override
 
 # Worktree namespace acf-whip OWNS and may create/remove. acf-whip only ever touches
 # worktrees on the <ACFW_BRANCH_PREFIX>/<slug> branch — any other worktree (including one

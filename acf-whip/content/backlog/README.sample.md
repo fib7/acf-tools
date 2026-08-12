@@ -67,7 +67,16 @@ ALL agents MUST read on receiving a task:
 
 Implementer specialists and quality-reviewer invoke the `clean-checkout-before-task` skill as Step 0. The skill creates a git worktree at `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and logs the `clean-checkout: ok` token to the task transition log. Without that token, quality-reviewer auto-rejects.
 
-All implementer/reviewer commits land on `worktree/<slug>`, never on `main`. Integration to `main` (PR via `gh pr create` or fast-forward merge) is project-decided.
+All implementer/reviewer commits land on `worktree/<slug>`, never on `main` directly.
+
+**Integration is automatic by default.** Once a task is accepted, `/go` cherry-picks its change onto the **local** trunk and CAS-lands it with an in-tree ledger marker (LP-CAS). Nothing is pushed and no PR is opened — the change is on your local trunk, waiting for you to push. If your process requires a PR per group with human review, pin the mode instead of relying on prose:
+
+```bash
+# .acfwhip/config (committed) — or .backlog/.acfw-config, whichever this project has
+ACFW_INTEGRATION_MODE=override
+```
+
+In `override` mode `/go` stops at `accepted`, writes no marker, keeps each `worktree/<slug>` branch alive for you to push and PR from, and hands ordering to you. Unpinned, `/go` decides per run by reading `CLAUDE.md`. See `docs/acf/backlog/workflow.md` § Integration.
 
 See `docs/acf/backlog/workflow.md` for the full state machine and dispatch rules.
 

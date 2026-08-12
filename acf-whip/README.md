@@ -75,6 +75,20 @@ The `acfw-store` dispatcher resolves the configured backend and routes every rea
 - Exits only when all tasks in terminal states (accepted/blocked)
 - No manual intervention needed
 
+**Protected trunk / PR-per-task teams**: integration is automatic and **local** by default — accepted
+work is cherry-picked onto your local trunk, nothing is pushed and no PR is opened. If merges must go
+through review, pin the mode so it never depends on a per-run judgement:
+
+```bash
+echo 'ACFW_INTEGRATION_MODE=override' >> .acfwhip/config    # committed; travels with the repo
+```
+
+`/go` then stops at `accepted`, writes no ledger marker, and keeps each `worktree/<slug>` branch alive
+for you to push and open PRs from; dependency ordering becomes yours. It does not push or call `gh` —
+that stays your call. Left unpinned, `/go` decides each run by reading `CLAUDE.md`. Note `.backlog/`
+state transitions are committed on trunk in **both** modes; use a non-files task store (below) if
+trunk must stay free of bookkeeping commits. Details: `skills/go/SKILL.md` § Integration mode.
+
 ### 🩺 Backlog Integrity Doctor
 
 `/whip-doctor [--fix]` is the integrity battery (~18 invariants across FATAL/REPAIRABLE/WARN): status-vs-folder mismatch, missing/empty worktree slug, unknown agent, dangling/cyclic deps, cross-slug dependent dispatched before integration, orphaned worktrees, stale in-progress, and more. It runs automatically as a `/go` startup gate and per-iteration recheck, and at `/task` create-time.
@@ -814,6 +828,24 @@ If they say **"I just need to copy-paste this code"**, you've failed.
 ---
 
 ## Configuration
+
+### Runtime config keys
+
+Committed config lives in `.acfwhip/config` (or the legacy `.backlog/.acfw-config`; `acfw-store info`
+reports which file is active as `configFile`). Every key is also settable as an env var.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `ACFW_STORE` | `files` | Task-store backend: `files`, `beads`, `multica`, `linear`, or a drop-in adapter name. Env wins over config. |
+| `ACFW_INTEGRATION_MODE` | unset | `override` = `/go` stops at accepted and you integrate (PR per group); `default` = LP-CAS folds accepted work into the local trunk. Unset = decided per run from `CLAUDE.md`. Env wins over config. An unrecognized value is FATAL. |
+| `ACFW_INPROGRESS_TIMEOUT_HOURS` | `8` | Hours before an in-progress task is flagged stale / timed out to blocked. Env wins over config. |
+| `ACFW_WORKTREE_DIR` | `.worktree` | Directory acf-whip owns for task worktrees. **Config wins over env.** Change only on a fresh backlog. |
+| `ACFW_BRANCH_PREFIX` | `worktree` | Branch namespace acf-whip owns (`<prefix>/<slug>`). **Config wins over env.** Change only on a fresh backlog. |
+| `ACFW_GATE_CMD` | empty (skip) | Union quality gate, run by the integrator on the candidate tree before it lands. |
+| `ACFW_PARSE_SANITY_CMD` | empty (skip) | Cheap parse/lint check, run before the heavy gate; failure is a mechanism fault, not a quality reject. |
+
+Values are read literally: surrounding quotes and trailing whitespace are stripped, a trailing
+`# comment` is **not**. Keep comments on their own line.
 
 ### SessionStart Hook
 

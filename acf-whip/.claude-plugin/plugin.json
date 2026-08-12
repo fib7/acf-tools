@@ -1,6 +1,6 @@
 {
   "name": "acf-whip",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "description": "Workflow-native backlog automation with per-task authored child workflows. /task decomposes a scope into atomic, dependency-aware tasks; /go runs each unit as its OWN nested multi-agent workflow — a harness a workflow-architect agent fills into a locked, validated skeleton — in isolated git worktrees (one per slug), then reviews and integrates via LP-CAS, looping until every task is accepted or blocked. A harness that throws is amended by the architect and replays its completed stages from a durable ledger in zero agents; every exhaustion path falls back to single-agent dispatch, so it can be slower than before but never less correct. Task state lives behind an executable adapter contract: .backlog/ files (default), beads (bd, embedded Dolt), multica, or Linear — third-party backends drop in without forking. Integration is a compare-and-swap of a single-parent candidate onto the live trunk with an in-tree ledger marker as the sole oracle: no cached snapshot, no rebase, convergent on rewritten/high-churn trunks. Concurrency-safe and self-healing via /whip-doctor.",
   "author": {
     "name": "ACF Tools Team",
