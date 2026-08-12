@@ -37,6 +37,7 @@ JSON results on stdout (exactly one object), diagnostics on stderr. Non-JSON lin
 | `ACFW_TRUNK_ROOT` | absolute repo root |
 | `ACFW_TRUNK_BRANCH` | trunk branch name (may be empty) |
 | `ACFW_STORE_CONFIG` | resolved config file path (may be empty/absent) |
+| `ACFW_INTEGRATION_MODE` | `override`, `default`, or empty (unpinned). Whether the operator owns integration. Most adapters can ignore it — the dispatcher already passes `--mode` to `snapshot`; it is exported so the git-side batteries (`acfw-doctor-generic.sh`) resolve the same value the orchestrator is scheduling under. Added in 3.2.1; additive, so `ACFW_CONTRACT_VERSION` is still `1`. |
 | `ACFW_CONTRACT_VERSION` | `1` |
 | `ACFW_PLUGIN_LIB` | absolute path of `skills/lib/` (bash adapters may source `acfw-git.sh`) |
 
