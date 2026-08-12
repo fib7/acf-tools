@@ -39,11 +39,13 @@ shift
 STORE=$(acfw_resolve_store "$REPO_ROOT")
 CFG=$(acfw_resolve_config_file "$REPO_ROOT" || true)
 RUN_LOCK=$(acfw_run_lock_path "$REPO_ROOT" "$STORE")
+# Resolved for EVERY subcommand, not just info: an unrecognized pin must fail the first dispatcher
+# call of a run, whichever it is, rather than waiting for someone to ask for info. Empty = unpinned.
+MODE=$(acfw_resolve_integration_mode "$REPO_ROOT") || exit 2
 jesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
 
 if [ "$SUB" = "info" ]; then
   ADAPTER=$(acfw_locate_adapter "$STORE" "$REPO_ROOT" || true)
-  MODE=$(acfw_resolve_integration_mode "$REPO_ROOT")
   printf '{"store":"%s","configFile":"%s","adapter":"%s","runLock":"%s","integrationMode":"%s","contractVersion":%s}\n' \
     "$(jesc "$STORE")" "$(jesc "$CFG")" "$(jesc "$ADAPTER")" "$(jesc "$RUN_LOCK")" "$(jesc "$MODE")" "$ACFW_CONTRACT_VERSION"
   exit 0
@@ -60,6 +62,12 @@ export ACFW_TRUNK_BRANCH="${ACFW_TRUNK_BRANCH:-}"
 export ACFW_STORE_CONFIG="${CFG:-}"
 export ACFW_CONTRACT_VERSION
 export ACFW_PLUGIN_LIB="$LIB_DIR"
+# The integration pin reaches every downstream consumer through this one export: acfw-git.sh sources
+# acfw-store.sh, and doctor.sh / acfw-doctor-generic.sh / scan-backlog.sh / clean-checkout.sh /
+# integrate-lpcas.sh all source acfw-git.sh, so each resolves the same value with no flag threading.
+# The doctors need it to stop disagreeing with the scheduler about what "terminal" means in override
+# mode. Additive: adapters that ignore it are unaffected, so ACFW_CONTRACT_VERSION stays at 1.
+export ACFW_INTEGRATION_MODE="$MODE"
 
 # Capability probe — run at most once per dispatcher call, and only for the
 # subcommands whose routing depends on it (snapshot, doctor, transition --stage).
