@@ -34,7 +34,8 @@
 # or double-commit.
 #
 # Exit codes: 0 success or no-op; 2 bad args / file not found; 3 invoked off-trunk (would
-# poison a code-only branch); 99 lock contention.
+# poison a code-only branch); 4 the task document is collapsed (no ID/Status) — nothing was
+# moved, staged or committed; 99 lock contention.
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,6 +111,42 @@ rescue_deliverables() {
   echo "ok: committed uncommitted deliverables for $FNAME"
 }
 
+# assert_task_intact <phase> — the task document must still BE a task document. Checked TWICE:
+# on entry (before any sed touches it) and again immediately before mv/add/commit, because the
+# window between them is exactly where a concurrent emptier lands. Field incident 2026-08-24: a
+# 17507-byte task file was emptied by something in the ~9 minutes it sat dispatched, this script's
+# own append_log_row wrote its transition row into the void, and `git add` + `git commit` twenty
+# lines later published the 267-byte corpse. That the writer commits whatever is on disk, with no
+# content assertion anywhere, is what made the loss SILENT — the single worst property of the bug.
+# append_log_row now refuses the empty read; this is the second, independent line: even if some
+# future writer hands us a wreck, it never reaches trunk.
+#
+# The two phases are diagnostically distinct and worth keeping apart: "on-entry" means someone
+# else broke the file before we touched it; "pre-commit" means it broke UNDER this writer, which
+# is a live concurrency fault worth chasing.
+#
+# Deliberately NOT auto-repaired. `git checkout HEAD -- <path>` would discard the clean-checkout
+# token row, which is uncommitted BY DESIGN (clean-checkout.sh leaves it for the next transition
+# to commit), so the recovery is printed and never run. Same posture as doctor.sh's control-bytes:
+# a torn write must never be silently committed as "healed".
+assert_task_intact() { # <phase>
+  if [ -s "$TASK_FILE" ] \
+     && grep -qE '^- \*\*ID\*\*:' "$TASK_FILE" \
+     && grep -qE '^- \*\*Status\*\*:' "$TASK_FILE"; then
+    return 0
+  fi
+  echo "FATAL: $FNAME is not a task document ($1): no '- **ID**:' and/or '- **Status**:' line." >&2
+  echo "       Refusing to move or commit a collapsed task file. Nothing was staged or committed." >&2
+  echo "       Recover the last committed copy, then re-run this transition:" >&2
+  echo "         git -C $REPO_ROOT checkout HEAD -- .backlog/$FROM_STATE/$FNAME" >&2
+  echo "       Then run /whip-doctor. (Note: this discards any uncommitted clean-checkout token row.)" >&2
+  # WHIP-08: --stage deliverables are the specialist's only copy and the next checkout/stash would
+  # sweep them. Commit them even though the state move is refused — rescue_deliverables is already
+  # the sanctioned path for exactly this "crashed between mv and commit" case.
+  rescue_deliverables
+  exit 4
+}
+
 # Idempotency: already in the target folder -> no-op (safe re-apply after resume).
 if [ "$FROM_STATE" = "$TO_STATE" ]; then
   rescue_deliverables
@@ -125,6 +162,9 @@ if [ ! -f "$TASK_FILE" ]; then
   echo "FATAL: task file not found: $TASK_FILE" >&2
   exit 2
 fi
+
+# The file must be a task document before we mutate it (see assert_task_intact).
+assert_task_intact on-entry
 
 TS=$(date -u +"%Y-%m-%d %H:%M:%S")
 
@@ -155,7 +195,11 @@ fi
 # Folder is the source of truth: sync Status to the destination state atomically with the mv (I4).
 sed -i.bak -E "s/^- \*\*Status\*\*:.*/- **Status**: $TO_STATE/" "$TASK_FILE" && rm -f "$TASK_FILE.bak"
 
-append_log_row "$TASK_FILE" "$(printf '| %s | %s | %s | %s | %s |' "$TS" "$FROM_STATE" "$TO_STATE" "$AGENT" "$NOTES")"
+# A lost transition ROW must not strand a state MOVE — assert_task_intact below is what decides
+append_log_row "$TASK_FILE" "$(printf '| %s | %s | %s | %s | %s |' "$TS" "$FROM_STATE" "$TO_STATE" "$AGENT" "$NOTES")" \
+  || echo "WARN: transition row not logged for $FNAME (append_log_row rc=$?)" >&2
+# ...and still be one after every mutation, before anything is moved, staged or committed.
+assert_task_intact pre-commit
 mkdir -p "$REPO_ROOT/.backlog/$TO_STATE"
 mv "$TASK_FILE" "$DEST"
 

@@ -268,9 +268,15 @@ splice_row() {
   [ "$rc" -eq 0 ] || { echo "FATAL: issue get failed before log splice: $MC_ERR" >&2; return "$rc"; }
   desc=$(mc_tmp)
   printf '%s' "$MC_OUT" | jq -r '.description // ""' > "$desc"
-  append_log_row "$desc" "$row"
-  # append_log_row prints the row even when the document has no table, so an empty result
-  # can only mean the document itself vanished. Refuse rather than blank the description.
+  # `jq -r '.description // ""'` yields a ZERO-BYTE $desc for an issue with no description, and
+  # the old append_log_row wrote its row into that void — so the [ -s ] guard below PASSED and
+  # this adapter replaced a live issue description with a single log row. append_log_row now
+  # refuses an empty/blank read outright, which is what actually closes the hole; the guard
+  # stays as the second line of defence and is finally meaningful rather than defeated.
+  append_log_row "$desc" "$row" || {
+    echo "FATAL: refusing to log into an empty/collapsed issue description while logging '$row'" >&2
+    return 7
+  }
   [ -s "$desc" ] || { echo "FATAL: refusing to write an empty description while logging '$row'" >&2; return 7; }
   MC_STDIN="$desc"; multica_call issue update "$uuid" --description-stdin --output json
   rc=$(mc_classify)

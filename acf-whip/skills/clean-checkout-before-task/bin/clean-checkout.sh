@@ -134,7 +134,8 @@ fi
 # while remaining greppable anywhere in the file for the reviewer's auto-reject check.
 TS=$(date -u +"%Y-%m-%d %H:%M:%S")
 LINE="| $TS | clean-checkout | ok | $ACFW_AGENT_FIELD | $SLUG | $BRANCH |"
-append_log_row "$TASK_FILE" "$LINE"
+append_log_row "$TASK_FILE" "$LINE" \
+  || echo "WARN: could not record the clean-checkout token in $TASK_FILE (rc=$?) — the reviewer may auto-reject" >&2
 # Non-files store (3.1.0): a TASK_FILE outside .backlog/ is a MATERIALIZED spec, not the live task
 # document — the append above only helps agents re-reading this spec. The durable token (what the
 # reviewer's auto-reject reads after a store refresh) must land in the task store itself.
