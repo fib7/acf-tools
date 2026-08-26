@@ -95,7 +95,18 @@ publish_from_branch() {
 # so such a phantom can never ride into trunk via the fold. Restores .backlog to the observed trunk tree.
 strip_backlog_from_index() {
   [ -e "$INTEG_WT/.backlog" ] || git -C "$INTEG_WT" cat-file -e "$OBSERVED:.backlog" 2>/dev/null || return 0
-  git -C "$INTEG_WT" checkout "$OBSERVED" -- .backlog >/dev/null 2>&1 || true
+  # --no-overlay is REQUIRED. `git checkout <tree> -- <paths>` defaults to OVERLAY mode, which
+  # "never removes files from the index or the working tree" — so a candidate that ADDS a
+  # .backlog/X.md absent from OBSERVED survives this "strip", gets picked up by the `git add -A`
+  # below, and rides into trunk. That is precisely the phantom this function exists to stop:
+  # deletions and modifications were reverted, additions leaked.
+  if ! git -C "$INTEG_WT" checkout --no-overlay "$OBSERVED" -- .backlog >/dev/null 2>&1; then
+    # Not swallowed: a failed strip means the branch's whole .backlog delta is about to be folded
+    # into trunk and overwrite live task state. Refuse the candidate instead (mechanism fault).
+    emit "stall backlog-strip-failed key=$KEY"
+    cleanup_wt
+    exit 12
+  fi
 }
 
 # ---- Observe the live trunk tip (never cached). ----
@@ -108,7 +119,43 @@ OBSERVED=$(acfw_live_trunk "$ROOT" "$TRUNK") || { emit "stall trunk-unobservable
 land() { # <new-oid>
   local NEW="$1"
   if git -C "$ROOT" update-ref "refs/heads/$TRUNK" "$NEW" "$OBSERVED" 2>/dev/null; then
-    git_with_lock_backoff -C "$ROOT" reset --hard "$TRUNK" >/dev/null 2>&1 || true
+    # Resync ROOT in TWO steps, and never with `reset --hard`. Two defects motivated the split:
+    #
+    # (a) INDEX DESYNC (trunk corrupter). Between the update-ref above and the resync, ROOT's index
+    #     still holds OBSERVED's tree while HEAD already points at NEW. A concurrent
+    #     apply-transition.sh `git commit` builds from that index, producing a commit whose parent
+    #     is NEW and whose tree is OBSERVED — silently reverting every code change we just landed.
+    #     The old `>/dev/null 2>&1 || true` made this permanent whenever the resync itself failed
+    #     (git_with_lock_backoff returns 99 on persistent lock contention) with nothing to repair
+    #     it. The index repair is now unconditional and its failure is fatal rather than swallowed.
+    #
+    # (b) `reset --hard` rewrote .backlog/ too, discarding uncommitted task-file state at the root:
+    #     the clean-checkout token row (which acfw-store-files calls uncommitted BY DESIGN, so this
+    #     is the token-loss class whip-go.workflow.js already works around), and any operator repair
+    #     made between runs. Excluding .backlog is a no-op on COMMITTED content by construction:
+    #     strip_backlog_from_index restores .backlog to OBSERVED, and the 3-arg CAS above only lands
+    #     if trunk is still exactly OBSERVED — so NEW's .backlog tree IS OBSERVED's. Excluding it
+    #     can therefore only spare uncommitted work, never skip a real update.
+    #
+    # --no-overlay on the worktree step is REQUIRED: plain `checkout -- .` never removes files, so
+    # every integration that deleted or renamed a path would leave a resurrected untracked copy —
+    # invisible, since `git status` shows it as `??` and doctor.sh's dirty-trunk-root check skips
+    # `??`. Floors: exclude pathspec >= git 1.9.0 (2014), --no-overlay >= 2.22 (2019).
+    # ORDER MATTERS AND IS NOT THE OBVIOUS ONE. The checkout must run BEFORE the reset. Run
+    # `reset --mixed` first and a path the integration DELETED becomes untracked at that instant;
+    # `checkout` only manages tracked paths, so it can no longer remove it and the file is
+    # resurrected on disk as an invisible `??` (doctor.sh's dirty-trunk-root check skips `??`).
+    # Doing the checkout first — while the deleted path is still tracked at OBSERVED — lets
+    # --no-overlay actually delete it. Verified: a rename lands as one file, not two.
+    git_with_lock_backoff -C "$ROOT" checkout --no-overlay -q "$TRUNK" -- . ':(exclude).backlog' >/dev/null 2>&1 \
+      || echo "WARN: root worktree resync incomplete after landing $KEY (the index is still repaired below). Run: git -C $ROOT checkout --no-overlay -q $TRUNK -- . ':(exclude).backlog'" >&2
+    # The index repair is the one that must not be skipped, so it runs unconditionally and its
+    # failure is fatal: a stale index is what forges a tree-reverting commit (a) above.
+    if ! git_with_lock_backoff -C "$ROOT" reset --mixed "$TRUNK" >/dev/null 2>&1; then
+      emit "stall root-index-desync key=$KEY trunk=$NEW — ROOT's index still holds $OBSERVED while HEAD is $NEW; the next .backlog commit would revert this integration. Run: git -C $ROOT reset --mixed $TRUNK"
+      cleanup_wt
+      exit 12
+    fi
     cleanup_wt
     emit "integrated key=$KEY trunk=$NEW"
     exit 0
