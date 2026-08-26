@@ -163,6 +163,95 @@ check "I5B: ledger marker reachable from trunk -> counts terminal" \
   ". '$ACF_WHIP/skills/lib/acfw-git.sh'; acfw_is_integrated '$REPO' trunk gate-201-review"
 rm -f /tmp/p3-integ.out
 
+echo "== WHIP-23: append_log_row can never destroy a task file =="
+# Field incident 2026-08-24: a 17507-byte task document was replaced by a single 267-byte
+# transition row and committed. awk run against a file another process had momentarily emptied
+# emits ONLY the new row; `[ -s "$tmp" ]` passed (a row is non-empty) and `cat "$tmp" > "$file"`
+# wrote the corpse. The `else` fallback was no safer: `printf >> "$file"` CREATES the same corpse
+# on an empty or absent file. Both routes are now refused. (acfw-git.sh append_log_row.)
+# NOTE: a table-LESS file is NOT the bug and must keep working — see the I3 EOF-append check above.
+ALRW="$WORK/alr"; mkdir -p "$ALRW"
+
+: > "$ALRW/empty.md"
+append_log_row "$ALRW/empty.md" "| ts | a | b | c | d |" 2>/dev/null; ARC=$?
+check "WHIP-23: an emptied file is REFUSED (rc 3)"            "[ $ARC -eq 3 ]"
+check "WHIP-23: the emptied file is left empty, not made a one-row corpse" "[ ! -s '$ALRW/empty.md' ]"
+
+printf '\n\n' > "$ALRW/blank.md"     # [ -s ] alone would pass this; it is the same corpse class
+append_log_row "$ALRW/blank.md" "| ts | a | b | c | d |" 2>/dev/null; BRC=$?
+check "WHIP-23: a blank-only file is REFUSED (rc 3)" "[ $BRC -eq 3 ]"
+check "WHIP-23: the blank-only file gains no row"    "! grep -q '^|' '$ALRW/blank.md'"
+
+append_log_row "$ALRW/absent.md" "| ts | a |" 2>/dev/null; NRC=$?
+check "WHIP-23: an absent file is REFUSED (rc 3)"        "[ $NRC -eq 3 ]"
+check "WHIP-23: the absent file is NOT created by the fallback" "[ ! -e '$ALRW/absent.md' ]"
+
+mktask pending alr-healthy alrslug pending
+HF="$REPO/.backlog/pending/alr-healthy.md"
+BEFORE=$(wc -l < "$HF" | tr -d '[:space:]'); INO=$(ls -i "$HF" | awk '{print $1}')
+append_log_row "$HF" "| 2026-06-02 00:00:00 | pending | in-progress | orchestrator | go |"; HRC=$?
+SEPL=$(grep -n '^| --------- |' "$HF" | head -1 | cut -d: -f1)
+NEWL=$(grep -n 'in-progress | orchestrator' "$HF" | head -1 | cut -d: -f1)
+check "WHIP-23: a healthy file still gets its row (rc 0)" "[ $HRC -eq 0 ]"
+check "WHIP-23: spliced directly under the header separator" \
+  "[ -n \"$SEPL\" ] && [ \"$NEWL\" -eq \$(( SEPL + 1 )) ]"
+check "WHIP-23: the file grew by EXACTLY one line" \
+  "[ \"\$(wc -l < '$HF' | tr -d '[:space:]')\" -eq $((BEFORE+1)) ]"
+check "WHIP-23: metadata and the trailing section survived" \
+  "grep -q '^- \*\*ID\*\*: alr-healthy' '$HF' && grep -q '^## Implementation Notes' '$HF'"
+# The write-back must be an atomic same-directory rename. `cat "$tmp" > "$file"` truncates in
+# place, which is itself a 0-byte window for every OTHER reader (doctor field(), scan-backlog,
+# the reviewer's token grep). A changed inode is the observable proof it is a rename.
+check "WHIP-23: the write-back is a rename, not a truncate-in-place (inode changed)" \
+  "[ \"\$(ls -i '$HF' | awk '{print \$1}')\" != '$INO' ]"
+check "WHIP-23: mode stayed group/other readable (mktemp is 0600)" \
+  "ls -l '$HF' | cut -c1-10 | grep -q '^-rw.r..r..'"
+# A leftover temp must be invisible to every consumer glob: they all require a .md suffix.
+check "WHIP-23: no .acfw-log temp left beside the task file" \
+  "[ -z \"\$(ls -a '$REPO/.backlog/pending' | grep '^\.acfw-log\.' || true)\" ]"
+
+echo "== WHIP-23: apply-transition refuses to MOVE or COMMIT a collapsed task file =="
+# What made the incident silent was not the truncation but the commit 25 lines later: this writer
+# ran sed/append/mv/add/commit with no content assertion anywhere. Two guards now bracket the
+# mutations. Fixture is the observed artifact verbatim: one transition row, nothing else.
+mktask pending t-corpse corpseslug pending
+git add -A; git commit -qm t-corpse
+H0=$(git rev-parse HEAD)
+printf '| 2026-08-25 01:41:36 | pending | completed | nextjs-engineer | note |\n' \
+  > "$REPO/.backlog/pending/t-corpse.md"
+bash "$APPLY" "$REPO/.backlog/pending/t-corpse.md" completed orchestrator "done" 0 0 \
+  >"$WORK/corpse.out" 2>&1; CRC=$?
+check "WHIP-23: refused with the distinct exit code 4" "[ $CRC -eq 4 ]"
+check "WHIP-23: the file did NOT move" \
+  "[ -f '$REPO/.backlog/pending/t-corpse.md' ] && [ ! -f '$REPO/.backlog/completed/t-corpse.md' ]"
+check "WHIP-23: nothing was committed" "[ \"\$(git rev-parse HEAD)\" = '$H0' ]"
+check "WHIP-23: nothing was staged"    "[ -z \"\$(git diff --cached --name-only)\" ]"
+check "WHIP-23: the message carries the literal recovery command" \
+  "grep -q 'checkout HEAD -- .backlog/pending/t-corpse.md' '$WORK/corpse.out'"
+check "WHIP-23: the phase is reported as on-entry (it arrived broken)" \
+  "grep -q 'on-entry' '$WORK/corpse.out'"
+check "WHIP-23: append_log_row added no second row to the corpse" \
+  "[ \"\$(wc -l < '$REPO/.backlog/pending/t-corpse.md' | tr -d '[:space:]')\" -eq 1 ]"
+
+# The PRE-COMMIT guard, exercised deterministically rather than as a real race (which would be
+# flaky). A PATH-shimmed `date` empties the file at the TS= line — after the on-entry guard, before
+# the first sed — which is exactly the window a concurrent emptier occupies.
+mkdir -p "$WORK/shim"
+printf '#!/usr/bin/env bash\n[ -n "${ACFW_TEST_TRUNCATE:-}" ] && : > "$ACFW_TEST_TRUNCATE"\nexec /bin/date "$@"\n' \
+  > "$WORK/shim/date"; chmod +x "$WORK/shim/date"
+mktask pending t-torn tornslug pending
+git add -A; git commit -qm t-torn
+H1=$(git rev-parse HEAD)
+PATH="$WORK/shim:$PATH" ACFW_TEST_TRUNCATE="$REPO/.backlog/pending/t-torn.md" \
+  bash "$APPLY" "$REPO/.backlog/pending/t-torn.md" in-progress orchestrator "x" 0 0 \
+  >"$WORK/torn.out" 2>&1; TRC=$?
+check "WHIP-23: a truncation AFTER the entry guard is caught before the mv (exit 4)" "[ $TRC -eq 4 ]"
+check "WHIP-23: the phase is reported as pre-commit (it broke UNDER the writer)" \
+  "grep -q 'pre-commit' '$WORK/torn.out'"
+check "WHIP-23: still nothing committed" "[ \"\$(git rev-parse HEAD)\" = '$H1' ]"
+check "WHIP-23: append_log_row refused rather than writing a row into the emptied file" \
+  "[ ! -s '$REPO/.backlog/pending/t-torn.md' ]"
+
 echo ""
 echo "==================================================="
 echo "Phase 3 reliability test: $PASS passed, $FAIL failed"

@@ -327,6 +327,25 @@ check "A14c: the state move itself still landed" \
 FAKE_FAIL_UPDATE=1 "$ADAPTER" log-event fail --row "$TOKEN" >/dev/null 2>&1; LRC=$?
 check "A14d: log-event is STRICT — a lost token is a hard failure" "[ $LRC -ne 0 ]"
 
+# ---- A15 (WHIP-23): an EMPTY description is refused, never replaced by a single row ------
+# This backend hit the 2026-08-24 clobber on its own surface, with no concurrency needed:
+# `jq -r '.description // ""'` yields a ZERO-BYTE $desc for an issue that has no description, the
+# old append_log_row happily wrote its row into that void, and so the `[ -s "$desc" ]` guard below
+# it PASSED — this adapter then replaced a live issue description with one log row. append_log_row
+# now refuses an empty read, which is what actually closes it; the guard is finally meaningful.
+mktask blankdesc
+"$ADAPTER" create --file "$WORK/blankdesc.md" --folder pending >/dev/null 2>&1
+BD_ID=$(uuid_of blankdesc)
+check "A15a: fixture issue exists" "[ -n \"$BD_ID\" ]"
+# blank the stored description behind the adapter's back — the state an issue created outside
+# acf-whip is in
+jq '.description = ""' "$FAKE_STORE/issues/$BD_ID.json" > "$WORK/bd.json" \
+  && mv "$WORK/bd.json" "$FAKE_STORE/issues/$BD_ID.json"
+"$ADAPTER" log-event blankdesc --row "$TOKEN" >/dev/null 2>&1; BRC=$?
+check "A15b: log-event onto an empty description is REFUSED (exit 7)" "[ $BRC -eq 7 ]"
+check "A15c: the description was NOT replaced by the bare row" \
+  "[ -z \"\$(jq -r '.description' '$FAKE_STORE/issues/$BD_ID.json')\" ]"
+
 echo ""
 echo "==================================================="
 echo "Phase 12 multica transition-log test: $PASS passed, $FAIL failed"
