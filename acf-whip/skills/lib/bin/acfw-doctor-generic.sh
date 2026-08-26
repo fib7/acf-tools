@@ -17,6 +17,12 @@
 # Emits SEV|code|task|detail lines + SUMMARY|; exit 0 iff no FATAL. The dispatcher
 # merges these lines with the adapter's own findings and recomputes the summary.
 #
+# NOT here: `collapsed-task-file` (and `control-bytes`) are FILES-ONLY. Both read raw file
+# bytes and this script consumes a snapshot, so it cannot run their discriminators. On a
+# non-files backend the equivalent protection is write-time, not scan-time: append_log_row
+# refuses an empty/blank read, so an adapter can no longer replace a stored document with a
+# lone log row (see acfw-store-multica's log-event guard).
+#
 # Requires jq (only runs behind non-files adapters, which already require it).
 
 set -u
