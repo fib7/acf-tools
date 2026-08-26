@@ -2,6 +2,125 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.2.2 — the transition writer stops destroying the task it is moving
+
+A `/go` run aborted at iteration 4 with two FATALs about missing metadata fields. The task file
+behind them had been 17507 bytes and 219 lines one commit earlier; it was now **267 bytes and one
+line** — a single transition-log row. The row was the one that transition was itself writing, and
+`apply-transition.sh` committed the wreck twenty lines after producing it. Nothing warned, nothing
+failed: the writer moved the file, staged it, and committed it exactly as if the transition had
+worked. Reported from a downstream project (`docs/research/20260824-acf-whip-task-file-clobber.md`),
+whose diagnosis of the blast radius and the manual repair was correct.
+
+**`append_log_row` could write a file's replacement from a read that returned nothing.** It is a
+read-modify-write: awk reads the task file, and the result replaced the original. Run it against a
+file some other process had momentarily emptied and awk emits *only* the new row — no table was
+seen, so the terminal clause appends one. `[ -s "$tmp" ]` then passes, because a row is not empty.
+The `else` fallback was no safer: `printf '%s\n' "$row" >> "$file"` **creates** the identical corpse
+from an empty or absent file. Both guards admitted the wreck; one of them manufactured it.
+
+Worth being precise about what was *not* wrong, because the field report guessed and the guess
+implies a different fix: a **table-less** input was always handled correctly. Every non-table line
+reaches an unconditional `print`, so such a file is emitted in full with the row appended at EOF —
+the documented legacy behavior, pinned by a test since 2.1.0. **Only a zero-byte read** produces a
+lone row. Guarding "no table" would have fixed nothing and broken a tested path.
+
+Four changes make the function structurally incapable of shrinking a file:
+
+- It **refuses** an absent, empty, or whitespace-only target up front, and again inside awk
+  (`END { if (NR == 0) exit 3 }`) so the gap between the two checks is closed rather than trusted.
+- The write-back is an **atomic same-directory rename**, not `cat "$tmp" > "$file"`. That matters
+  twice over: `>` truncates in place, so the old code was *itself* a zero-byte window for every
+  other reader — the doctor's field lookups, `scan-backlog.sh`, the reviewer's token grep. Every
+  other task-file writer in the tree already used temp-plus-rename; this one function did not. The
+  temp must be born beside the target, because `$TMPDIR` is a different filesystem from the repo on
+  macOS and `mv` across one degrades to copy-and-truncate — reopening the window being closed.
+- A **first-line comparison** before the rename. onetrueawk does not report a stdout write error, so
+  a full disk could otherwise rename a half-written file over a good one.
+- The EOF fallback now runs only against a file the refusal gate already proved healthy.
+
+It returns `0` / `3` (refused, file untouched) / `1` (environmental, file intact, row not written),
+and never `2`, so a refusal can never be misread as a usage error. All four call sites opt in
+individually: a lost *log row* must not strand a state *move*, so the two shell callers warn, while
+the two adapters fail.
+
+**`apply-transition.sh` will not commit a corpse.** The truncation was the accident; committing it
+was the defect. This writer ran `sed`, `append_log_row`, `mv`, `git add`, `git commit` with no
+content assertion anywhere. `assert_task_intact` now brackets the mutations — once on entry, once
+immediately before the move — and refuses with a new **exit 4**, leaving the file where it is,
+nothing staged, nothing committed, and the recovery command printed. The two call sites are kept
+apart deliberately: *on-entry* means someone else broke the file, *pre-commit* means it broke under
+this writer, which is a live concurrency fault worth chasing. The files adapter maps 4 to contract
+exit 7 ("invalid state or value") — not contract 4, which means "conflict (duplicate key)" and would
+send an operator hunting a duplicate id that does not exist.
+
+**`collapsed-task-file` is now its own FATAL.** The doctor reported the wreck as
+`unparseable-frontmatter` plus `missing-worktree-slug`, which reads as *someone fat-fingered the
+metadata* and sends you to re-type two fields — when the whole document is gone and is sitting one
+commit back in git. The discriminator is unmistakable and costs nothing on the happy path (it runs
+only for a file that already failed the field lookup): no `#` heading, and every non-blank line a
+table row. It is FATAL even in `accepted/`, skipping the usual terminal-tasks-are-advisory tier,
+because this is content loss rather than a structural quirk. Deliberately **not** `--fix`-able, for
+`control-bytes`' reason: restoring from `HEAD` would silently discard the clean-checkout token row,
+which is uncommitted by design, and `--fix` must never commit a torn write as "healed".
+
+**Also fixed — the LP-CAS integrator's root resync, which was two bugs sharing three lines.**
+`land()` advanced trunk and then resynced `ROOT` with `git reset --hard "$TRUNK" >/dev/null 2>&1 ||
+true`. Between those two statements — and permanently, whenever the resync failed, since
+`git_with_lock_backoff` returns 99 under lock contention and `|| true` ate it — **ROOT's index held
+the old tree while HEAD pointed at the new one**. Any `.backlog` commit landing in that gap builds
+from that index and produces a commit whose parent is the integration and whose tree is its
+predecessor: it silently reverts every code change just landed. The index repair is now
+unconditional and its failure fatal. Separately, `reset --hard` rewrote `.backlog/` as well,
+discarding uncommitted task state at the root — the clean-checkout token (which the files adapter
+calls uncommitted *by design*, and whose loss `/go` already works around as a "mechanism" fault) and
+any operator repair made between runs. The worktree half is now
+`checkout --no-overlay "$TRUNK" -- . ':(exclude).backlog'`, provably a no-op on committed content:
+`strip_backlog_from_index` restores `.backlog` to `OBSERVED`, and the compare-and-swap only lands if
+trunk is still exactly `OBSERVED`, so the two `.backlog` trees are identical and excluding it can
+only spare uncommitted work. **`--no-overlay` is load-bearing and so is the order.** Overlay mode —
+the default — never removes files, so an integration that deleted or renamed a path would leave a
+resurrected copy on disk, invisible because `git status` shows it as `??` and the `dirty-trunk-root`
+check skips `??`. And the checkout must run *before* the index reset: reset first and the deleted
+path becomes untracked at that instant, after which checkout can no longer remove it.
+
+**Also fixed — `strip_backlog_from_index` leaked additions.** It used `git checkout <tree> --
+.backlog` in overlay mode, so a candidate that *added* a `.backlog/X.md` absent from the observed
+trunk survived the strip, was picked up by the following `git add -A`, and rode into trunk. That is
+precisely the phantom the function exists to stop: deletions and modifications were reverted,
+additions were not. A failed strip is no longer swallowed either — it quarantines the candidate.
+
+**Also fixed — the same clobber on the multica backend, with no concurrency required.**
+`jq -r '.description // ""'` yields a zero-byte file for an issue with no description; the old
+`append_log_row` wrote its row into that void, so the `[ -s "$desc" ]` guard below it *passed* and
+the adapter replaced a live issue description with one log row. The refusal closes it; the guard is
+finally meaningful rather than defeated.
+
+**Deliberately not done.** A real mutex shared by every `.backlog` writer. It is the only thing that
+would close the remaining hole (below), and it is not obviously worth its cost: macOS ships neither
+`flock(1)` nor `lockf(1)`, so it means a hand-rolled `mkdir` spinlock with stale-lock reaping across
+agents that get killed mid-run — a new wedging failure mode in a system whose stated design is that
+the lock is git itself. Also not done: `--fix` auto-repair of a collapsed file from git history, for
+the reason given above.
+
+**What is still open, stated plainly.** A *partial* (non-empty) read is not covered: `- **ID**:` and
+`- **Status**:` sit in the first few lines, so a file truncated in its tail passes both assertions
+having lost its body. Concurrent writers still lose a *row* to last-rename-wins — neither destroys
+the file, and the multica adapter has documented that parity since 3.2.0. And `evidenceSink` /
+`reviewSink` still instruct agents to write the live task document; the two changes above make that
+non-destructive without stopping it. The emptier in the original incident was never identified —
+there was no `reset --hard`, no stash and no integration within minutes of it, so the surviving
+candidates are a sibling `append_log_row`'s own truncation window and an agent's Write. The fix is
+deliberately mechanism-agnostic for that reason: it defends the read, not one particular racer.
+
+`tests/phase11-checkout-reentrancy` has launched two concurrent `clean-checkout.sh` against the same
+task file since 3.2.0 and asserted only their exit codes — the suite ran the corruption scenario and
+looked away from the file. It now checks the file. Regressions also cover the refusal paths, the
+rename (by inode), the collapse discriminator against both a corpse and an ordinary field-less file,
+`--fix` declining to heal it, temp-file invisibility to every `*.md` consumer, the multica empty
+description, and an integration that deletes a file while `.backlog` is dirty. Suite: **754
+assertions**, green on stock macOS bash 3.2 with BSD sed/awk.
+
 ## 3.2.1 — the integration mode is a setting, and override mode survives a run
 
 Override (PR) mode was documented since 2.x and reachable in practice by almost nobody. Selecting it

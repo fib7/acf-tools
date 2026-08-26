@@ -28,6 +28,7 @@ Severity is scoped to the dispatch path: a task in `accepted/` is terminal, so i
 | `detached-head` | No branch checked out at the repo root. | `git checkout <trunk-branch>` |
 | `unparseable-frontmatter` | Task file is missing `ID` and/or `Status`. | Restore both fields by hand, then `/whip-doctor`. |
 | `control-bytes` | Raw NUL bytes (`0x00`) in a task file — every field lookup is unreliable. | `LC_ALL=C tr -d '\000' < f > f.tmp && mv f.tmp f`, then re-run `/whip-doctor`. See below. |
+| `collapsed-task-file` | The task document was destroyed by a concurrent write — all that is left is transition-log rows. | `git checkout HEAD -- .backlog/<state>/<stem>.md`, then re-run `/whip-doctor`. See below. |
 | `dangling-dep` | Task depends on an id with no task file. | Create the missing task, or drop the dep. |
 | `cyclic-deps` | Task participates in a dependency cycle. | Break the cycle: remove one edge with an edit to `Dependencies`, or split the task. |
 | `cross-slug-dep-not-integrated` | A dispatched task's cross-slug dep is not yet on trunk. | Let `/go` integrate the dep first; if the dep is genuinely on trunk, see `accepted-branchless-unverified` below. |
@@ -47,6 +48,28 @@ LC_ALL=C tr -dc '\000' < f | wc -c
 ```
 
 Strip them with `tr` (above), not with your editor: Read renders a NUL invisibly, Edit cannot match it in `old_string`, and `grep $'\x00'` truncates the pattern at the NUL.
+
+### On `collapsed-task-file`
+
+The document is gone and only transition-log rows remain — usually exactly one. The doctor reports it separately from `unparseable-frontmatter` because the recovery is completely different: nothing is missing from the metadata, the *whole file* was overwritten, and the content is still in git one commit back.
+
+Cause: `append_log_row` performs a read-modify-write. Before 3.2.2 it could read a file that another process had momentarily emptied, and then write only its own row back. `apply-transition.sh` committed the result. 3.2.2 makes both steps refuse, so a file collapsed this way predates the fix (or was destroyed by something outside acf-whip).
+
+Restore it from the last commit that still has it:
+
+```bash
+git log --all --oneline -- '.backlog/*/<stem>.md'
+git checkout <sha> -- .backlog/<state>/<stem>.md
+```
+
+Two things to get right afterwards:
+
+- **`Status` must match the folder the file now sits in.** The restored copy carries whatever state it had at that commit. Use `/whip-move` rather than editing it by hand.
+- **Commit the repair immediately.** An uncommitted `.backlog` repair at the trunk root is invisible to `dirty-trunk-root` (which excludes `.backlog/` by design), so nothing warns you before something else overwrites it.
+
+Any transition rows written between the restored commit and now are lost. Re-insert them under the separator that follows the `## Transition Log` heading — not the first `|---|` in the file, which belongs to a different table.
+
+Not `--fix`-able, for the same reason as `control-bytes`: restoring from `HEAD` would silently discard the clean-checkout token row, which is uncommitted by design, and a bootstrap `--fix` must never commit a torn write as "healed".
 
 ---
 

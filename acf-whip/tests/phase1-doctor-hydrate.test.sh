@@ -418,6 +418,59 @@ FIXED_OUT=$(bash "$DOC" "$NB"); FIXED_RC=$?
 check "runbook strip recipe clears the FATAL (exit 0)" "[ $FIXED_RC -eq 0 ]"
 rm -rf "$NB"
 
+echo "== WHIP-23: a COLLAPSED task file is its own FATAL, not generic unparseable-frontmatter =="
+# Field incident 2026-08-24: an unlocked read-modify-write in append_log_row let a 17507-byte task
+# document be replaced by its own 267-byte transition row, and the writer committed it. The doctor
+# then reported it as unparseable-frontmatter + missing-worktree-slug — which reads as "someone
+# fat-fingered the metadata" and sends the operator to re-type two fields, when in fact the whole
+# document is gone and is sitting one commit back in git. Same shape as WHIP-22 above: name the
+# real defect once, carry the recovery command, and do NOT let --fix silently "heal" a torn write.
+CL="$WORK/collapse-repo"; git init -q -b trunk "$CL" >/dev/null
+git -C "$CL" config user.email t@t; git -C "$CL" config user.name t
+mkdir -p "$CL"/.backlog/{pending,in-progress,completed,in-review,blocked,rejected,accepted} "$CL/.claude/agents"
+: > "$CL/.claude/agents/go-engineer.md"
+# the corpse, verbatim from the incident
+printf '| 2026-08-25 01:41:36 | pending | completed | nextjs-engineer | note |\n' \
+  > "$CL/.backlog/in-progress/dead-1.md"
+# a merely field-less file must KEEP the old code — this is the discriminator's other half
+printf '# Task: prose-1\n\nno metadata bullets at all\n' > "$CL/.backlog/pending/prose-1.md"
+git -C "$CL" add -A >/dev/null 2>&1; git -C "$CL" commit -qm seed >/dev/null 2>&1
+CL_OUT=$(bash "$DOC" "$CL"); CL_RC=$?
+check "collapsed-task-file FATAL emitted" "echo \"\$CL_OUT\" | grep -q '^FATAL|collapsed-task-file|dead-1'"
+check "collapsed-task-file makes the gate fail (exit 1)" "[ $CL_RC -eq 1 ]"
+check "NOT reported as unparseable-frontmatter" "! echo \"\$CL_OUT\" | grep -q 'unparseable-frontmatter|dead-1'"
+check "NO phantom missing-worktree-slug for the same stem" "! echo \"\$CL_OUT\" | grep -q 'missing-worktree-slug|dead-1'"
+# exactly one FATAL: a later mtime-based pass may still add a stale-in-progress WARN, which is
+# correct and unrelated — what must not happen is a FATAL cascade.
+check "exactly one FATAL for the collapsed stem (no cascade)" \
+  "[ \"\$(echo \"\$CL_OUT\" | grep -c '^FATAL|.*|dead-1|')\" -eq 1 ]"
+check "the finding carries the literal restore command" \
+  "echo \"\$CL_OUT\" | grep -q 'checkout HEAD -- .backlog/in-progress/dead-1.md'"
+check "a merely field-less file KEEPS unparseable-frontmatter" \
+  "echo \"\$CL_OUT\" | grep -q '^FATAL|unparseable-frontmatter|prose-1'"
+check "prose is NOT misclassified as collapsed" "! echo \"\$CL_OUT\" | grep -q 'collapsed-task-file|prose-1'"
+# Deliberately not repairable, for WHIP-22's reason: restoring from HEAD would discard the
+# clean-checkout token row, which is uncommitted by design.
+bash "$DOC" --fix "$CL" >/dev/null 2>&1
+check "--fix does NOT heal the collapse (no silent commit of a torn write)" \
+  "[ \"\$(wc -l < '$CL/.backlog/in-progress/dead-1.md' | tr -d '[:space:]')\" -eq 1 ]"
+check "--fix leaves the FATAL standing" "! bash '$DOC' '$CL' >/dev/null 2>&1"
+# the documented recipe actually clears it
+git -C "$CL" checkout HEAD -- .backlog/in-progress/dead-1.md >/dev/null 2>&1
+printf '# Task\n\n- **ID**: dead-1\n- **Status**: in-progress\n- **Assigned Agent**: go-engineer\n- **Worktree**: deadslug\n- **Dependencies**: none\n' > "$CL/.backlog/in-progress/dead-1.md"
+check "restoring the document clears collapsed-task-file" \
+  "! bash '$DOC' '$CL' 2>&1 | grep -q 'collapsed-task-file'"
+
+echo "== WHIP-23: a leftover append_log_row temp is invisible to every *.md consumer =="
+# The atomic write-back leaves .acfw-log.XXXXXX in the task's own directory if it is SIGKILLed
+# mid-splice. It is dot-prefixed AND non-.md so no consumer glob can mistake it for a task.
+: > "$CL/.backlog/pending/.acfw-log.decoy"
+DEC_OUT=$(bash "$DOC" "$CL" 2>&1)
+check "the doctor emits no finding for the temp" "! echo \"\$DEC_OUT\" | grep -q 'acfw-log'"
+check "scan-backlog does not list the temp as a task" \
+  "! bash '$ACF_WHIP/skills/go/bin/scan-backlog.sh' '$CL' 2>/dev/null | grep -q 'acfw-log'"
+rm -rf "$CL"
+
 echo "== WHIP-19: legacy JSON-style Dependencies is REPAIRABLE and --fix clears the false dangling-dep =="
 BD="$WORK/brackets-repo"; git init -q -b trunk "$BD" >/dev/null
 git -C "$BD" config user.email t@t; git -C "$BD" config user.name t

@@ -1,6 +1,6 @@
 ---
 name: whip-doctor
-description: Backlog integrity check for ACF Whip. Scans .backlog/ and the git worktree registry for ~18 invariants (status/folder mismatch, dangling or cyclic dependencies, missing/duplicate worktree slugs, orphaned worktrees, unknown agents, stray Integrated-At, out-of-range Rejection Count, missing clean-checkout tokens, cross-slug glob overlap, stale in-progress). Reports FATAL/REPAIRABLE/WARN; --fix auto-repairs the REPAIRABLE class. Run it before /go, or any time the backlog looks inconsistent.
+description: Backlog integrity check for ACF Whip. Scans .backlog/ and the git worktree registry for ~19 invariants (status/folder mismatch, collapsed task files, dangling or cyclic dependencies, missing/duplicate worktree slugs, orphaned worktrees, unknown agents, stray Integrated-At, out-of-range Rejection Count, missing clean-checkout tokens, cross-slug glob overlap, stale in-progress). Reports FATAL/REPAIRABLE/WARN; --fix auto-repairs the REPAIRABLE class. Run it before /go, or any time the backlog looks inconsistent.
 argument-hint: "[--fix]"
 allowed-tools:
   - Bash
@@ -40,7 +40,11 @@ Exit 0 when `ok=true` (no FATAL), exit 1 otherwise.
   duplicate ID across files, dangling or cyclic dependencies, a code-mutating task with
   no `Worktree:` slug, an `Assigned Agent` with no agent file, an acf-whip worktree on the
   wrong branch, a dispatched task whose cross-slug dependency is not yet integrated, detached
-  HEAD at the repo root, unparseable frontmatter.
+  HEAD at the repo root, unparseable frontmatter, a task file collapsed to bare
+  Transition Log rows by a concurrent write.
+  Two of these are deliberately **not** `--fix`-able — `control-bytes` and
+  `collapsed-task-file`. Both mark a torn write, and a bootstrap `--fix` must never commit
+  one as "healed"; the finding carries the recovery command instead.
 - **REPAIRABLE** — safe to auto-fix with `--fix`, then re-scan to confirm: stray
   `Integrated-At` on a non-accepted task (cleared), `Rejection Count` out of `[0,5]`
   (clamped), the same task present in two folders (kept the one matching its `Status`),

@@ -160,6 +160,19 @@ check 'E2 the worktree exists on the right branch afterwards' \
   '[ -n "$(observe_wt worktree/rc)" ]'
 check 'E3 a loser (if any) reported the branch-in-use code 2, not a corrupt state' \
   '[ "$rc1" = "0" ] && [ "$rc2" = "0" ] || [ "$rc1" = "2" ] || [ "$rc2" = "2" ] || [ "$rc1" = "99" ] || [ "$rc2" = "99" ]'
+# WHIP-23: this block has ALWAYS run two concurrent append_log_row calls against race.md (both
+# checkouts log their token into the same root task file) and asserted only exit codes — the suite
+# executed the corruption scenario and looked away from the file. A 2026-08-24 field incident
+# turned that blind spot into a destroyed 17KB task document. Assert the file itself now.
+RF="$REPO/.backlog/pending/race.md"
+check 'E4 race.md survived two concurrent append_log_row calls (metadata intact)' \
+  'grep -q "^- \*\*ID\*\*:" "$RF" && grep -q "^- \*\*Status\*\*:" "$RF"'
+check 'E5 race.md was NOT collapsed to a bare log row' \
+  '[ "$(grep -c "^#" "$RF")" -gt 0 ]'
+check 'E6 the seed transition row was not lost to the race' \
+  'grep -q "Initial task creation" "$RF"'
+check 'E7 no .acfw-log temp left behind by the losing writer' \
+  '[ -z "$(ls -a "$REPO/.backlog/pending" | grep "^\.acfw-log\." || true)" ]'
 
 echo
 echo "phase11-checkout-reentrancy: $PASS passed, $FAIL failed"

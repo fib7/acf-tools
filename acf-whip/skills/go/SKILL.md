@@ -282,6 +282,11 @@ acfw_apply_result() {
   [ "$reject_inc" = "1" ] && [ "$transition" = "rejected" ] && inc=1
   bash "${CLAUDE_PLUGIN_ROOT}/skills/go/bin/apply-transition.sh" \
     "$task_file" "$new_state" "${ASSIGNED_AGENT:-orchestrator}" "$notes" "$inc"
+  rc=$?
+  # Exit 4 = the task document is collapsed (no ID/Status): nothing was moved or committed.
+  # Say so loudly — the writer refused for a reason and /whip-doctor names the recovery.
+  [ $rc -eq 4 ] && echo "FATAL: transition refused for $(basename "$task_file") — collapsed task document; run /whip-doctor" >&2
+  return $rc
 }
 ```
 

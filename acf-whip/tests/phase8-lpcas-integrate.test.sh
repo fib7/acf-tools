@@ -181,6 +181,44 @@ KEYS=$(acfw_integrated_keys "$REPO" trunk | sort | tr '\n' ' ')
 check "integrated keys include k1 and k10"   "echo \"$KEYS\" | grep -q 'k1 ' && echo \"$KEYS\" | grep -q 'k10'"
 check "non-integrated k_o_b absent from set" "! echo \"$KEYS\" | grep -qw 'k_o_b'"
 
+echo "== Test 12 (WHIP-23): the root resync applies deletions and spares uncommitted .backlog =="
+# land() used to resync ROOT with `git reset --hard "$TRUNK"`, which had two defects:
+#   (a) it rewrote .backlog/ too, discarding uncommitted task state at the root — the clean-checkout
+#       token row (uncommitted BY DESIGN) and any operator repair made between runs; and
+#   (b) it ran AFTER update-ref with its failure swallowed, so a failed resync left ROOT's index on
+#       the OLD tree while HEAD was on the new one — and the next .backlog commit built from that
+#       index would silently revert the whole integration.
+# The replacement is `checkout --no-overlay <trunk> -- . ':(exclude).backlog'` then `reset --mixed`.
+# ORDER MATTERS: reset --mixed first would untrack a deleted path, after which checkout can no
+# longer remove it and the file is resurrected as an invisible untracked leftover.
+mkdir -p "$REPO/.backlog/accepted"
+printf 'delete-me\n' > "$REPO/doomed.txt"; printf 'v1\n' > "$REPO/kept.txt"
+git -C "$REPO" add -A >/dev/null 2>&1; git -C "$REPO" commit -qm "seed resync fixture" >/dev/null 2>&1
+mktask k_resync
+# a candidate that MODIFIES one file and DELETES another
+RWT="$WORK/cand-k_resync"; rm -rf "$RWT"
+git -C "$REPO" worktree add --detach -q "$RWT" trunk
+printf 'v2\n' > "$RWT/kept.txt"; rm -f "$RWT/doomed.txt"
+git -C "$RWT" add -A; git -C "$RWT" commit -q -m "feat: k_resync"
+git -C "$REPO" update-ref "refs/acfw/patch/k_resync" "$(git -C "$RWT" rev-parse HEAD)"
+git -C "$REPO" worktree remove --force "$RWT"
+# dirty .backlog at the root exactly the way clean-checkout does: uncommitted, never committed by us
+printf '| 2026-06-01 00:00:00 | clean-checkout | ok | a | k_resync | worktree/k_resync |\n' \
+  >> "$REPO/.backlog/accepted/k_resync.md"
+run_iw bash "$IW" "$(TF k_resync)"
+check "k_resync integrates"                          "[ $RC -eq 0 ]"
+check "k_resync: modified file synced into the root worktree" \
+  "[ \"\$(cat '$REPO/kept.txt')\" = 'v2' ]"
+check "k_resync: DELETED file actually removed from the root worktree (--no-overlay)" \
+  "[ ! -e '$REPO/doomed.txt' ]"
+check "k_resync: no untracked resurrection of the deleted path" \
+  "! git -C '$REPO' status --porcelain | grep -q '^?? doomed.txt'"
+check "k_resync: the uncommitted clean-checkout token SURVIVED the resync" \
+  "grep -q 'clean-checkout | ok' '$REPO/.backlog/accepted/k_resync.md'"
+# The index must match trunk for code, or the next .backlog commit forges a tree-reverting commit.
+check "k_resync: root index is NOT desynced from trunk" \
+  "[ -z \"\$(git -C '$REPO' diff --cached --name-only -- . ':(exclude).backlog')\" ]"
+
 echo ""
 echo "phase8-lpcas-integrate: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

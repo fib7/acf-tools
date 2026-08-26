@@ -232,6 +232,29 @@ for st in $LOOP_FOLDERS; do
     sev_struct=FATAL; [ "$folder" = "accepted" ] && sev_struct=WARN
 
     if [ -z "$id" ] || [ -z "$status" ]; then
+      # A file loses ID/Status two very different ways, and the recovery is different, so name them
+      # apart. COLLAPSE: append_log_row's read-modify-write was unlocked and something emptied the
+      # file mid-read, so a 17KB task document became its own transition-log row and the writer
+      # committed it (field incident 2026-08-24). The corpse is unmistakable: not one "#" heading,
+      # and every non-blank line is a table row (or the file is blank outright). Anything else is
+      # ordinary bad frontmatter and keeps the old code. Reporting it as unparseable-frontmatter
+      # was actively misleading — it reads as "someone fat-fingered the metadata" and sends the
+      # operator to re-type two fields, when the whole document is gone and is sitting in git.
+      # ONE awk, and ONLY for a file that already failed the field lookup — a well-formed task
+      # never reaches this line, so the check costs nothing on the happy path.
+      collapsed=$(awk '/^#/{h++} /^\|/{r++} /[^[:space:]]/{n++}
+                       END{print ((h+0)==0 && (n+0)==(r+0)) ? 1 : 0}' "$f" 2>/dev/null)
+      if [ "${collapsed:-0}" = "1" ]; then
+        # FATAL unconditionally, skipping the sev_struct accepted->WARN tier: this is content LOSS,
+        # not a structural quirk, and an accepted task whose document was destroyed is still
+        # destroyed. control-bytes above sets the same precedent. Deliberately NOT --fix-able for
+        # its reason too: restoring from HEAD discards the clean-checkout token row (uncommitted by
+        # design), and --fix must never silently commit a torn write as "healed".
+        nrow=$(grep -c '^|' "$f" 2>/dev/null || true); nrow=${nrow:-0}
+        if [ "$nrow" -eq 0 ]; then what="task file is empty"; else what="task file collapsed to $nrow transition-log row(s) — no headings, no metadata"; fi
+        emit FATAL collapsed-task-file "$stem" "$what. A concurrent write destroyed the document; the content is still in git. Restore: git -C $REPO_ROOT checkout HEAD -- .backlog/$folder/$stem.md   (then re-run /whip-doctor; NOT --fix-able)"
+        continue
+      fi
       emit "$sev_struct" unparseable-frontmatter "$stem" "missing ID and/or Status field"
     elif [ "$status" != "$folder" ]; then
       # Status-folder mismatch is REPAIRABLE, not FATAL: the folder is the source of truth, so --fix

@@ -230,6 +230,9 @@ cmd_transition() {
   fi
   rc=$?
   [ $rc -eq 3 ] && exit 8   # off-trunk refusal -> contract "policy refusal"
+  [ $rc -eq 4 ] && exit 7   # collapsed task document -> contract "invalid state or value".
+                            # NOT contract 4, which means "conflict (duplicate key)" and would
+                            # send the caller looking for a duplicate id that does not exist.
   exit $rc
 }
 
@@ -303,7 +306,16 @@ cmd_log_event() {
   f=$(resolve_task_file "$stem") || exit 3
   # Uncommitted by design: the token/event rides the task file and is committed by the
   # next transition (exactly how clean-checkout.sh has always written the ok token).
-  append_log_row "$f" "$row"
+  #
+  # CONTRACT.md states log-event is "invoked concurrently, by design" — and on this backend
+  # log-event IS append_log_row on a live .backlog document. That is the concurrency the old
+  # unlocked read-modify-write could not survive: it would happily write its row into a file
+  # another process had momentarily emptied, destroying the task. append_log_row now refuses
+  # that read; surface the refusal rather than reporting a successful log.
+  append_log_row "$f" "$row" || {
+    echo "FATAL: refusing to log into a collapsed task document: $f — run /whip-doctor" >&2
+    exit 7
+  }
   printf '{"key":"%s","logged":true}\n' "$(jesc "$(basename "$f" .md)")"
 }
 
