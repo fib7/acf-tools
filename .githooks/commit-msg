@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# commit-msg: reject AI attribution trailers.
+#
+# This repository does not record AI co-authorship in git history.
+# Enable per clone with:  git config core.hooksPath .githooks
+#
+# Portable to stock macOS bash 3.2 + BSD grep. No GNU-isms.
+set -u
+
+MSG_FILE="$1"
+
+# Match git's own view of the message: strip comment lines first, so a
+# commented-out example in the editor template never trips the gate.
+HITS=$(git stripspace --strip-comments < "$MSG_FILE" | grep -inE \
+  '^[[:space:]]*(Co-authored-by:.*(claude|anthropic\.com)|Claude-Session:)|Generated with \[?Claude Code')
+
+if [ -n "$HITS" ]; then
+  EDITMSG=$(git rev-parse --git-path COMMIT_EDITMSG)
+  {
+    echo "commit-msg: REJECTED -- AI attribution trailer in the commit message."
+    echo
+    echo "$HITS" | sed 's/^/    line /'
+    echo
+    echo "  This repository does not record AI co-authorship in git history."
+    echo "  Remove the offending line(s) and commit again."
+    echo
+    echo "  ALLOWED trailers (do not strip these):"
+    echo "      ACFW-Stage:  ACFW-Task:  ACFW-Patch:"
+    echo "      Co-authored-by: lines naming a human"
+    echo
+    echo "  Your message was preserved. Edit and retry with:"
+    echo "      git commit -e -F \"$EDITMSG\""
+    echo
+    echo "  Do not bypass with --no-verify: the pre-push hook enforces the"
+    echo "  same rule across the whole pushed range."
+  } >&2
+  exit 1
+fi
+
+exit 0
