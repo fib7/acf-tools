@@ -24,6 +24,12 @@ const filesStore = store === 'files'
 // Prompts are informational only — the agent always uses the path clean-checkout.sh prints — so a
 // stale default here is cosmetic, but keeping it in sync avoids confusing the specialist.
 let branchPrefix = (args && args.branchPrefix) || 'worktree'
+// Run scope (3.2.3). A list of task stems/ids to run INSTEAD of the whole backlog; absent/empty =>
+// today's full-backlog behaviour, byte-identical. The skill resolves both `/go <id> <id>` and a
+// natural-language filter ("frontend tasks only") to this same concrete list BEFORE launching, so the
+// scheduler stays deterministic and the selected set cannot drift mid-run.
+const ONLY = (args && Array.isArray(args.only) && args.only.length) ? args.only.map(String) : null
+const SCOPE_FILTER = (args && typeof args.scopeFilter === 'string') ? args.scopeFilter : ''
 if (!pluginRoot || !trunkRoot) {
   return { error: 'whip-go.workflow.js requires args.pluginRoot and args.trunkRoot', got: { pluginRoot, trunkRoot } }
 }
@@ -250,6 +256,38 @@ function depsSatisfied(t, idx) {
     if (mode === 'default' && crossSlug && dep.slug !== 'none' && dep.hasWorktreeBranch && !dep.hasIntegratedAt) return false
   }
   return true
+}
+
+// Run scope (3.2.3). Expand a caller-supplied seed of task stems/ids into the set of stems the
+// scheduler may act on. A scoped task whose dependency sits OUTSIDE the seed would stay correctly
+// gated by depsSatisfied and never progress, so unmet (non-terminal) transitive deps are pulled IN;
+// an already-terminal dep needs nothing and is left out. Seed tokens resolve through the same
+// idx.resolve as everything else (id, stem, unique prefix, or a collapsed-accepted satisfiedDeps
+// entry), so a scoped id that the scanner collapsed resolves to a synthesized terminal object whose
+// stem is simply absent from the working set — neutral to both numerator and denominator below.
+// PURE: no clock, no closure beyond `mode` (reached via isTerminal), so the <scheduler-pure>
+// extraction in tests/phase2-scheduler.test.mjs keeps working. `seed` is a parameter, never `args`.
+function expandScope(seed, idx) {
+  const scope = new Set(), added = [], unresolved = [], stack = []
+  for (const tok of (seed || [])) {
+    const t = idx.resolve(tok)
+    if (!t) { unresolved.push(tok); continue }
+    stack.push(t.stem)
+  }
+  while (stack.length) {
+    const stem = stack.pop()
+    if (scope.has(stem)) continue
+    scope.add(stem)
+    const t = idx.byStem.get(stem)
+    if (!t) continue // collapsed-accepted (synthesized): terminal, nothing to walk
+    for (const depTok of (t.deps || [])) {
+      const dep = idx.resolve(depTok)
+      if (!dep || scope.has(dep.stem) || isTerminal(dep)) continue
+      added.push(dep.stem)
+      stack.push(dep.stem)
+    }
+  }
+  return { scope, added, unresolved }
 }
 
 // Topological order (Kahn) over cross-slug dependency edges among the integration candidates,
@@ -1316,6 +1354,10 @@ const attemptedIntegrate = new Set() // every stem handed to integrateOne — us
 const parkedThisRun = new Set() // stems a specialist blocked on with dependency-missing (BUG-2) — not re-dispatched
 const parkedNeeds = new Map() // stem -> needs_task text (for the final operator report)
 let lastSnapshot = null
+// The resolved scope of the LAST iteration (stems). Null on an unscoped run. Held at run level so the
+// post-loop integration drain and the final report stay inside the scope the operator asked for —
+// otherwise a scoped run would fold in, and report on, other people's accepted work.
+let runScope = null
 let stopReason = 'max-iterations'
 
 while (iter < MAX_ITER) {
@@ -1372,12 +1414,26 @@ Return the ScanResult.`
   if (snap.branchPrefix) branchPrefix = snap.branchPrefix
   const tasks = snap.tasks || []
   const idx = indexTasks(tasks, snap.satisfiedDeps)
+  // Run scope (3.2.3). The INDEX stays whole — dependency resolution must still see out-of-scope
+  // tasks, because depsSatisfied treats an unresolvable dep token as dangling and refuses to
+  // dispatch (conservative by design). Only the SCHEDULING VIEW narrows; `sched` replaces `tasks`
+  // at every planning site below, and nowhere else.
+  const scoped = ONLY ? expandScope(ONLY, idx) : null
+  if (scoped && scoped.unresolved.length) {
+    stopReason = 'scope-unresolved'
+    return { aborted: true, reason: `/go was scoped to tasks that do not exist in the backlog: ${scoped.unresolved.join(', ')} — check the ids (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+  }
+  const sched = scoped ? tasks.filter((t) => scoped.scope.has(t.stem)) : tasks
+  if (scoped) runScope = scoped.scope
+  if (scoped && iter === 1) {
+    log(`scope: ${sched.length} task(s)${scoped.added.length ? ` (+${scoped.added.length} pulled in as unmet dependencies: ${scoped.added.join(', ')})` : ''}${SCOPE_FILTER ? ` — filter: ${SCOPE_FILTER}` : ''}`)
+  }
 
   // Unblock/timeout plan is computed HERE (before the completion check) so completion can require that
   // no blocked task is about to be unblocked — otherwise a cross-slug dep that integrates in the final
   // iteration hits 100% terminal and the loop breaks before the blocked dependent gets its unblock pass
   // (retro I5A). Reused below for the pre-move batch.
-  const { unblockActions, timeoutActions, freshInProgress } = planUnblockAndTimeout(tasks, idx, {
+  const { unblockActions, timeoutActions, freshInProgress } = planUnblockAndTimeout(sched, idx, {
     timeoutH: (snap.inProgressTimeoutHours != null ? snap.inProgressTimeoutHours : DEFAULT_TIMEOUT_H),
     maxReject: MAX_REJECT_RETRY,
     maxBlock: MAX_BLOCK_RETRY,
@@ -1394,12 +1450,26 @@ Return the ScanResult.`
   // isTerminal over the collapsed working set would UNDERcount and stall forever as 'no-progress'
   // instead of 'complete'. Abort loudly instead.
   if (snap.counts.runtimeTerminalDefault == null || snap.counts.runtimeTerminalOverride == null) {
-    stopReason = 'snapshot-version-skew'
-    return { aborted: true, reason: 'backlog snapshot is missing runtimeTerminal counts — snapshot engine / workflow version skew (or a store adapter emitting a pre-contract snapshot); reinstall acf-whip so both halves match', mode, iteration: iter }
+    // A scoped run counts isTerminal over its own tasks and never reads these, so skew here cannot
+    // mis-measure it — warn instead of aborting, so a slightly stale adapter still permits scoping.
+    if (!scoped) {
+      stopReason = 'snapshot-version-skew'
+      return { aborted: true, reason: 'backlog snapshot is missing runtimeTerminal counts — snapshot engine / workflow version skew (or a store adapter emitting a pre-contract snapshot); reinstall acf-whip so both halves match', mode, iteration: iter }
+    }
+    if (iter === 1) log('WARN snapshot is missing runtimeTerminal counts (snapshot/workflow version skew) — tolerated because this run is scoped, but reinstall acf-whip')
   }
-  const total = snap.counts.total
-  const terminal = mode === 'override' ? snap.counts.runtimeTerminalOverride : snap.counts.runtimeTerminalDefault
-  log(`iter ${iter}: ${terminal}/${total} active terminal (integrated=${snap.counts.integrated}, accepted=${snap.counts.accepted}, blocked=${snap.counts.blocked}, workingSet=${tasks.length})`)
+  // A SCOPED run must measure completion over its own set. snap.counts is store-wide, so reusing it
+  // here would make `terminal === total` unreachable and burn NO_GAIN_LIMIT iterations before exiting
+  // 'no-progress' — silent, slow and expensive. Scoped stems the scanner collapsed as terminal-accepted
+  // are absent from the working set, so they drop out of BOTH sides and stay neutral.
+  const total = scoped ? sched.length : snap.counts.total
+  const terminal = scoped
+    ? sched.filter(isTerminal).length
+    : (mode === 'override' ? snap.counts.runtimeTerminalOverride : snap.counts.runtimeTerminalDefault)
+  // Every scoped task already terminal (or all of them collapsed-accepted) => nothing to do. The
+  // unscoped guard below is `total > 0`, which would spin here instead of stopping.
+  if (scoped && total === 0) { stopReason = 'complete'; break }
+  log(`iter ${iter}: ${terminal}/${total} ${scoped ? 'scoped' : 'active'} terminal (integrated=${snap.counts.integrated}, accepted=${snap.counts.accepted}, blocked=${snap.counts.blocked}, workingSet=${tasks.length}${scoped ? `, scope=${sched.length}` : ''})`)
   // Complete only when 100% terminal AND nothing is queued to unblock — the extra unblock+dispatch
   // pass (retro I5A) keeps a last-iteration-integrated dependency from stranding its blocked dependent.
   if (total > 0 && terminal === total && unblockActions.length === 0) { stopReason = 'complete'; break }
@@ -1425,8 +1495,8 @@ Return the ScanResult.`
   // (unblockActions/timeoutActions/freshInProgress were hoisted above the completion check — retro I5A.)
 
   // reviewers first: completed (premove -> in-review) and lingering in-review (re-review). They claim the slug.
-  const inReview = tasks.filter((t) => t.folder === 'in-review').sort(byPriorityThenStem)
-  const completed = tasks.filter((t) => t.folder === 'completed').sort(byPriorityThenStem)
+  const inReview = sched.filter((t) => t.folder === 'in-review').sort(byPriorityThenStem)
+  const completed = sched.filter((t) => t.folder === 'completed').sort(byPriorityThenStem)
   for (const t of [...inReview, ...completed]) {
     if (codeSlug(t) && !claim(t.slug)) continue
     reviewQ.push({ t, premove: t.folder === 'completed' })
@@ -1434,7 +1504,7 @@ Return the ScanResult.`
 
   // then specialists: in-progress (re-dispatch recovery — FRESH only; stale ones were timed out
   // above) and pending (start), one per free slug.
-  const pending = tasks.filter((t) => t.folder === 'pending').sort(byPriorityThenStem)
+  const pending = sched.filter((t) => t.folder === 'pending').sort(byPriorityThenStem)
   for (const t of [...freshInProgress.slice().sort(byPriorityThenStem), ...pending]) {
     if (t.slug === 'none') {
       if (t.folder === 'pending' && !depsSatisfied(t, idx)) continue
@@ -1448,7 +1518,7 @@ Return the ScanResult.`
   }
 
   // rejection self-heal (writer pre-move): rejected with count < bound -> retry (pending); else -> blocked.
-  const rejected = tasks.filter((t) => t.folder === 'rejected')
+  const rejected = sched.filter((t) => t.folder === 'rejected')
   const rejectActions = rejected.map((t) =>
     (t.rejectionCount < MAX_REJECT_RETRY)
       ? { stem: t.stem, toState: 'pending', agent: 'orchestrator', notes: `retry (rejection ${t.rejectionCount}/${MAX_REJECT_RETRY})`, inc: 0 }
@@ -1696,7 +1766,7 @@ Return the ScanResult.`
   if (mode === 'default') {
     const seenC = new Set()
     const candidates = []
-    for (const t of tasks.filter((t) => t.folder === 'accepted' && codeSlug(t) && !t.hasIntegratedAt && t.hasWorktreeBranch && !parkedThisRun.has(t.stem))) {
+    for (const t of sched.filter((t) => t.folder === 'accepted' && codeSlug(t) && !t.hasIntegratedAt && t.hasWorktreeBranch && !parkedThisRun.has(t.stem))) {
       if (seenC.has(t.stem)) continue
       seenC.add(t.stem); candidates.push(t)
     }
@@ -1784,7 +1854,7 @@ Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}
   finalSnap = snap2 || lastSnapshot
   if (snap2) {
     const idx2 = indexTasks(snap2.tasks || [], snap2.satisfiedDeps)
-    const left = topoIntegrationOrder((snap2.tasks || []).filter((t) => t.folder === 'accepted' && t.slug && t.slug !== 'none' && !t.hasIntegratedAt && t.hasWorktreeBranch && !integratedStems.includes(t.stem)), idx2)
+    const left = topoIntegrationOrder((snap2.tasks || []).filter((t) => t.folder === 'accepted' && t.slug && t.slug !== 'none' && !t.hasIntegratedAt && t.hasWorktreeBranch && !integratedStems.includes(t.stem) && (!runScope || runScope.has(t.stem))), idx2)
     for (const t of left) {
       // single defensive pass: an exit-7 here is intentionally left for the next /go run (no resolver post-loop)
       attemptedIntegrate.add(t.stem)
@@ -1818,6 +1888,7 @@ const { integrated, rejectedAtIntegration, reconciled } = reconcileIntegrationTa
 // loop-breaker intentionally stops re-dispatching them instead of livelocking. Surface them explicitly,
 // with the missing-task hint when the specialist provided one.
 const capParked = ((finalSnap && finalSnap.tasks) || [])
+  .filter((t) => (!runScope || runScope.has(t.stem)))
   .filter((t) => t.folder === 'blocked' && ((t.blockCount || 0) >= MAX_BLOCK_RETRY || (t.rejectionCount || 0) >= MAX_REJECT_RETRY))
   .map((t) => ({ stem: t.stem, blockCount: t.blockCount || 0, rejectionCount: t.rejectionCount || 0, needsTask: parkedNeeds.get(t.stem) || '' }))
 const capParkedStems = new Set(capParked.map((n) => n.stem))
@@ -1827,6 +1898,12 @@ return {
   completed: stopReason === 'complete',
   stopReason, // complete | no-progress | max-iterations | scan-degraded | agent-cap-reached | (aborts return earlier)
   mode,
+  // Run scope (3.2.3). All three are null/empty on an unscoped run. scopeFilter is the operator's raw
+  // words (a natural-language filter resolves to stems in the SKILL, so this is the only record of what
+  // was actually asked for); scopedTo is the seed; scopeResolved is what ran, including deps pulled in.
+  scopeFilter: SCOPE_FILTER || null,
+  scopedTo: ONLY,
+  scopeResolved: runScope ? [...runScope] : null,
   iterations: iter,
   finalCounts,
   integrated,

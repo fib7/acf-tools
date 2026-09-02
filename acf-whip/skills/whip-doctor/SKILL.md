@@ -1,6 +1,6 @@
 ---
 name: whip-doctor
-description: Backlog integrity check for ACF Whip. Scans .backlog/ and the git worktree registry for ~19 invariants (status/folder mismatch, collapsed task files, dangling or cyclic dependencies, missing/duplicate worktree slugs, orphaned worktrees, unknown agents, stray Integrated-At, out-of-range Rejection Count, missing clean-checkout tokens, cross-slug glob overlap, stale in-progress). Reports FATAL/REPAIRABLE/WARN; --fix auto-repairs the REPAIRABLE class. Run it before /go, or any time the backlog looks inconsistent.
+description: Backlog integrity check for ACF Whip. Scans .backlog/ and the git worktree registry for ~20 invariants (status/folder mismatch, collapsed task files, dangling or cyclic dependencies, missing/duplicate worktree slugs, orphaned worktrees, unknown agents, stray Integrated-At, out-of-range Rejection Count, missing clean-checkout tokens, cross-slug glob overlap, stale in-progress). Reports FATAL/REPAIRABLE/WARN; --fix auto-repairs the REPAIRABLE class. Run it before /go, or any time the backlog looks inconsistent.
 argument-hint: "[--fix]"
 allowed-tools:
   - Bash

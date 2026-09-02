@@ -1,6 +1,7 @@
 ---
 name: go
 description: Continuous backlog execution until 100% tasks reach terminal states (accepted/blocked)
+argument-hint: "[task-ids | filter description]"
 allowed-tools:
   - Bash
   - Glob
@@ -12,7 +13,8 @@ allowed-tools:
 
 # /go - Continuous Backlog Execution
 
-Fire-and-forget automation. Processes ENTIRE backlog without manual intervention until 100% complete.
+Fire-and-forget automation. Processes the ENTIRE backlog without manual intervention until 100%
+complete — or, when given arguments, exactly the subset you name (see **Run scope** below).
 
 ## State Machine (User-Specified)
 
@@ -38,6 +40,38 @@ Execute backlog continuously:
 7. Exit only when 100% complete OR user intervention needed.
 
 **CRITICAL**: This command does NOT terminate after one pass. It continues looping until backlog complete AND every accepted worktree is folded into trunk.
+
+## Run scope
+
+`/go` with no arguments drains the whole backlog. With arguments it runs **only** what you name:
+
+```
+/go                            every actionable task (unchanged)
+/go MUL-7.1 MUL-7.2        exactly those two, plus their unmet dependencies
+/go frontend tasks only        everything a frontend agent owns
+/go bugfixes                   the fix/bug tasks
+/go high priority backend      any predicate over the backlog
+```
+
+Both forms resolve to the same thing before launch: a concrete list of task stems
+(`args.only`). Ids go straight through; a natural-language filter is matched against the task
+store in **step 3** below, shown to you, and confirmed once. The orchestrator itself is
+deterministic either way — it never re-interprets your words mid-run, and the set cannot drift.
+
+Three properties worth knowing:
+
+- **Unmet dependencies are pulled in.** A scoped task whose dependency is outside your list would
+  otherwise sit gated forever. The orchestrator adds non-terminal transitive deps and names them in
+  the run log. Dependencies that are already accepted/integrated are left alone.
+- **Everything stays inside the scope.** Out-of-scope tasks are never dispatched, never transitioned,
+  and never integrated — including by the post-loop drain. This is what makes `/go` safe to run
+  against a backlog shared with other people.
+- **Completion is measured over your scope**, not the whole backlog, so a scoped run ends when
+  *your* tasks are done. A stem that does not exist aborts the run instead of quietly running less
+  than you asked for.
+
+The `RunReport` echoes `scopeFilter` (your words), `scopedTo` (what you asked for) and
+`scopeResolved` (what actually ran, including pulled-in dependencies).
 
 ## Integration mode
 
@@ -85,14 +119,49 @@ legacy loop has). Prefer it.
    ```
    If `TRUNK_BRANCH` is empty, STOP — `/go` requires a branch checked out at the repo root.
    The `acfw-store info` line reports the active **task-store backend** (`store`, default `files`),
-   its adapter, and the run-lock path (`runLock`) — pass both through in step 3.
-3. Launch the orchestrator (it runs in the background; bootstrap runs a doctor `--fix` hard gate and
+   its adapter, and the run-lock path (`runLock`) — pass both through in step 4.
+3. **Resolve the run scope** from whatever the user typed after `/go`. Three branches:
+
+   **(a) No arguments** — omit `only` entirely. Full-backlog behaviour, unchanged.
+
+   **(b) The arguments are task ids or stems** (they match the backlog's id/stem shape, e.g.
+   `MUL-7.1`, `add-login-form`) — pass them straight through as `only: ["MUL-7.1", ...]`.
+   No confirmation: the user named exact tasks.
+
+   **(c) Anything else is a filter predicate** — "frontend tasks only", "bugfixes",
+   "high priority backend", "the auth work". Resolve it to a concrete list *here*, before launching:
+   ```bash
+   bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" snapshot --digest
+   ```
+   Match the predicate against the fields the snapshot projects on every backend —
+   `stem` · `id` · `folder` · `slug` · `agent` · `priority` · `deps` · `touchesGlobs`:
+
+   | Predicate | Match on |
+   |---|---|
+   | "frontend tasks" | `agent` (e.g. `frontend-engineer`), `touchesGlobs` (`src/web/**`), `slug` |
+   | "bugfixes" | `stem` (`fix-*`, `bug-*`) — stems are descriptive kebab by convention |
+   | "high priority" / "blockers" | `priority` (blocker \| critical \| high \| medium \| low) |
+   | "the auth work" | `slug`, `stem` |
+
+   There is **no title or body in the snapshot**. If the predicate cannot be decided from these
+   fields, say so and ask for ids rather than guessing. Then **show the matched task list and get one
+   confirmation before launching.** This does not violate the fire-and-forget rule below — that rule
+   forbids interrupting *between tasks*; this is a single check at launch, and a natural-language
+   filter is fuzzy enough that silently committing a long, expensive run to it is worse.
+   **If nothing matches, stop and say so — never fall back to the whole backlog.**
+
+   Scope is resolved **once, at launch**: the workflow receives a fixed stem list, so tasks created
+   while the run is in flight do not join it. Unmet dependencies of a scoped task *are* pulled in
+   automatically by the orchestrator and named in the run log.
+4. Launch the orchestrator (it runs in the background; bootstrap runs a doctor `--fix` hard gate and
    the loop re-checks integrity every iteration):
    ```
    Workflow({
      scriptPath: "<PLUGIN_ROOT>/workflows/whip-go.workflow.js",
      args: { pluginRoot: "<PLUGIN_ROOT>", trunkRoot: "<TRUNK_ROOT>", trunkBranch: "<TRUNK_BRANCH>",
-             mode: "default" | "override", store: "<info.store>", runLockPath: "<info.runLock>" }
+             mode: "default" | "override", store: "<info.store>", runLockPath: "<info.runLock>",
+             // step 3, both branches (b) and (c); OMIT both when the user gave no arguments
+             only: ["<stem-or-id>", ...], scopeFilter: "<the user's words, verbatim>" }
    })
    ```
 
@@ -107,6 +176,13 @@ legacy loop has). Prefer it.
    | `agentBudget` | `8` | Agent ceiling for one harness (enforced inside the child, not advisory). |
    | `agentCap` | `1000` | The run's total agent budget. Drives the FULL → LEAN → DIRECT → CLOSE ladder. |
    | `shellModel` | `haiku` | Model for the deterministic shell-runner agents. |
+
+   **Run-scope args (3.2.3).** Both come from step 3 and are omitted together on a full-backlog run:
+
+   | Arg | Default | Effect |
+   |-----|---------|--------|
+   | `only` | *(none)* | Task stems/ids to run **instead of** the whole backlog. The orchestrator plans, transitions, integrates and counts completion over just these, plus any **unmet dependencies**, which it pulls in and names in the log. An id that does not exist aborts the run rather than silently running a smaller set. |
+   | `scopeFilter` | `""` | The operator's raw words, recorded in the `RunReport` — for a natural-language filter this is the only record of what was actually asked for, since `only` holds the resolved stems. |
    The per-iteration scan runs `acfw-store snapshot --digest` (a small scheduling snapshot — counts +
    actionable tasks + a compact `satisfiedDeps` list, with terminal-accepted tasks collapsed) and
    `whip-doctor --active-only` (full integrity over active folders; accepted fed as cheap stubs), so a
@@ -114,9 +190,11 @@ legacy loop has). Prefer it.
    (scan, the single writer, integrate, bootstrap, drain) run on a fast model; pass an optional
    `shellModel` arg to override it (e.g. pin to the session model for rollback). Specialists, reviewers,
    and conflict-resolvers always run on the session model.
-4. When it completes, report the returned `RunReport` (completed?, iterations, finalCounts,
-   integrated[], stopReason). If it returns `aborted: true` (detached HEAD or an unrepairable FATAL),
-   surface the reason + fatals and STOP. Re-running `/go` is the documented resume — git + the task
+5. When it completes, report the returned `RunReport` (completed?, iterations, finalCounts,
+   integrated[], stopReason). If it returns `aborted: true` (detached HEAD, an unrepairable FATAL, or
+   `stopReason: 'scope-unresolved'` — an id in `only` that matches no task), surface the reason +
+   fatals and STOP. On a scoped run also report `scopeResolved`, so the operator sees which tasks
+   actually ran and which dependencies were pulled in. Re-running `/go` is the documented resume — git + the task
    store (`.backlog/` on the default files backend) are the only durable state.
 
    Also surface `escalation{}` and `agentsUsed`/`agentCap`. They are how an operator tells a fully
@@ -133,6 +211,11 @@ legacy loop has). Prefer it.
 **Only if the `Workflow` tool is NOT available** (dynamic workflows disabled, or older Claude Code):
 run the legacy single-context loop below. It enforces the same doctor gate and slug rules, but the
 loop lives in your context (and grows it).
+
+**Run scope on the legacy path.** That loop is prose you execute, not a script taking args, so a scope
+cannot be threaded into it mechanically. Resolve it exactly as in step 3, then treat the resolved stem
+list — plus any unmet dependencies — as the *entire* backlog for this run: never select, transition or
+integrate a task outside it, and state the resolved list before you begin.
 
 ---
 
@@ -1065,7 +1148,8 @@ See stack-specific quality gates: `docs/development/quality-gates-{stack}.md`
 
 ### ❌ Manual Intervention Per Task
 
-**Never**: Ask user after each task
+**Never**: Ask user after each task (one confirmation at launch for a natural-language scope filter
+is fine and expected — see step 3; what is forbidden is interrupting *between* tasks)
 **Always**: Fire-and-forget until completion or blockage
 
 ### ❌ Skipping Quality Gate Auto-Fix
