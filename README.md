@@ -10,22 +10,22 @@
 
 This repository contains 7 specialized plugins for Agentic Continuous Flow workflows:
 
-### Cognitive Modes (4 plugins)
+### Cognitive Modes (3 plugins)
 
 Specialized cognitive modes that enforce specific thinking patterns and validation approaches:
 
 - **acf-challenger-mode** - Reasoning validation mode with intellectually aggressive logic enforcement
 - **acf-arazor-mode** - Production verification mode with ruthless honesty and zero tolerance for false claims
 - **acf-nitro** - Parallel execution enforcement mode that catches sequential violations and enforces speed optimization
-- **acf-mission-control** - Status line HUD for tracking position, git branch, and context fuel with color-coded indicators. **Accurate cost** as of 1.3.0: prices the session from transcript token usage against the LiteLLM rate table, so models behind a gateway — which Claude Code reports as `$0.00` — bill correctly
 
-### Workflow Tools (3 plugins)
+### Workflow Tools (4 plugins)
 
 Functional tools for ACF workflow automation and convention enforcement:
 
+- **acf-mission-control** - Status line HUD for tracking position, git branch, and context fuel with color-coded indicators. **Accurate cost** as of 1.3.0: prices the session from transcript token usage against the LiteLLM rate table, so models behind a gateway — which Claude Code reports as `$0.00` — bill correctly. **1.3.1** folds in subagent and workflow transcripts (`<transcript>/subagents/`), which were silently excluded and often carry most of the spend
 - **acf-librarian** - Convention enforcement through context injection, auto-initializes organization standards, audits compliance
-- **acf-whip** - Task workflow enforcer with zero tolerance backlog automation from decomposition to acceptance. **Concurrency-safe** as of 1.2.0: tasks declare `Worktree:` and `PR Group:` slugs; `/go` partitions on `Worktree:` and dispatches at most one specialist per slug. Specialists invoke `clean-checkout-before-task` (Step 0) which uses git's worktree branch registry as the lock. No custom locks, daemons, or schedulers. **Pluggable task stores** as of 3.1.0: `.backlog/` files (default), [beads](https://github.com/gastownhall/beads), [multica](https://github.com/multica-ai/multica), or [Linear](https://linear.app) behind an executable adapter contract — third-party backends drop in without forking (`acf-whip/adapters/CONTRACT.md`; mechanics and authoring guide: `acf-whip/adapters/README.md`).
-- **acf-advisor** - Lean `advisor` skill for consulting another LLM (thinking/reasoning mode on by default) via any OpenAI-compatible endpoint. Env-var driven (`LITELLM_API_KEY` / `LITELLM_BASE_URL` / `ADVISOR_MODEL`, with `OPENAI_*` fallbacks). Single uv-run script, stdlib only. Use it for second opinions, design review, or domain expertise outside Claude's strengths.
+- **acf-whip** - Task workflow enforcer with zero tolerance backlog automation from decomposition to acceptance. **Concurrency-safe** as of 1.2.0: tasks declare `Worktree:` and `PR Group:` slugs; `/go` partitions on `Worktree:` and dispatches at most one specialist per slug. Specialists invoke `clean-checkout-before-task` (Step 0) which uses git's worktree branch registry as the lock. No custom locks, daemons, or schedulers. **LP-CAS integration** as of 3.0.0: each accepted task is cherry-picked onto the **live** trunk as a single-parent candidate, co-committed with an in-tree ledger marker and landed by compare-and-swap — the marker's presence on trunk is the sole integration oracle, so metadata cannot diverge from reality and a poison candidate quarantines one task instead of aborting the run. **Pluggable task stores** as of 3.1.0: `.backlog/` files (default), [beads](https://github.com/gastownhall/beads), [multica](https://github.com/multica-ai/multica), or [Linear](https://linear.app) behind an executable adapter contract — third-party backends drop in without forking (`acf-whip/adapters/CONTRACT.md`; mechanics and authoring guide: `acf-whip/adapters/README.md`). **Per-task child workflows** as of 3.2.0: every dispatched unit runs as its own nested workflow, authored per task into a locked, validated skeleton, degrading to single-agent dispatch as the run's agent budget depletes. **Scoped runs** as of 3.2.3: `/go MUL-7.1 MUL-7.2` or `/go frontend tasks only` runs just that slice of the backlog, so a backlog shared by a team is no longer all-or-nothing.
+- **acf-advisor** - `advisor` skill for consulting another LLM (thinking/reasoning mode on by default) via any OpenAI-compatible endpoint, plus `board` — a multi-persona advisory panel composed per decision and run in parallel. Env-var driven (`LITELLM_API_KEY` / `LITELLM_BASE_URL` / `ADVISOR_MODEL`, with `OPENAI_*` fallbacks). Single uv-run script, stdlib only. Use it for second opinions, design review, or domain expertise outside Claude's strengths.
 
 ---
 
@@ -117,8 +117,8 @@ claude plugin validate .
 | **acf-nitro** | Cognitive | Parallel enforcement | Catches sequential execution, calculates time waste, enforces TodoWrite batching |
 | **acf-mission-control** | Functional | Status HUD | Color-coded context tracking (green→yellow→red), git branch display, self-priced session cost (LiteLLM rate table) |
 | **acf-librarian** | Functional | Conventions | Auto-initializes docs/acf/organization.md, audit command, naming enforcement |
-| **acf-whip** | Functional | Workflow automation | Task decomposition, backlog state machine, quality gates, agent generation |
-| **acf-advisor** | Functional | Second-opinion LLM client | OpenAI-compatible endpoint, env-var configured, thinking mode on by default |
+| **acf-whip** | Functional | Workflow automation | Task decomposition, backlog state machine, parallel worktree dispatch, LP-CAS trunk integration, pluggable task stores, scoped runs, quality gates, agent generation |
+| **acf-advisor** | Functional | Second-opinion LLM client | OpenAI-compatible endpoint, env-var configured, thinking mode on by default, multi-persona `board` panel |
 
 ---
 
@@ -130,7 +130,9 @@ claude plugin validate .
 |---------|----------------|---------|
 | `/whip-init` | `--priority=3-level\|5-level`<br>`--coverage=60\|80\|95`<br>`--strict\|--standard`<br>`--with-specialists`<br>`--store=files\|beads\|multica\|linear` | Initialize backlog workflow: creates the task store (`.backlog/` structure on the default files backend; `beads`/`multica`/`linear` configure `ACFW_STORE` in `.acfwhip/config` instead), installs quality gates, generates universal agents + manifests. Use `--with-specialists` to auto-generate stack-specific agents (python-engineer, react-engineer, etc.) |
 | `/task "<scope>"` | Scope description (string) | Decompose scope into atomic backlog tasks. Pure orchestration - analyzes requirements via Perplexity/Context7/Figma, creates tasks following WHAT/WHY style (never HOW), spawns task-engineer agents in parallel |
-| `/go` | None | Continuous backlog execution until 100% complete. Loops through: quality gate auto-fix → scan states → process transitions → **partition pending by `Worktree:` slug → dispatch one specialist per slug (parallel across slugs)** → check completion. Terminal states: accepted/blocked |
+| `/go` | *(none)* = whole backlog<br>`<task-id> [<task-id>...]`<br>or a filter description<br>e.g. `frontend tasks only` | Continuous backlog execution until 100% complete. Loops through: scan states → integrity recheck → process transitions → **partition pending by `Worktree:` slug → dispatch one specialist per slug (parallel across slugs)** → integrate accepted work into trunk (LP-CAS) → check completion. Terminal states: accepted/blocked. **Scoped runs (3.2.3)**: pass task ids, or describe a filter in plain language — it is resolved against the backlog and confirmed before launch. A scoped run touches nothing outside its scope and measures completion over it |
+| `/whip-doctor` | `--fix` (optional) | Backlog + worktree integrity battery (~20 invariants across FATAL/REPAIRABLE/WARN): status-vs-folder mismatch, missing/duplicate worktree slug, dangling or cyclic dependencies, collapsed task files, orphaned worktrees, stale in-progress, and more. Runs automatically as a `/go` startup gate and per-iteration recheck. `--fix` auto-repairs the REPAIRABLE class |
+| `/whip-move` | `<task> <state>`<br>`--reason "..."`<br>`--integrated-at SHA`<br>`--add-dep ID` | Move ONE task between states without hand-editing files. Runs the validated writer, so the folder move, `Status:` sync, transition-log row and commit stay atomic. Use for last-mile reconciliation after a crash; run `/whip-doctor` after |
 | `/research "<topic>"` | Topic description (string) | Conduct research using MCP tools (Perplexity, Context7, Figma). Creates temporal doc `docs/research/YYYYMMDD-topic.md`, generates backlog task from findings |
 | `/retro` | `--focus=<area>` (optional)<br>`--agent=<name>` (optional)<br>`--timeframe=<days>` (optional) | Retrospective analysis of blocked/rejected tasks. Applies Five Whys methodology, identifies systemic issues, creates improvement tasks in `.backlog/pending/` |
 | `/whip-add-agents` | `--backend=go\|python\|nodejs\|rust`<br>`--frontend=react\|nextjs\|vue\|angular`<br>`--data=dagster\|bentoml\|airflow`<br>`--infrastructure=k8s\|docker\|terraform`<br>`--specialized=temporal\|event-bus\|graphql` | Generate specialist agents + manifests from patterns. Auto-detects tech stack if no flags provided. Creates agent implementation (`.claude/agents/`) + comprehensive manifest (`docs/agents/`) with Priority 1/2/3 structure |

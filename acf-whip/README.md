@@ -64,11 +64,35 @@ The `acfw-store` dispatcher resolves the configured backend and routes every rea
 - **Third-party backends without forking**: drop one executable at `.acfwhip/adapters/acfw-store-<name>`, set `ACFW_STORE=<name>`, pass the conformance test (`ADAPTER=<path> bash tests/phase9-store-conformance.test.sh`). Contract, discovery order, JSON shapes and exit codes: `adapters/CONTRACT.md`; architecture, dispatcher mechanics, and an authoring walkthrough: `adapters/README.md`.
 - **What never moves into a backend**: the LP-CAS integration ledger (`.acfwhip/integrated/` in the git tree) — integration truth stays git-native on every store.
 
+### 🧬 Per-task child workflows (3.2.0)
+
+Every dispatched unit runs as its **own nested workflow**, not a single `agent()` call. A
+**workflow-architect** authors that harness for the specific task by filling four marked regions of a
+locked, byte-diffed skeleton (`skills/lib/child-skeleton.js.tmpl`); a 20-check validator rejects a
+defective harness *before* any child agent spawns. The default harness is deliberately shallow —
+checkout → implement → bounded gate loop → adversarial diff review → verify — holding the only three
+mechanisms a script structurally buys over one strong agent: a schema-*observed* advance condition, a
+fresh-context reviewer of the diff, and a durable stage ledger that survives the script throwing.
+
+- **Escalation is a policy, not a guarantee**: the runtime caps total agents per run, so `/go`
+  degrades FULL → LEAN → DIRECT → CLOSE back to verbatim 3.1.0 single-agent dispatch, and the report
+  says which one you got (`escalation{}`, `agentsUsed`/`agentCap`).
+- **Tunable**: `escalate` (default on — set false to revert to 3.1.0 dispatch; reach for this first
+  if a run looks hung), `escalateReview` (default **off**, the only subtractive seam), `maxAmend`,
+  `agentBudget`, `agentCap`, `shellModel`.
+
+### 🎯 Scoped runs (3.2.3)
+
+`/go` is no longer all-or-nothing. `/go MUL-7.1 MUL-7.2` runs exactly those tasks plus their
+unmet dependencies; `/go frontend tasks only` or `/go bugfixes` resolves a natural-language filter
+against the backlog once, before launch, and confirms the matched list with you. Nothing outside the
+scope is dispatched, transitioned or integrated — which is what makes `/go` usable on a backlog a
+whole team shares. See `/go` under Commands Reference.
+
 ### 🔄 Continuous Backlog Execution
 
-`/go` loops until 100% complete:
+`/go` loops until 100% complete — or, when scoped, until every task in the scope is terminal:
 - Processes ALL state transitions each iteration
-- Quality gate auto-fix before processing
 - Parallel agent spawning for independent tasks (one specialist per worktree slug)
 - Dependency-gated dispatch (same-slug needs accepted; cross-slug needs integrated)
 - Autonomous integration into local trunk with specialist-driven conflict resolution
@@ -91,7 +115,7 @@ trunk must stay free of bookkeeping commits. Details: `skills/go/SKILL.md` § In
 
 ### 🩺 Backlog Integrity Doctor
 
-`/whip-doctor [--fix]` is the integrity battery (~18 invariants across FATAL/REPAIRABLE/WARN): status-vs-folder mismatch, missing/empty worktree slug, unknown agent, dangling/cyclic deps, cross-slug dependent dispatched before integration, orphaned worktrees, stale in-progress, and more. It runs automatically as a `/go` startup gate and per-iteration recheck, and at `/task` create-time.
+`/whip-doctor [--fix]` is the integrity battery (~20 invariants across FATAL/REPAIRABLE/WARN): status-vs-folder mismatch, missing/empty worktree slug, unknown agent, dangling/cyclic deps, cross-slug dependent dispatched before integration, orphaned worktrees, stale in-progress, and more. It runs automatically as a `/go` startup gate and per-iteration recheck, and at `/task` create-time.
 
 ### 📦 Worktree Env Hydration
 
@@ -463,25 +487,42 @@ Next step: Run /go
 
 **Usage**:
 ```bash
-/go
+/go                          # every actionable task
+/go MUL-7.1 MUL-7.2      # exactly those, plus their unmet dependencies
+/go frontend tasks only      # a natural-language filter over the backlog
+/go bugfixes
 ```
 
+**Run scope (3.2.3)**: with no arguments `/go` drains the whole backlog. With arguments it runs
+**only** what you name. Task ids/stems pass straight through; a natural-language filter is resolved
+**once, before launch** — matched against the fields the snapshot projects on every backend
+(`agent`, `slug`, `priority`, `stem`, `touchesGlobs`), shown to you, and confirmed — so the
+orchestrator always receives a concrete task list and stays deterministic. Unmet transitive
+dependencies are pulled in and named in the log; already-accepted ones are left alone. Nothing
+outside the scope is dispatched, transitioned or integrated, including by the post-loop drain, which
+is what makes a scoped run safe against a backlog other people are working in. Completion is
+measured over your scope, and an id matching no task aborts the run rather than quietly running
+less than you asked for. The run report echoes `scopeFilter`, `scopedTo` and `scopeResolved`.
+
 **Behavior**:
-- Loops until ALL tasks in terminal states
+- Loops until ALL tasks in terminal states (or, when scoped, all tasks in the scope)
 - Each iteration:
-  - Quality gate auto-fix (stack-specific)
   - Scan ALL states (pending, in-progress, completed, in-review, rejected, blocked)
-  - Process ALL transitions (TodoWrite single call)
-  - Spawn agents in parallel
-  - Check completion
-- Exits: 100% complete OR no progress for 3 iterations
+  - Integrity re-check (`whip-doctor --active-only`)
+  - Process ALL transitions through the single writer
+  - Spawn agents in parallel, one per free worktree slug
+  - Integrate newly-accepted work into trunk (LP-CAS), then check completion
+- Exits: 100% complete, OR 3 consecutive iterations doing no work at all (genuinely stuck — e.g.
+  unsatisfiable dependencies), OR 15 iterations with no *terminal* gain (the perpetual-retry guard)
+- Quality gate auto-fix runs on the **legacy** single-context loop; the workflow orchestrator relies
+  on the per-task harness's own bounded gate loop instead
 
 **State Transitions Processed**:
 - `rejected` → `pending` (retry if <3 attempts, block if ≥3)
 - `blocked` → `pending` (dependencies resolved)
 - `pending` → `in-progress` (specialist agents start)
 - `completed` → `in-review` → `accepted|rejected` (quality-reviewer)
-- `in-progress` → `blocked` (timeout 48h)
+- `in-progress` → `blocked` (stale dispatch; default 8h, set `ACFW_INPROGRESS_TIMEOUT_HOURS` to change)
 
 **Output**: Continuous progress until completion
 
