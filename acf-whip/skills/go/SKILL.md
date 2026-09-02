@@ -46,11 +46,11 @@ Execute backlog continuously:
 `/go` with no arguments drains the whole backlog. With arguments it runs **only** what you name:
 
 ```
-/go                            every actionable task (unchanged)
-/go MUL-7.1 MUL-7.2        exactly those two, plus their unmet dependencies
-/go frontend tasks only        everything a frontend agent owns
-/go bugfixes                   the fix/bug tasks
-/go high priority backend      any predicate over the backlog
+/go                                          every actionable task (unchanged)
+/go api-014-token-refresh ui-021-login-form  exactly those two, plus their unmet dependencies
+/go frontend tasks only                      everything a frontend agent owns
+/go bugfixes                                 the fix/bug tasks
+/go high priority backend                    any predicate over the backlog
 ```
 
 Both forms resolve to the same thing before launch: a concrete list of task stems
@@ -125,7 +125,7 @@ legacy loop has). Prefer it.
    **(a) No arguments** — omit `only` entirely. Full-backlog behaviour, unchanged.
 
    **(b) The arguments are task ids or stems** (they match the backlog's id/stem shape, e.g.
-   `MUL-7.1`, `add-login-form`) — pass them straight through as `only: ["MUL-7.1", ...]`.
+   `api-014-token-refresh`, `add-login-form`) — pass them straight through as `only: ["api-014-token-refresh", ...]`.
    No confirmation: the user named exact tasks.
 
    **(c) Anything else is a filter predicate** — "frontend tasks only", "bugfixes",

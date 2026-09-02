@@ -83,7 +83,7 @@ fresh-context reviewer of the diff, and a durable stage ledger that survives the
 
 ### 🎯 Scoped runs (3.2.3)
 
-`/go` is no longer all-or-nothing. `/go MUL-7.1 MUL-7.2` runs exactly those tasks plus their
+`/go` is no longer all-or-nothing. `/go api-014-token-refresh ui-021-login-form` runs exactly those tasks plus their
 unmet dependencies; `/go frontend tasks only` or `/go bugfixes` resolves a natural-language filter
 against the backlog once, before launch, and confirms the matched list with you. Nothing outside the
 scope is dispatched, transitioned or integrated — which is what makes `/go` usable on a backlog a
@@ -487,10 +487,10 @@ Next step: Run /go
 
 **Usage**:
 ```bash
-/go                          # every actionable task
-/go MUL-7.1 MUL-7.2      # exactly those, plus their unmet dependencies
-/go frontend tasks only      # a natural-language filter over the backlog
-/go bugfixes
+/go                                          # every actionable task
+/go api-014-token-refresh ui-021-login-form  # exactly those, plus their unmet dependencies
+/go frontend tasks only                      # a natural-language filter over the backlog
+/go bugfixes                                 # the fix/bug tasks
 ```
 
 **Run scope (3.2.3)**: with no arguments `/go` drains the whole backlog. With arguments it runs

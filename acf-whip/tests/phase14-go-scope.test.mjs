@@ -55,9 +55,9 @@ const sorted = (set) => [...set].sort()
 
   // -- seed resolution: id, stem and unique prefix all reach the same task --
   {
-    const tasks = [T({ stem: 'add-login-form', id: 'MUL-7.1', folder: 'pending' })]
+    const tasks = [T({ stem: 'add-login-form', id: 'api-014-token-refresh', folder: 'pending' })]
     const idx = indexTasks(tasks, [])
-    check('seed resolves by id', sorted(expandScope(['MUL-7.1'], idx).scope).join() === 'add-login-form')
+    check('seed resolves by id', sorted(expandScope(['api-014-token-refresh'], idx).scope).join() === 'add-login-form')
     check('seed resolves by stem', sorted(expandScope(['add-login-form'], idx).scope).join() === 'add-login-form')
     check('seed resolves by unique prefix', sorted(expandScope(['add-login'], idx).scope).join() === 'add-login-form')
   }

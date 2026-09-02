@@ -19,10 +19,10 @@ which needs a frontier model to write, every time, for work the plugin already d
 **`/go` now takes arguments, in two forms that resolve to one mechanism.**
 
 ```
-/go                            every actionable task (unchanged)
-/go MUL-7.1 MUL-7.2        exactly those, plus their unmet dependencies
-/go frontend tasks only        everything a frontend agent owns
-/go bugfixes                   the fix/bug tasks
+/go                                          every actionable task (unchanged)
+/go api-014-token-refresh ui-021-login-form  exactly those, plus their unmet dependencies
+/go frontend tasks only                      everything a frontend agent owns
+/go bugfixes                                 the fix/bug tasks
 ```
 
 Ids pass straight through. A natural-language filter is matched **in the skill, once, before
