@@ -2,6 +2,78 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.2.3 — /go can be pointed at part of the backlog
+
+`/go` took the whole backlog or nothing. There was no way to say "run these two tasks" — not an
+argument, not an env var, not a config key, not an adapter flag. `skills/go/SKILL.md` was the only
+whip skill with no `argument-hint`, `whip-go.workflow.js` read thirteen args and none of them
+selected tasks, `scan-backlog.sh` parsed three flags, `adapters/CONTRACT.md` had no filter verb, and
+the multica adapter's `cmd_snapshot` says outright that its flags "are hints; a full snapshot is
+always valid". This was never a regression: no revision of the skill or the workflow has ever
+supported it.
+
+The cost was not ergonomic. On a backlog shared by a team, one person's `/go` is everyone's `/go`,
+so people stopped running the shipped orchestrator and hand-authored throwaway workflows instead —
+which needs a frontier model to write, every time, for work the plugin already does.
+
+**`/go` now takes arguments, in two forms that resolve to one mechanism.**
+
+```
+/go                            every actionable task (unchanged)
+/go MUL-7.1 MUL-7.2        exactly those, plus their unmet dependencies
+/go frontend tasks only        everything a frontend agent owns
+/go bugfixes                   the fix/bug tasks
+```
+
+Ids pass straight through. A natural-language filter is matched **in the skill, once, before
+launch** — against the fields every backend's snapshot already projects (`agent`, `slug`,
+`priority`, `stem`, `touchesGlobs`) — then shown to the operator and confirmed. The workflow
+receives a concrete stem list either way, so the orchestrator stays deterministic and the selected
+set cannot drift mid-run. Passing the predicate down and re-evaluating it per iteration would have
+cost an agent call each time and reintroduced exactly the unpredictability that drove people off
+`/go` in the first place. There is no title or body in the snapshot; a predicate that cannot be
+decided from the projected fields asks for ids rather than guessing, and a filter that matches
+nothing stops instead of falling back to the whole backlog.
+
+**The index stays whole; only the scheduling view narrows.** The obvious implementation — filter
+`tasks[]` — is wrong, and quietly so. `tasks[]` is the bounded working set that `indexTasks` builds
+dependency resolution from, and `depsSatisfied` treats an unresolvable dep token as dangling and
+refuses to dispatch (conservative by design, and the doctor FATALs on the same condition). Narrowing
+the array would therefore strand every scoped task that depends on something outside the scope. So
+`idx` is built from the full set and a separate `sched` view feeds the six planning sites — the
+unblock/timeout plan, the in-review, completed, pending and rejected queues, and the integration
+candidates — and nothing else.
+
+**Completion is counted over the scope.** `total`/`terminal` came from `snap.counts`, which is
+store-wide; reusing it for a scoped run makes `terminal === total` unreachable, so the run would
+burn all fifteen `NO_GAIN_LIMIT` iterations and exit `no-progress` having done its work. A scoped
+run counts `isTerminal` over its own tasks, and a scope that is already entirely terminal stops
+immediately rather than spinning past the `total > 0` guard.
+
+**Unmet dependencies are pulled in, terminal ones are not.** `expandScope` walks the seed's
+transitive deps and adds any that are not terminal, so a scoped task cannot sit gated forever behind
+something the operator forgot to name; an accepted-and-integrated dep needs nothing and is left
+alone. Cycles terminate. The pulled-in stems are named in the run log and in `scopeResolved`.
+
+**Nothing outside the scope is touched** — not dispatched, not transitioned, not integrated,
+including by the post-loop drain, and `needsOperator` is filtered to the scope too. That is what
+makes a scoped run safe against a backlog other people are working in. An id matching no task aborts
+the run (`stopReason: 'scope-unresolved'`) instead of silently running less than was asked for.
+
+The `RunReport` carries `scopeFilter` (the operator's words — the only record of a natural-language
+filter, since `only` holds resolved stems), `scopedTo` and `scopeResolved`. With no arguments every
+one of these is null and behaviour is byte-identical to 3.2.2.
+
+Scoping is not a fix for the deeper hazard it makes visible: on a shared non-files backend the run
+lock is still per-checkout and `transition` is still a read-modify-write with no compare-and-swap,
+so two runners can still collide. Scoping reduces the odds by keeping runners out of each other's
+tasks; the `atomic-claim` capability named in `CONTRACT.md` remains unimplemented.
+
+New suite `tests/phase14-go-scope.test.mjs` (37 assertions) covers `expandScope` through the same
+`<scheduler-pure>` extraction phase2 uses, and guards the wiring structurally — the two ways this
+feature breaks silently are a planning site reverting to `tasks` and completion reverting to
+`snap.counts`, neither of which fails visibly at runtime.
+
 ## 3.2.2 — the transition writer stops destroying the task it is moving
 
 A `/go` run aborted at iteration 4 with two FATALs about missing metadata fields. The task file

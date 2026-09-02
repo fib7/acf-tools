@@ -36,6 +36,7 @@ phase4-scan-degrade
 phase5-streaming
 phase10-child-skeleton
 phase11-escalation
+phase14-go-scope
 "
 
 TOTAL_PASS=0 TOTAL_FAIL=0 FAILED_SUITES="" SKIPPED=""
