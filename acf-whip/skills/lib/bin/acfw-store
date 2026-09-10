@@ -146,16 +146,28 @@ case "$SUB" in
     # (graph + git/worktree invariants computed from the snapshot). One report, one
     # recomputed SUMMARY; exit 0 iff no FATAL remains.
     MERGED=$(mktemp "${TMPDIR:-/tmp}/acfw-doc-merge.XXXXXX") || exit 2
-    trap 'rm -f "$MERGED"' EXIT
+    ADOUT=$(mktemp "${TMPDIR:-/tmp}/acfw-doc-adapter.XXXXXX") || exit 2
+    trap 'rm -f "$MERGED" "$ADOUT"' EXIT
+    # A battery that could NOT RUN is not a battery that found nothing. Both halves below used to
+    # discard that distinction — the adapter's status was the pipe's (i.e. grep's), and a failed
+    # snapshot became a WARN — so an unreachable backend, an expired token or a crashed adapter
+    # produced fatal=0 ok=true exit 0, and /go's startup HARD GATE dispatched against a board nobody
+    # had read. Absence of findings is not health; say so with a FATAL, which is what gates on.
     if has_cap doctor; then
-      "$ADAPTER" doctor "$@" | grep -E '^(FATAL|REPAIRABLE|WARN)\|' >> "$MERGED" || true
+      "$ADAPTER" doctor "$@" > "$ADOUT"; ADRC=$?
+      grep -E '^(FATAL|REPAIRABLE|WARN)\|' "$ADOUT" >> "$MERGED" || true
+      # Contract: exit 0 = ok, 1 = FATAL findings (already captured above as lines). Anything else is
+      # a typed failure (5 backend unavailable, 6 auth, 99 transient, ...) — the battery did not run.
+      if [ "$ADRC" -gt 1 ]; then
+        printf 'FATAL|doctor-unavailable|-|the %s adapter doctor could not run (exit %s) — findings are UNKNOWN, not absent; fix the backend and re-run\n' "$STORE" "$ADRC" >> "$MERGED"
+      fi
     fi
     SNAP=$(bash "$SCRIPT_DIR/acfw-store" snapshot 2>/dev/null || true)
     if [ -n "$SNAP" ]; then
       printf '%s\n' "$SNAP" | bash "$LIB_DIR/bin/acfw-doctor-generic.sh" "$REPO_ROOT" \
         | grep -E '^(FATAL|REPAIRABLE|WARN)\|' >> "$MERGED" || true
     else
-      printf 'WARN|snapshot-unavailable|-|doctor generic battery skipped: snapshot failed\n' >> "$MERGED"
+      printf 'FATAL|snapshot-unavailable|-|the generic graph/git battery could not run: the %s snapshot failed — the graph invariants (dangling/cyclic deps, duplicate ids, cross-slug integration) are UNVERIFIED\n' "$STORE" >> "$MERGED"
     fi
     awk -F'|' '
       /^(FATAL|REPAIRABLE|WARN)\|/ { print; sev[$1]++; code[$2]++ }

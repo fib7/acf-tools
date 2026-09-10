@@ -63,7 +63,7 @@ bash .../whip-move.sh docs-010-journey-docs-truth accepted --integrated-at 9f3c2
 Always run `/whip-doctor` to confirm the backlog is consistent:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh"
+bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" doctor
 ```
 
 `/whip-move` is for **one** task at a time. For bulk progress, use `/go`.

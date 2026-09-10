@@ -341,7 +341,7 @@ After all task-engineer agents complete, spawn ONE MORE agent to verify:
 - Validate file naming conventions
 - **Verify every code-mutating task has a kebab-case `Worktree:` slug (never empty, never equal to
   the task id), a `PR Group:`, and `Touches Globs:`; non-code tasks must use `Worktree: none` and
-  `Touches Globs: none`. Run the doctor as the final check: `bash ${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh "$(git rev-parse --show-toplevel)"` — fix any FATAL before exit.**
+  `Touches Globs: none`. Run the doctor as the final check: `bash ${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store doctor` — fix any FATAL before exit.**
 
 **Deliverable**:
 Validation report confirming tasks are ready for execution.

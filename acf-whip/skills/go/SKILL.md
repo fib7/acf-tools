@@ -280,9 +280,13 @@ echo "🌳 Trunk: $ACFW_TRUNK_BRANCH @ $ACFW_TRUNK_SHA_AT_START"
 Before the loop, run the integrity doctor as a **HARD GATE** over the ACTIVE backlog. The `--fix` pass self-heals the REPAIRABLE class first — including **deriving a missing `Worktree:` slug** for any active code task, so a pre-2.0.0 backlog dispatches instead of hard-failing. Only a remaining **FATAL** aborts. Findings on `accepted/` tasks are **advisory (WARN), never blocking**: an accepted task is terminal / out of the dispatch path, so a missing slug or stale `Status:` there does not gate the run.
 
 ```bash
-DOCTOR="${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh"
-bash "$DOCTOR" --fix "$ACFW_TRUNK_ROOT" >/dev/null 2>&1 || true   # self-heal REPAIRABLE (incl. derive missing slugs)
-if ! REPORT=$(bash "$DOCTOR" --quiet "$ACFW_TRUNK_ROOT"); then
+# Always the dispatcher, never a battery by path: the batteries are per-backend and the `files` one
+# refuses to run against another store (see /whip-doctor). This loop is files-only for other reasons,
+# but the doctor call has no reason to be the thing that hardcodes it.
+export ACFW_TRUNK_ROOT
+DOCTOR="${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store"
+bash "$DOCTOR" doctor --fix >/dev/null 2>&1 || true   # self-heal REPAIRABLE (incl. derive missing slugs)
+if ! REPORT=$(bash "$DOCTOR" doctor --quiet); then
   echo "❌ FATAL: backlog integrity gate failed. /go will not dispatch against an inconsistent backlog." >&2
   echo "$REPORT" | grep '^FATAL' >&2
   echo "Fix the FATAL findings (active-task errors: dangling/cyclic deps, status-folder mismatch) and re-run /go." >&2
@@ -451,7 +455,7 @@ done
 At the top of each iteration, re-run the doctor (report only — repairs were applied at the pre-loop gate). A FATAL introduced mid-run (e.g. a task-engineer retry that produced a cycle, or a half-applied transition after a crash) aborts the loop rather than dispatching against inconsistent state.
 
 ```bash
-if ! REPORT=$(bash "${CLAUDE_PLUGIN_ROOT}/skills/whip-doctor/bin/doctor.sh" --quiet "$ACFW_TRUNK_ROOT"); then
+if ! REPORT=$(ACFW_TRUNK_ROOT="$ACFW_TRUNK_ROOT" bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" doctor --quiet); then
   echo "❌ FATAL: integrity violation detected mid-run. Aborting before dispatch." >&2
   echo "$REPORT" | grep '^FATAL' >&2
   exit 1

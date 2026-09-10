@@ -119,6 +119,17 @@ for a in adapters/*/acfw-store-*; do
     printf '  %-34s FAIL  (syntax error or not chmod +x)\n' "$(basename "$a")"; STATIC_FAIL=1
   fi
 done
+# No skill may INVOKE a per-backend battery by path. doctor.sh is the `files` engine and now refuses
+# on any other store, so a skill that shells out to it directly hands non-files operators a hard
+# refusal where the dispatcher would have produced a real report. Matches `bash .../doctor.sh` only —
+# prose references and the whip-init existence probe (`[ -f ... ]`) are legitimate.
+BYPATH=$(grep -rn 'bash "\?\${\?CLAUDE_PLUGIN_ROOT}\?/skills/whip-doctor/bin/doctor\.sh' skills/ 2>/dev/null || true)
+if [ -z "$BYPATH" ]; then
+  printf '  %-34s ok    (no skill invokes a battery by path)\n' 'doctor-entrypoint'
+else
+  printf '  %-34s FAIL  (invoke via skills/lib/bin/acfw-store doctor)\n' 'doctor-entrypoint'
+  printf '%s\n' "$BYPATH" | sed 's/^/      /'; STATIC_FAIL=1
+fi
 if node --check skills/lib/bin/acfw-child-validate.mjs 2>/dev/null; then
   printf '  %-34s ok    (syntax)\n' 'acfw-child-validate.mjs'
 else

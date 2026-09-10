@@ -60,7 +60,7 @@ case "${1:-}" in
   capabilities) printf '%s\n' "${STUB_CAPS:?}" ;;
   snapshot)     if [ -n "${STUB_SNAPSHOT:-}" ]; then printf '%s\n' "$STUB_SNAPSHOT"
                 else printf '{"tasks":[],"counts":{"pending":0}}\n'; fi ;;
-  doctor)       printf '%s\n' "${STUB_DOCTOR:-SUMMARY|fatal=0|repairable=0|warn=0|ok=true}" ;;
+  doctor)       printf '%s\n' "${STUB_DOCTOR:-SUMMARY|fatal=0|repairable=0|warn=0|ok=true}"; exit "${STUB_DOCTOR_RC:-0}" ;;
   transition)   shift; printf 'ok: stub transition %s\n' "$*" ;;
   *)            printf '{"stub":true}\n' ;;
 esac
@@ -177,6 +177,55 @@ bash "$STORE" create --file "$REPO/disp-001-t1.md" >/dev/null && rm "$REPO/disp-
 bash "$STORE" transition disp-001-t1 in-progress >/dev/null
 SNAP=$(bash "$STORE" snapshot --counts-only)
 check "dispatcher routes files backend end-to-end" "printf '%s' \"\$SNAP\" | grep -q '\"store\":\"files\"' && printf '%s' \"\$SNAP\" | grep -q '\"in-progress\":1'"
+
+# ---- a battery that COULD NOT RUN must not read as a battery that found nothing -------------------
+# Both halves of the non-doctor-complete merge used to discard failure. The adapter's exit status was
+# the pipe's (grep's), and a failed snapshot became a WARN — so an unreachable backend, an expired
+# token or a crashed adapter yielded fatal=0 ok=true exit 0, and /go's startup HARD GATE dispatched
+# against a board nobody had read. Reproduced live against multica with no server configured.
+# Line 158 removed the config to exercise the files backend; re-select the stub, because the merge
+# path under test only runs for an adapter WITHOUT doctor-complete (files declares it and execs
+# doctor.sh directly, so leaving the store as files would make every assertion below vacuous).
+printf 'ACFW_STORE=stub\n' > .backlog/.acfw-config
+check "store re-selected to the stub (guards against vacuous assertions below)" "bash \"\$STORE\" info | grep -q '\"store\":\"stub\"'"
+export STUB_CAPS='{"backend":"stub","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition","doctor"]}'
+export STUB_SNAPSHOT='{"tasks":[],"counts":{"pending":0},"raw":true}'
+
+# Baseline: a healthy adapter still passes, or the assertions below prove nothing.
+unset STUB_DOCTOR_RC
+D_OK=$(bash "$STORE" doctor 2>/dev/null); D_OK_RC=$?
+check "healthy adapter doctor: ok=true, exit 0" "[ \$D_OK_RC -eq 0 ] && printf '%s' \"\$D_OK\" | grep -q 'ok=true'"
+
+# Contract exit 1 = 'ran, found FATALs'. Those are real findings, not a could-not-run.
+export STUB_DOCTOR='FATAL|some-real-defect|t1|a genuine finding'
+STUB_DOCTOR_RC=1 D_F=$(bash "$STORE" doctor 2>/dev/null) || true
+check "adapter exit 1 (FATAL findings) is NOT reported as doctor-unavailable" "! printf '%s' \"\$D_F\" | grep -q 'doctor-unavailable'"
+
+# Contract exit 5 = backend unavailable. The battery did not run.
+export STUB_DOCTOR='' STUB_DOCTOR_RC=5
+D_U=$(bash "$STORE" doctor 2>/dev/null); D_U_RC=$?
+check "adapter that could not run -> FATAL|doctor-unavailable" "printf '%s' \"\$D_U\" | grep -q '^FATAL|doctor-unavailable|'"
+check "adapter that could not run -> ok=false" "printf '%s' \"\$D_U\" | grep -q 'ok=false'"
+check "adapter that could not run -> exit 1 (the gate refuses)" "[ \$D_U_RC -eq 1 ]"
+check "the finding names the adapter exit code" "printf '%s' \"\$D_U\" | grep -q 'exit 5'"
+
+# A snapshot the dispatcher cannot obtain means the GRAPH invariants are unverified, not clean.
+unset STUB_DOCTOR_RC; export STUB_DOCTOR='SUMMARY|fatal=0|repairable=0|warn=0|ok=true'
+cat > "$WORK/nosnap" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  capabilities) printf '%s\n' "$STUB_CAPS" ;;
+  snapshot)     echo "backend unreachable" >&2; exit 5 ;;
+  doctor)       printf 'SUMMARY|fatal=0|repairable=0|warn=0|ok=true\n' ;;
+  *)            printf '{"stub":true}\n' ;;
+esac
+EOF
+chmod +x "$WORK/nosnap"; cp "$WORK/nosnap" "$WORK/override/acfw-store-stub"
+D_S=$(ACFW_STORE_ADAPTER_PATH="$WORK/override" bash "$STORE" doctor 2>/dev/null); D_S_RC=$?
+check "unobtainable snapshot -> FATAL|snapshot-unavailable (was WARN)" "printf '%s' \"\$D_S\" | grep -q '^FATAL|snapshot-unavailable|'"
+check "unobtainable snapshot -> ok=false, exit 1" "[ \$D_S_RC -eq 1 ] && printf '%s' \"\$D_S\" | grep -q 'ok=false'"
+check "the finding says the graph invariants are UNVERIFIED" "printf '%s' \"\$D_S\" | grep -q 'UNVERIFIED'"
+unset STUB_DOCTOR STUB_SNAPSHOT
 
 echo
 echo "phase9-dispatcher: $PASS passed, $FAIL failed"
