@@ -59,8 +59,15 @@ check('scan-degraded path breaks the loop (falls through to Drain)', (() => {
   return i > 0 && text.slice(i, i + 400).includes('break')
 })())
 check('schema-less text fallback is attempted before degrading', text.includes('textScanFallback('))
+// A GENUINE mid-run FATAL stays a hard abort. The gate now also distinguishes a doctor that could
+// not RUN (typed doctor-unavailable / snapshot-unavailable findings) from a board that is known-bad,
+// so both branches are asserted: the abort must survive, and it must not swallow the new one.
 check('mid-run integrity FATAL is STILL a hard abort (genuine, not transient)',
-  text.includes("stopReason = 'integrity-fatal-midrun'") && text.includes("aborted: true, reason: 'integrity FATAL detected mid-run"))
+  text.includes("'integrity-fatal-midrun'") && text.includes("'integrity FATAL detected mid-run"))
+check('a doctor that could not RUN aborts under its own stop reason, not the integrity one',
+  text.includes("'doctor-unavailable-midrun'") && text.includes('could not RUN'))
+check('the distinction is computed, not assumed (doctorVerdict gates both branches)',
+  /const v2? = doctorVerdict\(scan\.doctorFatals\)/.test(text))
 check('drain falls back to lastSnapshot when its own scan cannot emit (BUG-6a)',
   text.includes('if (!snap2) snap2 = lastSnapshot'))
 check('drain excludes stems already integrated this run (stale-snapshot guard)',

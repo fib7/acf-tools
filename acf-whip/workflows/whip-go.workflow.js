@@ -138,6 +138,19 @@ const MAX_BLOCK_RETRY = 3 // per-task re-block cap (retro I2): a task whose spec
 const DEFAULT_TIMEOUT_H = 8 // in-progress -> blocked fallback when the snapshot omits inProgressTimeoutHours
 const PRIORITY_RANK = { blocker: 0, critical: 1, high: 2, medium: 3, low: 4 }
 const prank = (p) => (p in PRIORITY_RANK ? PRIORITY_RANK[p] : 5)
+
+// The doctor now reports a battery that COULD NOT RUN as a typed FATAL rather than as silence
+// (acfw-store: doctor-unavailable / snapshot-unavailable). Both gates below used to model the
+// doctor's outcome as one boolean and tell the operator the backlog was inconsistent — a
+// misdiagnosis that sends them to /whip-doctor to fix findings that were never produced. Separate
+// "the board is broken" from "nobody could read the board", and name the remedy for the second.
+const UNAVAILABLE_RE = /^FATAL\|(doctor|snapshot)-unavailable\|/
+const doctorVerdict = (fatals) => {
+  const list = Array.isArray(fatals) ? fatals : []
+  const blocked = list.filter((f) => UNAVAILABLE_RE.test(String(f)))
+  if (!blocked.length || blocked.length !== list.length) return { reported: true }
+  return { reported: false, why: blocked.map((f) => String(f).split('|').slice(3).join('|')).join(' · ') }
+}
 const byPriorityThenStem = (a, b) => (prank(a.priority) - prank(b.priority)) || (a.stem < b.stem ? -1 : a.stem > b.stem ? 1 : 0)
 
 // ============================ schemas ============================
@@ -1233,7 +1246,11 @@ async function runAuthoredUnit(ctx) {
         const msg = String((threw && threw.message) || threw)
         // Environment kill switch (an older runtime, a name-only workflow policy, no workflow hook):
         // probe by DOING — one throw, then verbatim 3.1.0 for the rest of the run.
-        if (/named bundled workflows|nesting is limited|is not a function|not available in this build|unknown workflow/i.test(msg)) {
+        // 'named workflows' is the TOP-LEVEL tool's wording, 'named bundled workflows' is in-script
+        // workflow()'s — the two diverge, so both must be here or a copy from either side stops
+        // matching. The trailing alternatives are permission REFUSALS: not a missing capability, but
+        // also not something a repair round can converge on, so probe-by-doing and fall back once.
+        if (/named (bundled )?workflows|nesting is limited|is not a function|not available in this build|unknown workflow|script path this tool returned|outside the readable set|requested permissions|permission denied/i.test(msg)) {
           ESCALATE = false
           log(`↷ escalation disabled for this run — workflow() unavailable here (${msg.slice(0, 140)})`)
           esc.fellBack++; return { via: 'legacy', why: 'workflow() unavailable', prior }
@@ -1288,7 +1305,10 @@ if (boot.detached) {
   return { aborted: true, reason: 'detached HEAD at trunk root; /go requires a branch checked out at the repo root', mode }
 }
 if (!boot.doctorOk) {
-  return { aborted: true, reason: 'backlog integrity gate failed; will not dispatch against an inconsistent backlog', mode, doctorSummary: boot.doctorSummary, fatals: boot.fatals }
+  const v = doctorVerdict(boot.fatals)
+  return v.reported
+    ? { aborted: true, reason: 'backlog integrity gate failed; will not dispatch against an inconsistent backlog', mode, doctorSummary: boot.doctorSummary, fatals: boot.fatals }
+    : { aborted: true, reason: `the backlog integrity gate could not RUN, so the board is unverified rather than known-bad — nothing was dispatched. ${v.why}. Fix the store backend (credentials, connectivity, \`acfw-store info\`) and re-run /go; /whip-doctor will not help until the store is reachable.`, mode, doctorUnavailable: true, doctorSummary: boot.doctorSummary, fatals: boot.fatals }
 }
 log(`bootstrap ok — ${boot.doctorSummary}`)
 
@@ -1377,8 +1397,9 @@ Return the ScanResult.`
   // (unrepairable integrity) -> abort before dispatch. A non-emit/garbled echo is NOT genuine and is
   // handled below by parse-fallback + degrade (BUG-1), never by aborting the whole run.
   if (scan && !scan.doctorOk) {
-    stopReason = 'integrity-fatal-midrun'
-    return { aborted: true, reason: 'integrity FATAL detected mid-run; aborting before dispatch', mode, iteration: iter, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
+    const v = doctorVerdict(scan.doctorFatals)
+    stopReason = v.reported ? 'integrity-fatal-midrun' : 'doctor-unavailable-midrun'
+    return { aborted: true, reason: v.reported ? 'integrity FATAL detected mid-run; aborting before dispatch' : `the mid-run integrity recheck could not RUN — the board is unverified, not known-bad. ${v.why}`, mode, iteration: iter, doctorUnavailable: !v.reported, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
   }
 
   let snap = null
@@ -1389,8 +1410,9 @@ Return the ScanResult.`
     log(`iter ${iter}: snapshot JSON unparseable — re-scanning once`)
     scan = await safeAgent(scanPrompt, { label: `scan#${iter}:retry`, phase: 'Iterate', schema: SCAN_RESULT, model: SHELL_MODEL }, () => null)
     if (scan && !scan.doctorOk) {
-      stopReason = 'integrity-fatal-midrun'
-      return { aborted: true, reason: 'integrity FATAL detected mid-run (on scan retry); aborting before dispatch', mode, iteration: iter, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
+      const v2 = doctorVerdict(scan.doctorFatals)
+      stopReason = v2.reported ? 'integrity-fatal-midrun' : 'doctor-unavailable-midrun'
+      return { aborted: true, reason: v2.reported ? 'integrity FATAL detected mid-run (on scan retry); aborting before dispatch' : `the mid-run integrity recheck could not RUN (on scan retry) — the board is unverified, not known-bad. ${v2.why}`, mode, iteration: iter, doctorUnavailable: !v2.reported, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
     }
     if (scan) { try { snap = JSON.parse(scan.snapshotJson) } catch (e) { snap = null } }
   }

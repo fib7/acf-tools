@@ -38,6 +38,7 @@ phase10-child-skeleton
 phase11-escalation
 phase14-go-scope
 phase15-first-run-autoreject
+phase16-gate-legibility
 "
 
 TOTAL_PASS=0 TOTAL_FAIL=0 FAILED_SUITES="" SKIPPED=""
