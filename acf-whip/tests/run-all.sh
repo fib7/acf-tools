@@ -120,6 +120,27 @@ for a in adapters/*/acfw-store-*; do
     printf '  %-34s FAIL  (syntax error or not chmod +x)\n' "$(basename "$a")"; STATIC_FAIL=1
   fi
 done
+# The legacy loops in the SKILL.md files are shell a model executes verbatim, and they are the ONLY
+# path when the Workflow tool is unavailable or refused — so they must run on the oldest bash we
+# support. macOS ships 3.2, where `declare -A` fails outright with "declare: -A: invalid option" and
+# takes the whole loop with it. Also catch an array that is appended to but never read: DIRECT_DISPATCH
+# was collected and never consumed, silently dropping every non-code task from every iteration.
+SH_FAIL=0
+BASH4=$(grep -rn 'declare -A' skills/*/SKILL.md 2>/dev/null | grep -v '^\s*#' | grep -v 'declare -A` is a bash 4' || true)
+if [ -n "$BASH4" ]; then
+  printf '  %-34s FAIL  (bash 4 syntax; macOS ships 3.2)\n' 'skill-shell-portability'
+  printf '%s\n' "$BASH4" | sed 's/^/      /'; SH_FAIL=1
+fi
+for v in DISPATCH_QUEUE DIRECT_DISPATCH; do
+  W=$(grep -c "$v+=(" skills/go/SKILL.md 2>/dev/null || echo 0)
+  R=$(grep -c "\${$v\[@\]" skills/go/SKILL.md 2>/dev/null || echo 0)
+  if [ "$W" -gt 0 ] && [ "$R" -eq 0 ]; then
+    printf '  %-34s FAIL  (%s is appended to but never read)\n' 'skill-shell-portability' "$v"; SH_FAIL=1
+  fi
+done
+[ "$SH_FAIL" -eq 0 ] && printf '  %-34s ok    (bash 3.2 safe; no write-only arrays)\n' 'skill-shell-portability'
+[ "$SH_FAIL" -eq 0 ] || STATIC_FAIL=1
+
 # Workflow launch identity, checked in BOTH directions. A skill launching `acf-whip:<x>` that no
 # workflow `meta` declares fails exactly like the plugin-cache scriptPath it replaced — silently, at
 # the moment a user runs /go. The reciprocal check is the one with teeth: it fails when someone

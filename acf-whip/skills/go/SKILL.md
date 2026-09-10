@@ -373,6 +373,17 @@ acfw_apply_result() {
   transition=$(echo "$result" | sed -nE 's/^[[:space:]]*transition:[[:space:]]*([a-z]+).*/\1/p')
   reject_inc=$(echo "$result" | sed -nE 's/^[[:space:]]*rejection_increment:[[:space:]]*([0-9]+).*/\1/p')
   notes=$(echo "$result" | sed -nE 's/^[[:space:]]*notes:[[:space:]]*(.*)/\1/p')
+  # A NON-CODE task works in the root tree and never commits. Its deliverable_files are committed by
+  # THIS call or not at all: the next clean-checkout stashes the root tree and the work is gone. The
+  # workflow path stages them (safeStagePaths); this path used to drop them on the floor. Same refusal
+  # set as apply-transition.sh and the acfw-store dispatcher — no empty, absolute, .., or state paths.
+  STAGE_ARGS=()
+  for dfile in $(echo "$result" | sed -nE 's/^[[:space:]]*deliverable_files:[[:space:]]*(.*)/\1/p' | tr ',[]"' '    '); do
+    case "$dfile" in
+      ""|/*|*..*|.backlog/*|.acfwhip/*) [ -n "$dfile" ] && echo "WARN: refusing --stage path '$dfile'" >&2; continue ;;
+    esac
+    [ -e "$dfile" ] && STAGE_ARGS+=(--stage "$dfile")
+  done
   case "$transition" in
     completed) new_state=completed ;;
     blocked)   new_state=blocked   ;;
@@ -382,6 +393,7 @@ acfw_apply_result() {
   esac
   [ "$reject_inc" = "1" ] && [ "$transition" = "rejected" ] && inc=1
   bash "${CLAUDE_PLUGIN_ROOT}/skills/go/bin/apply-transition.sh" \
+    ${STAGE_ARGS[@]+"${STAGE_ARGS[@]}"} \
     "$task_file" "$new_state" "${ASSIGNED_AGENT:-orchestrator}" "$notes" "$inc"
   rc=$?
   # Exit 4 = the task document is collapsed (no ID/Status): nothing was moved or committed.
@@ -683,15 +695,22 @@ TodoWrite({
 Implementation in shell:
 
 ```bash
-declare -A IN_PROGRESS_SLUGS
+# bash 3.2 throughout — macOS ships 3.2 and `declare -A` is a bash 4 feature that fails there with
+# "declare: -A: invalid option", taking the whole legacy loop with it. Newline-delimited string sets
+# with `grep -qxF` are the portable equivalent, and are what doctor.sh uses for the same job.
+IN_PROGRESS_SLUGS=""
 for f in .backlog/in-progress/*.md; do
   [ -f "$f" ] || continue
   slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
-  [ -n "$slug" ] && IN_PROGRESS_SLUGS["$slug"]=1
+  [ -n "$slug" ] && IN_PROGRESS_SLUGS="$IN_PROGRESS_SLUGS$slug
+"
 done
 
-declare -a DISPATCH_QUEUE
-declare -A SEEN_SLUGS
+DISPATCH_QUEUE=()
+DIRECT_DISPATCH=()   # non-code tasks (Worktree: none). This array was appended to and never READ,
+                     # so every research/docs task was silently dropped from every iteration and sat
+                     # in pending/ forever — the loop could never terminalize it. Consumed in 4b-bis.
+SEEN_SLUGS=""
 for f in $(ls -1 .backlog/pending/*.md 2>/dev/null | sort); do
   slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
   if [ "$slug" = "none" ]; then DIRECT_DISPATCH+=("$f"); continue; fi   # research/docs-only: dispatch directly, no worktree, no clean-checkout
@@ -702,13 +721,14 @@ for f in $(ls -1 .backlog/pending/*.md 2>/dev/null | sort); do
     echo "WARN: $(basename "$f") has an empty Worktree: slug. Run /whip-doctor; this is a FATAL integrity violation." >&2
     continue
   fi
-  [ -n "${IN_PROGRESS_SLUGS[$slug]:-}" ] && continue   # group already busy
-  [ -n "${SEEN_SLUGS[$slug]:-}" ] && continue   # already picked one task from this group this iteration
+  printf '%s' "$IN_PROGRESS_SLUGS" | grep -qxF "$slug" && continue   # group already busy
+  printf '%s' "$SEEN_SLUGS" | grep -qxF "$slug" && continue   # already picked one task from this group this iteration
   # Apply dependency-gating rule (see Step 3): skip if any dep unsatisfied.
   # Cross-slug dep needs its ledger marker on trunk; same-slug dep needs accepted/.
   deps_ok=$(./.claude/skills/go/check-deps.sh "$f")  # conceptual; real impl inlines the check
   [ "$deps_ok" != "ok" ] && continue
-  SEEN_SLUGS["$slug"]=1
+  SEEN_SLUGS="$SEEN_SLUGS$slug
+"
   DISPATCH_QUEUE+=("$f")
 done
 ```
@@ -769,6 +789,43 @@ Agent 3 (Worktree: gamma): quality-reviewer (same rules; transition is accepted 
 After all Task() calls return, the orchestrator parses each agent's ACFW-RESULT marker and calls `acfw_apply_result` to perform the corresponding `.backlog/` move at root (in-progress→completed, or accepted→rejected, etc.).
 
 **Within-group serialization**: tasks sharing a slug are NOT dispatched in the same iteration; they wait until the in-progress task in their slug terminates.
+
+### Step 4b-bis: Dispatch the non-code tasks (`Worktree: none`)
+
+`DIRECT_DISPATCH` holds the tasks the partition set aside: research, docs, retro — no worktree, no
+clean-checkout, no branch. They are **not** subject to slug serialization (they have no slug), so all
+of them dispatch every iteration alongside 4b. Skipping this step is a livelock: a non-code task that
+is never dispatched is never terminalized, and the loop cannot reach 100%.
+
+Pre-move exactly as 4b does, then dispatch:
+
+```bash
+for f in ${DIRECT_DISPATCH[@]+"${DIRECT_DISPATCH[@]}"}; do
+  fname=$(basename "$f")
+  TS=$(date -u +"%Y-%m-%d %H:%M:%S")
+  printf '| %s | pending | in-progress | orchestrator | dispatch |\n' "$TS" >> "$f"
+  mv "$f" "$ACFW_TRUNK_ROOT/.backlog/in-progress/$fname"
+  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" add ".backlog/pending/$fname" ".backlog/in-progress/$fname"
+  git_with_lock_backoff -C "$ACFW_TRUNK_ROOT" commit -m "task: $fname pending -> in-progress" --quiet
+done
+```
+
+Their agent works in the **root tree** and does not commit, so its `ACFW-RESULT` marker MUST list
+every file it created or changed:
+
+```markdown
+Agent (Worktree: none): research-agent
+  TASK_FILE=$ACFW_TRUNK_ROOT/.backlog/in-progress/research-007.md
+  Rules: do NOT run clean-checkout and do NOT create a worktree; work in the
+  repo root; do NOT move the task file. End with the ACFW-RESULT marker, and
+  list EVERY file you created or modified outside .backlog/ in
+  deliverable_files — repo-relative. A file you do not list is never
+  committed, and the next clean-checkout stashes it away permanently.
+```
+
+`acfw_apply_result` turns `deliverable_files` into `--stage` flags, so the deliverables are committed
+in the same commit as the state move — the earliest possible moment, which is the narrowest window in
+which a concurrent checkout can destroy them.
 
 ### Agent Type Selection
 
