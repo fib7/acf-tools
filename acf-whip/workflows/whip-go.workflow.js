@@ -1348,6 +1348,7 @@ let noGain = 0 // consecutive iterations with no terminal gain (perpetual futile
 let prevTerminal = -1
 const integratedStems = []
 const rejectedStems = []
+const autoRejectedStems = [] // review-time clean-checkout auto-rejects; rejectedStems only ever held integrateOne's
 const attemptedIntegrate = new Set() // every stem handed to integrateOne — used to reconcile the report
                                      // against disk (WS5 / retro #9): an attempted stem now in rejected/
                                      // was rejected at integration even if the agent failed to emit it.
@@ -1646,8 +1647,15 @@ Return the ScanResult.`
   // Review one task that is NOW in in-review/ (moved there by premove for reviewQ, or inline below for a
   // freshly-completed specialist), then integrate on accept. A reviewer non-emit throws out of the unit
   // thunk -> parallel maps it to null; the task is left committed in in-review/ and re-reviewed next scan.
-  async function runReviewAndIntegrate(t) {
+  async function runReviewAndIntegrate(t, opts) {
     const isNone = t.slug === 'none'
+    // `t` is the SCAN-TIME object. On the inline path below (a unit this iteration just dispatched) its
+    // hasCleanCheckoutToken/hasWorktreeBranch were read BEFORE the implementer ran its own clean-checkout,
+    // so they are false for EVERY first attempt and describe the world one specialist-run in the past.
+    // Gate only on fields the scan observed AFTER the implementation — i.e. a task the scan already found
+    // in completed/ or in-review/. A specialist that genuinely skipped clean-checkout is still caught: the
+    // prose AUTO-REJECT rule in reviewerPrompt greps the LIVE document inside the review dispatched below.
+    const tokenObserved = !(opts && opts.tokenStale)
     // Deterministic clean-checkout AUTO-REJECT, decided HERE rather than by a reasoning prompt.
     // hasCleanCheckoutToken is an adapter-owned snapshot field on every backend (CONTRACT.md), so this
     // costs nothing and cannot be forgotten mid-review the way the prose rule in reviewerPrompt can.
@@ -1655,11 +1663,15 @@ Return the ScanResult.`
     // append_log_row is a read-modify-write with no lock, and clean-checkout's store log-event fallback
     // fails with only a WARN. So: branch exists + token missing => the token was lost, not the work
     // => mechanism, retried. No branch at all => nothing was ever checked out => a real quality reject.
-    if (!isNone && t.hasCleanCheckoutToken === false) {
+    if (!isNone && tokenObserved && t.hasCleanCheckoutToken === false) {
       if (t.hasWorktreeBranch) {
         log(`↷ ${t.stem}: clean-checkout token missing but ${branchPrefix}/${t.slug} exists — mechanism, left in-review/ for re-review`)
         return
       }
+      // The ONLY state change in this function that used to be silent: no log line, and absent from
+      // every run tally, so a run could auto-reject each task it dispatched and still report complete.
+      log(`✗ ${t.stem}: AUTO-REJECT — no clean-checkout token and no ${branchPrefix}/${t.slug} branch (the implementation never entered a worktree)`)
+      autoRejectedStems.push(t.stem)
       await streamWrite([{ stem: t.stem, toState: 'rejected', agent: 'orchestrator', notes: 'AUTO-REJECT: no clean-checkout token and no worktree branch — the implementation never entered a worktree', inc: 1 }], `review#${iter}:${t.stem}`)
       productiveDispatch = true
       return
@@ -1755,7 +1767,7 @@ Return the ScanResult.`
       { stem: d.t.stem, toState: 'in-review', agent: 'orchestrator', notes: 'review-dispatch', inc: 0 },
     ], `done#${iter}:${d.t.stem}`)
     productiveDispatch = true
-    await runReviewAndIntegrate(d.t)
+    await runReviewAndIntegrate(d.t, { tokenStale: true })
   }
 
   // Pre-existing accepted leftovers (from the scan) CAN be interdependent — integrate them in one
@@ -1908,6 +1920,9 @@ return {
   finalCounts,
   integrated,
   rejectedAtIntegration,
+  // A review-time clean-checkout auto-reject used to be recorded nowhere, so a run could charge a
+  // rejection to every task it dispatched and still report completed:true with an empty reject list.
+  rejectedAtReview: [...new Set(autoRejectedStems)],
   drainedPostLoop: drained,
   needsOperator,
   // Without these a run that silently degraded to 3.1.0 dispatch everywhere is indistinguishable from
