@@ -591,6 +591,50 @@ RL_OUT=$(bash "$DOC" "$RL")
 check "in sync with origin -> no trunk-unpushed WARN" "! echo \"\$RL_OUT\" | grep -q 'trunk-unpushed'"
 rm -rf "$RL"
 
+# ---------------------------------------------------------------------------------------------------
+# STORE GUARD. doctor.sh is the `files` engine: every check it owns is gated on a .backlog/<state>/
+# directory, so on another backend it used to skip all of them in silence and print ok=true. Worse,
+# the worktree pass is NOT gated — it built its live-slug set from the (empty) TSV, called every
+# acf-whip worktree an orphan, and under --fix force-removed the worktree and force-deleted the
+# branch. In override mode that branch is the only copy of an accepted-but-unintegrated deliverable.
+# A refusal must therefore be loud, non-zero, and MUST NOT emit a parseable SUMMARY line.
+SG=$(mktemp -d); ( cd "$SG" && git init -q . && git commit -q --allow-empty -m init )
+mkdir -p "$SG/.acfwhip" && echo 'ACFW_STORE=multica' > "$SG/.acfwhip/config"
+
+# A worktree + branch in acf-whip's namespace: exactly what --fix used to destroy.
+( cd "$SG" && git branch worktree/sg1 >/dev/null 2>&1 && \
+  git worktree add -q .worktree/sg1 worktree/sg1 >/dev/null 2>&1 ) || true
+
+SG_OUT=$(bash "$DOC" "$SG" 2>&1); SG_RC=$?
+check "non-files store: doctor.sh refuses (exit 2)" "[ $SG_RC -eq 2 ]"
+check "non-files store: does NOT report ok=true" "! echo \"\$SG_OUT\" | grep -q 'ok=true'"
+check "non-files store: emits NO SUMMARY line a caller could parse as a report" "! echo \"\$SG_OUT\" | grep -q '^SUMMARY|'"
+check "non-files store: names the store it found" "echo \"\$SG_OUT\" | grep -q \"multica\""
+check "non-files store: names acfw-store as the correct entry point" "echo \"\$SG_OUT\" | grep -q 'acfw-store\" doctor'"
+
+SG_FIX_OUT=$(bash "$DOC" --fix "$SG" 2>&1); SG_FIX_RC=$?
+check "non-files store: --fix refuses too (exit 2)" "[ $SG_FIX_RC -eq 2 ]"
+check "non-files store: --fix did NOT remove the worktree" "[ -d \"$SG/.worktree/sg1\" ]"
+check "non-files store: --fix did NOT delete the branch" "git -C \"$SG\" show-ref --verify --quiet refs/heads/worktree/sg1"
+
+# Resolution honours the env var as well as the config key.
+SG_ENV_RC=0; ACFW_STORE=beads bash "$DOC" "$SG" >/dev/null 2>&1 || SG_ENV_RC=$?
+check "non-files store via ACFW_STORE env: refuses" "[ $SG_ENV_RC -eq 2 ]"
+
+# files store with no .backlog/ is the same absence-equals-health inference, and refuses the same way.
+rm -f "$SG/.acfwhip/config"
+SG_NB_OUT=$(bash "$DOC" "$SG" 2>&1); SG_NB_RC=$?
+check "files store with no .backlog/: refuses (exit 2)" "[ $SG_NB_RC -eq 2 ]"
+check "files store with no .backlog/: does NOT report ok=true" "! echo \"\$SG_NB_OUT\" | grep -q 'ok=true'"
+
+# And the files path itself is unchanged: a healthy board still reports ok=true and exits 0.
+mkdir -p "$SG/.backlog/pending" "$SG/.backlog/accepted"
+SG_OK_OUT=$(bash "$DOC" "$SG" 2>&1); SG_OK_RC=$?
+check "files store WITH .backlog/: unchanged (exit 0, ok=true)" "[ $SG_OK_RC -eq 0 ] && echo \"\$SG_OK_OUT\" | grep -q 'ok=true'"
+
+( cd "$SG" && git worktree remove --force .worktree/sg1 >/dev/null 2>&1 ) || true
+rm -rf "$SG"
+
 echo ""
 echo "==================================================="
 echo "Phase 1 doctor+hydrate test: $PASS passed, $FAIL failed"

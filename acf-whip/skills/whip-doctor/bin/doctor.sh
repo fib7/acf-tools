@@ -61,6 +61,37 @@ case "$MODE_ARG" in
 esac
 REPO_ROOT="${1:-${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}}"
 BL="$REPO_ROOT/.backlog"
+
+# ---- store guard (the ONLY thing between a non-files board and a destructive --fix) --------------
+# Resolved HERE, before acfw_load_namespace (:70) and the config source at (:77) below, for the
+# same reason the --mode block above documents: those helpers SOURCE the config file, which would put
+# the config's ACFW_STORE into the environment and silently invert the documented env > config
+# precedence acfw_resolve_store implements.
+#
+# This script is the `files` engine. Every check it owns is gated on a `.backlog/<state>/` directory,
+# so on a store that keeps state elsewhere every one of them is skipped and the summary reports
+# fatal=0 ok=true against zero evidence. Worse, the worktree-registry pass further down is NOT gated:
+# it builds its live-slug set from the (now empty) TSV, concludes every acf-whip worktree is orphaned,
+# and under --fix runs `git worktree remove --force` + `git branch -D` on each one. In override mode
+# those branches are the operator's only copy of an accepted-but-unintegrated deliverable.
+#
+# So: refuse. Loudly, on stderr, with exit 2, and WITHOUT emitting a SUMMARY line — a refusal a caller
+# could parse as a clean report is the same defect one layer up.
+ACFW_DOCTOR_STORE=$(acfw_resolve_store "$REPO_ROOT")
+if [ "$ACFW_DOCTOR_STORE" != "files" ]; then
+  cat >&2 <<EOF
+FATAL: doctor.sh is the 'files' store engine, but the active task store is '$ACFW_DOCTOR_STORE'.
+       It cannot read that store, and running it anyway reports a clean board against no evidence
+       (and with --fix would delete this repo's acf-whip worktrees and their branches).
+       Use the dispatcher, which routes to the right battery for every backend:
+         bash "\$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" doctor [--fix]
+EOF
+  exit 2
+fi
+if [ ! -d "$BL" ]; then
+  echo "FATAL: task store is 'files' but there is no .backlog/ at $REPO_ROOT — run /whip-init." >&2
+  exit 2
+fi
 # Integration mode: --mode (explicit caller intent) > ACFW_INTEGRATION_MODE env > config key > unpinned.
 # Resolved BEFORE acfw_load_namespace because that helper SOURCES the config file, which would
 # overwrite an inherited ACFW_INTEGRATION_MODE with the config's own value and silently invert the

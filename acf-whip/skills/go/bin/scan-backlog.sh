@@ -56,6 +56,16 @@ done
 [ "$MODE_ARG" = "override" ] || MODE_ARG=default
 REPO_ROOT="${1:-${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}}"
 BL="$REPO_ROOT/.backlog"
+
+# ---- store guard -------------------------------------------------------------------------------
+# Symmetric with doctor.sh: this is the `files` scanner and every folder it reads is under .backlog/.
+# On another backend it would emit a syntactically valid snapshot describing an EMPTY backlog, and the
+# orchestrator would read that as "nothing to do" and report the run complete. Refuse on stderr and
+# emit NO JSON — a caller must not be able to parse a refusal as an empty board.
+if [ "$(acfw_resolve_store "$REPO_ROOT")" != "files" ]; then
+  echo "FATAL: scan-backlog.sh is the 'files' store scanner; active store is '$(acfw_resolve_store "$REPO_ROOT")'. Use: acfw-store snapshot" >&2
+  exit 2
+fi
 ACTIVE="pending in-progress completed in-review blocked rejected accepted"
 # Non-accepted active folders (digest emits these as full objects; accepted is handled separately).
 ACTIVE_NONACC="pending in-progress completed in-review blocked rejected"
