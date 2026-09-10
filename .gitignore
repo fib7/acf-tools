@@ -29,3 +29,6 @@ Thumbs.db
 *.log
 .claude
 .mcp.json
+
+# Local scratch / handover notes (never committed)
+.sandbox/
