@@ -157,13 +157,27 @@ legacy loop has). Prefer it.
    the loop re-checks integrity every iteration):
    ```
    Workflow({
-     scriptPath: "<PLUGIN_ROOT>/workflows/whip-go.workflow.js",
+     name: "acf-whip:whip-go",
      args: { pluginRoot: "<PLUGIN_ROOT>", trunkRoot: "<TRUNK_ROOT>", trunkBranch: "<TRUNK_BRANCH>",
              mode: "default" | "override", store: "<info.store>", runLockPath: "<info.runLock>",
              // step 3, both branches (b) and (c); OMIT both when the user gave no arguments
              only: ["<stem-or-id>", ...], scopeFilter: "<the user's words, verbatim>" }
    })
    ```
+
+   **Launch by NAME, never by path.** `scriptPath` is checked against the readable set — the working
+   directory plus any `--add-dir`/`permissions.additionalDirectories` entry — and on a real
+   marketplace install the plugin lives under `~/.claude/plugins/cache/`, which is in neither. So a
+   `scriptPath` launch is refused for every user who installed this plugin normally. A plugin cannot
+   declare permissions (plugins are not a settings source), but the registry resolves
+   `acf-whip:whip-go` without touching a path at all.
+
+   **If the `Workflow` call is refused or the workflow cannot be found**: do NOT edit the user's
+   settings, and do NOT retry with `scriptPath`. Say in one line why the orchestrator could not start,
+   then run the legacy loop below. One case genuinely has no workflow route: under
+   `CLAUDE_WORKFLOW_NAME_ONLY` the runtime enumerates only built-in workflows, so neither `name` nor
+   `scriptPath` resolves and the legacy loop is the only correct path — and that loop is
+   **files-backend only**, so on another store report the refusal and stop rather than improvising.
 
    **Optional args (3.2.0 per-task child workflows).** Every dispatched unit runs as its own nested
    workflow by default; these tune or disable that:

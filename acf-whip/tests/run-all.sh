@@ -119,6 +119,34 @@ for a in adapters/*/acfw-store-*; do
     printf '  %-34s FAIL  (syntax error or not chmod +x)\n' "$(basename "$a")"; STATIC_FAIL=1
   fi
 done
+# Workflow launch identity, checked in BOTH directions. A skill launching `acf-whip:<x>` that no
+# workflow `meta` declares fails exactly like the plugin-cache scriptPath it replaced — silently, at
+# the moment a user runs /go. The reciprocal check is the one with teeth: it fails when someone
+# renames a meta.name and forgets the skill. Launch name = <plugin.json name>:<meta.name>.
+PLUGIN_NAME=$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' .claude-plugin/plugin.json | head -1)
+WF_FAIL=0
+for f in workflows/*.workflow.js; do
+  MN=$(sed -n "s/^[[:space:]]*name:[[:space:]]*'\([^']*\)'.*/\1/p" "$f" | head -1)
+  if [ -z "$MN" ]; then
+    printf '  %-34s FAIL  (%s declares no meta.name)\n' 'workflow-launch-names' "$f"; WF_FAIL=1; continue
+  fi
+  grep -rqF "name: \"$PLUGIN_NAME:$MN\"" skills/ || {
+    printf '  %-34s FAIL  (%s:%s declared by %s, launched by no skill)\n' 'workflow-launch-names' "$PLUGIN_NAME" "$MN" "$f"; WF_FAIL=1
+  }
+done
+# ...and no skill may name a workflow that does not exist.
+for n in $(grep -rhoE 'name: "'"$PLUGIN_NAME"':[a-z0-9-]+"' skills/ | sed 's/.*://; s/"//g' | sort -u); do
+  grep -rqE "^[[:space:]]*name: '$n'," workflows/*.workflow.js || {
+    printf '  %-34s FAIL  (a skill launches %s:%s — no workflow meta declares it)\n' 'workflow-launch-names' "$PLUGIN_NAME" "$n"; WF_FAIL=1
+  }
+done
+# A scriptPath launch under the plugin root is refused on every normal install; never reintroduce one.
+if grep -rn 'scriptPath: *"<PLUGIN_ROOT>' skills/ >/dev/null 2>&1; then
+  printf '  %-34s FAIL  (a skill launches by plugin-cache path — use the registered name)\n' 'workflow-launch-names'; WF_FAIL=1
+fi
+[ "$WF_FAIL" -eq 0 ] && printf '  %-34s ok    (skills and workflow meta agree, both ways)\n' 'workflow-launch-names'
+[ "$WF_FAIL" -eq 0 ] || STATIC_FAIL=1
+
 # No skill may INVOKE a per-backend battery by path. doctor.sh is the `files` engine and now refuses
 # on any other store, so a skill that shells out to it directly hands non-files operators a hard
 # refusal where the dispatcher would have produced a real report. Matches `bash .../doctor.sh` only —

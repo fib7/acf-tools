@@ -45,7 +45,7 @@ script, not in your context.
 2. Launch the workflow (runs in the background; intermediate state never enters your context):
    ```
    Workflow({
-     scriptPath: "<PLUGIN_ROOT>/workflows/whip-task.workflow.js",
+     name: "acf-whip:whip-task",
      args: {
        scope: "<the full /task argument text, verbatim>",
        pluginRoot: "<PLUGIN_ROOT>",
@@ -58,10 +58,19 @@ script, not in your context.
 3. When it completes, report the returned summary: created task ids + slugs + dependencies, the
    commit sha, and the doctor verdict. If it returns `aborted: true`, surface the `defects` list and
    **STOP** — do NOT hand-write task files to route around the validation gate. If it returns
-   `error`, fall back to the legacy path below.
+   `error`, **or the `Workflow` call is refused outright**, fall back to the legacy path below — a
+   denied tool call returns no value at all, so the `error` branch never sees it. Never retry with
+   `scriptPath` and never edit the user's settings.
 4. Do **not** also run the legacy steps — the workflow replaces them.
 
-**Only if the `Workflow` tool is NOT available** (dynamic workflows disabled, or older Claude Code):
+**Launch by NAME, never by path.** `scriptPath` is checked against the readable set (the working
+directory plus any added directory); on a real marketplace install the plugin lives under
+`~/.claude/plugins/cache/`, which is neither, so a `scriptPath` launch is refused for every user who
+installed this plugin normally. The registry resolves `acf-whip:whip-task` without touching a path.
+
+**Only if the `Workflow` tool is NOT available or cannot resolve the workflow** (dynamic workflows
+disabled, `CLAUDE_WORKFLOW_NAME_ONLY` set — which enumerates built-ins only, so no plugin workflow
+resolves under either form — or older Claude Code):
 run the legacy decomposition loop below (Steps 1–8). It produces the same task files — including the
 mandatory `Worktree:` / `PR Group:` / `Touches Globs:` slug fields — but as a single-context
 orchestration.
