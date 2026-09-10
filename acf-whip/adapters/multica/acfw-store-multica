@@ -764,10 +764,15 @@ cmd_doctor() {
   sev=$(jq -rs '
     def nstat: {"draft":"backlog","pending":"todo","in-progress":"in_progress","completed":"in_review","in-review":"in_review","accepted":"done","rejected":"todo","blocked":"blocked","archive":"cancelled"};
     def states: ["draft","pending","in-progress","completed","in-review","accepted","rejected","blocked","archive"];
+    # An out-of-vocabulary whip_state is QUARANTINE, not corruption. The scheduler dispatches on exact
+    # folder equality, so a card in a state it does not name is inert: it can never be dispatched,
+    # transitioned or integrated, and cannot make a run wrong. A FATAL here aborted a whole board over
+    # one such card — typically a hand-made or half-migrated issue whose metadata was never updated.
+    # WARN surfaces it with the remedy without gating anyone.
     (group_by(.metadata.whip_key)[] | select(length > 1)
        | "FATAL|duplicate-key|\(.[0].metadata.whip_key)|\(length) issues share this whip_key"),
     (.[] | select((.metadata.whip_state // "") as $s | (states | index($s)) == null)
-       | "FATAL|invalid-state|\(.metadata.whip_key)|whip_state=\(.metadata.whip_state // "<none>")"),
+       | "WARN|invalid-state|\(.metadata.whip_key)|whip_state=\(.metadata.whip_state // "<none>") is outside the whip vocabulary; no scheduler path can dispatch, transition or integrate it. Retire it with: acfw-store transition \(.metadata.whip_key) archive"),
     (.[] | select((.metadata.whip_state // "") as $s | (nstat[$s] // "") as $w | ($w != "" and .status != $w))
        | "REPAIRABLE|status-drift|\(.metadata.whip_key)|native=\(.status) want=\(nstat[.metadata.whip_state])"),
     (.[] | select((.metadata.whip_rejections | type) != "number")
@@ -781,7 +786,17 @@ cmd_doctor() {
   repairable=$(printf '%s\n' "$sev" | grep -c '^REPAIRABLE|'); repairable=${repairable//[^0-9]/}
   warn=$(printf '%s\n' "$sev" | grep -c '^WARN|'); warn=${warn//[^0-9]/}
 
-  [ "$quiet" -eq 1 ] || { [ -n "$sev" ] && printf '%s\n' "$sev"; }
+  # --quiet suppresses the ADVISORY dump, never the gate decision. This is the reference semantics
+  # from skills/whip-doctor/bin/doctor.sh: FATAL lines always flow, because the dispatcher recomputes
+  # ok= from the lines it RECEIVES (skills/lib/bin/acfw-store) — so an adapter that swallows its own
+  # FATALs under --quiet reports ok=true to /go's startup gate and to every per-iteration recheck.
+  # Suppressing everything here is exactly how a live FATAL stayed invisible to the orchestrator while
+  # the verbose /whip-doctor path showed it, which reads to an operator as two tools disagreeing.
+  if [ "$quiet" -eq 1 ]; then
+    printf '%s\n' "$sev" | grep '^FATAL|' || true
+  else
+    [ -n "$sev" ] && printf '%s\n' "$sev"
+  fi
 
   if [ "$fix" -eq 1 ] && [ -n "$sev" ]; then
     local sk code task detail uuid ws

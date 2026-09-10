@@ -805,7 +805,17 @@ cmd_doctor() {
   repairable=$(printf '%s\n' "$sev" | grep -c '^REPAIRABLE|'); repairable=${repairable//[^0-9]/}
   warn=$(printf '%s\n' "$sev" | grep -c '^WARN|'); warn=${warn//[^0-9]/}
 
-  [ "$quiet" -eq 1 ] || { [ -n "$sev" ] && printf '%s\n' "$sev"; }
+  # --quiet suppresses the ADVISORY dump, never the gate decision. This is the reference semantics
+  # from skills/whip-doctor/bin/doctor.sh: FATAL lines always flow, because the dispatcher recomputes
+  # ok= from the lines it RECEIVES (skills/lib/bin/acfw-store) — so an adapter that swallows its own
+  # FATALs under --quiet reports ok=true to /go's startup gate and to every per-iteration recheck.
+  # Suppressing everything here is exactly how a live FATAL stayed invisible to the orchestrator while
+  # the verbose /whip-doctor path showed it, which reads to an operator as two tools disagreeing.
+  if [ "$quiet" -eq 1 ]; then
+    printf '%s\n' "$sev" | grep '^FATAL|' || true
+  else
+    [ -n "$sev" ] && printf '%s\n' "$sev"
+  fi
 
   if [ "$fix" -eq 1 ] && [ -s "$drift_file" ]; then
     while IFS=$'\t' read -r iid want; do

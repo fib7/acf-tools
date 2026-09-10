@@ -258,9 +258,17 @@ for st in $LOOP_FOLDERS; do
     hasTok=0; grep -qE '\| clean-checkout \| ok \|' "$f" && hasTok=1
     agentOk=1; { [ -n "$agent" ] && [ "$agent" != "none" ] && [ ! -f "$REPO_ROOT/.claude/agents/$agent.md" ]; } && agentOk=0
 
-    # Severity tier: a task in accepted/ is terminal (out of the dispatch path), so its
-    # structural defects are advisory (WARN), never blocking. Active folders keep FATAL.
-    sev_struct=FATAL; [ "$folder" = "accepted" ] && sev_struct=WARN
+    # Severity tier: is this task IN THE DISPATCH PATH? A structural defect only gates a run if the
+    # scheduler could act on the task. `accepted` is terminal; `draft` is the human gate (excluded
+    # from every scan and from the completion denominator); `archive` is retired. None of the three
+    # can be dispatched, transitioned or integrated, so a defect there is advisory, never a gate
+    # FATAL. This used to test `accepted` alone, which was correct on `files` (its scanner never
+    # emits draft/archive) but wrong on every other backend, where the adapter DOES list them: a
+    # draft stub with no agent file produced FATAL|unknown-agent and blocked /go outright.
+    case "$folder" in
+      accepted|draft|archive) sev_struct=WARN ;;
+      *)                      sev_struct=FATAL ;;
+    esac
 
     if [ -z "$id" ] || [ -z "$status" ]; then
       # A file loses ID/Status two very different ways, and the recovery is different, so name them

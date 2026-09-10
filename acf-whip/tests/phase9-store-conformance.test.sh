@@ -184,6 +184,27 @@ check "transition of a missing key is exit 3" "[ $RC -eq 3 ]"
 if printf '%s' "$CAPS" | grep -q '"doctor"'; then
   DOC=$("$ADAPTER" doctor 2>/dev/null || true)
   check "doctor emits a SUMMARY line" "printf '%s\n' \"\$DOC\" | grep -q '^SUMMARY|'"
+
+  # --quiet suppresses the ADVISORY dump, never the gate decision. Without doctor-complete the
+  # dispatcher recomputes ok= from the lines it RECEIVES, so an adapter that swallows its FATALs
+  # under --quiet reports a clean board to /go's startup gate while the verbose operator path shows
+  # the same FATAL. Two adapters shipped that way; nothing here asserted otherwise.
+  DOCQ=$("$ADAPTER" doctor --quiet 2>/dev/null || true)
+  check "doctor --quiet still emits the SUMMARY line" "printf '%s\n' \"\$DOCQ\" | grep -q '^SUMMARY|'"
+  check "doctor --quiet emits no REPAIRABLE/WARN advisory lines" \
+    "! printf '%s\n' \"\$DOCQ\" | grep -qE '^(REPAIRABLE|WARN)\\|'"
+  # If the board carries a FATAL, --quiet MUST still show it. Assert the invariant that binds the
+  # two outputs, so this holds on a clean board too rather than silently checking nothing.
+  NF=$(printf '%s\n' "$DOC"  | grep -c '^FATAL|' || true); NF=${NF//[^0-9]/}
+  NFQ=$(printf '%s\n' "$DOCQ" | grep -c '^FATAL|' || true); NFQ=${NFQ//[^0-9]/}
+  check "doctor --quiet keeps every FATAL line the verbose run reported ($NF)" "[ \"\${NFQ:-0}\" -eq \"\${NF:-0}\" ]"
+  check "doctor --quiet agrees with the verbose run on ok=" \
+    "[ \"\$(printf '%s\n' \"\$DOC\" | sed -n 's/.*|ok=\\(.*\\)/\\1/p' | tail -1)\" = \"\$(printf '%s\n' \"\$DOCQ\" | sed -n 's/.*|ok=\\(.*\\)/\\1/p' | tail -1)\" ]"
+
+  # A state outside the whip vocabulary is quarantine, not corruption: inert to the scheduler, so it
+  # must never gate a run. One such card produced the only FATAL on a large board.
+  check "doctor reports an out-of-vocabulary state as WARN, never FATAL" \
+    "! printf '%s\n' \"\$DOC\" | grep -q '^FATAL|invalid-state|'"
 else
   ok "doctor capability absent (skipped)"
 fi

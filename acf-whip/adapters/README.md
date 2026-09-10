@@ -27,8 +27,14 @@ Two truths anchor the design:
   (`.acfwhip/integrated/<shard>/<key>.json` in the trunk tree) is the sole integration oracle on
   every backend — adapters never see, store, or fake it. The dispatcher merges ledger facts into
   snapshots so the scheduler gets one coherent picture.
-- **One sequential writer.** The `/go` orchestrator serializes all state writes. Adapters may rely
-  on this: read-modify-write counter bumps are legal; no locking is required of the adapter.
+- **One sequential writer — for `transition` only.** The `/go` orchestrator serializes state writes,
+  so read-modify-write counter bumps inside `transition` are legal. **Nothing else is serialized.**
+  `/go` dispatches specialists with `parallel()`, and each independently runs `read --materialize`
+  and — via `clean-checkout.sh` — `log-event`. Those three ARE invoked concurrently by design
+  (`CONTRACT.md`, Concurrency), so an adapter must be safe under concurrent invocation of them and
+  must never block indefinitely on a backend lock: bound the wait and exit `99`. Reading the first
+  sentence as "no locking is ever required" is how an unlocked read-modify-write of a shared document
+  ends up on the `log-event` path, where a lost row costs a task an entire review round.
 
 ## Dispatcher mechanics
 
@@ -120,7 +126,7 @@ Details per backend: [`files/`](./files/) · [`beads/README.md`](./beads/README.
    (`noop:`, exit 0, no bumps).
 4. **Drop it in** at `<repo>/.acfwhip/adapters/acfw-store-<backend>` (commit it) or on `$PATH`,
    set `ACFW_STORE=<backend>` in `.acfwhip/config` — no fork, no dispatcher change.
-5. **Prove it**: `ADAPTER=<path> bash tests/phase9-store-conformance.test.sh` (36 assertions) is
+5. **Prove it**: `ADAPTER=<path> bash tests/phase9-store-conformance.test.sh` is
    the executable spec — an adapter that passes it, conforms. `tests/phase9-dispatcher.test.sh`
    covers the compensation paths. The linear adapter's test shows how to conformance-test an
    HTTP backend offline via an injectable transport.

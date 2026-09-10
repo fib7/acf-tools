@@ -62,11 +62,21 @@ if [ -n "$HEAD_BR" ] && git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/rem
 fi
 
 # ---- per-task checks from the snapshot ----
-# One jq pass emits pipe-joined records; bash turns them into findings. Severity tier
-# mirrors doctor.sh: accepted-folder structural defects are advisory (WARN), never FATAL.
+# One jq pass emits pipe-joined records; bash turns them into findings. The severity tier below is
+# kept textually identical to doctor.sh — the two batteries must agree on what gates a run.
 while IFS='|' read -r stem folder id status agent rc bc hasTok isCode hasBranch hasInteg age; do
   [ -n "$stem" ] || continue
-  sev_struct=FATAL; [ "$folder" = "accepted" ] && sev_struct=WARN
+  # Severity tier: is this task IN THE DISPATCH PATH? A structural defect only gates a run if the
+  # scheduler could act on the task. `accepted` is terminal; `draft` is the human gate (excluded
+  # from every scan and from the completion denominator); `archive` is retired. None of the three
+  # can be dispatched, transitioned or integrated, so a defect there is advisory, never a gate
+  # FATAL. This used to test `accepted` alone, which was correct on `files` (its scanner never
+  # emits draft/archive) but wrong on every other backend, where the adapter DOES list them: a
+  # draft stub with no agent file produced FATAL|unknown-agent and blocked /go outright.
+  case "$folder" in
+    accepted|draft|archive) sev_struct=WARN ;;
+    *)                      sev_struct=FATAL ;;
+  esac
   if [ -z "$id" ] || [ -z "$status" ]; then
     emit "$sev_struct" unparseable-frontmatter "$stem" "missing ID and/or Status field"
   fi
