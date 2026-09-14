@@ -71,10 +71,27 @@ check "...and staleness is REPORTED instead" "printf '%s' \"\$OUT3\" | grep -q '
 check "...naming the file" "printf '%s' \"\$OUT3\" | grep -q '$DEST_REL'"
 
 # --- 5. the hook must never break a session -------------------------------------------
+# "Does not break the session" is NOT exit 0 plus valid JSON: main()'s catch-all satisfies both while
+# replacing the entire payload with an errno string. That drops the MANDATORY style-guide injection
+# and the store warning — so the assertions have to check the payload SURVIVED, not merely that the
+# process did. Both original checks passed green on the broken code, which is how this shipped.
 P4="$WORK/hostile"; mkdir -p "$P4/$DEST_REL"   # a DIRECTORY where the file should be
 OUT4=$(run_hook "$P4" 2>/dev/null); RC4=$?
 check "an unwritable destination does not break the session (exit 0)" "[ $RC4 -eq 0 ]"
 check "...and still returns valid hook JSON" "printf '%s' \"\$OUT4\" | python3 -c 'import json,sys; json.load(sys.stdin)'"
+check "...and the MANDATORY style guide is still injected" "printf '%s' \"\$OUT4\" | grep -q 'Enforcement Active'"
+check "...and the failure is surfaced rather than swallowed" "printf '%s' \"\$OUT4\" | grep -q 'could not sync'"
+
+# The likeliest real trigger is a decode error, not an OSError: these are the documents the refresh
+# mechanism invites consumers to EDIT, and one cp1252 smart quote pasted from a word processor is the
+# ordinary way a non-UTF-8 byte arrives. An OSError-only guard leaves this case fatal.
+P5="$WORK/badbytes"; mkdir -p "$P5/$(dirname "$DEST_REL")"
+printf '# Workflow\n\nsmart quote: \223hello\224\n' > "$P5/$DEST_REL"
+OUT5=$(run_hook "$P5" 2>/dev/null); RC5=$?
+check "a non-UTF-8 byte in an edited document does not break the session" "[ $RC5 -eq 0 ]"
+check "...and the style guide still reaches the session" "printf '%s' \"\$OUT5\" | grep -q 'Enforcement Active'"
+check "...and the undecodable file is named, not silently skipped" "printf '%s' \"\$OUT5\" | grep -q 'workflow.md'"
+check "...and the file itself is left untouched" "grep -q 'smart quote' \"$P5/$DEST_REL\""
 
 # --- 6. the manifest must cover what is shipped now ------------------------------------
 # If it does not, a freshly installed file is unrecognisable on the next session and every consumer

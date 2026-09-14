@@ -74,8 +74,19 @@ run_one() { # <runner> <name>
   # COULD NOT FAIL THE BUILD no matter what its assertions said. Silent-coverage-loss, which is the
   # exact failure this runner exists to prevent.
   if printf '%s' "$out" | grep -q '^SKIP:' && [ -z "$line" ]; then
-    SKIPPED="$SKIPPED $name"
-    printf '  %-34s SKIP\n' "$name"
+    # Only a suite listed in OPTIONAL may skip. Any other suite that skips has lost its coverage —
+    # masking a missing interpreter or a renamed fixture behind a green run, which is the
+    # silent-coverage-loss this runner exists to prevent. Measured: masking python3 gave
+    # "ALL GREEN, 882 passed" with 62 assertions gone, including all of phase18.
+    case " $OPTIONAL " in
+      *" $name "*)
+        SKIPPED="$SKIPPED $name"
+        printf '  %-34s SKIP\n' "$name"
+        return ;;
+    esac
+    FAILED_SUITES="$FAILED_SUITES $name(skipped)"
+    printf '  %-34s FAIL  (skipped, but not in OPTIONAL — coverage lost)\n' "$name"
+    printf '%s' "$out" | grep '^SKIP:' | head -2 | sed 's/^/      /'
     return
   fi
   p=$(printf '%s' "$line" | grep -Eo '[0-9]+' | head -1)
@@ -142,10 +153,14 @@ if [ -n "$BASH4" ]; then
   printf '  %-34s FAIL  (bash 4 syntax; macOS ships 3.2)\n' 'skill-shell-portability'
   printf '%s\n' "$BASH4" | sed 's/^/      /'; SH_FAIL=1
 fi
+# Boolean tests, not counts. `grep -c` prints its count AND exits 1 on zero matches, so
+# `R=$(grep -c ... || echo 0)` yields the two-line string "0\n0"; `[ "$R" -eq 0 ]` then aborts with
+# status 2 and the FAIL branch below became unreachable for every input. Verified against the live
+# tree: with the only read of DIRECT_DISPATCH deleted — the exact regression this guards — the gate
+# did not fire. Dropping `|| echo 0` alone is not enough either: an absent or renamed SKILL.md would
+# leave R empty and short-circuit the same way.
 for v in DISPATCH_QUEUE DIRECT_DISPATCH; do
-  W=$(grep -c "$v+=(" skills/go/SKILL.md 2>/dev/null || echo 0)
-  R=$(grep -c "\${$v\[@\]" skills/go/SKILL.md 2>/dev/null || echo 0)
-  if [ "$W" -gt 0 ] && [ "$R" -eq 0 ]; then
+  if grep -q "$v+=(" skills/go/SKILL.md 2>/dev/null && ! grep -q "\${$v\[@\]" skills/go/SKILL.md 2>/dev/null; then
     printf '  %-34s FAIL  (%s is appended to but never read)\n' 'skill-shell-portability' "$v"; SH_FAIL=1
   fi
 done

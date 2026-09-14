@@ -109,9 +109,23 @@ def main() -> None:
         # attributed to their own documentation. Refresh what is unedited; never touch what is not.
         version = plugin_version(plugin_root)
         known = known_digests(plugin_root)
-        refreshed, stale = [], []
+        refreshed, stale, unreadable = [], [], []
         for src_rel, dest_rel in MANAGED:
-            outcome = sync_artifact(plugin_root, src_rel, dest_rel, version, known)
+            # Guard EACH artifact, not the loop. Before 3.3.0 this hook short-circuited on
+            # `target_path.exists()` and never touched a destination; it now reads and writes every
+            # managed document on every session, which introduces failure modes the old code could not
+            # have. The likeliest is a decode error, not an OSError: these are exactly the documents
+            # the refresh mechanism invites consumers to edit, and one cp1252 smart quote pasted from
+            # a word processor raises UnicodeDecodeError. Without a per-artifact guard that propagates
+            # to main()'s catch-all, which replaces the WHOLE payload with an errno string — dropping
+            # the mandatory style-guide injection, the store warning, and every later document's sync,
+            # on every session, permanently. Broad `except Exception` on purpose: a hook that cannot
+            # break a session must not be selective about what it survives.
+            try:
+                outcome = sync_artifact(plugin_root, src_rel, dest_rel, version, known)
+            except Exception as exc:  # noqa: BLE001 - non-blocking by contract
+                unreadable.append((dest_rel, type(exc).__name__))
+                continue
             if outcome == "refreshed":
                 refreshed.append(dest_rel)
             elif isinstance(outcome, tuple):
@@ -122,6 +136,12 @@ def main() -> None:
             artifact_notice += (
                 "\n\n📄 acf-whip refreshed {} unmodified document(s) to v{}: {}.\n".format(
                     len(refreshed), version, ", ".join(refreshed))
+            )
+        if unreadable:
+            artifact_notice += (
+                "\n\n⚠️ acf-whip could not sync {} document(s) and skipped them: {}.\nCheck the file "
+                "encoding (UTF-8) and permissions; everything else in this session is unaffected.\n".format(
+                    len(unreadable), ", ".join("{} ({})".format(d, e) for d, e in unreadable))
             )
         if stale:
             artifact_notice += (
