@@ -138,6 +138,26 @@ directory moves under the already-ignored `.acfwhip/run/`; and `doctor --snapsho
 with a full snapshot spare the dispatcher a second store walk, refusing a narrowed or digest one as a
 usage error because the graph invariants cannot be computed from a subset.
 
+**Reviewed before shipping, and it mattered.** The diff above was put through an adversarial review
+of its own, and thirteen follow-up commits landed before release. Three were regressions this work
+introduced: the SessionStart hook gained destination-side I/O with no per-artifact guard, so one
+non-UTF-8 byte in a document the release invites consumers to edit discarded the entire session
+payload; `--active-only` on the bootstrap gate silently dropped the two content-loss FATALs, which
+are the ones that mark a destroyed document; and unioning `inactive[]` into the dependency index made
+`/go <a-draft-task>` answer "complete" instead of "not actionable".
+
+The rest were a single pattern worth naming: **a guard that reports success on the exact condition it
+exists to catch.** The derived-slug registry was a shell variable assigned inside a command
+substitution, so it never accumulated and its FATAL was unreachable. The four new multica read guards
+interpolated a variable set in a subshell, printing a dangling colon instead of the backend's error.
+`run-all.sh`'s write-only-array gate used `grep -c` with `|| echo 0`, producing `"0\n0"` and an
+arithmetic abort, so it could not fail for any input. The reviewer's clean-checkout backstop — cited
+in a code comment to justify weakening the deterministic gate — greped for a row the reviewer's own
+Step 0 writes. And five assertions, including two written as proof that these fixes work, passed with
+the code under test deleted.
+
+Every fix above now has an assertion verified to go red when the fix is reverted.
+
 All contract changes are additive; `ACFW_CONTRACT_VERSION` stays `1`.
 
 ## 3.2.3 — /go can be pointed at part of the backlog
