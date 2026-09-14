@@ -192,6 +192,13 @@ gql() {
     429)     GQL_ERRCODE=99; return 99 ;;
     5??)     GQL_ERRCODE=5; return 5 ;;
   esac
+  # A response that is not JSON at all reached this point as SUCCESS: the errors probe below uses
+  # `jq -e ... 2>/dev/null`, which fails the same way for "no errors key" and for "not parseable", so
+  # a proxy error page, a captive-portal redirect or a truncated body fell through to GQL_ERRCODE=0
+  # and every caller then read an empty result as a definite, authoritative answer.
+  if ! printf '%s' "$GQL_BODY" | jq -e . >/dev/null 2>&1; then
+    GQL_ERRCODE=5; return 5
+  fi
   if printf '%s' "$GQL_BODY" | jq -e '(.errors // []) | length > 0' >/dev/null 2>&1; then
     if printf '%s' "$GQL_BODY" | jq -e 'any((.errors // [])[]; ((.extensions.type // .extensions.code // "") | ascii_downcase | test("not.?found|entitynotfound")) or (((.message // "") | ascii_downcase) | test("not found|could not find|entity not")))' >/dev/null 2>&1; then
       GQL_ERRCODE=3; return 3

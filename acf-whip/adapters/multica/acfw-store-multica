@@ -675,6 +675,17 @@ cmd_log_event() {
     esac
   done
   [ -n "$stem" ] && [ -n "$row" ] || { echo "FATAL: usage: log-event <stem> --row '| ... |'" >&2; exit 2; }
+  # A transition-log row is ONE LINE by construction. cmd_transition builds its rows through
+  # log_row/logcell, which guarantees that; this path takes the row pre-formatted from the caller and
+  # spliced it in verbatim, so an embedded newline (a multi-line note reaching clean-checkout.sh, say)
+  # tore the table in half — and a torn table is the collapsed-task-file corpse doctor.sh has a
+  # dedicated non-repairable FATAL for. Cell escaping stays the caller's job, because the caller owns
+  # the delimiters; line safety does not. Normalise, and require the row shape the contract states.
+  row=$(printf '%s' "$row" | tr '\n\r\t' '   ' | sed -e 's/  */ /g' -e 's/^ *//' -e 's/ *$//')
+  case "$row" in
+    \|*\|) ;;
+    *) echo "FATAL: --row must be a single pipe-delimited table row, e.g. '| a | b | c |' (got: ${row:0:60})" >&2; exit 2 ;;
+  esac
   uuid=$(resolve_key "$stem") || exit $?
   # The row splices into the document's Transition Log — the same place the files adapter
   # puts it, and where both snapshot's token scan and the reviewer's grep look. STRICT

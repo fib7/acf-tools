@@ -274,6 +274,27 @@ check "--quiet drops the advisory but keeps the SUMMARY" \
   "! printf '%s\n' \"\$DOCQ\" | grep -q '^WARN|' && printf '%s\n' \"\$DOCQ\" | grep -q '^SUMMARY|'"
 
 # ============================================================================
+# A transition-log row is ONE LINE by construction. cmd_transition guarantees that via log_row/logcell;
+# log-event took the row pre-formatted and spliced it in verbatim, so an embedded newline tore the
+# table in half — and a torn table is the collapsed-task-file corpse doctor.sh has a dedicated
+# NON-repairable FATAL for, because it marks a write that cannot be safely healed.
+echo
+echo "== log-event cannot tear the transition log =="
+LG=$(mkstore "$WORK/lg")
+export ACFW_TRUNK_ROOT="$WORK/lg" MC_FAKE_STATE="$LG"
+mktask "$WORK/lg.md" l-001 sl
+"$ADAPTER" create --file "$WORK/lg.md" --stem l-001-x --folder pending >/dev/null
+# The injected second line must itself LOOK like a row, or counting ^| lines proves nothing.
+"$ADAPTER" log-event l-001-x --row "$(printf '| ts | clean-checkout | ok |\n| EVIL | x |')" >/dev/null
+BODY=$("$ADAPTER" read --body l-001-x | jq -r '.body')
+ROWS=$(printf '%s\n' "$BODY" | grep -c '^|' || true)
+check "an embedded newline is flattened into ONE row, not two" "[ \"\$ROWS\" = '1' ]"
+check "...and the token is still greppable in the single row" "printf '%s' \"\$BODY\" | grep -q 'clean-checkout | ok'"
+LG_OUT=$("$ADAPTER" log-event l-001-x --row "not a table row" 2>&1); LG_RC=$?
+check "a row that is not pipe-delimited is a usage error (exit 2)" "[ $LG_RC -eq 2 ]"
+check "...and says what shape it wanted" "printf '%s' \"\$LG_OUT\" | grep -q 'single pipe-delimited table row'"
+
+# ============================================================================
 if [ -n "${MULTICA_TEST_SERVER:-}" ] && [ -n "${MULTICA_TEST_TOKEN:-}" ] && [ -n "${MULTICA_TEST_WORKSPACE_ID:-}" ]; then
   echo
   echo "== ALSO running the frozen suite against the live server $MULTICA_TEST_SERVER =="

@@ -286,11 +286,19 @@ cmd_read() {
     # quality-reviewer greps the refreshed doc for the `| clean-checkout | ok |`
     # token that log-event recorded as a comment, and the whip-transition rows
     # become visible history. `bd show` omits comments, so fetch them explicitly.
-    if bd_run comments "$id" --json; then
-      local trail
-      trail="$(printf '%s' "$BD_OUT" | jq -r '.[]?.text // empty')"
-      [ -n "$trail" ] && { printf '\n## Store Audit Trail\n\n'; printf '%s\n' "$trail"; } >> "$dest"
+    # CONTRACT.md makes the audit trail MANDATORY in a materialized document and says why: the
+    # quality-reviewer's auto-reject greps the refreshed document for the clean-checkout token. A
+    # failed fetch used to fall through this `if` with no else, silently producing a document with no
+    # trail — which reads to the reviewer exactly like a task that never ran clean-checkout, and costs
+    # it a rejection. Refuse instead; a caller can retry an error, but cannot detect a quiet omission.
+    if ! bd_run comments "$id" --json; then
+      echo "FATAL: could not read the audit trail for '$key' — refusing to materialize a document without it (the reviewer's clean-checkout check greps it and would auto-reject)" >&2
+      rm -f "$dest"
+      return 99
     fi
+    local trail
+    trail="$(printf '%s' "$BD_OUT" | jq -r '.[]?.text // empty')"
+    [ -n "$trail" ] && { printf '\n## Store Audit Trail\n\n'; printf '%s\n' "$trail"; } >> "$dest"
     printf '%s\n' "$dest"
     return 0
   fi
@@ -619,7 +627,16 @@ cmd_doctor() {
   fi
 
   # Per whip-issue checks: id<->key bijection and numeric counters.
-  if bd_run export; then
+  # An export that FAILS used to fall through this `if` with no else, so a locked or unreadable store
+  # produced a clean bill of health — the whole per-issue battery silently skipped, ok=true, exit 0.
+  # Absence of findings is not health; the dispatcher turns a non-zero doctor into
+  # FATAL|doctor-unavailable, so exiting is what makes the gate refuse.
+  if ! bd_run export; then
+    printf 'FATAL|store-unreadable|-|bd export failed, so the per-issue battery did not run — findings are UNKNOWN, not absent\n'
+    printf 'SUMMARY|fatal=%d|repairable=%d|warn=%d|ok=false\n' "$((fatal + 1))" "$repairable" "$warn"
+    return 5
+  fi
+  {
     local report
     report="$(printf '%s' "$BD_OUT" | jq -rs "$JQ_DEFS"'
       .[] | select(._type=="issue") | select(.metadata.whip_key != null)
@@ -633,7 +650,7 @@ cmd_doctor() {
       fatal=$((fatal + $(printf '%s\n' "$report" | grep -c '^FATAL|')))
       warn=$((warn + $(printf '%s\n' "$report" | grep -c '^WARN|')))
     fi
-  fi
+  }
 
   local ok=true; [ "$fatal" -eq 0 ] || ok=false
   printf 'SUMMARY|fatal=%d|repairable=%d|warn=%d|ok=%s\n' "$fatal" "$repairable" "$warn" "$ok"
