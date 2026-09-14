@@ -153,7 +153,7 @@ map_field_to_key() {
 # ---- capabilities (no backend, no jq needed) -------------------------------
 
 cmd_capabilities() {
-  printf '{"backend":"multica","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition","update-field","update-body","log-event","comment","doctor","doctor-fix","init"]}\n'
+  printf '{"backend":"multica","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition","update-field","update-body","log-event","comment","doctor","doctor-fix","init","token-all-states"]}\n'
 }
 
 if [ "$SUB" = "capabilities" ]; then cmd_capabilities; exit 0; fi
@@ -234,19 +234,36 @@ mset() {
 }
 
 # mget_str <uuid> <key> — echo the string value ("" when the key is absent).
+# Both helpers are TRI-STATE, and the distinction is load-bearing. A three-valued question — the key
+# holds X / the key is absent / I could not ask — used to be answered with one value, so any transient
+# (timeout, 5xx, expired token) was indistinguishable from "absent" and the read-modify-write callers
+# below fabricated state from it: a rejection counter reset to 1, a dependency list replaced by its
+# newest entry, an idempotence guard that missed and re-ran a transition that had already landed.
+#
+# Contract: exit 0 = answered (value echoed; "" / 0 when the key is genuinely absent, which
+# mc_classify reports as 3). Any other exit = COULD NOT DETERMINE, carrying mc_classify's typed code
+# (5 backend, 6 auth, 99 transient). $(...) swallows the status, so every read-modify-write caller
+# must check it explicitly — exit 99 is retryable by the orchestrator; a silently wrong write is not.
 mget_str() {
+  local rc
   multica_call issue metadata get "$1" --key "$2" --output json
-  [ "$MC_RC" -eq 0 ] || { printf ''; return 0; }
-  printf '%s' "$MC_OUT" | jq -r '. // ""' 2>/dev/null
+  rc=$(mc_classify)
+  [ "$rc" -eq 0 ] || { printf ''; [ "$rc" -eq 3 ] && return 0; return "$rc"; }
+  # The backend answered. Decode it, but never let jq's own exit status become this helper's
+  # tri-state answer — a payload that will not parse is a malformed ANSWER, not "could not ask".
+  printf '%s' "$MC_OUT" | jq -r '. // ""' 2>/dev/null || printf ''
+  return 0
 }
 
-# mget_num <uuid> <key> — echo the integer value (0 when absent/non-numeric).
+# mget_num <uuid> <key> — echo the integer value (0 when absent/non-numeric). Same tri-state contract.
 mget_num() {
-  local v
+  local v rc
   multica_call issue metadata get "$1" --key "$2" --output json
-  [ "$MC_RC" -eq 0 ] || { printf '0'; return 0; }
+  rc=$(mc_classify)
+  [ "$rc" -eq 0 ] || { printf '0'; [ "$rc" -eq 3 ] && return 0; return "$rc"; }
   v=$(printf '%s' "$MC_OUT" | tr -dc '0-9')
   [ -n "$v" ] && printf '%s' "$v" || printf '0'
+  return 0
 }
 
 # splice_row <uuid> <row> — put ROW into the issue document's `## Transition Log` table.
@@ -534,9 +551,11 @@ cmd_transition() {
     echo "FATAL: usage: transition <stem> <TO_STATE> [AGENT] [NOTES] [RINC] [BINC]" >&2; exit 2
   fi
   valid_state "$to" || { echo "FATAL: invalid TO_STATE '$to' (one of: $ALL_STATES)" >&2; exit 7; }
-  local uuid from nto rc now cur
+  local uuid from nto rc now cur grc
   uuid=$(resolve_key "$stem") || exit $?
-  from=$(mget_str "$uuid" whip_state)
+  # A fabricated "" here makes the no-op guard below MISS, re-running a transition that already landed
+  # — re-bumping its counter and re-appending its audit row. Refuse instead; the caller can retry.
+  from=$(mget_str "$uuid" whip_state) || { grc=$?; echo "FATAL: could not read current state of '$stem' (exit $grc): $MC_ERR" >&2; exit "$grc"; }
   nto=$(nstatus "$to")
 
   if [ "$from" = "$to" ]; then
@@ -552,10 +571,12 @@ cmd_transition() {
   multica_call issue status "$uuid" "$nto" --output json
   rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: set native status failed: $MC_ERR" >&2; exit "$rc"; }
   if [ "$to" = "rejected" ] && [ "$rinc" = "1" ]; then
-    cur=$(mget_num "$uuid" whip_rejections); mset "$uuid" whip_rejections "$((cur + 1))" number || exit $?
+    cur=$(mget_num "$uuid" whip_rejections) || { grc=$?; echo "FATAL: could not read whip_rejections for '$stem' (exit $grc): $MC_ERR — refusing to write, a fabricated 0 would RESET the counter" >&2; exit "$grc"; }
+    mset "$uuid" whip_rejections "$((cur + 1))" number || exit $?
   fi
   if [ "$to" = "blocked" ] && [ "$binc" = "1" ]; then
-    cur=$(mget_num "$uuid" whip_blocks); mset "$uuid" whip_blocks "$((cur + 1))" number || exit $?
+    cur=$(mget_num "$uuid" whip_blocks) || { grc=$?; echo "FATAL: could not read whip_blocks for '$stem' (exit $grc): $MC_ERR — refusing to write, a fabricated 0 would RESET the counter" >&2; exit "$grc"; }
+    mset "$uuid" whip_blocks "$((cur + 1))" number || exit $?
   fi
   now=$(date -u +"%Y-%m-%d %H:%M:%S")
   mset "$uuid" whip_last_transition_ts "$now" string || exit $?
@@ -616,9 +637,12 @@ cmd_update_field() {
   fi
 
   if [ ${#ADDDEPS[@]} -gt 0 ]; then
-    local dep cur new
+    local dep cur new grc
     for dep in "${ADDDEPS[@]}"; do
-      cur=$(mget_str "$uuid" whip_deps | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//')
+      # A fabricated "" takes the `none|""` branch below and REPLACES the whole dependency list with
+      # this one dep. The contract is explicit that dependency tokens must never be dropped.
+      cur=$(mget_str "$uuid" whip_deps) || { grc=$?; echo "FATAL: could not read whip_deps for '$stem' (exit $grc): $MC_ERR — refusing to write, a fabricated empty list would DESTROY the existing dependencies" >&2; exit "$grc"; }
+      cur=$(printf '%s' "$cur" | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//')
       case "$cur" in none|"") new="$dep" ;; *) new="$cur, $dep" ;; esac
       mset "$uuid" whip_deps "$new" string || exit $?
       edited=1

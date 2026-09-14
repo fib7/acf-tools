@@ -96,7 +96,7 @@ set_field() {
 # ---- subcommands -----------------------------------------------------------
 
 cmd_capabilities() {
-  printf '{"backend":"files","contractVersion":1,"commitsToGit":true,"capabilities":["snapshot","snapshot-enriched","read","create","transition","stage","update-field","update-body","log-event","comment","doctor","doctor-fix","doctor-complete","init","sync"]}\n'
+  printf '{"backend":"files","contractVersion":1,"commitsToGit":true,"capabilities":["snapshot","snapshot-enriched","read","create","transition","stage","update-field","update-body","log-event","comment","doctor","doctor-fix","doctor-complete","init","sync","token-all-states"]}\n'
 }
 
 cmd_init() {

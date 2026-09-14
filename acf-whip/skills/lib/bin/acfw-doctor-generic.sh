@@ -61,6 +61,12 @@ if [ -n "$HEAD_BR" ] && git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/rem
   [ "${nahead:-0}" -gt 0 ] && emit WARN trunk-unpushed "(repo)" "local $HEAD_BR is $nahead commit(s) ahead of origin/$HEAD_BR — acf-whip never pushes; push when ready"
 fi
 
+# Does this backend answer hasCleanCheckoutToken in every state? The dispatcher resolves it from the
+# adapter's capabilities and injects it. Absent (a snapshot not produced by the dispatcher) => assume
+# yes, which is the files behaviour and keeps the standalone path unchanged.
+TOKEN_ALL_STATES=$(printf '%s' "$SNAP" | jq -r 'if has("tokenAllStates") then (.tokenAllStates | tostring) else "true" end' 2>/dev/null)
+[ -n "$TOKEN_ALL_STATES" ] || TOKEN_ALL_STATES=true
+
 # ---- per-task checks from the snapshot ----
 # One jq pass emits pipe-joined records; bash turns them into findings. The severity tier below is
 # kept textually identical to doctor.sh — the two batteries must agree on what gates a run.
@@ -89,7 +95,11 @@ while IFS='|' read -r stem folder id status agent rc bc hasTok isCode hasBranch 
   if [ "$bc" -lt 0 ] 2>/dev/null || [ "$bc" -gt 9 ] 2>/dev/null; then
     emit WARN block-count-out-of-range "$stem" "Block-Count $bc out of [0,9] (repair via the adapter's doctor --fix)"
   fi
-  [ "$folder" = "accepted" ] && [ "$hasTok" = "false" ] && emit WARN missing-clean-checkout-token "$stem" "accepted without a 'clean-checkout | ok' token"
+  # Only meaningful when the adapter actually answers this field for accepted tasks. Where the answer
+  # costs a request, adapters bound the paid set to the review states; `false` on an accepted task
+  # then means "not scanned", and warning on it puts a permanent false advisory on every finished task.
+  [ "$TOKEN_ALL_STATES" = "true" ] && [ "$folder" = "accepted" ] && [ "$hasTok" = "false" ] \
+    && emit WARN missing-clean-checkout-token "$stem" "accepted without a 'clean-checkout | ok' token"
   [ "$folder" = "in-review" ] && emit WARN lingering-in-review "$stem" "stuck in in-review (quality-reviewer must terminate it)"
   if [ "$folder" = "in-progress" ] && [ "$age" -ge "$TIMEOUT_H" ] 2>/dev/null; then
     emit WARN stale-in-progress "$stem" "in-progress for ${age}h (>= ${TIMEOUT_H}h timeout)"

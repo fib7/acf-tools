@@ -1,101 +1,288 @@
 #!/usr/bin/env bash
-# phase9-adapter-multica.test.sh — live wrapper that runs the store-conformance
-# suite against the multica adapter. It SKIPs cleanly (exit 0) unless a throwaway
-# multica server is provided, because the adapter talks to a real API — there is
-# no offline stub (build one in scratchpad if you need to exercise it without a
-# server; see adapters/multica/README.md).
+# phase9-adapter-multica.test.sh — runs the frozen store-conformance suite against the multica
+# adapter, OFFLINE by default, plus multica-specific assertions the frozen spec cannot express.
 #
-# To run against a live server, export ALL of:
-#   MULTICA_TEST_SERVER       e.g. https://multica.example.com
-#   MULTICA_TEST_TOKEN        a `mul_` PAT with issue read/write in the workspace
-#   MULTICA_TEST_WORKSPACE_ID the workspace UUID
-# Optional:
-#   MULTICA_TEST_PROJECT      scope conformance issues to this project id
-#   ACFW_MULTICA_BIN          path to the `multica` CLI (default: `multica` on PATH)
+# This used to SKIP unless a live throwaway server was provided, and run-all.sh treats a SKIP as a
+# pass. So the adapter shipped untested on every developer machine and in CI, and a whole class of
+# defects — a snapshot field answered for one state only, an inert card raised to a gate FATAL, a
+# transient silently converted into a definite answer — was invisible until a user hit it.
 #
-# The conformance run creates issues keyed conf-a / conf-b in the workspace; the
-# EXIT trap tears them down (status→cancelled and whip_key metadata deleted, so a
-# re-run starts clean — multica has no `issue delete`, but a key-less issue is
-# invisible to the adapter's resolve/snapshot).
+# The seam that makes an offline run possible already existed: every backend call funnels through
+# multica_call -> "$MULTICA_BIN", and MULTICA_BIN is ${ACFW_MULTICA_BIN:-multica}. That is the same
+# shape phase9-adapter-linear.test.sh uses for Linear via ACFW_LINEAR_TRANSPORT. All that was missing
+# was the stand-in, so this file writes one: a JSON-file-backed fake of the CLI surface the adapter
+# actually uses, with fault injection so the transient paths can be exercised deliberately.
+#
+# Live server (optional, additive): export MULTICA_TEST_SERVER, MULTICA_TEST_TOKEN and
+# MULTICA_TEST_WORKSPACE_ID to ALSO run the frozen suite against a real workspace.
 
 set -u
 ACF_WHIP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ADAPTER="$ACF_WHIP/adapters/multica/acfw-store-multica"
 
-if [ -z "${MULTICA_TEST_SERVER:-}" ] || [ -z "${MULTICA_TEST_TOKEN:-}" ] || [ -z "${MULTICA_TEST_WORKSPACE_ID:-}" ]; then
-  echo "SKIP: multica adapter live test needs MULTICA_TEST_SERVER, MULTICA_TEST_TOKEN, and MULTICA_TEST_WORKSPACE_ID"
-  exit 0
-fi
-
-MULTICA_BIN="${ACFW_MULTICA_BIN:-multica}"
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not installed (required by the multica adapter)"; exit 0; }
-command -v "$MULTICA_BIN" >/dev/null 2>&1 || { echo "SKIP: multica CLI '$MULTICA_BIN' not found (set ACFW_MULTICA_BIN)"; exit 0; }
 [ -x "$ADAPTER" ] || { echo "FATAL: adapter not executable: $ADAPTER" >&2; exit 1; }
 
-# Map the test-scoped vars onto the native CLI env the adapter passes through.
-export MULTICA_SERVER_URL="$MULTICA_TEST_SERVER"
-export MULTICA_TOKEN="$MULTICA_TEST_TOKEN"
-export MULTICA_WORKSPACE_ID="$MULTICA_TEST_WORKSPACE_ID"
-[ -n "${MULTICA_TEST_PROJECT:-}" ] && export ACFW_MULTICA_PROJECT="$MULTICA_TEST_PROJECT"
+PASS=0 FAIL=0
+ok(){ PASS=$((PASS+1)); echo "  PASS: $1"; }
+bad(){ FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
+check(){ if eval "$2"; then ok "$1"; else bad "$1 [cond: $2]"; fi; }
 
-# Teardown: neutralize the conformance issues so re-runs are clean. Deleting the
-# whip_key metadata makes each issue invisible to the adapter (there is no CLI
-# issue-delete); cancelling is best-effort cosmetic.
-cleanup() {
-  local k id
-  local -a largs
-  for k in conf-a conf-b mat-tok; do
-    largs=(issue list --metadata "whip_key=$k" --limit 1 --output json)
-    [ -n "${ACFW_MULTICA_PROJECT:-}" ] && largs+=(--project "$ACFW_MULTICA_PROJECT")
-    id=$(LC_ALL=C "$MULTICA_BIN" "${largs[@]}" 2>/dev/null | jq -r '.issues[0].id // empty')
-    [ -n "$id" ] || continue
-    LC_ALL=C "$MULTICA_BIN" issue status "$id" cancelled >/dev/null 2>&1 || true
-    LC_ALL=C "$MULTICA_BIN" issue metadata delete "$id" --key whip_key >/dev/null 2>&1 || true
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/acfw-mc.XXXXXX"); trap 'rm -rf "$WORK"' EXIT
+FAKE="$WORK/multica-fake"
+
+# ---- the offline stand-in (no network; one JSON file is the whole store) ----
+cat > "$FAKE" <<'FAKEEOF'
+#!/usr/bin/env bash
+# multica-fake — an offline stand-in for the `multica` CLI, backed by one JSON file.
+#
+# The adapter funnels every backend call through multica_call -> "$MULTICA_BIN", and MULTICA_BIN is
+# ${ACFW_MULTICA_BIN:-multica}. That single seam is all an offline conformance run needs — the same
+# shape phase9-adapter-linear.test.sh already uses for Linear via ACFW_LINEAR_TRANSPORT.
+#
+# State:   $MC_FAKE_STATE (JSON: {"issues":{<uuid>:{...}},"seq":N})
+# Faults:  $MC_FAKE_FAIL  — "<pattern>:<exit>" pairs, comma separated. A pattern is one or more
+#            substrings joined by "+", ALL of which must appear in the joined argv. The AND form is
+#            what makes a fault precise: "metadata get+whip_rejections" fails the READ of that key
+#            without also failing the WRITE, which would mask the very fabrication under test.
+#          $MC_FAKE_FAIL_ONCE — same, but each pattern fires once then clears (via $MC_FAKE_FIRED)
+set -u
+STATE="${MC_FAKE_STATE:?MC_FAKE_STATE must be set}"
+[ -f "$STATE" ] || printf '{"issues":{},"seq":0}\n' > "$STATE"
+
+ARGV="$*"
+matches_all() { # <pattern-with-+-separators> — every part must appear in $ARGV
+  local part
+  for part in $(printf '%s' "$1" | tr '+' '\n'); do
+    case "$ARGV" in *"$part"*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+fault() { # honour MC_FAKE_FAIL / MC_FAKE_FAIL_ONCE against the joined argv
+  local spec pat code
+  for spec in $(printf '%s' "${MC_FAKE_FAIL_ONCE:-}" | tr ',' ' '); do
+    pat="${spec%:*}"; code="${spec##*:}"
+    if matches_all "$pat"; then
+      if [ -n "${MC_FAKE_FIRED:-}" ] && [ -f "$MC_FAKE_FIRED" ] && grep -qxF "$spec" "$MC_FAKE_FIRED"; then continue; fi
+      [ -n "${MC_FAKE_FIRED:-}" ] && echo "$spec" >> "$MC_FAKE_FIRED"
+      echo "fake: injected transient for '$pat'" >&2; exit "$code"
+    fi
+  done
+  for spec in $(printf '%s' "${MC_FAKE_FAIL:-}" | tr ',' ' '); do
+    pat="${spec%:*}"; code="${spec##*:}"
+    matches_all "$pat" && { echo "fake: injected failure for '$pat'" >&2; exit "$code"; }
   done
 }
-trap cleanup EXIT
+fault
 
-echo "== multica adapter conformance (live server: $MULTICA_SERVER_URL) =="
-cleanup   # clear any leftovers from a prior aborted run before we start
-ADAPTER="$ADAPTER" bash "$ACF_WHIP/tests/phase9-store-conformance.test.sh"; conf_rc=$?
+jqs() { jq "$@" "$STATE"; }
+save() { local t; t=$(mktemp); jq "$@" "$STATE" > "$t" && mv "$t" "$STATE"; }
 
-# Targeted: the clean-checkout token must survive `read --materialize`. The frozen
-# conformance materializes a token-less task, so it does NOT cover the reviewer's
-# auto-reject grep — this does. Create a task, log the token via log-event, then
-# grep the refreshed materialized document for it.
+SUB="${1:-}"; shift || true
+[ "$SUB" = "issue" ] || { echo "fake: unsupported command '$SUB'" >&2; exit 2; }
+ACT="${1:-}"; shift || true
+
+case "$ACT" in
+  create)
+    TITLE=""; DESC=""; STATUS="todo"; PRIO=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --title) TITLE="$2"; shift 2 ;;
+      --description-stdin) DESC=$(cat); shift ;;
+      --status) STATUS="$2"; shift 2 ;;
+      --priority) PRIO="$2"; shift 2 ;;
+      --output) shift 2 ;;
+      *) shift ;;
+    esac; done
+    ID="iss-$(jqs -r '.seq + 1')"
+    save --arg id "$ID" --arg t "$TITLE" --arg d "$DESC" --arg s "$STATUS" --arg p "$PRIO" \
+      '.seq += 1 | .issues[$id] = {id:$id, identifier:("T-"+($id|ltrimstr("iss-"))), title:$t, description:$d, status:$s, priority:$p, metadata:{}, comments:[]}'
+    jqs -r --arg id "$ID" '.issues[$id] | {id, identifier, title, status}'
+    ;;
+  list)
+    LIMIT=1000; OFFSET=0; MKEY=""; MVAL=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --limit) LIMIT="$2"; shift 2 ;;
+      --offset) OFFSET="$2"; shift 2 ;;
+      --metadata) MKEY="${2%%=*}"; MVAL="${2#*=}"; shift 2 ;;
+      --project) shift 2 ;;
+      --output) shift 2 ;;
+      *) shift ;;
+    esac; done
+    # Real shape: {"issues":[...],"has_more":bool} — the adapter paginates on has_more and counts
+    # .issues|length, so a bare array breaks both.
+    jqs -r --argjson lim "$LIMIT" --argjson off "$OFFSET" --arg mk "$MKEY" --arg mv "$MVAL" '
+      ([.issues[]]
+       | if $mk == "" then . else map(select(((.metadata[$mk] // "") | tostring) == $mv)) end
+       | sort_by(.id)) as $all
+      | {issues: $all[$off:($off + $lim)], has_more: (($off + $lim) < ($all | length))}'
+    ;;
+  get)
+    ID="$1"; shift
+    jqs -e -r --arg id "$ID" '.issues[$id] // empty' || { echo "fake: no such issue $ID" >&2; exit 4; }
+    ;;
+  status)
+    ID="$1"; ST="$2"
+    jqs -e --arg id "$ID" '.issues | has($id)' >/dev/null || { echo "fake: no such issue $ID" >&2; exit 4; }
+    save --arg id "$ID" --arg s "$ST" '.issues[$id].status = $s'
+    jqs -r --arg id "$ID" '.issues[$id] | {id, status}'
+    ;;
+  update)
+    ID="$1"; shift
+    while [ $# -gt 0 ]; do case "$1" in
+      --description-stdin) D=$(cat); save --arg id "$ID" --arg d "$D" '.issues[$id].description = $d'; shift ;;
+      --priority) save --arg id "$ID" --arg p "$2" '.issues[$id].priority = $p'; shift 2 ;;
+      --output) shift 2 ;;
+      *) shift ;;
+    esac; done
+    jqs -r --arg id "$ID" '.issues[$id] | {id}'
+    ;;
+  metadata)
+    MACT="${1:-}"; shift || true
+    ID="$1"; shift
+    KEY=""; VAL=""; TYPE="string"
+    while [ $# -gt 0 ]; do case "$1" in
+      --key) KEY="$2"; shift 2 ;;
+      --value) VAL="$2"; shift 2 ;;
+      --type) TYPE="$2"; shift 2 ;;
+      --output) shift 2 ;;
+      *) shift ;;
+    esac; done
+    case "$MACT" in
+      set) if [ "$TYPE" = "number" ]; then save --arg id "$ID" --arg k "$KEY" --argjson v "${VAL:-0}" '.issues[$id].metadata[$k] = $v'
+           else save --arg id "$ID" --arg k "$KEY" --arg v "$VAL" '.issues[$id].metadata[$k] = $v'; fi
+           printf '{"ok":true}\n' ;;
+      # --output json means JSON, not a bare word: the adapter pipes this through jq.
+      get) jqs -e --arg id "$ID" --arg k "$KEY" '.issues[$id].metadata[$k] // empty' \
+             || { echo "fake: no such metadata key $KEY" >&2; exit 4; } ;;
+      *)   echo "fake: unsupported metadata action '$MACT'" >&2; exit 2 ;;
+    esac
+    ;;
+  comment)
+    CACT="${1:-}"; shift || true
+    ID="$1"; shift
+    case "$CACT" in
+      add)  C=""; while [ $# -gt 0 ]; do case "$1" in --content-stdin) C=$(cat); shift ;; --output) shift 2 ;; *) shift ;; esac; done
+            save --arg id "$ID" --arg c "$C" '.issues[$id].comments += [{content:$c}]'; printf '{"ok":true}\n' ;;
+      list) jqs -r --arg id "$ID" '.issues[$id].comments // []' ;;
+      *)    echo "fake: unsupported comment action '$CACT'" >&2; exit 2 ;;
+    esac
+    ;;
+  *) echo "fake: unsupported issue action '$ACT'" >&2; exit 2 ;;
+esac
+FAKEEOF
+chmod +x "$FAKE"
+
+mkstore() {  # <dir> — a fresh repo + empty fake store, echoed as the state path
+  local d="$1"
+  mkdir -p "$d" && ( cd "$d" && git init -q -b trunk . && git config user.email t@t && git config user.name t \
+    && echo seed > seed && git add -A && git commit -qm seed ) >/dev/null 2>&1
+  printf '{"issues":{},"seq":0}\n' > "$d/state.json"
+  printf '%s' "$d/state.json"
+}
+
+mktask() {  # <file> <id> <slug> [deps]
+  printf -- '- **ID**: %s\n- **Status**: pending\n- **Priority**: high\n- **Assigned Agent**: none\n- **Worktree**: %s\n- **PR Group**: %s\n- **Touches Globs**: none\n- **Dependencies**: %s\n\n# Task\n\nbody\n' \
+    "$2" "$3" "$3" "${4:-none}" > "$1"
+}
+
+# ============================================================================
+echo "== multica adapter: frozen store-conformance, OFFLINE =="
+CONF=$(mkstore "$WORK/conf")
+( export ACFW_TRUNK_ROOT="$WORK/conf" ACFW_MULTICA_BIN="$FAKE" MC_FAKE_STATE="$CONF"
+  ADAPTER="$ADAPTER" bash "$ACF_WHIP/tests/phase9-store-conformance.test.sh" ) > "$WORK/conf.out" 2>&1
+CONF_RC=$?
+sed 's/^/    /' "$WORK/conf.out" | tail -3
+check "frozen conformance spec passes against multica with no server" "[ $CONF_RC -eq 0 ]"
+
+# ============================================================================
+# Transient handling. A three-valued question — the key holds X / the key is absent / I could not ask
+# — answered with one value lets any timeout or 5xx masquerade as a definite answer, and the
+# read-modify-write callers then WRITE that fabrication. Each case below corrupts durable state.
 echo
-echo "== materialize audit-trail token check =="
-tok_rc=0
-work=$(mktemp -d "${TMPDIR:-/tmp}/acfw-mtok.XXXXXX")
-cat > "$work/mat-tok.md" <<'DOC'
-# Task: mat-tok
+echo "== transient reads must never become definite answers =="
+TRI=$(mkstore "$WORK/tri")
+export ACFW_TRUNK_ROOT="$WORK/tri" ACFW_MULTICA_BIN="$FAKE" MC_FAKE_STATE="$TRI"
+mktask "$WORK/tri.md" t-001 sa "dep-a, dep-b, dep-c"
+"$ADAPTER" create --file "$WORK/tri.md" --stem t-001-x --folder pending >/dev/null
 
-## Metadata
+cycle() { for s in in-progress completed in-review; do "$ADAPTER" transition t-001-x "$s" o d 0 0 >/dev/null; done; }
+cycle; "$ADAPTER" transition t-001-x rejected q bad 1 0 >/dev/null
+"$ADAPTER" transition t-001-x pending o retry 0 0 >/dev/null
+cycle; "$ADAPTER" transition t-001-x rejected q bad2 1 0 >/dev/null
+RC0=$("$ADAPTER" read t-001-x | jq -r '.fields.rejection_count')
+check "baseline: two real rejections counted" "[ \"$RC0\" = '2' ]"
 
-- **ID**: mat-tok
-- **Status**: pending
-- **Priority**: high
-- **Assigned Agent**: test-agent
-- **Worktree**: slug-mat-tok
-- **PR Group**: slug-mat-tok
-- **Touches Globs**: none
-- **Dependencies**: none
-- **Rejection Count**: 0
-- **Block-Count**: 0
+"$ADAPTER" transition t-001-x pending o retry 0 0 >/dev/null; cycle
+OUT=$(MC_FAKE_FAIL="metadata get+whip_rejections:2" "$ADAPTER" transition t-001-x rejected q bad3 1 0 2>&1); TR_RC=$?
+RC1=$("$ADAPTER" read t-001-x | jq -r '.fields.rejection_count')
+check "a transient on the counter read is refused, not fabricated" "[ $TR_RC -ne 0 ]"
+# The fault hits ONLY the read, so the write path is live: without the guard the fabricated 0 is
+# written and the counter drops from 2 to 1. Failing the write too would mask exactly that.
+check "the rejection counter is NOT reset by it (still 2, would be 1 if fabricated)" "[ \"$RC1\" = '2' ]"
+check "the refusal says what it was protecting" "printf '%s' \"\$OUT\" | grep -q 'RESET the counter'"
 
-## Description
+DEP0=$("$ADAPTER" read t-001-x | jq -r '.fields.dependencies')
+OUT=$(MC_FAKE_FAIL="metadata get+whip_deps:2" "$ADAPTER" update-field t-001-x --add-dep dep-d 2>&1); DEP_RC=$?
+DEP1=$("$ADAPTER" read t-001-x | jq -r '.fields.dependencies')
+check "a transient on the dependency read is refused" "[ $DEP_RC -ne 0 ]"
+check "the dependency list survives intact (would collapse to just dep-d)" "[ \"$DEP1\" = \"$DEP0\" ] && [ \"$DEP1\" != 'dep-d' ]"
 
-materialize token round-trip spec
-DOC
-if "$ADAPTER" create --file "$work/mat-tok.md" --folder pending >/dev/null &&
-   "$ADAPTER" log-event mat-tok --row '| 2026-07-15 10:00:00 | clean-checkout | ok | clean-checkout-before-task | slug-mat-tok | worktree/slug-mat-tok |' >/dev/null &&
-   MAT=$("$ADAPTER" read --materialize "$work" mat-tok) &&
-   grep -q '| clean-checkout | ok |' "$MAT"; then
-  echo "  PASS: materialized document exposes the clean-checkout token"
-else
-  echo "  FAIL: clean-checkout token missing from materialized document"
-  tok_rc=1
+# The idempotence guard reads current state first. A fabricated "" makes it MISS, so an
+# already-applied transition re-runs as a forward one, re-bumping counters and re-appending audit.
+OUT=$(MC_FAKE_FAIL="metadata get+whip_state:2" "$ADAPTER" transition t-001-x rejected q again 1 0 2>&1); ST_RC=$?
+check "a transient on the state read is refused, not treated as a state change" "[ $ST_RC -ne 0 ]"
+RC2=$("$ADAPTER" read t-001-x | jq -r '.fields.rejection_count')
+check "no counter was bumped by the refused transition" "[ \"$RC2\" = \"$RC1\" ]"
+
+# A genuinely ABSENT key is not a transient: it must still answer normally.
+"$ADAPTER" update-field t-001-x --set 'Priority=low' >/dev/null 2>&1
+check "an absent metadata key still reads as absent, not as a failure" "[ \$? -eq 0 ]"
+
+# ============================================================================
+echo
+echo "== snapshot fidelity the frozen spec cannot express =="
+SNP=$(mkstore "$WORK/snap")
+export ACFW_TRUNK_ROOT="$WORK/snap" MC_FAKE_STATE="$SNP"
+mktask "$WORK/s1.md" s-001 sa; "$ADAPTER" create --file "$WORK/s1.md" --stem s-001-a --folder pending >/dev/null
+mktask "$WORK/s2.md" s-002 sb; "$ADAPTER" create --file "$WORK/s2.md" --stem s-002-b --folder pending >/dev/null
+
+# hasCleanCheckoutToken in EVERY state. This adapter answered it for in-review alone, so a task the
+# orchestrator lifted from completed into review read its token as absent and had its review skipped.
+"$ADAPTER" transition s-001-a in-progress o d 0 0 >/dev/null
+"$ADAPTER" log-event s-001-a --row '| 2026-07-15 10:00:00 | clean-checkout | ok | x | sa | worktree/sa |' >/dev/null 2>&1
+TOK_IP=$("$ADAPTER" snapshot | jq -r '.tasks[] | select(.stem=="s-001-a") | .hasCleanCheckoutToken')
+check "token is reported in IN-PROGRESS" "[ \"$TOK_IP\" = 'true' ]"
+"$ADAPTER" transition s-001-a completed s d 0 0 >/dev/null
+TOK_C=$("$ADAPTER" snapshot | jq -r '.tasks[] | select(.stem=="s-001-a") | .hasCleanCheckoutToken')
+check "token is reported in COMPLETED (the state the review queue is built from)" "[ \"$TOK_C\" = 'true' ]"
+"$ADAPTER" transition s-001-a in-review o r 0 0 >/dev/null
+"$ADAPTER" transition s-001-a accepted q ship 0 0 >/dev/null
+TOK_A=$("$ADAPTER" snapshot | jq -r '.tasks[] | select(.stem=="s-001-a") | .hasCleanCheckoutToken')
+check "token is reported in ACCEPTED (the generic doctor warns on false)" "[ \"$TOK_A\" = 'true' ]"
+TOK_N=$("$ADAPTER" snapshot | jq -r '.tasks[] | select(.stem=="s-002-b") | .hasCleanCheckoutToken')
+check "a task that never logged one still reports false" "[ \"$TOK_N\" = 'false' ]"
+
+# An out-of-vocabulary whip_state is inert, not corrupt: no scheduler path can act on it.
+UUID=$(jq -r '.issues | to_entries[] | select(.value.metadata.whip_key=="s-002-b") | .key' "$SNP")
+ACFW_MULTICA_BIN="$FAKE" "$FAKE" issue metadata set "$UUID" --key whip_state --value in-external-review --type string >/dev/null
+DOC=$("$ADAPTER" doctor 2>/dev/null); DOC_RC=$?
+check "an out-of-vocabulary state is WARN, not FATAL" "printf '%s\n' \"\$DOC\" | grep -q '^WARN|invalid-state|'"
+check "...and therefore does not fail the gate" "[ $DOC_RC -eq 0 ]"
+check "...and names the remedy" "printf '%s\n' \"\$DOC\" | grep -q 'transition s-002-b archive'"
+DOCQ=$("$ADAPTER" doctor --quiet 2>/dev/null)
+check "--quiet drops the advisory but keeps the SUMMARY" \
+  "! printf '%s\n' \"\$DOCQ\" | grep -q '^WARN|' && printf '%s\n' \"\$DOCQ\" | grep -q '^SUMMARY|'"
+
+# ============================================================================
+if [ -n "${MULTICA_TEST_SERVER:-}" ] && [ -n "${MULTICA_TEST_TOKEN:-}" ] && [ -n "${MULTICA_TEST_WORKSPACE_ID:-}" ]; then
+  echo
+  echo "== ALSO running the frozen suite against the live server $MULTICA_TEST_SERVER =="
+  export MULTICA_SERVER_URL="$MULTICA_TEST_SERVER" MULTICA_TOKEN="$MULTICA_TEST_TOKEN" MULTICA_WORKSPACE_ID="$MULTICA_TEST_WORKSPACE_ID"
+  unset ACFW_MULTICA_BIN MC_FAKE_STATE
+  ADAPTER="$ADAPTER" bash "$ACF_WHIP/tests/phase9-store-conformance.test.sh"
+  check "frozen conformance spec passes against the live server" "[ $? -eq 0 ]"
 fi
-rm -rf "$work"
 
-[ "$conf_rc" -eq 0 ] && [ "$tok_rc" -eq 0 ]
+echo
+echo "phase9-adapter-multica: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ] || exit 1

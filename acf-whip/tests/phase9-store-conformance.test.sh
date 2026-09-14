@@ -157,10 +157,17 @@ if printf '%s' "$CAPS" | grep -q '"log-event"'; then
   SNAP_A=$("$ADAPTER" snapshot)
   # Three shapes are legal for an accepted task: collapsed out of tasks[] entirely (files does this
   # for terminal accepted work), present as a slim dependency stub, or present in full WITH its token.
-  # Present-in-full-and-false is not: that is the defect this asserts against.
+  # Present-in-full-and-false is legal ONLY for an adapter that does not declare `token-all-states` —
+  # where each answer costs a request, bounding the paid set to the review states is the right trade,
+  # and the declaration is what stops a consumer reading that `false` as "no token".
   A_TOK=$(jget "$SNAP_A" 'j.tasks.some(t=>t.stem==="conf-a") ? (j.tasks.find(t=>t.stem==="conf-a").slim ? "slim" : String(j.tasks.find(t=>t.stem==="conf-a").hasCleanCheckoutToken)) : "absent"')
-  check "accepted task is collapsed, slim, or still reports its token (got: $A_TOK)" \
-    "[ \"\$A_TOK\" = 'absent' ] || [ \"\$A_TOK\" = 'slim' ] || [ \"\$A_TOK\" = 'true' ]"
+  if printf '%s' "$CAPS" | grep -q '"token-all-states"'; then
+    check "accepted task reports its token (adapter declares token-all-states; got: $A_TOK)" \
+      "[ \"\$A_TOK\" = 'absent' ] || [ \"\$A_TOK\" = 'slim' ] || [ \"\$A_TOK\" = 'true' ]"
+  else
+    check "accepted task is collapsed, slim, or reports a token the adapter admits it did not scan (got: $A_TOK)" \
+      "[ \"\$A_TOK\" = 'absent' ] || [ \"\$A_TOK\" = 'slim' ] || [ \"\$A_TOK\" = 'true' ] || [ \"\$A_TOK\" = 'false' ]"
+  fi
 fi
 RD=$("$ADAPTER" read conf-a)
 check "A reached accepted" "[ \"\$(jget \"\$RD\" 'j.folder')\" = 'accepted' ]"

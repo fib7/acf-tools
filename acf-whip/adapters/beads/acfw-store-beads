@@ -175,7 +175,7 @@ meta_str() { printf '%s' "$1" | jq -r --arg k "$2" '.[0].metadata[$k] // ""'; }
 # ---- subcommands -----------------------------------------------------------
 
 cmd_capabilities() {
-  printf '{"backend":"beads","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition","update-field","update-body","log-event","comment","doctor","doctor-fix","init","sync"]}\n'
+  printf '{"backend":"beads","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition","update-field","update-body","log-event","comment","doctor","doctor-fix","init","sync","token-all-states"]}\n'
 }
 
 cmd_init() {

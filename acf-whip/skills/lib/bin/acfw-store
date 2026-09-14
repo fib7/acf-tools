@@ -79,8 +79,13 @@ case "$SUB" in
 
   snapshot)
     OUT=$("$ADAPTER" snapshot "$@") || exit $?
-    # Additive dispatcher metadata: which store produced this snapshot.
-    OUT=$(printf '%s\n' "$OUT" | sed '1s/^{/{"store":"'"$STORE"'",/')
+    # Additive dispatcher metadata: which store produced this snapshot, and whether its
+    # hasCleanCheckoutToken can be trusted in EVERY state. Where an answer costs a request, an adapter
+    # may bound the paid set to the states where a wrong answer costs something now — in which case
+    # `false` outside those states means "not scanned", not "no token", and a consumer that treats the
+    # two alike raises a standing false advisory on every accepted task.
+    TAS=false; has_cap token-all-states && TAS=true
+    OUT=$(printf '%s\n' "$OUT" | sed '1s/^{/{"store":"'"$STORE"'","tokenAllStates":'"$TAS"',/')
     if has_cap snapshot-enriched; then
       printf '%s\n' "$OUT"
     else

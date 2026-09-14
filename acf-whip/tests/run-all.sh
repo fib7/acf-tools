@@ -12,8 +12,10 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE/.." || exit 1
 
-# Optional suites: these skip themselves unless their backend is reachable, and a SKIP is not a failure.
-OPTIONAL="phase9-adapter-beads phase9-adapter-linear phase9-adapter-multica"
+# Optional suites: these skip themselves unless their backend is reachable, and a SKIP is not a
+# failure. phase9-adapter-multica is NOT here any more: it drives the adapter through an offline fake
+# of the multica CLI (injected at the ACFW_MULTICA_BIN seam), so it runs everywhere and must pass.
+OPTIONAL="phase9-adapter-beads"
 
 SUITES_SH="
 phase0-extraction
@@ -28,6 +30,8 @@ phase10-validate-child
 phase11-checkout-reentrancy
 phase12-multica-transition-log
 phase13-integration-mode
+phase9-adapter-multica
+phase9-adapter-linear
 $OPTIONAL
 "
 SUITES_MJS="
@@ -62,7 +66,12 @@ run_one() { # <runner> <name>
   local out rc line p f
   out=$("$runner" "$file" 2>&1); rc=$?
   line=$(tally "$out")
-  if printf '%s' "$out" | grep -q '^SKIP:'; then
+  # A suite counts as SKIPPED only if it printed a SKIP: line AND ran no assertions. Matching
+  # `^SKIP:` ANYWHERE used to swallow the whole suite, so a suite that skipped one optional section
+  # (the linear emulator suite skips only its live-server half) was reported as skipped entirely and
+  # COULD NOT FAIL THE BUILD no matter what its assertions said. Silent-coverage-loss, which is the
+  # exact failure this runner exists to prevent.
+  if printf '%s' "$out" | grep -q '^SKIP:' && [ -z "$line" ]; then
     SKIPPED="$SKIPPED $name"
     printf '  %-34s SKIP\n' "$name"
     return
