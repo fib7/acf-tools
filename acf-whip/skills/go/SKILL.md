@@ -715,6 +715,13 @@ DIRECT_DISPATCH=()   # non-code tasks (Worktree: none). This array was appended 
 SEEN_SLUGS=""
 for f in $(ls -1 .backlog/pending/*.md 2>/dev/null | sort); do
   slug=$(grep -E '^- \*\*Worktree\*\*:' "$f" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+  # Dependency gate FIRST, for every pending task. It used to sit below the `slug = none` branch, so
+  # non-code tasks skipped it entirely: a docs task depending on an unfinished research task was
+  # dispatched immediately, while the workflow path (depsSatisfied) gates both kinds alike. Nothing
+  # about having no worktree makes a dependency satisfied.
+  # Cross-slug dep needs its ledger marker on trunk; same-slug dep needs accepted/.
+  deps_ok=$(./.claude/skills/go/check-deps.sh "$f")  # conceptual; real impl inlines the check
+  [ "$deps_ok" != "ok" ] && continue
   if [ "$slug" = "none" ]; then DIRECT_DISPATCH+=("$f"); continue; fi   # research/docs-only: dispatch directly, no worktree, no clean-checkout
   if [ -z "$slug" ]; then
     # An empty slug on a code task is a FATAL doctor violation that already aborted the run
@@ -725,10 +732,6 @@ for f in $(ls -1 .backlog/pending/*.md 2>/dev/null | sort); do
   fi
   printf '%s' "$IN_PROGRESS_SLUGS" | grep -qxF "$slug" && continue   # group already busy
   printf '%s' "$SEEN_SLUGS" | grep -qxF "$slug" && continue   # already picked one task from this group this iteration
-  # Apply dependency-gating rule (see Step 3): skip if any dep unsatisfied.
-  # Cross-slug dep needs its ledger marker on trunk; same-slug dep needs accepted/.
-  deps_ok=$(./.claude/skills/go/check-deps.sh "$f")  # conceptual; real impl inlines the check
-  [ "$deps_ok" != "ok" ] && continue
   SEEN_SLUGS="$SEEN_SLUGS$slug
 "
   DISPATCH_QUEUE+=("$f")

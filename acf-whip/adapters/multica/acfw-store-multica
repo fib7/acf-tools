@@ -862,7 +862,14 @@ cmd_doctor() {
       [ "$sk" = "REPAIRABLE" ] || continue
       uuid=$(resolve_key "$task" 2>/dev/null) || continue
       case "$code" in
-        status-drift) ws=$(mget_str "$uuid" whip_state); multica_call issue status "$uuid" "$(nstatus "$ws")" --output json >/dev/null 2>&1 || true ;;
+        # The FIFTH mget_str call site, and the one this release left unguarded. A transient here
+        # returns "" with a non-zero status; discarding it sends nstatus "" to `issue status`, writing
+        # an EMPTY native status onto a task whose whip_state is intact — turning a REPAIRABLE
+        # status-drift finding into a worse one, during the repair that was supposed to fix it.
+        status-drift)
+          ws=$(mget_str "$uuid" whip_state) || { echo "warn: skipped status-drift repair for '$task' — could not read whip_state" >&2; continue; }
+          [ -n "$ws" ] || { echo "warn: skipped status-drift repair for '$task' — whip_state is empty" >&2; continue; }
+          multica_call issue status "$uuid" "$(nstatus "$ws")" --output json >/dev/null 2>&1 || true ;;
         bad-rejections) mset "$uuid" whip_rejections 0 number >/dev/null 2>&1 || true ;;
         bad-blocks) mset "$uuid" whip_blocks 0 number >/dev/null 2>&1 || true ;;
       esac

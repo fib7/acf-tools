@@ -148,6 +148,15 @@ done
 # takes the whole loop with it. Also catch an array that is appended to but never read: DIRECT_DISPATCH
 # was collected and never consumed, silently dropping every non-code task from every iteration.
 SH_FAIL=0
+# Both legacy loops write .backlog/ directly, so both must say they are files-backend only. /go's
+# fallback stated it; /task's did not — and this release made /task's fallback MORE reachable by
+# routing a refusal into it, so a non-files project could be told to hand-write task files the store
+# will never see, while the run reports success. Pattern allows the backtick/hyphen variants in use.
+for sk in go task; do
+  if ! grep -qiE 'files.?.?backend only' "skills/$sk/SKILL.md" 2>/dev/null; then
+    printf '  %-34s FAIL  (skills/%s/SKILL.md legacy loop has no files-backend fence)\n' 'skill-shell-portability' "$sk"; SH_FAIL=1
+  fi
+done
 BASH4=$(grep -rn 'declare -A' skills/*/SKILL.md 2>/dev/null | grep -v '^\s*#' | grep -v 'declare -A` is a bash 4' || true)
 if [ -n "$BASH4" ]; then
   printf '  %-34s FAIL  (bash 4 syntax; macOS ships 3.2)\n' 'skill-shell-portability'

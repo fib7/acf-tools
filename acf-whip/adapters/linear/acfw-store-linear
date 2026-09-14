@@ -205,6 +205,14 @@ gql() {
     fi
     GQL_ERRCODE=5; return 5
   fi
+  # Parseable JSON with no errors key is still not necessarily a GraphQL RESPONSE: a proxy or a CDN
+  # can return a well-formed JSON error object, and every caller would then read its missing fields as
+  # authoritative empty answers. A real response carries a `data` object. Checked AFTER the errors
+  # probe on purpose — a genuine GraphQL error envelope has data absent or null and must keep its
+  # 3/5 classification above rather than being reclassified here.
+  if ! printf '%s' "$GQL_BODY" | jq -e '(.data // null) | type == "object"' >/dev/null 2>&1; then
+    GQL_ERRCODE=5; return 5
+  fi
   GQL_ERRCODE=0; return 0
 }
 

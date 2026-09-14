@@ -73,9 +73,19 @@ directory plus any added directory); on a real marketplace install the plugin li
 `~/.claude/plugins/cache/`, which is neither, so a `scriptPath` launch is refused for every user who
 installed this plugin normally. The registry resolves `acf-whip:whip-task` without touching a path.
 
+**The legacy loop is `files`-backend ONLY.** It writes and commits task documents directly into
+`.backlog/pending/`. On `beads`, `multica`, `linear` or a third-party adapter there is no such
+directory, and files written there are invisible to the store — the tasks simply do not exist, while
+the run reports success. `/go` states the same fence for its own fallback.
+
+So **resolve the backend before falling back**: `bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" info`.
+That call is made inside the `Workflow` branch above, so on this path you may not have run it yet. If
+`store` is anything other than `files`, report the refusal and **STOP** — do not improvise, and do not
+write `.backlog/` files on a store that does not use them.
+
 **Only if the `Workflow` tool is NOT available or cannot resolve the workflow** (dynamic workflows
 disabled, `CLAUDE_WORKFLOW_NAME_ONLY` set — which enumerates built-ins only, so no plugin workflow
-resolves under either form — or older Claude Code):
+resolves under either form — or older Claude Code) **AND the resolved store is `files`**:
 run the legacy decomposition loop below (Steps 1–8). It produces the same task files — including the
 mandatory `Worktree:` / `PR Group:` / `Touches Globs:` slug fields — but as a single-context
 orchestration.
