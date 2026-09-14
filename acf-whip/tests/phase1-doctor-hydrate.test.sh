@@ -592,6 +592,38 @@ check "in sync with origin -> no trunk-unpushed WARN" "! echo \"\$RL_OUT\" | gre
 rm -rf "$RL"
 
 # ---------------------------------------------------------------------------------------------------
+# DERIVED-SLUG COLLISION. Two ids with the same descriptive tail derive the same worktree slug, and
+# --fix would write it onto both — two tasks on one branch, which is the single thing a per-task slug
+# exists to prevent. The registry that detects this MUST be a file: derive_slug_unique is invoked as
+# `derived=$(derive_slug_unique "$id")`, a SUBSHELL, so a shell variable assigned inside it is
+# discarded and the check can never fire. It shipped that way once; this is what catches it.
+DS=$(mktemp -d); ( cd "$DS" && git init -q -b trunk . && git config user.email t@t && git config user.name t )
+mkdir -p "$DS"/.backlog/{draft,pending,in-progress,completed,in-review,blocked,rejected,accepted} "$DS/.claude/agents"
+echo x > "$DS/.claude/agents/go-engineer.md"
+dmk(){ printf -- '# T\n\n- **ID**: %s\n- **Status**: pending\n- **Assigned Agent**: go-engineer\n- **Worktree**:\n- **Dependencies**: none\n- **Touches Globs**: none\n' "$1" > "$DS/.backlog/pending/$1-x.md"; }
+dmk feature-001-auth   # -> auth
+dmk bug-002-auth       # -> auth  (same tail, different category and number)
+dmk feature-003-solo   # -> solo  (must be unaffected)
+( cd "$DS" && echo s > s && git add -A && git commit -qm s ) >/dev/null 2>&1
+
+DS_OUT=$(bash "$DOC" "$DS" 2>/dev/null)
+check "two ids deriving one slug is a FATAL" \
+  "printf '%s\n' \"\$DS_OUT\" | grep -q '^FATAL|duplicate-derived-slug|'"
+check "exactly ONE of the pair is reported (the second claimant, not both)" \
+  "[ \"\$(printf '%s\n' \"\$DS_OUT\" | grep -c '^FATAL|duplicate-derived-slug|')\" -eq 1 ]"
+check "the collided task gets no contradictory repair promise" \
+  "! printf '%s\n' \"\$DS_OUT\" | grep -q \"will derive '' from the id\""
+check "a task with a unique tail is still offered its repair" \
+  "printf '%s\n' \"\$DS_OUT\" | grep -q \"missing-worktree-slug|feature-003-solo-x|no Worktree slug; --fix will derive 'solo'\""
+
+bash "$DOC" --fix "$DS" >/dev/null 2>&1
+DS_AUTH=$(grep -l '^- \*\*Worktree\*\*: auth$' "$DS"/.backlog/pending/*.md 2>/dev/null | wc -l | tr -d ' ')
+check "--fix writes the contended slug to exactly one task, never both" "[ \"\${DS_AUTH:-0}\" -eq 1 ]"
+check "--fix still repairs the uncontended task" \
+  "grep -q '^- \*\*Worktree\*\*: solo$' \"$DS/.backlog/pending/feature-003-solo-x.md\""
+rm -rf "$DS"
+
+# ---------------------------------------------------------------------------------------------------
 # CROSS-SLUG GLOB OVERLAP. Nothing asserted this at all, which is how it stayed a pairwise double loop:
 # O(P^2) comparisons emitting one WARN per overlapping PAIR, so a handful of tasks sharing one glob
 # buried every real finding under a quadratic wall of advisories. It is an index — group by glob, count

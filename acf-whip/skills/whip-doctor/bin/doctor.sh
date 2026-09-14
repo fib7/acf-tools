@@ -111,7 +111,11 @@ TIMEOUT_H="${ENV_TIMEOUT:-${ACFW_INPROGRESS_TIMEOUT_HOURS:-8}}"
 
 FINDINGS=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor.XXXXXX")
 TSV=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-tsv.XXXXXX")
-trap 'rm -f "$FINDINGS" "$TSV"' EXIT
+# Slugs derived during THIS scan. A file, not a variable, for the same reason $FINDINGS is one: the
+# per-task loop and its callees run inside command substitutions and pipelines, so a shell variable
+# assigned in there never reaches the parent.
+DERIVED=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-slugs.XXXXXX")
+trap 'rm -f "$FINDINGS" "$TSV" "$DERIVED"' EXIT
 emit() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >> "$FINDINGS"; }
 field() { grep -E "^- \*\*$2\*\*:" "$1" 2>/dev/null | head -1 | sed -E "s/.*$2\*\*:[[:space:]]*//" | sed -E 's/[[:space:]]+$//'; }
 commit_fix() { # <path-rel> <msg>
@@ -204,14 +208,17 @@ derive_slug() { # <id>
 }
 
 # Within-run dedup: two ids that derive the same slug must not both get it written. The second and
-# later collisions are reported instead of repaired — picking a disambiguated slug here would invent
-# a branch name the task document never states, and the operator needs to see the id collision.
-ACFW_DERIVED_SLUGS=""
-derive_slug_unique() { # <id> -> slug, or empty when it would collide
+# later collisions are reported instead of repaired — picking a disambiguated slug here would invent a
+# branch name the task document never states, and the operator needs to see the id collision.
+#
+# The registry is $DERIVED (a file). It cannot be a shell variable: this function is invoked as
+# `derived=$(derive_slug_unique "$id")`, which runs it in a SUBSHELL, so an assignment here would be
+# discarded and the collision check could never fire — leaving --fix free to write one slug onto two
+# tasks, which is the exact condition this exists to prevent.
+derive_slug_unique() { # <id> -> slug on stdout; exit 1 (and empty) when the slug is already claimed
   local d; d=$(derive_slug "$1")
-  if printf '%s' "$ACFW_DERIVED_SLUGS" | grep -qxF "$d"; then printf ''; return 1; fi
-  ACFW_DERIVED_SLUGS="$ACFW_DERIVED_SLUGS$d
-"
+  if grep -qxF "$d" "$DERIVED" 2>/dev/null; then printf ''; return 1; fi
+  printf '%s\n' "$d" >> "$DERIVED"
   printf '%s' "$d"
 }
 
@@ -343,10 +350,11 @@ for st in $LOOP_FOLDERS; do
         emit WARN missing-worktree-slug "$stem" "accepted task has no Worktree: slug (historical; advisory)"
       elif [ -n "$id" ]; then
         if ! derived=$(derive_slug_unique "$id"); then
+          # Collision: another task this scan already claimed this slug. Report ONLY the FATAL — a
+          # REPAIRABLE beside it would promise a repair that deliberately will not happen, and
+          # "--fix will derive ''" is not a sentence anyone can act on.
           emit FATAL duplicate-derived-slug "$stem" "id '$id' derives a worktree slug already claimed by another task this scan — give one of them an explicit, distinct Worktree: slug"
-          derived=""
-        fi
-        if [ -n "$derived" ] && [ "$FIX" = "1" ]; then
+        elif [ "$FIX" = "1" ]; then
           write_slug "$f" "$folder" "$stem" "$derived"
           slug="$derived"   # use the derived slug for this task's remaining checks (TSV, registry)
           emit REPAIRABLE missing-worktree-slug "$stem" "derived '$derived' from id and wrote it into the task"
