@@ -2,6 +2,144 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.3.0 — the non-`files` backends stop being invisible
+
+Every defect in this release was found against a live non-`files` store, and they share one cause:
+**`files` is the only backend the test suite could see.** `run-all.sh` marked the three adapter
+suites OPTIONAL, each skipped unless a live server was reachable, and the runner counted a `SKIP` as
+a pass — so the backends were green by absence on every developer machine and in CI. The contract's
+own executable spec, `phase9-store-conformance.test.sh`, defaulted to the `files` adapter: the
+"executable spec" only ever ran against the one implementation that already worked.
+
+That is fixed first, because nothing else in this list could have been caught without it. The
+multica suite now writes an offline fake of the CLI — injected at the `ACFW_MULTICA_BIN` seam the
+adapter already funnels every call through, the same shape the Linear suite has used for its GraphQL
+emulator since 3.1.0 — and runs the frozen conformance spec with no server, no credentials and no
+skip. Fixing the runner's skip detection then un-masked the Linear suite, which had been reported as
+skipped (and therefore could not fail) merely because it skips its live-server half. Both are now
+first-class; only `beads` still skips, because it needs a real `bd`.
+
+**The orchestrator charged a spurious rejection to every code task.** `runReviewAndIntegrate` has two
+callers with opposite freshness guarantees, and its deterministic clean-checkout gate assumed the
+fresh one. On the inline path the task object is the one the scanner produced *before* this iteration
+dispatched the implementer, so on a first attempt both `hasCleanCheckoutToken` and
+`hasWorktreeBranch` are false — and false-with-no-branch is the gate's most destructive arm. Every
+code task, on every backend including `files`, was hard-rejected on its first completion and charged
+one of its three lives, then recovered next iteration once the branch existed. The recovery is why
+this survived undiagnosed since 3.2.0. The gate now applies only where the scan observed the task
+*after* the implementation ran; a specialist that genuinely skipped clean-checkout is still caught by
+the reviewer's own rule on the live document. The auto-reject was also the one unlogged outcome in
+that function and appeared in no run tally, so a run could reject everything it dispatched and still
+report `completed: true`.
+
+**`/whip-doctor --fix` destroyed deliverables on non-`files` stores.** `doctor.sh` is the `files`
+engine: every task check is gated on a `.backlog/<state>/` directory, so on another backend all of
+them were skipped and the summary reported `ok=true` against zero evidence. The worktree pass is not
+gated — it built its live-slug set from the now-empty task table, concluded every acf-whip worktree
+was orphaned, and under `--fix` ran `git worktree remove --force` plus `git branch -D` on each. In
+override mode that branch is the operator's only copy of an accepted-but-unintegrated deliverable,
+which `doctor.sh` says in its own comment. Both it and `scan-backlog.sh` now refuse when the resolved
+store is not `files`, on stderr, with no parseable output — a refusal a caller could read as a clean
+report is the same defect one layer up. Every skill that invoked a battery by path now goes through
+the dispatcher, and a static gate keeps it that way.
+
+**Absence of findings was treated as health, in four places.** The dispatcher discarded the adapter
+doctor's exit status (it took the pipe's) and turned a failed snapshot into a WARN, so an unreachable
+backend, an expired token or a crashed adapter produced `ok=true`, `exit 0` — and `/go`'s startup
+hard gate dispatched against a board nobody had read. `beads`' doctor skipped its entire per-issue
+battery on a failed export with no `else`; its `read --materialize` silently omitted the audit trail
+the reviewer greps for the clean-checkout token, which reads exactly like a task that never ran it.
+Linear's `gql` returned success on a body that was not JSON at all. All four now say so, and the
+dispatcher reports a battery that could not run as `FATAL|doctor-unavailable` rather than as silence.
+`/go`'s gates tell the operator which failure they hit, because "the backlog is inconsistent" sends
+someone whose store is unreachable to a tool that also cannot reach it.
+
+**Transients were written into durable state.** multica's metadata helpers answered a three-valued
+question — the key holds X, the key is absent, I could not ask — with one value, so any timeout or
+5xx was indistinguishable from "absent" and the read-modify-write callers wrote the fabrication.
+Demonstrated against the offline fake, with the fault targeting only the read so the write path stays
+live: a rejection counter went from 2 to 1, and a dependency list of three entries collapsed to the
+one being added. A third case made the idempotence guard miss and re-ran a transition that had
+already landed. Both helpers are tri-state now and the four call sites refuse rather than write.
+
+**One inert card gated a whole board.** multica reported any `whip_state` outside the canonical nine
+as a FATAL. But the scheduler dispatches on exact state equality, so a card in a state it does not
+name can never be dispatched, transitioned or integrated — it cannot make a run wrong. It is a WARN
+with the retire command in the detail. Relatedly, both doctor batteries computed "is this a gate
+FATAL?" as `folder == accepted`, which is right on `files` (whose scanner never emits `draft` or
+`archive`) and wrong everywhere else, where the adapter lists them: a draft stub with no agent file
+produced `FATAL|unknown-agent` and blocked `/go` outright. The tier is now the real question — is
+this task in the dispatch path? — and `draft`/`archive` move to a sibling `inactive[]` array that
+dependency resolution still sees but nothing schedules, counts or checks. A task depending on a draft
+now reports `WARN|dep-inactive` with the remedy instead of `FATAL|dangling-dep`, which was a lie.
+
+**`--quiet` hid the gate decision.** Both API adapters suppressed every finding line, FATALs
+included. Without `doctor-complete` the dispatcher recomputes `ok=` from the lines it receives, so a
+swallowed FATAL became `ok=true` for the startup gate and every recheck — while the verbose
+`/whip-doctor` path showed the same FATAL. That is how one backlog produced two contradictory
+verdicts on the same day.
+
+**`hasCleanCheckoutToken` was answered for one or two states.** The contract defines it as a flat
+per-task boolean, and two consumers read it. multica answered it for `in-review` alone, so every task
+lifted from `completed` into review read its token as absent and had its review skipped. Widening it
+there is free — since 3.2.0 the transition log lives in the issue description, which the snapshot
+already fetches — and it removed a quadratic re-parse at the same time. Where each answer costs a
+request, the paid set is bounded to the states where a wrong answer costs something now, and the new
+`token-all-states` capability is what lets a consumer tell "no token" from "not scanned": without it
+every finished task on Linear carried a permanent false advisory.
+
+**The plugin could not fix a document it had already shipped.** The SessionStart hook copied three
+plugin-owned documents into a consumer project and never looked at them again, so every correction
+made here aged in place in someone else's repository and was attributed to their own documentation —
+the mechanism behind the whole shipped-template defect class. The obvious fix does nothing on the
+release that introduces it: stamp a version, compare, upgrade, but every existing copy predates
+stamping and an unstamped file must never be clobbered. So a pristine copy is now recognised by its
+**content**: `content/.digests.json` carries the sha256 of every version of each managed document
+this plugin has shipped, and a local copy matching any of them is refreshed. One matching none was
+edited by hand, is never touched, and is reported as behind.
+
+**What the plugin ships now agrees with what it requires.** The reviewer template argued with itself
+— its first section ordered the reviewer to move task files, Step 10 two hundred lines later said it
+must not — and obeying the first is worse than useless: the writer is idempotent, so a task the
+reviewer already moved makes the transition a no-op, which silently drops the rejection increment.
+It told reviewers to escalate at five rejections while the orchestrator blocks at three, making the
+branch unreachable. `research-agent-pattern.md` instructed a non-code agent to move and commit its own
+task file and never mentioned `deliverableFiles` at all — the one field standing between a research
+document and the next `clean-checkout`. Eleven templates hardcoded `.backlog/` with no indication
+that it is one backend's layout. And `workflow-architect`, selected by `/go` since 3.2.0 and
+documented in three places, was created by no installer — so the headline capability degraded to the
+default agent on every project, silently, for two releases. It now exists, `whip-init` installs it,
+and its absence is logged and reported. `phase17-template-drift` pins all of this to values read from
+the runtime source, so the test cannot drift away from what it guards.
+
+**`derive_slug` truncated ids.** Its fallback matched four digits followed by an unanchored `.*`, so
+`bug-62015-alpha` and `bug-62017-beta` both derived `bug-6201` — two tasks on one worktree branch,
+which is the one thing a per-task slug exists to prevent. The sequence number is unbounded and
+anchored now, an id the pattern cannot account for gives up rather than matching a prefix of itself,
+and a collision is a FATAL naming both. The category vocabulary gains the conventional-commit types
+beyond the original eight, and its two implementations are pinned to each other.
+
+**Doctor cost, measured.** No board above 337 tasks had ever been timed, so "more than ten minutes"
+could not be attributed. At 600 tasks the two superlinear graph passes are **not** the bottleneck:
+memoising the dependency resolver and inverting the glob-overlap pass from pairwise to indexed moved
+wall-clock by about 3%. What they fixed is the output — one advisory per overlapping *pair* meant 120
+pending tasks produced 541 lines to read past, now 121. The win is `--active-only` on the bootstrap
+re-scan: 30.4s to 8.7s, from one word, with a byte-identical FATAL set, which `doctor.sh`'s header has
+promised since 2.x. `tests/perf-doctor.sh` records the baseline. Batching the per-file extraction is
+the next real win and is deliberately not attempted: rewriting that layer earns its risk against a
+measured need, and 8s at 600 tasks is not one yet.
+
+**Also**: `/go` and `/task` launch by registered name rather than by a path under the plugin cache,
+which the Workflow tool refuses for anyone who installed this plugin normally; the legacy fallback
+loop they now route into actually runs (it used bash 4 associative arrays, and dropped every non-code
+task into an array nothing read); `args.maxReject`/`args.maxBlock` bind all four cap decision sites,
+not the one that already accepted them; `args.planners` is finally passed through; `/task`'s scratch
+directory moves under the already-ignored `.acfwhip/run/`; and `doctor --snapshot FILE` lets a caller
+with a full snapshot spare the dispatcher a second store walk, refusing a narrowed or digest one as a
+usage error because the graph invariants cannot be computed from a subset.
+
+All contract changes are additive; `ACFW_CONTRACT_VERSION` stays `1`.
+
 ## 3.2.3 — /go can be pointed at part of the backlog
 
 `/go` took the whole backlog or nothing. There was no way to say "run these two tasks" — not an

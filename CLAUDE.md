@@ -33,10 +33,10 @@
 | **acf-nitro** | Cognitive | Parallel execution enforcer | 6 |
 | **acf-mission-control** | Functional | Two-line status line HUD (1M-aware fuel gauge, self-priced cost, rate limits, cache warmth); themeable glyphs (sleek/emoji/nerd/text); self-upgrading | 6 |
 | **acf-librarian** | Functional | Convention enforcement | 9 |
-| **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe; per-task authored child workflows; LP-CAS integration; pluggable task stores: files/beads/multica/linear; scopeable /go) | 100 |
+| **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe; per-task authored child workflows; LP-CAS integration; pluggable task stores: files/beads/multica/linear; scopeable /go; offline contract suite for every backend; self-refreshing installed docs) | 108 |
 | **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 17 |
 
-**Total**: 151 plugin files + 11 project/docs files = 162 tracked files.
+**Total**: 159 plugin files + 13 project/docs files = 172 tracked files.
 
 **acf-mission-control** prices sessions itself as of **1.3.0**. Claude Code only knows rates for models it ships, so anything behind a gateway (`nebius/zai-org/GLM-5.2`, `zai-org/GLM-5.2`) reported `$0.00` no matter the spend. The HUD now sums transcript token usage — deduplicated by `requestId`, since Claude Code writes one record per content block and repeats the full usage in each, which inflates naive sums 3-4× — and multiplies it by LiteLLM's rate table, cached under `~/.cache/acf-mission-control/` and refreshed daily in a detached process so the status line never blocks on the network. Provider prefixes are routing, not identity: segments are stripped left to right until an entry matches, then the bare model name is looked up wherever it is published. Self-priced figures are marked `≈`, a trailing `?` flags tokens the table could not price exactly, and `--price-check <model-id>` shows the resolved entry. With no cached table the segment degrades to Claude Code's own figure. **1.3.1** makes that figure the *whole* session: subagent and workflow conversations live in sibling transcripts under `<transcript>/subagents/` and were silently excluded, often most of the spend (a measured session read `≈$6.03` and actually cost `$25.71`). It also stops a zero-rate entry from producing a confident `≈$0.00` that suppressed the fallback, raises `?` when a missing cache rate forces tokens onto the input rate (~4× overstatement, reachable on gateway-served Claude ids), applies published speed multipliers (fast mode bills 2×), resolves context-window variants like `claude-opus-5[1m]`, and splits JSONL on newlines only — `splitlines()` also breaks on U+2028/U+2029/U+0085 and silently dropped those records' tokens.
 
@@ -45,6 +45,29 @@
 **3.2.0 replaces the one-agent-per-task leaf.** Until now every dispatched unit — a one-line config bump and a cross-cutting refactor alike — was executed by exactly one `agent()` call, with no depth or fan-out variation. Each unit now runs as **its own nested workflow**, whose harness a **workflow-architect** agent authors for that specific task by filling four marked regions of a locked, byte-diffed skeleton (`skills/lib/child-skeleton.js.tmpl`); a 20-check validator rejects a defective harness *before* any child agent spawns, turning most generated-code throw classes into error strings the architect repairs. Free-form generated scripts were designed and rejected: their keystone defect inverted the durability requirement, making every resumed harness return `'none'` forever. When a harness does throw, a scout reconciles its stage ledger against git — trusting a commit-bearing entry only when an `ACFW-Stage:` trailer confirms it, and resolving every disagreement toward an *informed re-run* rather than a skip — and the amended run replays completed stages in **zero agents**. Repair rounds are granted only when the last one measurably moved something. The default harness is deliberately shallow (checkout → implement → bounded gate loop → adversarial diff review → verify), holding the only three mechanisms a script structurally buys over one strong agent: a schema-*observed* advance condition, a fresh-context reviewer of the diff, and a durable ledger. Exactly one agent may write a worktree at a time and exactly one `clean-checkout` runs per attempt — `clean-checkout.sh` is not reentrant, and its silent `stash push -u` would otherwise sweep a sibling stage's work into the shared `refs/stash`. Implementation and conflict resolution escalate by default; the multi-lens review panel ships **off** (`args.escalateReview`) as the only subtractive seam. Because the runtime caps total agents per run, `/go` degrades FULL → LEAN → DIRECT → CLOSE back to verbatim 3.1.0 dispatch — escalation is a policy, not a guarantee, and the report says which one you got. `args.escalate: false` disables it entirely. 3.2.0 also moves the **multica** adapter's audit trail out of issue comments and into the task document's `## Transition Log` table (shared `append_log_row`, files row shape): on that backend a comment thread is a live agent channel, so orchestrator bookkeeping there landed inside a conversation agents act on — and the move drops a `comment list` per in-review task from `snapshot`, retires materialize's synthesized audit section, and keeps a comment-scan fallback so projects upgrading mid-flight are not auto-rejected. `beads`/`linear` keep comments; `CONTRACT.md` now makes the row's location a per-adapter choice.
 
 **3.2.3 makes `/go` scopeable.** It took the whole backlog or nothing — no argument, env var, config key or adapter flag selected tasks, and `skills/go/SKILL.md` was the only whip skill without an `argument-hint`. That is not ergonomics on a shared backlog: one person's `/go` is everyone's, so teams stop running the shipped orchestrator and hand-author throwaway workflows instead, which needs a frontier model every time. Now `/go api-014-token-refresh ui-021-login-form` runs exactly those, and a natural-language filter (`/go frontend tasks only`, `/go bugfixes`) resolves **in the skill, once, before launch** — matched against the fields every backend's snapshot already projects (`agent`, `slug`, `priority`, `stem`, `touchesGlobs`), shown, and confirmed — so the workflow always receives a concrete stem list and stays deterministic. Two things make it correct rather than merely narrow: the dependency **index stays whole** while only the scheduling view narrows (filtering `tasks[]` would make out-of-scope deps unresolvable, and `depsSatisfied` refuses to dispatch on a dangling token), and **completion is counted over the scope** — reusing the store-wide `snap.counts` would make `terminal === total` unreachable and burn all 15 `NO_GAIN_LIMIT` iterations before exiting `no-progress` with the work done. Unmet transitive deps are pulled in and named; nothing outside the scope is dispatched, transitioned or integrated, including by the post-loop drain. Scoping is not a fix for the shared-backend hazard it exposes: the run lock is still per-checkout and `transition` still has no compare-and-swap, so `atomic-claim` remains unimplemented. See `acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
+
+**3.3.0 makes the non-`files` backends visible.** Every defect it fixes was found against a live
+non-`files` store, and they shared one cause: `run-all.sh` marked the three adapter suites OPTIONAL,
+each skipped without a live server, and a `SKIP` counted as a pass — so those backends were green by
+absence, and `phase9-store-conformance.test.sh`, the contract's own executable spec, defaulted to the
+one adapter that already worked. The multica suite now drives the adapter through an offline fake of
+its CLI, injected at the `ACFW_MULTICA_BIN` seam (the shape Linear's GraphQL emulator has used since
+3.1.0), and runs the frozen spec with no server; fixing the runner's skip detection un-masked the
+Linear suite, which had been unable to fail for the same reason. What that exposed: transients written
+into durable state (a rejection counter reset from 2 to 1, a three-entry dependency list collapsed to
+one — both reproduced under fault injection), `hasCleanCheckoutToken` answered for one state so every
+task lifted from `completed` into review had its review skipped, `--quiet` swallowing the FATAL the
+gate reads, and one out-of-vocabulary card gating a large board. Separately and on **every**
+backend including `files`: the review gate read a scan-time task object on the inline path, so every
+code task was auto-rejected on its first completion and charged one of three lives, recovering next
+iteration — which is why it went undiagnosed since 3.2.0. And `/whip-doctor --fix` on a non-`files`
+store force-removed every acf-whip worktree and deleted its branch, which in override mode is the only
+copy of an unintegrated deliverable. The doctor and the scanner now refuse to run against a store they
+cannot read, and a battery that could not run reports `FATAL|doctor-unavailable` instead of silence.
+The plugin also stops shipping documents it can never correct: installed copies that are unedited
+refresh themselves, recognised by content digest rather than by a version stamp they predate, and
+edited ones are reported rather than clobbered. `workflow-architect` — selected by `/go` since 3.2.0,
+documented in three places, created by no installer — finally exists. See `acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
 
 **Plugin architecture**: Each plugin is fully self-contained with no cross-dependencies. Users can install any combination.
 
@@ -64,7 +87,7 @@ acf-tools/
 ├── acf-nitro/                       # Parallel enforcement (6 files)
 ├── acf-mission-control/             # Status HUD (6 files)
 ├── acf-librarian/                   # Convention enforcement (9 files)
-├── acf-whip/                        # Workflow automation, workflow-native (100 files; skills/ + workflows/ + adapters/ + tests/)
+├── acf-whip/                        # Workflow automation, workflow-native (108 files; skills/ + workflows/ + adapters/ + tests/)
 └── acf-advisor/                     # Second-opinion LLM client (17 files)
 ```
 
@@ -416,6 +439,6 @@ The plugins themselves CREATE documentation when installed in user projects:
 ---
 
 **Repository Version**: v1.0
-**Last Updated**: 2026-07-25
+**Last Updated**: 2026-09-13
 **Marketplace Plugins**: 7
-**Total Files**: 151 (tracked)
+**Total Files**: 172 (tracked)

@@ -89,6 +89,29 @@ against the backlog once, before launch, and confirms the matched list with you.
 scope is dispatched, transitioned or integrated — which is what makes `/go` usable on a backlog a
 whole team shares. See `/go` under Commands Reference.
 
+### 🧪 Every backend under the contract suite, offline (3.3.0)
+
+`tests/phase9-store-conformance.test.sh` is the contract's executable spec, and it used to run only
+against the default `files` adapter — the three others skipped unless a live server was reachable, and
+the runner counted a skip as a pass. So the API backends were green by absence, and a whole class of
+defect was invisible until a user hit it: a snapshot field answered for one task state, an inert card
+raised to a gate FATAL, a network timeout written into a rejection counter.
+
+The multica suite now drives the real adapter through an offline fake of its CLI — injected at the
+`ACFW_MULTICA_BIN` seam every call already funnels through — and runs the frozen spec with no server,
+no credentials and no skip, with fault injection so the transient paths are exercised deliberately.
+Writing an adapter for your own backend? `ADAPTER=<path> bash tests/phase9-store-conformance.test.sh`
+is the whole acceptance criterion, and `tests/phase9-adapter-multica.test.sh` is a worked example of
+testing one without a backend to talk to.
+
+### 🔁 Installed docs that stay current (3.3.0)
+
+The plugin installs a few documents into your project (`docs/acf/backlog/workflow.md` and friends).
+Those used to be copied once and never touched again, so a correction made here never reached a
+project that already had the file. Now an **unedited** copy refreshes itself — recognised by content,
+so it works on projects that predate the mechanism — and an **edited** one is never overwritten: the
+session tells you it is behind and leaves the merge to you.
+
 ### 🔄 Continuous Backlog Execution
 
 `/go` loops until 100% complete — or, when scoped, until every task in the scope is terminal:
