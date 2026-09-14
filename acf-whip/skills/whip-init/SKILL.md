@@ -310,7 +310,7 @@ Store values for agent generation (Step 6).
 
 Create `.claude/agents/` directory if missing. **Generate** 6-7 agents from patterns in `${CLAUDE_PLUGIN_ROOT}/content/agent-patterns/universal/{agent}-pattern.md`:
 
-**Always generate**: task-engineer, quality-reviewer, lean-architect, precommit, retro, research-agent
+**Always generate**: task-engineer, quality-reviewer, lean-architect, precommit, retro, research-agent, workflow-architect
 **Conditional**: devops (if `create_devops=true`)
 
 **Customization variables per agent**:
@@ -323,6 +323,7 @@ Create `.claude/agents/` directory if missing. **Generate** 6-7 agents from patt
 | **precommit** | `{backend_stack}`, `{frontend_stack}`, `{backend_linter}`, `{backend_formatter}`, `{pre_commit_config_path}` | golangci-lint, gofmt, .pre-commit-config.yaml |
 | **retro** | `{project_name}`, `{retrospective_frequency}`, `{has_sla_priorities}` | weekly, sla=true if 5-level |
 | **research-agent** | `{project_name}` | Replace project references |
+| **workflow-architect** | `{project_name}` | Replace project references. Do **not** add a `model:` pin — `/go` dispatches it with no model option so it runs on the session model. |
 | **devops** | `{LOCAL_ORCHESTRATION}`, `{DEPLOYMENT_TARGET}`, `{CI_TOOL}`, `{MONITORING_STACK}`, `{CLOUD_PROVIDER}`, `{HAS_K8S}`, `{PROJECT_NAME}`, `{ORCHESTRATION_RESPONSIBILITY}`, `{K8S_DELEGATION_SECTION}` | docker-compose, github-actions, prometheus-grafana, gke |
 
 **Coverage threshold logic**: 95% → api 95-98%, core 95% | 80% → api 90-95%, core 90% | 60% → api 75-80%, core 70%

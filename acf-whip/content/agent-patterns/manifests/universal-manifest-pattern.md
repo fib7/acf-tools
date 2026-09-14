@@ -1,5 +1,10 @@
 # Universal Agent Manifest Pattern
 
+> **Task-store note.** Paths shown as `.backlog/…` are the **default `files` task-store backend**. A
+> project configured with `beads`, `multica`, `linear` or a third-party adapter has no `.backlog/`
+> directory; read task documents at the path the orchestrator gives you, and reach store-wide
+> information through `acfw-store` rather than the filesystem.
+
 Pattern for `docs/agents/{agent-name}.md` with Priority 1/2/3 structure (58-74% token reduction).
 
 This template creates manifests for the 6 universal agents: task-engineer, quality-reviewer, lean-architect, precommit, retro, research-agent.
@@ -128,10 +133,13 @@ See stack-specific quality gates in Priority 1 docs for exact commands.
 Coverage thresholds: API 90-95%, Core 90%, Services 85-90%, Utils 85%, UI 80%
 
 ## Common Workflows
-1. Review: Move to in-review → Verify criteria → Check quality gates → Binary decision
-2. Accept: Verify all gates → Log acceptance → Move to accepted → Commit
-3. Reject: Document failures → Increment rejection_count → Move to rejected → Commit
-4. Escalate: If rejection_count >= 5 → Move to blocked → Notify task-engineer
+1. Review: Verify acceptance criteria → Check quality gates → Binary decision
+2. Accept: Verify all gates → Log the evidence into the task document → return `transition: accepted`
+3. Reject: Document the specific failures → return `transition: rejected` with `rejection_increment: 1`
+
+The orchestrator performs every state move and owns the retry cap: it counts rejections, decides when
+a task has exhausted them, and blocks it for redesign. You have no rejection budget to manage and no
+threshold to compare against — review each attempt on its merits.
 
 ## Integration Points
 **From**: Specialist agents (via .backlog/completed/), **To**: Terminal states (accepted/rejected)

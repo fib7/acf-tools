@@ -43,6 +43,7 @@ phase11-escalation
 phase14-go-scope
 phase15-first-run-autoreject
 phase16-gate-legibility
+phase17-template-drift
 "
 
 TOTAL_PASS=0 TOTAL_FAIL=0 FAILED_SUITES="" SKIPPED=""

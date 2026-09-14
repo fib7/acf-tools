@@ -1,5 +1,11 @@
 # Infrastructure Specialist Agent Implementation Pattern
 
+> **Task-store note.** `TASK_FILE` is a path the orchestrator hands you — always use the path you were
+> given rather than constructing one. Paths shown as `.backlog/<state>/…` are the **default `files`
+> task-store backend**; a project on another backend (`beads`, `multica`, `linear`, or a third-party
+> adapter) has no `.backlog/` directory at all, and the orchestrator materializes the task document
+> somewhere else. Nothing about your job changes: you never move the task file on any backend.
+
 This template creates infrastructure specialist agent implementations for `.claude/agents/{stack}-engineer.md`
 
 ## Template Variables

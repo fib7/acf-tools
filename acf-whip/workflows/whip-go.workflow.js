@@ -121,6 +121,7 @@ let agentsUsed = 0
 let REGISTRY = []
 const registryHas = (n) => REGISTRY.indexOf(n) >= 0
 const esc = { authored: 0, amended: 0, preflight: 0, fellBack: 0, refused: 0, shallow: 0, replayed: 0, faults: [] }
+let archMissingLogged = false // announce a missing workflow-architect ONCE, not once per unit
 // Every agent() in this script routes through agentC (or safeAgent, which charges its own retries) so
 // the ledger cannot drift low and let the CLOSE rung fire too late.
 async function agentC(p, o) { agentsUsed++; return agent(p, o) }
@@ -1206,7 +1207,16 @@ async function runAuthoredUnit(ctx) {
     while (round <= MAX_AMEND) {
       // ---- 1. AUTHOR / AMEND. Real design work => NO model option (session model), like specialists.
       const aopts = { label: `arch:${ctx.kind}:${ctx.key}${round ? `:amend${round}` : ''}`, phase: ctx.phase, schema: ARCHITECT }
+      // The architect persona is optional, but its ABSENCE used to be completely silent: the agent has
+      // been documented since 3.2.0 and no installer ever created it, so registryHas was false on
+      // every project and the headline capability degraded to the default agent everywhere, for two
+      // releases, with nothing in the log or the report to say so. Announce it once per run; the
+      // report carries it too, so a run that quietly used the fallback is distinguishable afterwards.
       if (registryHas('workflow-architect')) aopts.agentType = 'workflow-architect'
+      else if (!archMissingLogged) {
+        archMissingLogged = true
+        log('⚠ no workflow-architect agent installed — harnesses are being authored by the default agent (run /whip-init to install it: content/agent-patterns/universal/workflow-architect-pattern.md)')
+      }
       const a = await safeAgent(architectPrompt(ctx, budget, round, lastErr, prior), aopts, () => null)
       if (!a || a.wrote !== true) { esc.fellBack++; return { via: 'legacy', why: 'architect wrote no script', prior } }
       if (a.refuse === 'unrepairable') { esc.fellBack++; return { via: 'legacy', why: `architect declined: ${a.summary}`, prior } }
@@ -1958,6 +1968,9 @@ return {
   // a fully escalated one — the single most misleading way this feature could fail.
   agentsUsed,
   agentCap: AGENT_CAP,
+  // Whether harnesses were authored by the dedicated persona or by the default agent. Without this a
+  // run that silently degraded is indistinguishable from one that did not.
+  workflowArchitectInstalled: registryHas('workflow-architect'),
   lanes: LANES,
   escalation: {
     enabled: ESCALATE,

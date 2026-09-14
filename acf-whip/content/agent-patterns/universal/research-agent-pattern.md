@@ -191,54 +191,44 @@ Follow `docs/acf/style/research-documents.md` (or equivalent) for all research d
 - Rich markdown formatting with structured comparison tables
 - Objective assessment of solutions with clear trade-offs
 
-## Task File Version Control
+## Returning Your Work
 
-**CRITICAL**: Task files MUST be committed with research documents following `.backlog/README.md` protocols.
+You are a **non-code** task (`Worktree: none`). You work in the repository root, you do **not** get a
+worktree, and you do **not** commit anything yourself.
 
-### Task Pickup Protocol
+### Do not touch task state
 
-**MANDATORY**: Commit task file when moving pending → in-progress
+Do NOT move, rename or commit the task file, and do NOT edit its `Status`. The `/go` orchestrator is
+the single writer of task state on every task-store backend, and it performs the move when it reads
+your `ACFW-RESULT` marker. Committing the task file yourself races that writer on the default `files`
+backend and refers to paths that do not exist on any other.
 
-```bash
-# Update task status in file first, then:
-git add .backlog/in-progress/research-123-[topic]-analysis.md
-git commit -m "task: start research-123-[topic]-analysis"
+### List every file you created — or it is destroyed
+
+Your research documents are committed by the orchestrator, **in the same commit as your state move**,
+and only if you name them. Return them in `deliverable_files`, repo-relative:
+
+```
+ACFW-RESULT:
+  transition: completed | blocked
+  commit_sha: n/a
+  rejection_increment: 0
+  deliverable_files: ["docs/research/2026-01-15-topic-comparison.md"]
+  notes: <one-line summary of what you found, or why you blocked>
 ```
 
-### Task Completion Protocol
+**A file you do not list is never committed, and the next `clean-checkout` in any worktree stashes
+the repository root — so it is gone permanently.** This has lost finished work. List every file you
+created or modified outside the task document itself, including diagrams and data files.
 
-**MANDATORY**: Stage task file WITH research documents for completion commit
+Leave `deliverable_files` empty only when the entire deliverable lives inside the task document.
 
-```bash
-# After updating task status to completed:
-git add .backlog/completed/research-123-[topic]-analysis.md
-git add docs/research/comparative-analysis/2025-01-15-[topic]-comparison.md
-git commit -m "research: complete [topic] analysis with task completion
+### What belongs in the task document
 
-- Comprehensive analysis of X alternatives
-- Performance benchmarks: [key findings]
-- Cost analysis: [key findings]
-- Recommendation: [clear recommendation]
-- Complete research-123-[topic]-analysis with all findings
-
-Task: research-123-[topic]-analysis"
-```
-
-### Research-Specific Commit Requirements
-
-- Include key findings and recommendations in commit body
-- Reference quantified comparisons and performance metrics
-- Document methodology and source diversity used
-- Link to specific research documents created in `docs/research/`
-
-## Consequences of Non-Compliance
-
-- Research findings lose version history without task file tracking
-- Quality review process cannot validate research completion
-- Project maintainer cannot audit research decision processes
-- Implementation agents cannot access committed research artifacts
-
-**Reference**: See `.backlog/README.md` sections on task transition protocols for complete workflow requirements.
+Write your findings, evidence and recommendation into the task document at the path the orchestrator
+gave you as `TASK_FILE`. That path is backend-dependent — on the default `files` store it is a real
+file under `.backlog/`; on another backend it is a materialized copy the orchestrator syncs back —
+so always use the path you were given rather than constructing one.
 
 ---
 

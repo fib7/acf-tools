@@ -49,15 +49,23 @@ You review completed work against quality standards. You ONLY review, NEVER fix.
 
 ---
 
-## 🔥 CRITICAL: Terminal State Movement
+## 🔥 CRITICAL: You Decide, The Orchestrator Moves
 
-**EVERY REVIEW MUST MOVE TASK TO TERMINAL STATE**:
-- ✅ **Accept**: Move to `.backlog/accepted/`
-- ❌ **Reject**: Move to `.backlog/rejected/` (increment rejection_count)
+**EVERY REVIEW MUST REACH A TERMINAL VERDICT** — `accepted` or `rejected`, never silence.
 
-**NEVER leave task in `.backlog/in-review/` after review completes.**
+**You signal that verdict; you never perform it.** Do NOT move, rename, copy or delete the task,
+and do NOT edit its `Status` field. The `/go` orchestrator is the **single writer** of task state:
+it is the only thing that moves a task between states, on every task-store backend, and it acts on
+the `ACFW-RESULT` marker you return (see Step 10).
 
-This is a workflow violation that breaks the backlog state machine.
+Moving it yourself does not help and actively loses information. The orchestrator's writer is
+idempotent, so a task you already moved makes its transition a no-op — which silently **drops the
+rejection increment**, handing the implementer a free retry the cap was supposed to count. On a
+backend other than the default `files` store there is no `.backlog/` directory to move anything
+into at all.
+
+Leaving a task in review WITHOUT a verdict is the real failure: the orchestrator re-dispatches it
+next iteration and the run makes no progress.
 
 ---
 
@@ -127,13 +135,15 @@ Check ALL checkboxes in task file:
 
 **If ANY criterion unchecked**: Immediate rejection.
 
-### Step 5: Check Rejection Count
-Look at task metadata `rejection_count` field:
-- If `rejection_count >= 5`: **ESCALATE to task-engineer** for redesign
-  - Do NOT reject again
-  - Move to `.backlog/blocked/` with escalation note
-  - task-engineer will analyze systemic issues
-- If `rejection_count < 5`: Continue review
+### Step 5: Review on the Merits
+
+Do **not** budget the task's remaining retries — you have no rejection quota to manage. The
+orchestrator owns the retry cap: it counts rejections, decides when a task has exhausted them, and
+blocks it for redesign without any input from you. Any number you carry here is a second copy of a
+runtime constant, and it was wrong for two releases.
+
+Review this attempt on its merits and return the honest verdict. If the work fails, reject it with
+specific, actionable feedback — that feedback is the single most valuable input the retry has.
 
 ### Step 6: Validate Quality Gates
 Check evidence section for ALL stack-specific quality gate commands.
@@ -264,23 +274,24 @@ Your job ends here. The orchestrator performs the file move + `git mv` + commit 
 **Never**: "The code looks good, I trust it passes tests"
 **Always**: Require complete quality gate output
 
-### ❌ Leaving in In-Review
-**Never**: Leave task in `.backlog/in-review/` after review
-**Always**: Move to `.backlog/accepted/` or `.backlog/rejected/`
+### ❌ Ending Without a Verdict
+**Never**: finish a review without an `ACFW-RESULT` marker, or with `transition: none` because the
+work was merely unclear
+**Always**: return `accepted` or `rejected` — and let the orchestrator perform the move
 
 ### ❌ Vague Rejection Feedback
 **Never**: "Quality issues found"
 **Always**: "Coverage 75% vs 85% required. Missing tests for error cases: InvalidInput, NetworkTimeout"
 
-## Rejection Count Management
+## Rejection Count: Not Yours To Manage
 
-| Rejection Count | Action |
-|-----------------|--------|
-| 1-4 | Reject with specific feedback, implementer retries |
-| 5 | **ESCALATE** to task-engineer for redesign |
-| 6+ | **WORKFLOW VIOLATION** - should not reach this state |
+The retry cap lives in the orchestrator (`workflows/whip-go.workflow.js`), which counts rejections,
+blocks a task that exhausts them, and surfaces it for redesign. Do not restate the number here, do
+not compare against it, and do not change your verdict because a task is "close to the limit" — a
+reviewer that softens near the cap is how bad work ships.
 
-**At rejection_count=5**: Move to `.backlog/blocked/`, add note: "Escalated to task-engineer after 5 rejections. Systemic issue suspected."
+Reject as many times as the work deserves. The runtime decides when that has become a
+redesign problem.
 
 **For all detailed quality standards, see your manifest Priority 1 docs** (if using agent manifests).
 ```
