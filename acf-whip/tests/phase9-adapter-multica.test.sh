@@ -59,19 +59,31 @@ matches_all() { # <pattern-with-+-separators> — every part must appear in $ARG
   return 0
 }
 fault() { # honour MC_FAKE_FAIL / MC_FAKE_FAIL_ONCE against the joined argv
-  local spec pat code
-  for spec in $(printf '%s' "${MC_FAKE_FAIL_ONCE:-}" | tr ',' ' '); do
+  local spec pat code OLDIFS
+  # Split on COMMAS only. `$(... | tr ',' ' ')` word-splits on spaces too, so an AND-pattern containing
+  # one ("metadata get+whip_state") became two broken specs, the first of which ("metadata") matched
+  # every metadata call — defeating the precision the AND form exists to provide.
+  OLDIFS="$IFS"; IFS=','
+  for spec in ${MC_FAKE_FAIL_ONCE:-}; do
+    IFS="$OLDIFS"
     pat="${spec%:*}"; code="${spec##*:}"
     if matches_all "$pat"; then
       if [ -n "${MC_FAKE_FIRED:-}" ] && [ -f "$MC_FAKE_FIRED" ] && grep -qxF "$spec" "$MC_FAKE_FIRED"; then continue; fi
       [ -n "${MC_FAKE_FIRED:-}" ] && echo "$spec" >> "$MC_FAKE_FIRED"
       echo "fake: injected transient for '$pat'" >&2; exit "$code"
     fi
+    IFS=','
   done
-  for spec in $(printf '%s' "${MC_FAKE_FAIL:-}" | tr ',' ' '); do
+  IFS="$OLDIFS"
+  IFS=','
+  for spec in ${MC_FAKE_FAIL:-}; do
+    IFS="$OLDIFS"
     pat="${spec%:*}"; code="${spec##*:}"
+    case "$code" in ''|*[!0-9]*) echo "fake: malformed MC_FAKE_FAIL spec '$spec' (want <pattern>:<exit>)" >&2; exit 64 ;; esac
     matches_all "$pat" && { echo "fake: injected failure for '$pat'" >&2; exit "$code"; }
+    IFS=','
   done
+  IFS="$OLDIFS"
 }
 fault
 
@@ -220,6 +232,12 @@ check "a transient on the counter read is refused, not fabricated" "[ $TR_RC -ne
 # written and the counter drops from 2 to 1. Failing the write too would mask exactly that.
 check "the rejection counter is NOT reset by it (still 2, would be 1 if fabricated)" "[ \"$RC1\" = '2' ]"
 check "the refusal says what it was protecting" "printf '%s' \"\$OUT\" | grep -q 'RESET the counter'"
+# The backend's own words must reach the operator. The helpers run inside $(...), so MC_ERR is set in a
+# subshell and is empty by the time a caller interpolates it — the messages printed a dangling colon
+# and nothing else. The detail is emitted from inside the helper now, on stderr, which does escape.
+check "the failure names the backend detail, not just an exit code" \
+  "printf '%s' \"\$OUT\" | grep -q \"metadata get 'whip_rejections' failed\""
+check "...and does not end in a dangling colon" "! printf '%s' \"\$OUT\" | grep -qE '\\(exit [0-9]+\\): *$'"
 
 DEP0=$("$ADAPTER" read t-001-x | jq -r '.fields.dependencies')
 OUT=$(MC_FAKE_FAIL="metadata get+whip_deps:2" "$ADAPTER" update-field t-001-x --add-dep dep-d 2>&1); DEP_RC=$?

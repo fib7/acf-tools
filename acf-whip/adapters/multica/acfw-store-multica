@@ -248,7 +248,11 @@ mget_str() {
   local rc
   multica_call issue metadata get "$1" --key "$2" --output json
   rc=$(mc_classify)
-  [ "$rc" -eq 0 ] || { printf ''; [ "$rc" -eq 3 ] && return 0; return "$rc"; }
+  # Report the backend detail HERE. These helpers are invoked as `x=$(mget_str ...)`, so MC_ERR is set
+  # in a subshell and never reaches the caller — a caller interpolating it printed a dangling colon and
+  # nothing else. stderr escapes command substitution; a variable assignment does not.
+  [ "$rc" -eq 0 ] || { printf ''; [ "$rc" -eq 3 ] && return 0
+    echo "multica: metadata get '$2' failed (exit $rc): ${MC_ERR:-no detail from the CLI}" >&2; return "$rc"; }
   # The backend answered. Decode it, but never let jq's own exit status become this helper's
   # tri-state answer — a payload that will not parse is a malformed ANSWER, not "could not ask".
   printf '%s' "$MC_OUT" | jq -r '. // ""' 2>/dev/null || printf ''
@@ -260,7 +264,8 @@ mget_num() {
   local v rc
   multica_call issue metadata get "$1" --key "$2" --output json
   rc=$(mc_classify)
-  [ "$rc" -eq 0 ] || { printf '0'; [ "$rc" -eq 3 ] && return 0; return "$rc"; }
+  [ "$rc" -eq 0 ] || { printf '0'; [ "$rc" -eq 3 ] && return 0
+    echo "multica: metadata get '$2' failed (exit $rc): ${MC_ERR:-no detail from the CLI}" >&2; return "$rc"; }
   v=$(printf '%s' "$MC_OUT" | tr -dc '0-9')
   [ -n "$v" ] && printf '%s' "$v" || printf '0'
   return 0
@@ -555,7 +560,7 @@ cmd_transition() {
   uuid=$(resolve_key "$stem") || exit $?
   # A fabricated "" here makes the no-op guard below MISS, re-running a transition that already landed
   # — re-bumping its counter and re-appending its audit row. Refuse instead; the caller can retry.
-  from=$(mget_str "$uuid" whip_state) || { grc=$?; echo "FATAL: could not read current state of '$stem' (exit $grc): $MC_ERR" >&2; exit "$grc"; }
+  from=$(mget_str "$uuid" whip_state) || { grc=$?; echo "FATAL: could not read current state of '$stem' (exit $grc)" >&2; exit "$grc"; }
   nto=$(nstatus "$to")
 
   if [ "$from" = "$to" ]; then
@@ -571,11 +576,11 @@ cmd_transition() {
   multica_call issue status "$uuid" "$nto" --output json
   rc=$(mc_classify); [ "$rc" -eq 0 ] || { echo "FATAL: set native status failed: $MC_ERR" >&2; exit "$rc"; }
   if [ "$to" = "rejected" ] && [ "$rinc" = "1" ]; then
-    cur=$(mget_num "$uuid" whip_rejections) || { grc=$?; echo "FATAL: could not read whip_rejections for '$stem' (exit $grc): $MC_ERR — refusing to write, a fabricated 0 would RESET the counter" >&2; exit "$grc"; }
+    cur=$(mget_num "$uuid" whip_rejections) || { grc=$?; echo "FATAL: could not read whip_rejections for '$stem' (exit $grc) — refusing to write, a fabricated 0 would RESET the counter" >&2; exit "$grc"; }
     mset "$uuid" whip_rejections "$((cur + 1))" number || exit $?
   fi
   if [ "$to" = "blocked" ] && [ "$binc" = "1" ]; then
-    cur=$(mget_num "$uuid" whip_blocks) || { grc=$?; echo "FATAL: could not read whip_blocks for '$stem' (exit $grc): $MC_ERR — refusing to write, a fabricated 0 would RESET the counter" >&2; exit "$grc"; }
+    cur=$(mget_num "$uuid" whip_blocks) || { grc=$?; echo "FATAL: could not read whip_blocks for '$stem' (exit $grc) — refusing to write, a fabricated 0 would RESET the counter" >&2; exit "$grc"; }
     mset "$uuid" whip_blocks "$((cur + 1))" number || exit $?
   fi
   now=$(date -u +"%Y-%m-%d %H:%M:%S")
@@ -641,7 +646,7 @@ cmd_update_field() {
     for dep in "${ADDDEPS[@]}"; do
       # A fabricated "" takes the `none|""` branch below and REPLACES the whole dependency list with
       # this one dep. The contract is explicit that dependency tokens must never be dropped.
-      cur=$(mget_str "$uuid" whip_deps) || { grc=$?; echo "FATAL: could not read whip_deps for '$stem' (exit $grc): $MC_ERR — refusing to write, a fabricated empty list would DESTROY the existing dependencies" >&2; exit "$grc"; }
+      cur=$(mget_str "$uuid" whip_deps) || { grc=$?; echo "FATAL: could not read whip_deps for '$stem' (exit $grc) — refusing to write, a fabricated empty list would DESTROY the existing dependencies" >&2; exit "$grc"; }
       cur=$(printf '%s' "$cur" | sed -E 's/^\[//; s/\]$//; s/[[:space:]]+$//')
       case "$cur" in none|"") new="$dep" ;; *) new="$cur, $dep" ;; esac
       mset "$uuid" whip_deps "$new" string || exit $?
