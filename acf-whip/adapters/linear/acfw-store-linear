@@ -721,10 +721,15 @@ cmd_snapshot() {
   local jsonl; jsonl=$(mk_tmp)
   collect_issues "$jsonl"
 
-  # clean-checkout token: bounded N+1 over ONLY in-review/completed tasks (whose
-  # comments persist from when clean-checkout logged the token). All others false.
+  # clean-checkout token. On this backend the token lives in an issue COMMENT (CONTRACT.md lets each
+  # adapter choose where the audit row goes), so there is no free description scan the way multica has
+  # — every answer costs a request. The set is therefore bounded to the states where a wrong answer
+  # costs something NOW: in-progress (clean-checkout has run by then) plus the two review states the
+  # gate and the auto-reject read. `accepted` is deliberately excluded: buying its coverage means an
+  # N+1 over a monotonically growing accepted backlog on every snapshot, to refine an advisory WARN.
+  # The bound is the dispatch width, not the board size.
   local toks="" id
-  for id in $(jq -rs 'map(select((.meta.whip_state == "in-review") or (.meta.whip_state == "completed")) | .id) | .[]' "$jsonl"); do
+  for id in $(jq -rs 'map(select((.meta.whip_state // "") as $s | ($s == "in-progress" or $s == "completed" or $s == "in-review")) | .id) | .[]' "$jsonl"); do
     if issue_has_token "$id"; then toks="$toks$id"$'\n'; fi
   done
   local tok_json; tok_json=$(printf '%s' "$toks" | jq -Rn '[inputs | select(length > 0)]')

@@ -63,6 +63,14 @@ Capability flags: `snapshot-enriched`, `stage`, `update-field`, `update-body`, `
 ### `snapshot [--digest] [--counts-only] [--mode default|override]`
 One BacklogSnapshot JSON object. Adapter-owned fields per task: `stem`, `id`, `folder` (whip state), `status`, `slug` (worktree), `agent`, `priority`, `deps[]` (stems), `touchesGlobs[]`, `rejectionCount` (number), `blockCount` (number), `lastTransitionTs` (`YYYY-MM-DD HH:MM:SS` UTC), `hasCleanCheckoutToken` (bool), plus top-level `counts{<state>:n,...}` and `generatedAt`. `--digest`/`--counts-only`/`--mode` may be treated as hints (a full snapshot is always acceptable).
 
+An entry MAY carry `"slim": true` to mark it a **dependency-resolution stub** rather than a task
+record — the `files` scanner emits terminal accepted tasks that way, keeping only what `depsSatisfied`
+reads (`folder`, `slug`, `hasIntegratedAt`, `hasWorktreeBranch`, counts) and dropping the rest so a
+lived-in backlog's payload stays small enough for an agent to echo verbatim. A consumer checking
+per-task invariants MUST skip slim entries: every dropped field reads as absent, so a slim accepted
+task otherwise draws a standing `missing-clean-checkout-token` WARN for a token it has. Dependency
+resolution MUST still see them.
+
 **`tasks[]` is the ACTIVE working set**: the seven states the scheduler can act on (`pending`,
 `in-progress`, `completed`, `in-review`, `blocked`, `rejected`, `accepted`). `draft` and `archive`
 belong in a sibling **`inactive[]`** array of the same shape. An adapter may simply list everything in
@@ -102,7 +110,7 @@ Output: `ok:`/`noop:`/`warn:` lines (echoed verbatim into run reports).
 | `init` | Create/verify the store. Idempotent. Config via env. |
 | `update-field <key> [--set Field=Value]... [--add-dep ID]...` | Field edits. `Dependencies` via `--set` is full replacement (bare comma list); `--add-dep` appends. State changes are refused (exit 2) — use `transition`. Dependency tokens may name **not-yet-created keys** — adapters must record and report them verbatim, never drop them (graph-backed stores keep an out-of-graph dep record as the contract-of-record; the doctor, not the adapter, flags dangling deps). |
 | `update-body <key>` | Replace the task document/description from stdin. Refuse empty input. |
-| `log-event <key> --row "\| ... \|"` | Append one machine-greppable event row (the `clean-checkout \| ok` token). Must surface in later `snapshot.hasCleanCheckoutToken`. |
+| `log-event <key> --row "\| ... \|"` | Append one machine-greppable event row (the `clean-checkout \| ok` token). Must surface in later `snapshot.hasCleanCheckoutToken` — **in every task state, not only the review ones**. The field is a flat per-task boolean with no state qualifier: `false` means "this task has no token", and a consumer cannot tell a real absence from a state the adapter declined to scan. Two consumers depend on it: the review gate auto-rejects on `false`, and the generic doctor WARNs on an accepted task without one. Where an answer costs a request, bound the PAID set to the states where a wrong answer costs something now (`in-progress`, `completed`, `in-review`) rather than narrowing the field itself — never buy `accepted` coverage with an N+1 over a monotonically growing backlog. |
 | `comment <key> [--author A]` | Free-form evidence/review note from stdin. |
 | `doctor [--fix] [--quiet] [--active-only]` | Store-native integrity findings: `SEV\|code\|task\|detail` lines + `SUMMARY\|fatal=N\|repairable=N\|warn=N\|ok=bool`. Exit 0 iff no FATAL. **`--quiet` suppresses the ADVISORY dump (WARN/REPAIRABLE), never the gate decision: every `FATAL\|` line MUST still be printed.** Without `doctor-complete` the dispatcher recomputes `ok=` from the lines it receives, so an adapter that swallows its FATALs under `--quiet` reports a clean board to `/go`'s startup gate while the verbose operator path shows the same FATAL — two tools disagreeing about one backlog. **Exit status is load-bearing**: `0` = ran, clean; `1` = ran, found FATALs (already emitted as lines); anything else = the battery COULD NOT RUN, and the dispatcher turns that into `FATAL\|doctor-unavailable` rather than silence, because absence of findings is not health. `doctor-complete` = covers the full battery (files); without it the dispatcher merges in the generic graph/git checks. |
 | `sync` | Durability flush (beads: `bd export` JSONL — bd's own `export.auto` defaults to false, so this is the only thing that refreshes the mirror). Best-effort; dispatcher never fails on it. |

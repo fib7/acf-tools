@@ -684,19 +684,37 @@ cmd_snapshot() {
   local jsonl; jsonl=$(mc_tmp)
   collect_whip_issues "$jsonl"
 
-  # clean-checkout token, over ONLY in-review tasks, cheapest source first:
-  #   1. the description already in hand from `issue list` — zero extra calls;
-  #   2. `issue get` for that one issue, if list omits description;
-  #   3. the legacy comment scan — a task that entered review BEFORE the log moved into
-  #      the document has its token in a comment, and dropping that would auto-reject it
-  #      on upgrade. Costs nothing once a task has been through the new write path.
-  local toks="" id desc
-  for id in $(jq -rs 'map(select(.metadata.whip_state == "in-review") | .id) | .[]' "$jsonl"); do
-    desc=$(jq -rs --arg id "$id" 'map(select(.id == $id)) | .[0].description // ""' "$jsonl")
-    if [ -z "$desc" ]; then
-      multica_call issue get "$id" --output json
-      [ "$MC_RC" -eq 0 ] && desc=$(printf '%s' "$MC_OUT" | jq -r '.description // ""' 2>/dev/null)
-    fi
+  # clean-checkout token. CONTRACT.md requires this field for EVERY task state; this used to answer it
+  # for `in-review` alone, so every task the orchestrator lifted from `completed` into review read the
+  # token as absent and had its review skipped, and every accepted task drew a spurious
+  # missing-clean-checkout-token WARN from the generic battery.
+  #
+  # Widening is free. Since 3.2.0 the transition log lives in the issue DESCRIPTION, and
+  # collect_whip_issues already emits `.description` inline for every issue — so one jq pass over the
+  # JSONL answers the question for the whole board with zero extra calls and zero per-id jq (the old
+  # loop re-parsed the entire JSONL once per in-review task, which is quadratic in board size).
+  local toks free_ids id desc
+  free_ids=$(jq -rs --arg tok "$CLEAN_CHECKOUT_TOKEN" \
+    'map(select((.description // "") | contains($tok)) | .id) | .[]' "$jsonl")
+  toks="$free_ids"
+  [ -n "$toks" ] && toks="$toks"$'\n'
+
+  # PAID fallbacks, deliberately bounded to the states where a wrong answer costs something NOW:
+  #   in-progress/completed/in-review — the review gate and the auto-reject read these.
+  # `accepted` is answered by the free pass only. Buying its coverage would mean an N+1 over a
+  # monotonically growing accepted backlog on every snapshot, to refine an advisory WARN.
+  #   (a) `issue get` when list omitted the description entirely;
+  #   (b) the legacy comment scan — a task that entered review BEFORE the log moved into the document
+  #       has its token in a comment, and dropping that would auto-reject it on upgrade.
+  for id in $(jq -rs --arg tok "$CLEAN_CHECKOUT_TOKEN" '
+        map(select((.metadata.whip_state // "") as $s
+                   | ($s == "in-progress" or $s == "completed" or $s == "in-review")
+                     and (((.description // "") | contains($tok)) | not))
+            | {id: .id, empty: (((.description // "") | length) == 0)})
+        | .[] | .id' "$jsonl"); do
+    desc=""
+    multica_call issue get "$id" --output json
+    [ "$MC_RC" -eq 0 ] && desc=$(printf '%s' "$MC_OUT" | jq -r '.description // ""' 2>/dev/null)
     if printf '%s' "$desc" | grep -qF "$CLEAN_CHECKOUT_TOKEN"; then
       toks="$toks$id"$'\n'
       continue

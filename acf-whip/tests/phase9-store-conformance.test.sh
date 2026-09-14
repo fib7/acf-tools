@@ -115,7 +115,28 @@ check "snapshot carries B's --set Touches Globs override" "[ \"\$(jget \"\$SNAP\
 "$ADAPTER" transition conf-a in-progress orchestrator "dispatch" 0 0 >/dev/null
 "$ADAPTER" transition conf-a completed specialist "done" 0 0 >/dev/null
 "$ADAPTER" log-event conf-a --row '| 2026-07-15 10:00:00 | clean-checkout | ok | clean-checkout-before-task | slug-a | worktree/slug-a |' >/dev/null 2>&1 || true
+
+# hasCleanCheckoutToken is a flat per-task boolean with NO state qualifier (CONTRACT.md). Two shipped
+# adapters answered it for the review states only and emitted false everywhere else, so every task the
+# orchestrator lifted from completed into review read the token as absent and had its review skipped.
+# Nothing here asserted the field at all, which is why that shipped. Assert it in `completed` FIRST —
+# the state both of them got wrong — then again after the move into in-review.
+if printf '%s' "$CAPS" | grep -q '"log-event"'; then
+  SNAP_C=$("$ADAPTER" snapshot)
+  check "hasCleanCheckoutToken is true in COMPLETED, right after log-event" \
+    "[ \"\$(jget \"\$SNAP_C\" 'j.tasks.find(t=>t.stem===\"conf-a\").hasCleanCheckoutToken')\" = 'true' ]"
+  check "a task that never logged one still reports false (not blanket true)" \
+    "[ \"\$(jget \"\$SNAP_C\" 'j.tasks.find(t=>t.stem===\"conf-b\").hasCleanCheckoutToken')\" = 'false' ]"
+else
+  ok "log-event capability absent (token assertions skipped)"
+fi
+
 "$ADAPTER" transition conf-a in-review orchestrator "review" 0 0 >/dev/null
+if printf '%s' "$CAPS" | grep -q '"log-event"'; then
+  SNAP_R=$("$ADAPTER" snapshot)
+  check "hasCleanCheckoutToken survives the move into IN-REVIEW" \
+    "[ \"\$(jget \"\$SNAP_R\" 'j.tasks.find(t=>t.stem===\"conf-a\").hasCleanCheckoutToken')\" = 'true' ]"
+fi
 "$ADAPTER" transition conf-a rejected quality-reviewer "needs work" 1 0 >/dev/null
 RD=$("$ADAPTER" read conf-a)
 check "reject with RINC=1 bumped rejection_count to 1" "[ \"\$(jget \"\$RD\" 'j.fields.rejection_count')\" = '1' ]"
@@ -125,6 +146,22 @@ check "read reports current folder rejected" "[ \"\$(jget \"\$RD\" 'j.folder')\"
 "$ADAPTER" transition conf-a completed specialist "done again" 0 0 >/dev/null
 "$ADAPTER" transition conf-a in-review orchestrator "review" 0 0 >/dev/null
 "$ADAPTER" transition conf-a accepted quality-reviewer "ship it" 0 0 >/dev/null
+if printf '%s' "$CAPS" | grep -q '"log-event"'; then
+  # The generic battery WARNs on an accepted task with no token, so an adapter that stops answering
+  # after in-review turns every accepted task into a standing false advisory.
+  #
+  # But an accepted task need not be LISTED at all: `files` collapses terminal accepted tasks out of
+  # tasks[] into counts + satisfiedDeps to keep the snapshot small enough for an agent to echo
+  # verbatim. Absent is legal; present-and-false is not. Assert the conditional, so this passes on a
+  # collapsing adapter without going vacuous on a listing one.
+  SNAP_A=$("$ADAPTER" snapshot)
+  # Three shapes are legal for an accepted task: collapsed out of tasks[] entirely (files does this
+  # for terminal accepted work), present as a slim dependency stub, or present in full WITH its token.
+  # Present-in-full-and-false is not: that is the defect this asserts against.
+  A_TOK=$(jget "$SNAP_A" 'j.tasks.some(t=>t.stem==="conf-a") ? (j.tasks.find(t=>t.stem==="conf-a").slim ? "slim" : String(j.tasks.find(t=>t.stem==="conf-a").hasCleanCheckoutToken)) : "absent"')
+  check "accepted task is collapsed, slim, or still reports its token (got: $A_TOK)" \
+    "[ \"\$A_TOK\" = 'absent' ] || [ \"\$A_TOK\" = 'slim' ] || [ \"\$A_TOK\" = 'true' ]"
+fi
 RD=$("$ADAPTER" read conf-a)
 check "A reached accepted" "[ \"\$(jget \"\$RD\" 'j.folder')\" = 'accepted' ]"
 check "reject loop did not double-bump rejection_count" "[ \"\$(jget \"\$RD\" 'j.fields.rejection_count')\" = '1' ]"

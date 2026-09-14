@@ -97,7 +97,12 @@ while IFS='|' read -r stem folder id status agent rc bc hasTok isCode hasBranch 
   if [ "$folder" = "accepted" ] && [ "$isCode" = "true" ] && [ "$hasBranch" = "false" ] && [ "$hasInteg" = "false" ]; then
     emit WARN accepted-branchless-unverified "$stem" "accepted, but no worktree branch and no ledger marker on trunk — verify the deliverable landed, then ack: whip-move $stem accepted --integrated-at <sha>"
   fi
-done < <(printf '%s' "$SNAP" | jq -r '.tasks[]? |
+# `slim: true` marks a DEPENDENCY-RESOLUTION STUB, not a task record: the files scanner emits terminal
+# accepted tasks that way, carrying only the fields depsSatisfied reads and dropping the rest to keep a
+# lived-in backlog's payload small. Checking per-task invariants against one reports every dropped
+# field as absent — a slim accepted task would draw a standing missing-clean-checkout-token WARN for a
+# token it has. They stay in the GRAPH pass below (that is what they exist for); they are skipped here.
+done < <(printf '%s' "$SNAP" | jq -r '.tasks[]? | select((.slim // false) | not) |
   [.stem, .folder, (.id // ""), (.status // ""), (.agent // ""),
    (.rejectionCount // 0 | tostring), (.blockCount // 0 | tostring),
    (.hasCleanCheckoutToken // false | tostring), (.isCodeMutating // false | tostring),
