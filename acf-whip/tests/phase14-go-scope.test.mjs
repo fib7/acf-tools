@@ -205,6 +205,34 @@ const sorted = (set) => [...set].sort()
   }
 
   // expandScope must stay PURE (inside the markers) or phase2's extraction silently loses it.
+// A seed naming a draft or archived task. The index resolves it — dependency resolution needs
+// inactive tasks visible — but it is absent from tasks[], so the scheduling view comes back EMPTY and
+// an empty scoped view reports `complete`. Asking to run a draft task answered "Backlog 100%
+// terminal" rather than saying it is not actionable.
+{
+  const { indexTasks, expandScope } = S
+  const idx = indexTasks([
+    { stem: 'api-001-live', id: 'api-001', folder: 'pending', slug: 'sa', deps: [] },
+    { stem: 'doc-009-draft', id: 'doc-009', folder: 'draft', slug: 'none', deps: [] },
+    { stem: 'old-002-arch', id: 'old-002', folder: 'archive', slug: 'none', deps: [] },
+  ], [])
+  const onlyDraft = expandScope(['doc-009-draft'], idx)
+  check('a draft seed is reported as not-actionable, not silently empty',
+    onlyDraft.inactiveSeeds.length === 1 && /doc-009-draft \(draft\)/.test(onlyDraft.inactiveSeeds[0]))
+  check('...and is NOT placed in the scope (an empty scope reports complete)', onlyDraft.scope.size === 0)
+  check('...and is not misreported as unresolvable (it exists; it is gated)', onlyDraft.unresolved.length === 0)
+
+  const archived = expandScope(['old-002-arch'], idx)
+  check('an archived seed is reported the same way', archived.inactiveSeeds.length === 1)
+
+  const mixed = expandScope(['api-001-live', 'doc-009-draft'], idx)
+  check('a mixed scope still names the inactive seed', mixed.inactiveSeeds.length === 1)
+  check('...and keeps the actionable one', mixed.scope.has('api-001-live') && mixed.scope.size === 1)
+
+  const live = expandScope(['api-001-live'], idx)
+  check('an ordinary scope is unaffected', live.inactiveSeeds.length === 0 && live.scope.has('api-001-live'))
+}
+
   check('expandScope lives inside <scheduler-pure>', block.includes('function expandScope('))
   check('expandScope does not close over args', !/function expandScope[\s\S]*?\n}/.exec(block)[0].includes('args'))
 }

@@ -281,11 +281,17 @@ function depsSatisfied(t, idx) {
 // stem is simply absent from the working set — neutral to both numerator and denominator below.
 // PURE: no clock, no closure beyond `mode` (reached via isTerminal), so the <scheduler-pure>
 // extraction in tests/phase2-scheduler.test.mjs keeps working. `seed` is a parameter, never `args`.
+const INACTIVE_STATES = ['draft', 'archive']
 function expandScope(seed, idx) {
-  const scope = new Set(), added = [], unresolved = [], stack = []
+  const scope = new Set(), added = [], unresolved = [], inactiveSeeds = [], stack = []
   for (const tok of (seed || [])) {
     const t = idx.resolve(tok)
     if (!t) { unresolved.push(tok); continue }
+    // The index resolves draft/archive tasks (dependency resolution needs them), but they are not
+    // schedulable and are absent from tasks[]. A seed naming one would produce an EMPTY scheduling
+    // view, and an empty scoped view reports `complete` — so asking to run a draft task used to
+    // answer "Backlog 100% terminal" instead of saying the task is not actionable.
+    if (INACTIVE_STATES.indexOf(t.folder) >= 0) { inactiveSeeds.push(`${t.stem} (${t.folder})`); continue }
     stack.push(t.stem)
   }
   while (stack.length) {
@@ -301,7 +307,7 @@ function expandScope(seed, idx) {
       stack.push(dep.stem)
     }
   }
-  return { scope, added, unresolved }
+  return { scope, added, unresolved, inactiveSeeds }
 }
 
 // Topological order (Kahn) over cross-slug dependency edges among the integration candidates,
@@ -1490,6 +1496,10 @@ Return the ScanResult.`
   // dispatch (conservative by design). Only the SCHEDULING VIEW narrows; `sched` replaces `tasks`
   // at every planning site below, and nowhere else.
   const scoped = ONLY ? expandScope(ONLY, idx) : null
+  if (scoped && scoped.inactiveSeeds.length) {
+    stopReason = 'scope-not-actionable'
+    return { aborted: true, reason: `/go was scoped to tasks that are not actionable: ${scoped.inactiveSeeds.join(', ')}. A draft task is behind the human gate and an archived one is retired; neither can be dispatched. Move it to pending first (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+  }
   if (scoped && scoped.unresolved.length) {
     stopReason = 'scope-unresolved'
     return { aborted: true, reason: `/go was scoped to tasks that do not exist in the backlog: ${scoped.unresolved.join(', ')} — check the ids (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
