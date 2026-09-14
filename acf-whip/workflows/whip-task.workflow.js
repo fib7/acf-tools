@@ -238,11 +238,12 @@ Read-only reconnaissance of the EXISTING backlog. Change nothing.
 1. Every existing task id:
 ${filesStore
     ? `     cd ${sq(trunkRoot)} && grep -rhoE '^- \\*\\*ID\\*\\*: .*' .backlog 2>/dev/null | sed -E 's/^- \\*\\*ID\\*\\*: *//' | sort -u`
-    : `     cd ${sq(trunkRoot)} && bash ${sq(STORE)} snapshot 2>/dev/null | jq -r '.tasks[]? | .id' 2>/dev/null | sort -u`}
-2. Every Worktree slug ALREADY CLAIMED by an existing task:
+    : `     cd ${sq(trunkRoot)} && bash ${sq(STORE)} snapshot 2>/dev/null | jq -r '(.tasks[]?, .inactive[]?) | .id' 2>/dev/null | sort -u`}
+2. Every Worktree slug ALREADY CLAIMED by an existing task (INCLUDING draft and archived ones — the
+   dispatcher splits those into inactive[], but a slug they hold is still taken):
 ${filesStore
     ? `     cd ${sq(trunkRoot)} && grep -rhoE '^- \\*\\*Worktree\\*\\*: .*' .backlog 2>/dev/null | sed -E 's/^- \\*\\*Worktree\\*\\*: *//' | tr -d ' ' | sort -u`
-    : `     cd ${sq(trunkRoot)} && bash ${sq(STORE)} snapshot 2>/dev/null | jq -r '.tasks[]? | .slug' 2>/dev/null | sort -u`}
+    : `     cd ${sq(trunkRoot)} && bash ${sq(STORE)} snapshot 2>/dev/null | jq -r '(.tasks[]?, .inactive[]?) | .slug' 2>/dev/null | sort -u`}
 3. Live worktree branches:  git -C ${sq(trunkRoot)} worktree list --porcelain | sed -n 's#^branch refs/heads/##p'
 Return the ReconBacklog.`, { label: 'recon:backlog', phase: 'Recon', schema: RECON_BACKLOG, model: SHELL_MODEL }),
 

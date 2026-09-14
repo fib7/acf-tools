@@ -242,5 +242,18 @@ const noTemplate = alwaysList.filter((a) => !AGENT_TEMPLATES.some((t) => rel(t).
 check(`every always-generate agent has a shipped template${noTemplate.length ? ` — missing: ${noTemplate.join(', ')}` : ''}`,
   noTemplate.length === 0)
 
+// ---------------------------------------------------------------------------
+// Every consumer that asks the store "what ids / slugs are taken?" must union inactive[]. The split
+// moved draft and archive out of tasks[], so a query reading tasks[] alone stopped seeing them — and
+// /task would then mint an id or a worktree slug a draft already holds. The files branch of the same
+// query greps .backlog recursively, which includes draft/ and archive/, so missing the union also
+// makes the two backends disagree about what is taken.
+const TASKJS = readFileSync(join(ROOT, 'workflows', 'whip-task.workflow.js'), 'utf8')
+const bareTasksQueries = (TASKJS.match(/jq -r '\.tasks\[\]\? \| \.(id|slug)'/g) || [])
+check(`whip-task's recon queries union inactive[]${bareTasksQueries.length ? ` — still bare: ${bareTasksQueries.join(', ')}` : ''}`,
+  bareTasksQueries.length === 0)
+check('...and they do query both arrays',
+  (TASKJS.match(/\(\.tasks\[\]\?, \.inactive\[\]\?\)/g) || []).length >= 2)
+
 console.log(`\nphase17-template-drift: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL === 0 ? 0 : 1)
