@@ -299,6 +299,43 @@ G_CYC=$(printf '%s' '{"tasks":[],"inactive":[{"stem":"a","id":"a","status":"draf
 check "a cycle among DRAFT tasks does not gate the run" \
   "! printf '%s\n' \"\$G_CYC\" | grep -q '^FATAL|cyclic-deps'"
 
+# ---- the enricher's ACTIVE/INACTIVE split -----------------------------------------------------------
+# 3.3.0's largest new concept, and it shipped with zero behavioural assertions: reverting the
+# `map(select(isactive))` filter with one token left the whole suite green. The split is load-bearing
+# in three places — a scoped run counts tasks[] as its denominator and isTerminal is false for both
+# inactive states, the per-task doctor battery raises findings against every entry, and inactive[] is
+# still unioned into the dependency index so a task depending on a draft reports dep-inactive rather
+# than the lie dangling-dep.
+ENR="$ACF_WHIP/skills/lib/bin/acfw-enrich-snapshot.sh"
+if command -v jq >/dev/null 2>&1; then
+  ENR_IN='{"raw":true,"tasks":[
+    {"stem":"e-pend","id":"e-pend","folder":"pending","slug":"sp","deps":["e-draft"]},
+    {"stem":"e-blk","id":"e-blk","folder":"blocked","slug":"sb","deps":[]},
+    {"stem":"e-acc","id":"e-acc","folder":"accepted","slug":"sa","deps":[]},
+    {"stem":"e-draft","id":"e-draft","folder":"draft","slug":"none","deps":[]},
+    {"stem":"e-arch","id":"e-arch","folder":"archive","slug":"none","deps":[]}],"counts":{}}'
+  ENR_OUT=$(printf '%s' "$ENR_IN" | bash "$ENR" "$REPO" 2>/dev/null)
+
+  check "enricher: draft and archive are OUT of tasks[]" \
+    "[ \"\$(printf '%s' \"\$ENR_OUT\" | jq -r '[.tasks[].stem] | sort | join(\",\")')\" = 'e-acc,e-blk,e-pend' ]"
+  check "enricher: they are in inactive[], not dropped" \
+    "[ \"\$(printf '%s' \"\$ENR_OUT\" | jq -r '[.inactive[].stem] | sort | join(\",\")')\" = 'e-arch,e-draft' ]"
+  check "enricher: counts.total spans the ACTIVE set only (3, not 5)" \
+    "[ \"\$(printf '%s' \"\$ENR_OUT\" | jq -r '.counts.total')\" = '3' ]"
+  check "enricher: an inactive task never appears in both arrays" \
+    "[ \"\$(printf '%s' \"\$ENR_OUT\" | jq -r '[.tasks[].stem] as \$a | [.inactive[].stem] | map(select(. as \$s | \$a | index(\$s))) | length')\" = '0' ]"
+  check "enricher: inactive entries still carry the git-derived facts deps need" \
+    "[ \"\$(printf '%s' \"\$ENR_OUT\" | jq -r '.inactive[0] | has(\"hasIntegratedAt\") and has(\"hasWorktreeBranch\")')\" = 'true' ]"
+
+  # And the consequence that matters: the graph battery must resolve the draft dep rather than call it
+  # dangling. This is what fails if the split is reverted AND inactive[] stops being emitted.
+  ENR_DOC=$(printf '%s' "$ENR_OUT" | bash "$ACF_WHIP/skills/lib/bin/acfw-doctor-generic.sh" "$REPO" 2>/dev/null)
+  check "a pending task depending on a draft reports dep-inactive, not dangling-dep" \
+    "printf '%s\n' \"\$ENR_DOC\" | grep -q '^WARN|dep-inactive|e-pend' && ! printf '%s\n' \"\$ENR_DOC\" | grep -q 'dangling-dep|e-pend'"
+else
+  ok "jq absent (enricher split assertions skipped)"
+fi
+
 echo
 echo "phase9-dispatcher: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

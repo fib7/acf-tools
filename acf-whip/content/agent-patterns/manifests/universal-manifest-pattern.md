@@ -1,9 +1,5 @@
 # Universal Agent Manifest Pattern
 
-> **Task-store note.** Paths shown as `.backlog/…` are the **default `files` task-store backend**. A
-> project configured with `beads`, `multica`, `linear` or a third-party adapter has no `.backlog/`
-> directory; read task documents at the path the orchestrator gives you, and reach store-wide
-> information through `acfw-store` rather than the filesystem.
 
 Pattern for `docs/agents/{agent-name}.md` with Priority 1/2/3 structure (58-74% token reduction).
 
@@ -29,6 +25,11 @@ This template creates manifests for the 6 universal agents: task-engineer, quali
 ### task-engineer
 
 ```markdown
+
+> **Task-store note.** Paths written as `.backlog/…` are the **default `files` task-store backend**. On
+> `beads`, `multica`, `linear` or a third-party adapter there is no `.backlog/` directory; read task
+> documents at the path the orchestrator gives you, and reach store-wide information through
+> `acfw-store` rather than the filesystem.
 # Task Engineer - Agent Manifest
 
 ## Agent Identity

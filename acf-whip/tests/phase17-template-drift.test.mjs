@@ -119,15 +119,35 @@ check(`every ACFW-RESULT block in a template names at least the core fields${sta
 // 4. Store-agnosticism. A template that hardcodes .backlog/ is wrong on every non-files backend,
 // where no such directory exists. Templates may still MENTION it when explicitly fenced as
 // files-backend-only, so the assertion is on unfenced use in agent-facing instructions.
+// Look ONLY at the ```markdown block: that block is what whip-init renders into
+// .claude/agents/<name>.md, i.e. the agent's system prompt. Scanning the whole FILE passes on a note
+// written in the installer-facing prose above it, which no agent ever reads — and all eleven notes
+// shipped in exactly that position, so this assertion was green while the change reached nobody.
+// Take the block to its LAST bare fence: the specialist templates nest a ```bash quality-gates block,
+// so stopping at the next fence would truncate and hide most of the prompt.
+const emitted = (text) => {
+  const i = text.indexOf('```markdown')
+  if (i < 0) return ''
+  const start = text.indexOf('\n', i) + 1
+  const end = text.lastIndexOf('\n```')
+  return end <= start ? text.slice(start) : text.slice(start, end)
+}
 const unfenced = []
 for (const f of AGENT_TEMPLATES) {
-  const text = readFileSync(f, 'utf8')
-  if (!/\.backlog\//.test(text)) continue
-  const fenced = /files.{0,20}backend|default `?files`?|non-files|store backend|task-store/i.test(text)
+  const block = emitted(readFileSync(f, 'utf8'))
+  if (!/\.backlog\//.test(block)) continue
+  const fenced = /files.{0,20}backend|default `?files`?|non-files|store backend|task-store/i.test(block)
   if (!fenced) unfenced.push(rel(f))
 }
-check(`every agent template mentioning .backlog/ says which backend that is${unfenced.length ? ` — unfenced: ${unfenced.join(', ')}` : ''}`,
+check(`every agent template mentioning .backlog/ IN THE EMITTED PROMPT says which backend that is${unfenced.length ? ` — unfenced: ${unfenced.join(', ')}` : ''}`,
   unfenced.length === 0)
+
+const misplaced = AGENT_TEMPLATES.filter((f) => {
+  const text = readFileSync(f, 'utf8')
+  return /Task-store note/.test(text) && !/Task-store note/.test(emitted(text))
+}).map(rel)
+check(`the task-store note is inside the emitted prompt, not the installer prose${misplaced.length ? ` — outside: ${misplaced.join(', ')}` : ''}`,
+  misplaced.length === 0)
 
 // ---------------------------------------------------------------------------
 // 5. Every agent type the orchestrator can select must have a template that generates it.
