@@ -144,6 +144,37 @@ case "$SUB" in
     ;;
 
   doctor)
+    # --snapshot FILE: reuse a snapshot the CALLER already has instead of taking a second one. On a
+    # backend without doctor-complete, every `doctor` walks the store twice — once in the adapter's own
+    # battery and once more below for the generic graph battery — and /go's per-iteration scan has a
+    # fresh snapshot in hand at that exact moment. Consumed here, never forwarded to the adapter.
+    DOC_SNAP=""
+    DOC_ARGS=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --snapshot) [ $# -ge 2 ] || { echo "FATAL: --snapshot requires a FILE" >&2; exit 2; }
+                    DOC_SNAP="$2"; shift 2 ;;
+        --snapshot=*) DOC_SNAP="${1#--snapshot=}"; shift ;;
+        *) DOC_ARGS[${#DOC_ARGS[@]}]="$1"; shift ;;
+      esac
+    done
+    set -- ${DOC_ARGS[@]+"${DOC_ARGS[@]}"}
+    if [ -n "$DOC_SNAP" ]; then
+      [ -r "$DOC_SNAP" ] || { echo "FATAL: --snapshot file not readable: $DOC_SNAP" >&2; exit 2; }
+      # A NARROWED snapshot cannot answer the graph invariants: dangling-dep, cyclic-deps,
+      # duplicate-id and cross-slug-dep-not-integrated are whole-graph properties, and computing them
+      # over a subset returns a confidently green report while two worktrees race. Refuse as a typed
+      # USAGE error (exit 2, no report line) rather than as a finding — a caller must not be able to
+      # read this as "the board is fine", which is the exact defect this dispatcher had elsewhere.
+      if grep -q '"scopeApplied"[[:space:]]*:[[:space:]]*true' "$DOC_SNAP" 2>/dev/null; then
+        echo "FATAL: --snapshot was given a NARROWED snapshot (scopeApplied=true). The graph invariants are whole-graph properties and cannot be computed from a subset; pass a full snapshot or omit --snapshot." >&2
+        exit 2
+      fi
+      if grep -q '"digest"[[:space:]]*:[[:space:]]*true' "$DOC_SNAP" 2>/dev/null; then
+        echo "FATAL: --snapshot was given a DIGEST snapshot, whose tasks[] is a bounded working set. Pass a full snapshot or omit --snapshot." >&2
+        exit 2
+      fi
+    fi
     if has_cap doctor-complete; then
       exec "$ADAPTER" doctor "$@"
     fi
@@ -167,7 +198,11 @@ case "$SUB" in
         printf 'FATAL|doctor-unavailable|-|the %s adapter doctor could not run (exit %s) — findings are UNKNOWN, not absent; fix the backend and re-run\n' "$STORE" "$ADRC" >> "$MERGED"
       fi
     fi
-    SNAP=$(bash "$SCRIPT_DIR/acfw-store" snapshot 2>/dev/null || true)
+    if [ -n "$DOC_SNAP" ]; then
+      SNAP=$(cat "$DOC_SNAP" 2>/dev/null || true)
+    else
+      SNAP=$(bash "$SCRIPT_DIR/acfw-store" snapshot 2>/dev/null || true)
+    fi
     if [ -n "$SNAP" ]; then
       printf '%s\n' "$SNAP" | bash "$LIB_DIR/bin/acfw-doctor-generic.sh" "$REPO_ROOT" \
         | grep -E '^(FATAL|REPAIRABLE|WARN)\|' >> "$MERGED" || true

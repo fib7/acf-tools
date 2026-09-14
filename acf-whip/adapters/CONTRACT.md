@@ -28,6 +28,16 @@ compensation, data-flow walkthroughs, and a write-your-own authoring guide, see 
 acfw-store-<backend> <subcommand> [args...]
 ```
 
+**Dispatcher-implemented flags** (consumed by `skills/lib/bin/acfw-store`, never forwarded to an adapter):
+`doctor --snapshot FILE` reuses a snapshot the caller already holds instead of taking a second one —
+on a backend without `doctor-complete` every `doctor` otherwise enumerates the store twice, once in
+the adapter's own battery and once for the generic graph battery. The file must be a **full**
+snapshot: one carrying `scopeApplied: true` or `digest: true` is refused with a typed usage error
+(exit 2, no report line), because `dangling-dep`, `cyclic-deps`, `duplicate-id` and
+`cross-slug-dep-not-integrated` are whole-graph properties and computing them over a subset returns a
+confidently green report while two worktrees race. The refusal is deliberately not a finding: a caller
+must not be able to read it as "the board is fine".
+
 JSON results on stdout (exactly one object), diagnostics on stderr. Non-JSON line protocols (`ok:`/`noop:`/`warn:` for transition; `SEV|code|task|detail` + `SUMMARY|` for doctor) are part of the contract where noted.
 
 **Environment** (set by the dispatcher; adapters must also work when invoked directly, falling back to `git rev-parse --show-toplevel`):

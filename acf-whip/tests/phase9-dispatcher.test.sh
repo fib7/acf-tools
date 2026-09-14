@@ -227,6 +227,49 @@ check "unobtainable snapshot -> ok=false, exit 1" "[ \$D_S_RC -eq 1 ] && printf 
 check "the finding says the graph invariants are UNVERIFIED" "printf '%s' \"\$D_S\" | grep -q 'UNVERIFIED'"
 unset STUB_DOCTOR STUB_SNAPSHOT
 
+# ---- doctor --snapshot: one store enumeration, not two -------------------------------------------
+# On a backend without doctor-complete every `doctor` walks the store TWICE — once in the adapter's own
+# battery, once more for the generic graph battery. A caller that already holds a full snapshot can
+# hand it over. The refusals matter more than the saving: a NARROWED or DIGEST snapshot cannot answer
+# the graph invariants (dangling-dep, cyclic-deps, duplicate-id, cross-slug-dep-not-integrated are
+# whole-graph properties), and computing them over a subset returns a confidently green report while
+# two worktrees race. Refuse as a typed USAGE error, never as a finding.
+export STUB_CAPS='{"backend":"stub","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition","doctor"]}'
+export STUB_SNAPSHOT='{"tasks":[],"counts":{"pending":0},"raw":true}'
+unset STUB_DOCTOR STUB_DOCTOR_RC
+printf 'ACFW_STORE=stub\n' > .backlog/.acfw-config
+
+: > "$STUB_LOG"
+bash "$STORE" doctor --quiet >/dev/null 2>&1
+N_NOSNAP=$(grep -c '^ARGS:snapshot' "$STUB_LOG" || true); N_NOSNAP=${N_NOSNAP//[^0-9]/}
+
+bash "$STORE" snapshot > "$WORK/full.json" 2>/dev/null
+: > "$STUB_LOG"
+bash "$STORE" doctor --quiet --snapshot "$WORK/full.json" >/dev/null 2>&1
+N_SNAP=$(grep -c '^ARGS:snapshot' "$STUB_LOG" || true); N_SNAP=${N_SNAP//[^0-9]/}
+
+check "doctor without --snapshot enumerates the store for the generic battery" "[ \"\${N_NOSNAP:-0}\" -ge 1 ]"
+check "doctor --snapshot reuses the caller's snapshot instead (fewer enumerations)" "[ \"\${N_SNAP:-0}\" -lt \"\${N_NOSNAP:-0}\" ]"
+
+V1=$(bash "$STORE" doctor --quiet 2>/dev/null | tail -1)
+V2=$(bash "$STORE" doctor --quiet --snapshot "$WORK/full.json" 2>/dev/null | tail -1)
+check "the verdict is identical either way" "[ \"\$V1\" = \"\$V2\" ]"
+
+printf '{"scopeApplied":true,"tasks":[],"counts":{}}\n' > "$WORK/narrow.json"
+NOUT=$(bash "$STORE" doctor --snapshot "$WORK/narrow.json" 2>&1); NRC=$?
+check "a NARROWED snapshot is refused (exit 2)" "[ $NRC -eq 2 ]"
+check "...as a usage error, emitting no report line a caller could read as clean" \
+  "! printf '%s\n' \"\$NOUT\" | grep -qE '^(SUMMARY|FATAL)\|'"
+check "...and says why a subset cannot answer graph invariants" "printf '%s' \"\$NOUT\" | grep -q 'whole-graph'"
+
+printf '{"digest":true,"tasks":[],"counts":{}}\n' > "$WORK/dig.json"
+DRC=0; bash "$STORE" doctor --snapshot "$WORK/dig.json" >/dev/null 2>&1 || DRC=$?
+check "a DIGEST snapshot is refused too (bounded working set)" "[ $DRC -eq 2 ]"
+
+MRC=0; bash "$STORE" doctor --snapshot "$WORK/does-not-exist" >/dev/null 2>&1 || MRC=$?
+check "an unreadable --snapshot file is a usage error" "[ $MRC -eq 2 ]"
+unset STUB_SNAPSHOT
+
 echo
 echo "phase9-dispatcher: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
