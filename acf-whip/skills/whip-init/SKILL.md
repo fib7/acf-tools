@@ -334,7 +334,7 @@ Store values for agent generation (Step 6).
 
 ### Step 6: Generate Universal Agents from Patterns
 
-Create `.claude/agents/` directory if missing. **Generate** 6-7 agents from patterns in `${CLAUDE_PLUGIN_ROOT}/content/agent-patterns/universal/{agent}-pattern.md`:
+Create `.claude/agents/` directory if missing. **Generate** 7-8 agents from patterns in `${CLAUDE_PLUGIN_ROOT}/content/agent-patterns/universal/{agent}-pattern.md`:
 
 **Always generate**: task-engineer, quality-reviewer, lean-architect, precommit, retro, research-agent, workflow-architect
 **Conditional**: devops (if `create_devops=true`)
@@ -656,7 +656,7 @@ fi
 
 **Universal agents** (always included):
 ```bash
-# Universal: Core/task-engineer, Quality/quality-reviewer, Architecture/lean-architect, Quality/precommit, Process/retro, Research/research-agent
+# Universal: Core/task-engineer, Quality/quality-reviewer, Architecture/lean-architect, Quality/precommit, Process/retro, Research/research-agent, Workflow/workflow-architect
 # DevOps: Infrastructure/devops/{detected_orchestration}, CI/CD ({detected_ci_tool}), monitoring (if create_devops=true)
 ```
 
@@ -702,7 +702,7 @@ ACF Whip active. State machine: `pending → in-progress → completed → in-re
 
 **Core Docs**: `docs/acf/backlog/workflow.md`, `docs/acf/backlog/recovery-runbook.md`, `docs/acf/backlog/task-template.md`, `docs/acf/style/task-descriptions.md`, `.backlog/README.md`
 
-**Universal Agents**: task-engineer (WHAT/WHY only), quality-reviewer (accept/reject), lean-architect (design, max 2-3 line snippets), retro, precommit, research-agent (Perplexity/Context7)
+**Universal Agents**: task-engineer (WHAT/WHY only), quality-reviewer (accept/reject), lean-architect (design, max 2-3 line snippets), retro, precommit, research-agent (Perplexity/Context7), workflow-architect (authors the per-task child-workflow harness)
 
 **Quality Gates**: `docs/development/quality-gates-{stack}.md` | **Zero Bypass Tolerance**: No `--no-verify`, no skipping.
 
@@ -714,7 +714,7 @@ ACF Whip active. State machine: `pending → in-progress → completed → in-re
 Compare expected state (Steps 1-9) with actual state on disk:
 
 ```bash
-# 1. Check Universal Agents: expected_agents=(task-engineer quality-reviewer lean-architect precommit retro research-agent [+devops]) → missing_agents=[]
+# 1. Check Universal Agents: expected_agents=(task-engineer quality-reviewer lean-architect precommit retro research-agent workflow-architect [+devops]) → missing_agents=[]
 # 2. Check Manifests: docs/agents/{agent}.md → missing_manifests=[]
 # 3. Check Core Docs: docs/acf/style/task-descriptions.md, docs/acf/backlog/task-template.md, docs/acf/backlog/workflow.md, docs/acf/backlog/recovery-runbook.md → missing_docs=[]
 # 4. Check Quality Gates: .pre-commit-config.yaml, docs/development/quality-gates-{stack}.md → missing_quality_gates=[]
@@ -748,14 +748,14 @@ Compare expected state (Steps 1-9) with actual state on disk:
 📋 Core Docs: ✓ task-descriptions.md, ✓ research-documents.md, ✓ research-protocol.md, ✓ task-template.md, ✓ workflow.md, ✓ recovery-runbook.md, ✓ .backlog/README.md
 
 👥 Universal Agents (customized for {stack}):
-   ✓ task-engineer, quality-reviewer, lean-architect, retro, precommit, research-agent
+   ✓ task-engineer, quality-reviewer, lean-architect, retro, precommit, research-agent, workflow-architect
 {IF create_devops}   ✓ devops ({detected_orchestration}, {detected_ci_tool}, {detected_monitoring}, {detected_cloud}, {deployment_target})
 
 {IF with_specialists}🎯 Specialized Agents (auto-generated from tech stack):
 {IF with_specialists}   ✓ {created_specialists[]} ({backend_stack}, {frontend_stack}, {infrastructure})
 {IF with_specialists}
 {IF with_specialists}📊 Manifests (Priority 1/2/3, 58-74% token reduction): ✓ docs/agents/{6-7 universal + N specialists}.md
-{IF NOT with_specialists}📊 Manifests (Priority 1/2/3, 58-74% token reduction): ✓ docs/agents/{6-7 agents}.md
+{IF NOT with_specialists}📊 Manifests (Priority 1/2/3, 58-74% token reduction): ✓ docs/agents/{7-8 agents}.md
 
 {IF has_docs_index}📋 Documentation Hub: docs/README.md found → Agents will use it for discovery. Keep it updated.
 {IF NOT has_docs_index}📂 Documentation: Scanning standard directories. 💡 Create docs/README.md to help agents discover ALL docs.
@@ -836,7 +836,7 @@ Please specify manually: --backend=go|python|nodejs --frontend=react|nextjs
 
 ✅ .backlog/ structure created with 9 folders
 ✅ CLAUDE.md created or enhanced
-✅ Universal agents installed (6-7 agents)
+✅ Universal agents installed (7-8 agents)
 ✅ Specialist agents installed (if --with-specialists flag used)
 ✅ Agent manifests generated (universal + specialists)
 ✅ Core documentation initialized

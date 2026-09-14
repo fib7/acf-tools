@@ -179,10 +179,14 @@ The orchestrator derives the worktree path as `.worktree/<slug>` (singular, dot-
 - Set priorities and dependencies
 - Set `Worktree:`, `PR Group:`, and `Touches Globs:` (mandatory for code-mutating tasks; `none` for non-code tasks)
 - Write acceptance criteria **following style guide**
-- Commit task files to git on the **trunk branch** at the repo root
-- Move tasks between `.backlog/<state>/` folders at the repo root for: retry (rejected→pending), unblock (blocked→pending), redesign (rejected→blocked at >5 rejections)
+- Commit NEW task documents to the task store (`/task` does this through its single writer)
 
 **CANNOT:**
+
+- Move a task between states — the orchestrator is the single writer, on every backend. Retry
+  (rejected→pending), unblock (blocked→pending) and redesign are all scheduler decisions driven by
+  the runtime's retry cap; a task-engineer that performs them races the writer and, because that
+  writer is idempotent, silently drops the counter increment the cap depends on.
 
 - Implement tasks
 - Write code

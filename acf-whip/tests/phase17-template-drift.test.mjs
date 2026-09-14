@@ -86,6 +86,27 @@ for (const f of ALL) {
 check(`no shipped template instructs an agent to move task state${moveOffenders.length ? ` — found: ${moveOffenders.join(' | ')}` : ''}`,
   moveOffenders.length === 0)
 
+// The move instruction also hides in AUTHORITY/capability lists, which the pattern above cannot see
+// because they name no folder: "Move tasks between states" under **CAN:** grants exactly what the
+// rewrite removed, 23 lines after the text forbidding it. Same for committing task state.
+const GRANT = /^\s*[-*]\s*(move\s+(a\s+)?tasks?\b(?![^\n]*\borchestrator\b)|commit\s+task\s+(status|state)\b)/gim
+const grants = []
+for (const f of ALL) {
+  const text = readFileSync(f, 'utf8')
+  let m
+  GRANT.lastIndex = 0
+  while ((m = GRANT.exec(text)) !== null) {
+    const line = m[0].trim()
+    // A line that names who actually does it, or that appears under CANNOT/NEVER, is not a grant.
+    const before = text.slice(Math.max(0, m.index - 400), m.index)
+    if (/\*\*(CANNOT|NEVER|MUST NOT)/i.test(before.split('**CAN:**').pop() || before)) continue
+    if (/orchestrator|single writer|never|do not|cannot/i.test(line)) continue
+    grants.push(`${rel(f)}: "${line.slice(0, 70)}"`)
+  }
+}
+check(`no shipped template GRANTS an agent the power to move or commit task state${grants.length ? ` — found: ${grants.join(' | ')}` : ''}`,
+  grants.length === 0)
+
 // ---------------------------------------------------------------------------
 // 3. The result contract. The orchestrator reads it via StructuredOutput against ACFW_RESULT, and
 // the dispatch prompts carry the authoritative field list — so a template must not ship a STALE
@@ -201,6 +222,25 @@ for (const f of walk(join(ROOT, 'content'))) {
 }
 check(`no shipped document contains the literal clean-checkout token${tokenLiteral.length ? ` — found in: ${tokenLiteral.join(', ')}` : ''}`,
   tokenLiteral.length === 0)
+
+// ---------------------------------------------------------------------------
+// whip-init's "always generate" list and its gap-analysis list must agree — and both must agree with
+// the templates that exist. They drifted the moment workflow-architect was added: the installer
+// created it while the gap analysis still enumerated six agents, so a project missing it would be
+// reported complete by the very check that exists to find missing agents.
+const INIT = readFileSync(join(ROOT, 'skills', 'whip-init', 'SKILL.md'), 'utf8')
+const always = (INIT.match(/\*\*Always generate\*\*: ([^\n]+)/) || [])[1] || ''
+const alwaysList = always.split(',').map((x) => x.trim()).filter(Boolean)
+const expected = (INIT.match(/expected_agents=\(([^)]*)\)/) || [])[1] || ''
+const expectedList = expected.replace(/\[\+[a-z]+\]/g, '').split(/\s+/).map((x) => x.trim()).filter(Boolean)
+
+check(`whip-init declares an always-generate list (${alwaysList.length} agents)`, alwaysList.length >= 6)
+const missingFromGap = alwaysList.filter((a) => !expectedList.includes(a))
+check(`every always-generate agent is in the gap-analysis list${missingFromGap.length ? ` — missing: ${missingFromGap.join(', ')}` : ''}`,
+  missingFromGap.length === 0)
+const noTemplate = alwaysList.filter((a) => !AGENT_TEMPLATES.some((t) => rel(t).endsWith(`${a}-pattern.md`)))
+check(`every always-generate agent has a shipped template${noTemplate.length ? ` — missing: ${noTemplate.join(', ')}` : ''}`,
+  noTemplate.length === 0)
 
 console.log(`\nphase17-template-drift: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL === 0 ? 0 : 1)

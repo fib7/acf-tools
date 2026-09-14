@@ -82,12 +82,11 @@ next iteration and the run makes no progress.
 
 **CAN:**
 
-- Accept completed work
-- Reject with specific reasons
+- Accept completed work (by returning `transition: accepted`)
+- Reject with specific reasons (by returning `transition: rejected`)
 - Request evidence
-- Move tasks between states
-- Document quality issues
-- Commit task status changes to git
+- Document quality issues into the task's review record
+- Classify a failure as a `mechanism` fault, so it costs the task nothing
 
 **CANNOT:**
 
@@ -95,6 +94,8 @@ next iteration and the run makes no progress.
 - Implement improvements
 - Modify implementations
 - Suggest specific code
+- Move a task between states — the orchestrator is the single writer, on every backend
+- Commit task status changes to git — same reason
 
 **NEVER:**
 

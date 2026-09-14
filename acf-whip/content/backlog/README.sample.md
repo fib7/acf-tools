@@ -167,18 +167,24 @@ This project uses a **3-level priority system**:
 
 ### For quality-reviewer
 
-1. **Step 0: clean-checkout-before-task**: Invoke the skill (idempotent; validates the worktree the implementer used)
-2. **Verify clean-checkout token**: Transition log MUST contain at least one `clean-checkout | ok` line. Auto-reject if absent.
+1. **Verify the clean-checkout token FIRST** — before Step 0, because Step 0 writes that same row.
+   The transition log must contain a `clean-checkout | ok` line. If it does not: no worktree branch
+   means nothing was ever checked out (reject, charge a rejection); a branch that exists means the row
+   was lost (reject as a *mechanism* fault, charge nothing).
+2. **Step 0: clean-checkout-before-task**: Invoke the skill (idempotent; validates the worktree the implementer used)
 3. **Read Priority 1 Docs**: This README, workflow, quality gates
-4. **Move to in-review**: Start of review (inside the worktree)
-5. **Verify ALL Acceptance Criteria**: Every checkbox must be checked
-6. **Check rejection_count**: If ≥5, escalate to task-engineer (don't reject again)
-7. **Validate Quality Gates**: ALL commands must have complete output
-8. **Check Test Coverage**: Meet thresholds (API 90-95%, Core 90%, Services 85-90%, Utils 85%)
-9. **Binary Decision**: Accept OR reject (no partial approvals)
-10. **MANDATORY: Move to Terminal State**: accepted/ OR rejected/ (NEVER leave in in-review/) inside the worktree
-11. **Update rejection_count**: Increment if rejecting
-12. **Commit**: `review: accept|reject {task-id}` on `worktree/<slug>`
+4. **Verify ALL Acceptance Criteria**: Every checkbox must be checked
+5. **Validate Quality Gates**: ALL commands must have complete output
+6. **Check Test Coverage**: Meet thresholds (API 90-95%, Core 90%, Services 85-90%, Utils 85%)
+7. **Binary Decision**: Accept OR reject (no partial approvals)
+8. **Return the `ACFW-RESULT` marker**: `transition: accepted | rejected`, with `fault_class` set to
+   `mechanism` when the failure is not the task's fault. **The orchestrator performs the state move,
+   on every backend.** Do not move the task, do not edit its `Status`, and do not maintain
+   `rejection_count` — the runtime owns the retry cap and blocks a task that exhausts it.
+
+> Moving the task yourself is worse than useless: the orchestrator's writer is idempotent, so a task
+> you already moved makes its transition a no-op — which silently drops the rejection increment and
+> leaves a `Status`/folder mismatch for `/whip-doctor` to find.
 
 ## Quality Gates Integration
 
