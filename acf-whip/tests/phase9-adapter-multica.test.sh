@@ -291,6 +291,29 @@ DOCQ=$("$ADAPTER" doctor --quiet 2>/dev/null)
 check "--quiet drops the advisory but keeps the SUMMARY" \
   "! printf '%s\n' \"\$DOCQ\" | grep -q '^WARN|' && printf '%s\n' \"\$DOCQ\" | grep -q '^SUMMARY|'"
 
+# --quiet must keep the GATE DECISION, not just the SUMMARY. Without doctor-complete the dispatcher
+# recomputes ok= from the lines it receives, so a swallowed FATAL flips /go's startup gate from refuse
+# to proceed. The assertion above cannot see that: on a board with zero FATALs it compares 0 to 0 and
+# the pre-fix code (which suppressed everything) passes it. Induce a REAL FATAL first.
+# duplicate-key is multica's remaining native FATAL now that invalid-state is a WARN: clone an issue
+# so two share one whip_key. Done LAST because it corrupts the fixture board.
+DUP=$(jq -r '.issues | keys[0]' "$SNP")
+python3 - "$SNP" "$DUP" <<'PY'
+import json, sys
+p, src = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+clone = dict(d["issues"][src]); clone["id"] = "iss-clone"
+d["issues"]["iss-clone"] = clone
+json.dump(d, open(p, "w"))
+PY
+DF=$("$ADAPTER" doctor 2>/dev/null); DF_N=$(printf '%s\n' "$DF" | grep -c '^FATAL|' || true); DF_N=${DF_N//[^0-9]/}
+DQ=$("$ADAPTER" doctor --quiet 2>/dev/null); DQ_N=$(printf '%s\n' "$DQ" | grep -c '^FATAL|' || true); DQ_N=${DQ_N//[^0-9]/}
+check "the fixture really does carry a native FATAL (guards against a vacuous compare)" "[ \"\${DF_N:-0}\" -ge 1 ]"
+check "--quiet keeps every FATAL the verbose run reported" "[ \"\${DQ_N:-0}\" -eq \"\${DF_N:-0}\" ]"
+check "--quiet still suppresses the advisories" "! printf '%s\n' \"\$DQ\" | grep -qE '^(WARN|REPAIRABLE)\\|'"
+check "--quiet and verbose agree on ok=" \
+  "[ \"\$(printf '%s\n' \"\$DF\" | sed -n 's/.*|ok=\\(.*\\)/\\1/p' | tail -1)\" = \"\$(printf '%s\n' \"\$DQ\" | sed -n 's/.*|ok=\\(.*\\)/\\1/p' | tail -1)\" ]"
+
 # ============================================================================
 # A transition-log row is ONE LINE by construction. cmd_transition guarantees that via log_row/logcell;
 # log-event took the row pre-formatted and spliced it in verbatim, so an embedded newline tore the

@@ -32,14 +32,20 @@ const check = (m, cond) => (cond ? ok(m) : bad(m))
 // ---- the fixture the SCANNER actually produces for a first-run pending task ----
 // scan-backlog.sh:124 greps the document for the token row -> false (no row yet).
 // scan-backlog.sh:129-130 derives the branch from refs/heads/worktree/* -> false (nothing created yet).
-const T = (stem, slug) => ({
-  stem, id: stem, folder: 'pending', slug, deps: [],
+const T = (stem, slug, folder = 'pending') => ({
+  stem, id: stem, folder, slug, deps: [],
   hasIntegratedAt: false,
   hasWorktreeBranch: false,      // <-- the two fields every other suite stubs the other way
   hasCleanCheckoutToken: false,
   rejectionCount: 0, blockCount: 0, ageHours: -1, priority: 'medium',
 })
-const model = new Map([['alpha', T('alpha', 'sa')]])
+// alpha: a first-run PENDING task. It is dispatched this iteration, so the object the gate sees
+//        predates its own clean-checkout — the stale-read case. Must NOT be auto-rejected.
+// beta:  already in COMPLETED at scan time, with no token and no branch. It reaches review through
+//        the premove call site, which passes NO opts, so the gate is LIVE for it. Must BE
+//        auto-rejected — otherwise the tokenStale fix is a hole rather than a correction, and every
+//        assertion below would pass just as well with the gate deleted outright.
+const model = new Map([['alpha', T('alpha', 'sa')], ['beta', T('beta', 'sb', 'completed')]])
 
 function isTerminalModel(t) { return t.folder === 'accepted' && (t.hasIntegratedAt || t.slug === 'none' || !t.hasWorktreeBranch) }
 function buildSnapshot() {
@@ -156,20 +162,25 @@ try {
 const rejects = events.filter((e) => e.kind === 'transition' && e.toState === 'rejected')
 
 // THE one that fails on the pre-fix tree.
-check('a unit that ran clean-checkout inside its own dispatch is NOT auto-rejected', rejects.length === 0)
+check('a unit that ran clean-checkout inside its own dispatch is NOT auto-rejected',
+  !rejects.some((e) => e.stem === 'alpha'))
 check('no rejection life is charged to a first-run task', model.get('alpha').rejectionCount === 0)
 check('the task was reviewed rather than skipped', events.some((e) => e.kind === 'review'))
 check('the task reached accepted', model.get('alpha').folder === 'accepted')
 check('the task was implemented exactly once (no spurious re-dispatch)',
   workflowCalls.filter((c) => c.stem === 'alpha').length + specialistRuns.filter((s) => s === 'alpha').length === 1)
 
-// The gate must still be LIVE on the scan-fresh path, or this fix would be a hole rather than a
-// correction. Proven by construction: the report exposes the tally, and it is empty here because the
-// only dispatch was inline. A scan-fresh task with no branch still takes the reject arm.
+// THE assertion that makes this suite a proof rather than a description. Without it every check
+// above passes with the deterministic gate deleted outright — verified. beta is scan-fresh with no
+// token and no branch, so the gate must fire for it.
+check('the gate is still LIVE on the scan-fresh path: beta IS auto-rejected',
+  rejects.some((e) => e.stem === 'beta'))
+check('...and it is charged a rejection (inc 1, a real quality reject)',
+  rejects.some((e) => e.stem === 'beta' && e.rinc === '1'))
+check('...and the report names it', report && (report.rejectedAtReview || []).includes('beta'))
 check('the run report exposes review-time auto-rejects (they used to be recorded nowhere)',
   report && Array.isArray(report.rejectedAtReview))
-check('no auto-reject was tallied for this run', report.rejectedAtReview.length === 0)
-check('the run completed', report && report.completed === true)
+check('alpha is NOT in that tally', !(report.rejectedAtReview || []).includes('alpha'))
 
 console.log(`\nphase15-first-run-autoreject: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL === 0 ? 0 : 1)
