@@ -102,11 +102,16 @@
 | ---------------------------- | ----- | ------- | ------------- | --------------------- |
 | $(date +"%Y-%m-%d %H:%M:%S") | draft | pending | task-engineer | Initial task creation |
 
-**Concurrency token (mandatory for code-mutating tasks)**: implementer specialists and quality-reviewer invoke `clean-checkout-before-task` as Step 0. The skill appends a line in this exact form:
+**Concurrency token (mandatory for code-mutating tasks)**: implementer specialists and quality-reviewer invoke `clean-checkout-before-task` as Step 0. The skill appends a line in this exact form, where `<status>` is literally `ok`:
 
 ```
-| <UTC ts> | clean-checkout | ok | clean-checkout-before-task | <slug> | <branch> |
+| <UTC ts> | clean-checkout | <status> | clean-checkout-before-task | <slug> | <branch> |
 ```
+
+Do **not** copy that line into a task document by hand. `<status>` is a placeholder here on purpose:
+the completed row is what `snapshot.hasCleanCheckoutToken` and the reviewer's pre-review check both
+grep for, so a document containing it claims a checkout that never happened — and silently disables
+the one diagnostic aimed at that condition.
 
 Quality-reviewer auto-rejects any task in `.backlog/in-review/` whose transition log lacks at least one `clean-checkout | ok` line.
 

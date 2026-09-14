@@ -580,26 +580,53 @@ Finally return the structured ACFWResult matching your marker (transition, commi
 
 function reviewerPrompt(t) {
   const rootPath = taskLoc(t, 'in-review')
-  const tokenRule = filesStore
-    ? `AUTO-REJECT rule: if the task's Transition Log lacks a "| clean-checkout | ok |" token, reject.`
-    : `AUTO-REJECT rule: AFTER Step 0, re-run  ${materializeCmd(t)}  (Step 0 recorded its own token in the store; the refresh picks it up) and check the refreshed document's Transition Log — if it lacks a "| clean-checkout | ok |" token, reject.`
+  // PRE-STEP-0, and that ordering is the whole point. The old rule ran AFTER Step 0 and greped the
+  // document for a "| clean-checkout | ok |" row — but Step 0 IS a clean-checkout, and
+  // clean-checkout.sh writes that row with a HARD-CODED agent field, so the reviewer's own row is
+  // byte-indistinguishable from the implementer's. The rule could never fire on a genuine skip; the
+  // non-files branch even said so out loud ("Step 0 recorded its own token; the refresh picks it up").
+  // Since the inline dispatch path now skips the deterministic gate (the scan object predates the
+  // implementer), this prose check is the only thing standing there — so it has to be asked BEFORE
+  // the reviewer contaminates the evidence.
+  //
+  // Both arms, mirroring the deterministic gate exactly. A single-arm version reintroduces the false
+  // positive fixed in c941764: a lost token with a live branch is a MECHANISM fault (append_log_row is
+  // an unlocked read-modify-write), not the task's fault, and must not cost it a life.
+  const tokenProbe = filesStore
+    ? `read the task's Transition Log at ${sq(rootPath)}`
+    : `run  ${materializeCmd(t)}  and read the Transition Log of the document it prints`
+  const tokenRule = `PRE-STEP-0 CHECK — do this FIRST, before Step 0, because Step 0 writes this very row:
+  ${tokenProbe} and look for a "| clean-checkout | ok |" row.
+    - Row present  -> the implementer did enter a worktree. Continue to Step 0 and review normally.
+    - Row ABSENT   -> run  git -C ${sq(trunkRoot)} rev-parse --verify refs/heads/${branchPrefix}/${t.slug}
+        * command FAILS (no branch): nothing was ever checked out. Return transition "rejected",
+          rejection_increment 1, fault_class quality, notes naming this. Do NOT run Step 0.
+        * command SUCCEEDS (branch exists): the work is there but the token row was lost — a MECHANISM
+          fault, not the task's fault. Return transition "rejected", rejection_increment 0,
+          fault_class mechanism, notes naming this. Do NOT run Step 0.`
   const reviewSink = filesStore
     ? `Write your review comments into the ROOT task file at ${sq(rootPath)}`
     : `Record your review comments in the task store — pipe them to:  bash ${sq(STORE)} comment ${sq(t.stem)} --author quality-reviewer`
   return `${ENV}
 You are quality-reviewer reviewing one acf-whip task that an implementer marked completed.
 ${fetchSpecStep(t)}
+${tokenRule}
+
 STEP 0: run  bash ${sq(CLEAN_CHECKOUT)} ${sq(rootPath)}  to attach to the task's worktree (branch ${branchPrefix}/${t.slug}) and validate it. If it exits non-zero, return transition "none" with the exit code in notes.
 
 Then review the implementation against the task's Acceptance Criteria and quality gates, working in the worktree.
-${tokenRule}
 ${reviewSink}, then end with the ACFW-RESULT marker:
   ACFW-RESULT:
     transition: accepted | rejected
     commit_sha: n/a
-    rejection_increment: <0 if accepted, 1 if rejected>
+    rejection_increment: <0 if accepted, 1 if rejected; 0 for a mechanism fault>
+    fault_class: quality | mechanism
     notes: <specific feedback>
 ${NO_BACKLOG_WRITES}
+
+"mechanism" means the failure is NOT the task's fault — a broken environment, a missing worktree, a
+lost clean-checkout token. It never charges the task's rejection count and the task is retried
+unchanged. Use "quality" (or omit) when the WORK is what is wrong.
 
 Return the structured ACFWResult matching your marker.`
 }
@@ -1734,8 +1761,11 @@ Return the ScanResult.`
     // hasCleanCheckoutToken/hasWorktreeBranch were read BEFORE the implementer ran its own clean-checkout,
     // so they are false for EVERY first attempt and describe the world one specialist-run in the past.
     // Gate only on fields the scan observed AFTER the implementation — i.e. a task the scan already found
-    // in completed/ or in-review/. A specialist that genuinely skipped clean-checkout is still caught: the
-    // prose AUTO-REJECT rule in reviewerPrompt greps the LIVE document inside the review dispatched below.
+    // in completed/ or in-review/. A specialist that genuinely skipped clean-checkout is caught by
+    // reviewerPrompt's PRE-STEP-0 CHECK, which asks this same question with the same two arms BEFORE
+    // the reviewer runs its own clean-checkout. That ordering is load-bearing and is why the check was
+    // moved: it used to run AFTER Step 0 and grep for a row Step 0 itself writes (clean-checkout.sh
+    // uses a hard-coded agent field), so it could never fire — and this comment cited it as a backstop.
     const tokenObserved = !(opts && opts.tokenStale)
     // Deterministic clean-checkout AUTO-REJECT, decided HERE rather than by a reasoning prompt.
     // hasCleanCheckoutToken is an adapter-owned snapshot field on every backend (CONTRACT.md), so this

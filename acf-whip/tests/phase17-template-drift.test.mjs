@@ -169,5 +169,18 @@ check('derive_slug does not bound the sequence number either',
 check('the id schema description is interpolated from CATEGORIES, not hardcoded',
   /category one of \$\{CATEGORIES\.join/.test(TASK_JS))
 
+// ---------------------------------------------------------------------------
+// No shipped document may contain the literal clean-checkout token. It is what
+// snapshot.hasCleanCheckoutToken and the reviewer's pre-review check both grep for, so a task
+// document that copies it from a template claims a checkout that never happened — disabling the one
+// diagnostic aimed at exactly that condition. task-template.md carried it as a worked example, and
+// whip-task instructs authors to follow that template "EXACTLY".
+const tokenLiteral = []
+for (const f of walk(join(ROOT, 'content'))) {
+  if (/\| clean-checkout \| ok \|/.test(readFileSync(f, 'utf8'))) tokenLiteral.push(rel(f))
+}
+check(`no shipped document contains the literal clean-checkout token${tokenLiteral.length ? ` — found in: ${tokenLiteral.join(', ')}` : ''}`,
+  tokenLiteral.length === 0)
+
 console.log(`\nphase17-template-drift: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL === 0 ? 0 : 1)

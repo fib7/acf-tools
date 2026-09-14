@@ -68,5 +68,26 @@ else {
     !re.test("Cannot read properties of undefined (reading 'passed')"))
 }
 
+// ---------------------------------------------------------------------------
+// The clean-checkout invariant. The inline dispatch path skips the deterministic gate (its task
+// object predates the implementer), so the reviewer's prose check is the only thing standing there.
+// That check used to run AFTER Step 0 and grep the document for a "| clean-checkout | ok |" row —
+// but Step 0 IS a clean-checkout, and clean-checkout.sh writes that row with a hard-coded agent
+// field, so the reviewer's own row is indistinguishable from the implementer's. It could never fire.
+const reviewerFn = src.slice(src.indexOf('function reviewerPrompt'), src.indexOf('function directReviewPrompt'))
+check('the reviewer checks the token BEFORE Step 0, not after',
+  reviewerFn.indexOf('PRE-STEP-0') >= 0 &&
+  reviewerFn.indexOf('${tokenRule}') < reviewerFn.indexOf('STEP 0: run'))
+// Both arms, or the fix reintroduces the false positive c941764 removed: a lost token with a live
+// branch is a MECHANISM fault and must not charge the task a life.
+check('the no-branch arm charges a rejection', /rejection_increment 1[\s\S]{0,90}fault_class quality/.test(reviewerFn))
+check('the branch-exists arm does NOT charge one', /rejection_increment 0[\s\S]{0,90}fault_class mechanism/.test(reviewerFn))
+check('the reviewer is told not to run Step 0 after rejecting', (reviewerFn.match(/Do NOT run Step 0/g) || []).length >= 2)
+check('the marker template carries fault_class', /fault_class: quality \| mechanism/.test(reviewerFn))
+check('the check verifies the branch with git, not by trusting the document',
+  /rev-parse --verify refs\/heads\//.test(reviewerFn))
+check('the tokenStale comment no longer cites a backstop that cannot fire',
+  !/prose AUTO-REJECT rule in reviewerPrompt greps the LIVE document/.test(src))
+
 console.log(`\nphase16-gate-legibility: ${P} passed, ${F} failed`)
 process.exit(F === 0 ? 0 : 1)
