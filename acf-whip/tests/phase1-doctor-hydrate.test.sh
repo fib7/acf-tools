@@ -661,6 +661,25 @@ DS_AUTH=$(grep -l '^- \*\*Worktree\*\*: auth$' "$DS"/.backlog/pending/*.md 2>/de
 check "--fix writes the contended slug to exactly one task, never both" "[ \"\${DS_AUTH:-0}\" -eq 1 ]"
 check "--fix still repairs the uncontended task" \
   "grep -q '^- \*\*Worktree\*\*: solo$' \"$DS/.backlog/pending/feature-003-solo-x.md\""
+
+# DURABILITY. The finding was one-shot: run 1 gave the slug to the first claimant and refused the
+# second; run 2 saw the first holding an EXPLICIT slug (so it never entered the derive path), found an
+# empty registry, and handed the same slug to the second — producing exactly the duplicate the FATAL
+# had reported. The registry is seeded from slugs already claimed, so the refusal survives re-runs.
+bash "$DOC" --fix "$DS" >/dev/null 2>&1
+bash "$DOC" --fix "$DS" >/dev/null 2>&1
+DS_AUTH2=$(grep -l '^- \*\*Worktree\*\*: auth$' "$DS"/.backlog/pending/*.md 2>/dev/null | wc -l | tr -d ' ')
+check "the refusal is DURABLE: three --fix runs still leave the slug on exactly one task" "[ \"\${DS_AUTH2:-0}\" -eq 1 ]"
+DS_RPT=$(bash "$DOC" "$DS" 2>/dev/null)
+check "...and the collision is still reported after those runs" \
+  "printf '%s\n' \"\$DS_RPT\" | grep -q '^FATAL|duplicate-derived-slug|'"
+
+# A derived slug must also lose to an EXPLICIT holder, not just to another derived one.
+dmk feature-004-solo   # derives 'solo', which feature-003 now holds explicitly
+( cd "$DS" && git add -A && git commit -qm x ) >/dev/null 2>&1
+DS_EXP=$(bash "$DOC" "$DS" 2>/dev/null)
+check "a derived slug colliding with an EXPLICIT holder is also a FATAL" \
+  "printf '%s\n' \"\$DS_EXP\" | grep -q 'duplicate-derived-slug|feature-004-solo-x'"
 rm -rf "$DS"
 
 # ---------------------------------------------------------------------------------------------------

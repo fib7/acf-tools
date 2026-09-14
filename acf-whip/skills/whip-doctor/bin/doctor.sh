@@ -304,6 +304,26 @@ fi
 # ---- Per-file pass: emit independent findings, apply per-file repairs, build TSV ----
 # --active-only restricts the full per-file pass to the non-accepted folders (accepted is fed to the
 # awk graph as a cheap batched stub appended below); full/--fix runs always cover every active folder.
+# Seed the derived-slug registry with every slug ALREADY CLAIMED, so the collision FATAL is durable.
+# Without this the finding is one-shot: run 1 gives the contended slug to the first claimant and
+# refuses the second, run 2 sees the first task holding an EXPLICIT slug (so it never enters the
+# derive path) and hands the same slug to the second — producing exactly the duplicate the FATAL
+# reported. Two sources, both already in hand: explicit Worktree values on non-accepted tasks (ONE
+# batched grep, no per-file cost) and the live worktree branches (already fetched at :155).
+# Deliberately NOT seeded from accepted tasks: their slugs are historical, and a long-lived backlog
+# would turn into an unrepairable wall of FATALs on first run.
+{
+  for _st in $ACTIVE_NONACC; do
+    [ -d "$BL/$_st" ] || continue
+    # Per-LINE whitespace strip. `tr -d '[:space:]'` is what the per-file code uses on a single
+    # value, but over a multi-line stream it also deletes the newlines and concatenates every slug
+    # into one unusable token.
+    grep -hE '^- \*\*Worktree\*\*:' "$BL/$_st/"*.md 2>/dev/null \
+      | sed -E 's/.*Worktree\*\*:[[:space:]]*//; s/[[:space:]]+$//; s/^[[:space:]]+//'
+  done
+  printf '%s\n' "$EXISTING_WT_SLUGS"
+} | grep -vxE '(none)?' | sort -u >> "$DERIVED" 2>/dev/null || true
+
 LOOP_FOLDERS="$ACTIVE"
 [ "$ACTIVE_ONLY" = "1" ] && LOOP_FOLDERS="$ACTIVE_NONACC"
 for st in $LOOP_FOLDERS; do
