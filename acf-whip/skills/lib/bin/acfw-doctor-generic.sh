@@ -135,6 +135,7 @@ printf '%s' "$SNAP" | jq -r '(.tasks[]? , .inactive[]?) |
    (if (.hasWorktreeBranch // false) then "1" else "0" end)] | @tsv' > "$TSV"
 
 awk -F'\t' -v mode="$MODE" '
+BEGIN{ split("pending in-progress completed in-review blocked rejected accepted", _a, " "); for(_i in _a) ACTIVE_SET[_a[_i]]=1 }
 # Memoised. A dep token is resolved once per DEPENDENT, so a token shared by many tasks rescanned the
 # whole stem table every time. The cache stores misses too ("" is a real answer), which is why the
 # presence test is on rcache and not on its value.
@@ -149,7 +150,11 @@ function resolve(d,   s){
   stems[stem]=1; state[stem]=folder; slugOf[stem]=slug; integOf[stem]=integ; depsOf[stem]=deps; globsOf[stem]=globs; hasBranchOf[stem]=hasBranch;
   if(id!=""){ idcount[id]++ }
   if(folder=="pending"){ pend[stem]=1 }
-  if(folder=="draft" || folder=="archive"){ inert[stem]=1 }
+  # The complement of the seven ACTIVE states, so this agrees by construction with the isactive
+  # whitelist in acfw-enrich-snapshot.sh, and also covers an out-of-vocabulary state (inert for the
+  # same reason: no scheduler path names it).
+  # NOTE: no apostrophes in this awk program -- it is inside a single-quoted shell string.
+  if(!(folder in ACTIVE_SET)){ inert[stem]=1 }
 }
 END{
   for(i in idcount) if(idcount[i]>1) print "WARN|duplicate-id|" i "|ID appears on " idcount[i] " tasks (quarantine: de-dup; run continues)";
@@ -159,7 +164,12 @@ END{
     for(k=1;k<=n;k++){ d=da[k]; gsub(/[ \t]/,"",d);
       if(d=="" || d=="none") continue;
       r=resolve(d);
-      if(r==""){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|dangling-dep|" s "|depends on " d " which has no task"; continue }
+      # Same severity question the per-task battery asks: is the REFERRING task in the dispatch path?
+      # accepted is terminal, draft is the human gate, archive is retired — a defect on any of them
+      # cannot make a run wrong, so it must not gate one. This half was missed when the per-task tier
+      # was fixed, so a draft stub naming a not-yet-created dependency — which the contract explicitly
+      # blesses — still produced a board-blocking FATAL on every backend that lists drafts.
+      if(r==""){ sev=(state[s]=="accepted" || (s in inert))?"WARN":"FATAL"; print sev "|dangling-dep|" s "|depends on " d " which has no task"; continue }
       # The dep EXISTS but is behind the human gate / retired. The scheduler already refuses to
       # dispatch (isTerminal is false for both), so this is not a gate FATAL — it is the reason a task
       # will sit in pending forever, which an operator otherwise has to work out from silence.
@@ -180,7 +190,7 @@ END{
     for(s in stems){ if(removed[s]) continue;
       if((s in indeg ? indeg[s] : 0) <= 0){ removed[s]=1; changed=1;
         m=split(adj[s], aa, " "); for(k=1;k<=m;k++){ t=aa[k]; if(t!="") indeg[t]-- } } } }
-  for(s in stems) if(!removed[s]){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|cyclic-deps|" s "|participates in a dependency cycle"; }
+  for(s in stems) if(!removed[s]){ sev=(state[s]=="accepted" || (s in inert))?"WARN":"FATAL"; print sev "|cyclic-deps|" s "|participates in a dependency cycle"; }
 
   # Contended globs, BY INDEX. This was a double loop over every pair of pending tasks with a nested
   # glob comparison — O(P^2 * G^2) — and it emitted one WARN per overlapping PAIR, so a handful of

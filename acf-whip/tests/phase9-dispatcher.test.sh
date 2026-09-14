@@ -270,6 +270,35 @@ MRC=0; bash "$STORE" doctor --snapshot "$WORK/does-not-exist" >/dev/null 2>&1 ||
 check "an unreadable --snapshot file is a usage error" "[ $MRC -eq 2 ]"
 unset STUB_SNAPSHOT
 
+# ---- the graph battery asks the DISPATCH-PATH question, not "is it accepted?" -----------------------
+# 118ab4d fixed that tier in the per-task battery and missed the graph pass, so a draft or archived
+# card still produced board-blocking FATALs on every backend that lists them — which is exactly where
+# this release's defects were found. A draft naming a not-yet-created dependency is explicitly blessed
+# by CONTRACT.md, so it must never gate a run.
+GEN="$ACF_WHIP/skills/lib/bin/acfw-doctor-generic.sh"
+GREPO="$WORK/graph"; git init -q -b trunk "$GREPO" 2>/dev/null
+( cd "$GREPO" && git config user.email t@t && git config user.name t && echo s > s && git add -A && git commit -qm s ) >/dev/null 2>&1
+
+G_DRAFT=$(printf '%s' '{"tasks":[{"stem":"p-1","id":"p-1","status":"pending","folder":"pending","slug":"sp","deps":[],"agent":"none"}],"inactive":[{"stem":"d-9","id":"d-9","status":"draft","folder":"draft","slug":"none","deps":["nope"],"agent":"none"}],"counts":{}}' | bash "$GEN" "$GREPO" 2>/dev/null)
+check "a DRAFT naming a nonexistent dep is a WARN, not a gate FATAL" \
+  "printf '%s\n' \"\$G_DRAFT\" | grep -q '^WARN|dangling-dep|d-9'"
+check "...and produces no dangling FATAL at all" \
+  "! printf '%s\n' \"\$G_DRAFT\" | grep -q '^FATAL|dangling-dep'"
+
+G_PEND=$(printf '%s' '{"tasks":[{"stem":"p-1","id":"p-1","status":"pending","folder":"pending","slug":"sp","deps":["nope"],"agent":"none"}],"counts":{}}' | bash "$GEN" "$GREPO" 2>/dev/null)
+check "a PENDING task naming the same dep still gates the run" \
+  "printf '%s\n' \"\$G_PEND\" | grep -q '^FATAL|dangling-dep|p-1'"
+
+# An out-of-vocabulary state is inert for the same reason and must be treated the same way.
+G_ODD=$(printf '%s' '{"tasks":[{"stem":"x-1","id":"x-1","status":"in-external-review","folder":"in-external-review","slug":"sx","deps":["nope"],"agent":"none"}],"counts":{}}' | bash "$GEN" "$GREPO" 2>/dev/null)
+check "an out-of-vocabulary state is inert too (no gate FATAL)" \
+  "! printf '%s\n' \"\$G_ODD\" | grep -q '^FATAL|dangling-dep'"
+
+# A cycle among drafts is likewise not a gate concern.
+G_CYC=$(printf '%s' '{"tasks":[],"inactive":[{"stem":"a","id":"a","status":"draft","folder":"draft","slug":"none","deps":["b"],"agent":"none"},{"stem":"b","id":"b","status":"draft","folder":"draft","slug":"none","deps":["a"],"agent":"none"}],"counts":{}}' | bash "$GEN" "$GREPO" 2>/dev/null)
+check "a cycle among DRAFT tasks does not gate the run" \
+  "! printf '%s\n' \"\$G_CYC\" | grep -q '^FATAL|cyclic-deps'"
+
 echo
 echo "phase9-dispatcher: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
