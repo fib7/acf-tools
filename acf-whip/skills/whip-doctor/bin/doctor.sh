@@ -118,6 +118,31 @@ DERIVED=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-slugs.XXXXXX")
 trap 'rm -f "$FINDINGS" "$TSV" "$DERIVED"' EXIT
 emit() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >> "$FINDINGS"; }
 field() { grep -E "^- \*\*$2\*\*:" "$1" 2>/dev/null | head -1 | sed -E "s/.*$2\*\*:[[:space:]]*//" | sed -E 's/[[:space:]]+$//'; }
+# The collapsed-document check, factored so the --active-only accepted screen can reuse it and the two
+# paths cannot disagree about what counts as a destroyed document. Kept SEPARATE from the NUL screen
+# and called only for a file whose field lookup already failed: a well-formed task must never reach
+# this awk, which is what keeps the per-file pass affordable on a large board.
+# Returns 0 (and emits) when the document is destroyed, 1 when it is fine.
+check_collapsed() { # <file> <stem> <folder>
+  local f="$1" stem="$2" folder="$3" collapsed nrow what
+  collapsed=$(awk '/^#/{h++} /^\|/{r++} /[^[:space:]]/{n++}
+                   END{print ((h+0)==0 && (n+0)==(r+0)) ? 1 : 0}' "$f" 2>/dev/null)
+  [ "${collapsed:-0}" = "1" ] || return 1
+  nrow=$(grep -c '^|' "$f" 2>/dev/null || true); nrow=${nrow:-0}
+  if [ "$nrow" -eq 0 ]; then what="task file is empty"; else what="task file collapsed to $nrow transition-log row(s) — no headings, no metadata"; fi
+  emit FATAL collapsed-task-file "$stem" "$what. A concurrent write destroyed the document; the content is still in git. Restore: git -C $REPO_ROOT checkout HEAD -- .backlog/$folder/$stem.md   (then re-run /whip-doctor; NOT --fix-able)"
+  return 0
+}
+
+# The NUL screen, same reasoning. Cheap (one tr), so it runs for every file, as it always has.
+check_control_bytes() { # <file> <stem> <folder>
+  local f="$1" stem="$2" folder="$3" nnul
+  nnul=$(LC_ALL=C tr -dc '\000' < "$f" 2>/dev/null | wc -c | tr -d '[:space:]')
+  [ "${nnul:-0}" -gt 0 ] || return 1
+  emit FATAL control-bytes "$stem" "$nnul raw NUL byte(s) (0x00) in the task file — every field lookup is unreliable. Strip: LC_ALL=C tr -d '\\000' < .backlog/$folder/$stem.md > /tmp/t && mv /tmp/t .backlog/$folder/$stem.md"
+  return 0
+}
+
 commit_fix() { # <path-rel> <msg>
   git_with_lock_backoff -C "$REPO_ROOT" add "$1" >/dev/null 2>&1 || true
   git_with_lock_backoff -C "$REPO_ROOT" commit -m "$2" --quiet >/dev/null 2>&1 || true
@@ -144,15 +169,16 @@ is_integrated_key() { printf '%s\n' "$INTEGRATED_KEYS" | grep -qxF "$1"; }
 # emitted (duplicate-id is FATAL across folders). TSV columns mirror the full pass exactly (11 cols).
 emit_accepted_stub_tsv() {
   [ -d "$BL/accepted" ] || return 0
-  local accf wtf ikf
+  local accf wtf ikf suspf sf kind sstem
   accf=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-acc.XXXXXX")
   wtf=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-wt.XXXXXX")
   ikf=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-ik.XXXXXX")
+  suspf=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-susp.XXXXXX")
   find "$BL/accepted" -maxdepth 1 -type f -name '*.md' ! -name 'README.md' 2>/dev/null > "$accf"
   printf '%s\n' "$EXISTING_WT_SLUGS" > "$wtf"
   printf '%s\n' "$INTEGRATED_KEYS" > "$ikf"
   grep -HE '^- \*\*(ID|Worktree|Integrated-At)\*\*:' "$BL/accepted/"*.md 2>/dev/null | awk \
-    -v accf="$accf" -v wtf="$wtf" -v ikf="$ikf" '
+    -v accf="$accf" -v wtf="$wtf" -v ikf="$ikf" -v suspf="$suspf" '
     BEGIN {
       while ((getline l < wtf) > 0) if (l != "") wt[l]=1
       while ((getline l < ikf) > 0) if (l != "") ik[l]=1
@@ -172,11 +198,28 @@ emit_accepted_stub_tsv() {
         # Ledger truth wins over the inert Integrated-At field: the gate asks the same oracle the scheduler does.
         if (ig=="" && (s in ik)) ig="ledger"
         hb=(sl!="" && sl!="none" && (sl in wt))?1:0
+        # An accepted file the batched grep found NO ID in is the CONTENT-LOSS signature: a collapsed
+        # document has no metadata line at all, and a raw NUL makes grep treat the file as binary and
+        # print nothing for it. Name it; the shell confirms below.
+        if (i=="") print f > suspf
         printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s, "accepted", i, "accepted", sl, "", "none", ig, "", 0, hb
       }
     }
   '
-  rm -f "$accf" "$wtf" "$ikf"
+  # CONFIRM the suspects. --active-only skips the per-file pass over accepted/ — that is the point of
+  # the flag and the reason it is ~3.5x faster — but control-bytes and collapsed-task-file are CONTENT
+  # LOSS, not advisories, and they are FATAL regardless of folder. Without this the fast path reports
+  # ok=true over a destroyed document, which is precisely what the gate exists to refuse, and the
+  # flag's documented contract ("the FATAL set and the ok flag are UNCHANGED") would be false.
+  # Bounded by the number of ID-less accepted files — normally zero — not by board size.
+  while IFS= read -r sf; do
+    [ -n "$sf" ] && [ -f "$sf" ] || continue
+    sstem=$(basename "$sf" .md)
+    check_control_bytes "$sf" "$sstem" "accepted" && continue
+    check_collapsed "$sf" "$sstem" "accepted" && continue
+    emit WARN unparseable-frontmatter "$sstem" "missing ID and/or Status field"
+  done < "$suspf"
+  rm -f "$accf" "$wtf" "$ikf" "$suspf"
 }
 
 # Derive a kebab-case worktree slug from a task id: drop the "<category>-<NNN>-" prefix and keep
@@ -276,11 +319,7 @@ for st in $LOOP_FOLDERS; do
     # --fix must never silently commit a half-written task as "healed". Scoped to NUL, not the whole C0
     # class: ESC/formfeed pasted from terminal output are harmless here, and flagging them would newly
     # block runs on files that parse fine.
-    nnul=$(LC_ALL=C tr -dc '\000' < "$f" 2>/dev/null | wc -c | tr -d '[:space:]')
-    if [ "${nnul:-0}" -gt 0 ]; then
-      emit FATAL control-bytes "$stem" "$nnul raw NUL byte(s) (0x00) in the task file — every field lookup is unreliable. Strip: LC_ALL=C tr -d '\\000' < .backlog/$folder/$stem.md > /tmp/t && mv /tmp/t .backlog/$folder/$stem.md"
-      continue
-    fi
+    if check_control_bytes "$f" "$stem" "$folder"; then continue; fi
 
     id=$(field "$f" "ID"); status=$(field "$f" "Status"); slug=$(field "$f" "Worktree" | tr -d '[:space:]')
     deps=$(field "$f" "Dependencies"); integ=$(field "$f" "Integrated-At" | tr -d '[:space:]')
@@ -313,19 +352,7 @@ for st in $LOOP_FOLDERS; do
       # operator to re-type two fields, when the whole document is gone and is sitting in git.
       # ONE awk, and ONLY for a file that already failed the field lookup — a well-formed task
       # never reaches this line, so the check costs nothing on the happy path.
-      collapsed=$(awk '/^#/{h++} /^\|/{r++} /[^[:space:]]/{n++}
-                       END{print ((h+0)==0 && (n+0)==(r+0)) ? 1 : 0}' "$f" 2>/dev/null)
-      if [ "${collapsed:-0}" = "1" ]; then
-        # FATAL unconditionally, skipping the sev_struct accepted->WARN tier: this is content LOSS,
-        # not a structural quirk, and an accepted task whose document was destroyed is still
-        # destroyed. control-bytes above sets the same precedent. Deliberately NOT --fix-able for
-        # its reason too: restoring from HEAD discards the clean-checkout token row (uncommitted by
-        # design), and --fix must never silently commit a torn write as "healed".
-        nrow=$(grep -c '^|' "$f" 2>/dev/null || true); nrow=${nrow:-0}
-        if [ "$nrow" -eq 0 ]; then what="task file is empty"; else what="task file collapsed to $nrow transition-log row(s) — no headings, no metadata"; fi
-        emit FATAL collapsed-task-file "$stem" "$what. A concurrent write destroyed the document; the content is still in git. Restore: git -C $REPO_ROOT checkout HEAD -- .backlog/$folder/$stem.md   (then re-run /whip-doctor; NOT --fix-able)"
-        continue
-      fi
+      if check_collapsed "$f" "$stem" "$folder"; then continue; fi
       emit "$sev_struct" unparseable-frontmatter "$stem" "missing ID and/or Status field"
     elif [ "$status" != "$folder" ]; then
       # Status-folder mismatch is REPAIRABLE, not FATAL: the folder is the source of truth, so --fix

@@ -592,6 +592,46 @@ check "in sync with origin -> no trunk-unpushed WARN" "! echo \"\$RL_OUT\" | gre
 rm -rf "$RL"
 
 # ---------------------------------------------------------------------------------------------------
+# --active-only MUST NOT CHANGE THE GATE VERDICT. Its contract, stated in doctor.sh's own header and
+# relied on by /go's bootstrap re-scan, is that it suppresses accepted-folder ADVISORIES while leaving
+# the FATAL set and the ok flag untouched. That was false for the two content-loss checks: they are
+# emitted from the per-file pass, which --active-only skips for accepted/, so a task document
+# destroyed by a torn write (the 2026-08-24 incident collapsed-task-file exists for) passed the gate
+# as ok=true. The equivalence below is the assertion that keeps the contract honest.
+AO=$(mktemp -d); ( cd "$AO" && git init -q -b trunk . && git config user.email t@t && git config user.name t )
+mkdir -p "$AO"/.backlog/{draft,pending,in-progress,completed,in-review,blocked,rejected,accepted} "$AO/.claude/agents"
+echo x > "$AO/.claude/agents/go-engineer.md"
+printf -- '# T\n\n- **ID**: feature-001\n- **Status**: pending\n- **Assigned Agent**: go-engineer\n- **Worktree**: sa\n- **Dependencies**: none\n' > "$AO/.backlog/pending/feature-001-ok.md"
+# An ACCEPTED document collapsed to bare transition-log rows.
+printf -- '| 2026-01-01 | pending | accepted | x | y |\n| 2026-01-02 | a | b | c | d |\n' > "$AO/.backlog/accepted/feature-002-collapsed.md"
+( cd "$AO" && echo s > s && git add -A && git commit -qm s ) >/dev/null 2>&1
+
+AO_FULL=$(bash "$DOC" --quiet "$AO" 2>/dev/null); AO_FULL_RC=$?
+AO_FAST=$(bash "$DOC" --quiet --active-only "$AO" 2>/dev/null); AO_FAST_RC=$?
+check "collapsed ACCEPTED document is FATAL on the full pass" \
+  "printf '%s\n' \"\$AO_FULL\" | grep -q '^FATAL|collapsed-task-file|feature-002-collapsed'"
+check "...and --active-only finds it too (the bootstrap gate runs that)" \
+  "printf '%s\n' \"\$AO_FAST\" | grep -q '^FATAL|collapsed-task-file|feature-002-collapsed'"
+check "--active-only reaches the same ok verdict as the full pass" \
+  "[ \"\$(printf '%s\n' \"\$AO_FULL\" | sed -n 's/.*|ok=\(.*\)/\1/p')\" = \"\$(printf '%s\n' \"\$AO_FAST\" | sed -n 's/.*|ok=\(.*\)/\1/p')\" ]"
+check "...and the same exit status" "[ $AO_FULL_RC -eq $AO_FAST_RC ]"
+
+# A raw NUL in an accepted document: the other content-loss signature, same requirement.
+printf -- '# T\n\n- **ID**: feature-003\n- **Status**: accepted\n\000\n' > "$AO/.backlog/accepted/feature-003-nul.md"
+AO_N_FULL=$(bash "$DOC" --quiet "$AO" 2>/dev/null | grep -c '^FATAL|control-bytes|' || true)
+AO_N_FAST=$(bash "$DOC" --quiet --active-only "$AO" 2>/dev/null | grep -c '^FATAL|control-bytes|' || true)
+check "a NUL in an accepted document is FATAL on both paths" \
+  "[ \"\${AO_N_FULL//[^0-9]/}\" -ge 1 ] && [ \"\${AO_N_FAST//[^0-9]/}\" -eq \"\${AO_N_FULL//[^0-9]/}\" ]"
+
+# And the flag must still do its actual job: suppress accepted ADVISORIES.
+printf -- '# T\n\n- **ID**: feature-004\n- **Status**: accepted\n- **Assigned Agent**: ghost-agent\n- **Worktree**: sd\n- **Dependencies**: none\n' > "$AO/.backlog/accepted/feature-004-adv.md"
+AO_W_FULL=$(bash "$DOC" "$AO" 2>/dev/null | grep -c '^WARN|' || true)
+AO_W_FAST=$(bash "$DOC" --active-only "$AO" 2>/dev/null | grep -c '^WARN|' || true)
+check "--active-only still suppresses accepted advisories (that is what it is for)" \
+  "[ \"\${AO_W_FAST//[^0-9]/}\" -lt \"\${AO_W_FULL//[^0-9]/}\" ]"
+rm -rf "$AO"
+
+# ---------------------------------------------------------------------------------------------------
 # DERIVED-SLUG COLLISION. Two ids with the same descriptive tail derive the same worktree slug, and
 # --fix would write it onto both — two tasks on one branch, which is the single thing a per-task slug
 # exists to prevent. The registry that detects this MUST be a file: derive_slug_unique is invoked as
