@@ -445,7 +445,15 @@ done
 
 # ---- Cross-task analysis in awk (portable associative arrays) ----
 awk -F'\t' -v mode="$MODE" '
-function resolve(d,   s){ if(d in stems) return d; for(s in stems){ if(index(s,d)==1) return s } return "" }
+# Memoised. A dep token is resolved once per DEPENDENT, so a token shared by many tasks rescanned the
+# whole stem table every time. The cache stores misses too ("" is a real answer), which is why the
+# presence test is on rcache and not on its value.
+function resolve(d,   s){
+  if(d in rcache) return rcache[d]
+  if(d in stems){ rcache[d]=d; return d }
+  for(s in stems){ if(index(s,d)==1){ rcache[d]=s; return s } }
+  rcache[d]=""; return ""
+}
 {
   stem=$1; folder=$2; id=$3; slug=$5; deps=$7; integ=$8; globs=$9; hasBranch=$11;
   stems[stem]=1; state[stem]=folder; slugOf[stem]=slug; integOf[stem]=integ; depsOf[stem]=deps; globsOf[stem]=globs; hasBranchOf[stem]=hasBranch;
@@ -491,14 +499,23 @@ END{
         m=split(adj[s], aa, " "); for(k=1;k<=m;k++){ t=aa[k]; if(t!="") indeg[t]-- } } } }
   for(s in stems) if(!removed[s]){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|cyclic-deps|" s "|participates in a dependency cycle"; }
 
-  np=0; for(s in pend){ np++; parr[np]=s }
-  for(a=1;a<=np;a++) for(b=a+1;b<=np;b++){ sa=parr[a]; sb=parr[b];
-    if(slugOf[sa]==slugOf[sb]) continue;
-    if(globsOf[sa]==""||globsOf[sb]=="") continue;
-    na=split(globsOf[sa],ga,","); done=0;
-    for(k=1;k<=na && !done;k++){ g=ga[k]; gsub(/[ \t]/,"",g); if(g=="") continue;
-      nb=split(globsOf[sb],gb,","); for(j=1;j<=nb;j++){ h=gb[j]; gsub(/[ \t]/,"",h);
-        if(g==h){ print "WARN|cross-slug-glob-overlap|" sa "|shares glob " g " with " sb " in a different slug (possible mis-partition)"; done=1; break } } }
+  # Contended globs, BY INDEX. This was a double loop over every pair of pending tasks with a nested
+  # glob comparison — O(P^2 * G^2) — and it emitted one WARN per overlapping PAIR, so a handful of
+  # tasks sharing one glob produced a quadratic wall of advisories that an operator has to read past
+  # to find a real finding. The relation is an index and always was: group by glob, count distinct
+  # slugs, and report each task once. O(P*G), and the output is bounded by the number of tasks.
+  for(s in pend){
+    if(globsOf[s]=="") continue
+    n=split(globsOf[s], gg, ",")
+    for(k=1;k<=n;k++){ g=gg[k]; gsub(/[ \t]/,"",g); if(g=="") continue
+      if(!((g SUBSEP slugOf[s]) in gseen)){ gseen[g SUBSEP slugOf[s]]=1; gslugs[g]++ } }
+  }
+  for(s in pend){
+    if(globsOf[s]=="") continue
+    n=split(globsOf[s], gg, ","); hit=""
+    for(k=1;k<=n;k++){ g=gg[k]; gsub(/[ \t]/,"",g); if(g=="") continue
+      if(gslugs[g] > 1) hit=(hit=="" ? g : hit ", " g) }
+    if(hit!="") print "WARN|cross-slug-glob-overlap|" s "|declares glob(s) " hit " also declared by a task in a different worktree slug (possible mis-partition)"
   }
 }' "$TSV" >> "$FINDINGS"
 

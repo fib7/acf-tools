@@ -592,6 +592,35 @@ check "in sync with origin -> no trunk-unpushed WARN" "! echo \"\$RL_OUT\" | gre
 rm -rf "$RL"
 
 # ---------------------------------------------------------------------------------------------------
+# CROSS-SLUG GLOB OVERLAP. Nothing asserted this at all, which is how it stayed a pairwise double loop:
+# O(P^2) comparisons emitting one WARN per overlapping PAIR, so a handful of tasks sharing one glob
+# buried every real finding under a quadratic wall of advisories. It is an index — group by glob, count
+# distinct slugs — and the output must be bounded by the number of TASKS, not pairs.
+GO=$(mktemp -d); ( cd "$GO" && git init -q -b trunk . && git config user.email t@t && git config user.name t )
+mkdir -p "$GO"/.backlog/{draft,pending,in-progress,completed,in-review,blocked,rejected,accepted} "$GO/.claude/agents"
+echo x > "$GO/.claude/agents/go-engineer.md"
+gmk(){ printf -- '# T\n\n- **ID**: feature-%s\n- **Status**: pending\n- **Assigned Agent**: go-engineer\n- **Worktree**: %s\n- **Dependencies**: none\n- **Touches Globs**: %s\n' "$1" "$2" "$3" > "$GO/.backlog/pending/feature-$1-t.md"; }
+for gi in 1 2 3 4 5 6; do gmk "00$gi" "slug-$gi" "src/shared/**"; done
+gmk 020 slug-20 "src/private/**"
+( cd "$GO" && echo s > s && git add -A && git commit -qm s ) >/dev/null 2>&1
+
+GO_OUT=$(bash "$DOC" "$GO" 2>/dev/null)
+GO_N=$(printf '%s\n' "$GO_OUT" | grep -c '^WARN|cross-slug-glob-overlap|' || true); GO_N=${GO_N//[^0-9]/}
+check "contended glob is reported once per TASK (6), not once per PAIR (15)" "[ \"\${GO_N:-0}\" -eq 6 ]"
+check "a task whose globs are its own is NOT flagged" \
+  "! printf '%s\n' \"\$GO_OUT\" | grep -q 'cross-slug-glob-overlap|feature-020-t'"
+check "the finding names the contended glob" \
+  "printf '%s\n' \"\$GO_OUT\" | grep -q 'cross-slug-glob-overlap|feature-001-t|declares glob(s) src/shared/\*\*'"
+check "overlap stays a WARN and never gates the run" \
+  "! printf '%s\n' \"\$GO_OUT\" | grep -q '^FATAL|cross-slug-glob-overlap'"
+
+# Same slug sharing a glob is BY DESIGN (one worktree, serialized) and must produce nothing.
+for gf in "$GO"/.backlog/pending/*.md; do perl -i -pe 's/^- \*\*Worktree\*\*: slug-\d+$/- **Worktree**: slug-same/' "$gf"; done
+GO_SAME=$(bash "$DOC" "$GO" 2>/dev/null | grep -c '^WARN|cross-slug-glob-overlap|' || true); GO_SAME=${GO_SAME//[^0-9]/}
+check "tasks sharing a glob in the SAME slug are not flagged (that is the design)" "[ \"\${GO_SAME:-0}\" -eq 0 ]"
+rm -rf "$GO"
+
+# ---------------------------------------------------------------------------------------------------
 # STORE GUARD. doctor.sh is the `files` engine: every check it owns is gated on a .backlog/<state>/
 # directory, so on another backend it used to skip all of them in silence and print ok=true. Worse,
 # the worktree pass is NOT gated — it built its live-slug set from the (empty) TSV, called every

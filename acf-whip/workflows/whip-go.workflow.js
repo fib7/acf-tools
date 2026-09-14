@@ -1313,9 +1313,13 @@ show.
 
 1. Run-lock check: run  find ${sq(RUN_LOCK_DIR)} -maxdepth 1 -name ${RUN_LOCK_BASE} -mmin -${LOCK_FRESH_MIN}  — if it prints a path, set lockFresh true and stop (do not run the doctor). Otherwise set lockFresh false (a "No such file or directory" error also means false).
 2. Detached HEAD check: run  git -C ${sq(trunkRoot)} symbolic-ref --quiet HEAD  — if it FAILS, set detached true and stop (do not run the doctor).
-3. If a branch is checked out: apply repairable integrity issues, then re-scan:
+3. If a branch is checked out: apply repairable integrity issues, then re-scan. The --fix pass is
+   deliberately FULL (it self-heals the accepted folder too, and doctor.sh forbids combining --fix
+   with --active-only); the re-scan that produces the gate verdict is --active-only, which by
+   doctor.sh's own contract leaves the FATAL set and the ok flag UNCHANGED and only suppresses
+   accepted-folder advisories — the per-file pass over a mostly-accepted board is the dominant cost:
      bash ${sq(STORE)} doctor --fix >/dev/null 2>&1 || true
-     bash ${sq(STORE)} doctor --quiet
+     bash ${sq(STORE)} doctor --quiet --active-only
    From the second run capture: doctorOk (SUMMARY ok=true), doctorSummary (the verbatim SUMMARY line), fatals (verbatim FATAL| lines).
 4. Core count (for the child-workflow concurrency bound):  sysctl -n hw.ncpu 2>/dev/null || nproc  -> cpuCores (0 if neither works).
 5. Installed agent registry:  ls -1 ${sq(trunkRoot)}/.claude/agents/*.md 2>/dev/null | sed -E 's#.*/##; s#\\.md$##'  -> agents (an empty list is not an error).
