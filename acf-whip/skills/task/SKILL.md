@@ -51,7 +51,12 @@ script, not in your context.
        pluginRoot: "<PLUGIN_ROOT>",
        trunkRoot: "<TRUNK_ROOT>",
        trunkBranch: "<TRUNK_BRANCH>",
-       store: "<info.store>"
+       store: "<info.store>",
+       // OPTIONAL. Competing planners decompose the scope and a judge picks or merges. 2 is the
+       // default; 1 skips the panel entirely, which is the right call for a small, well-understood
+       // scope where the judge round is most of the cost. Pass it when the user asks for a faster
+       // or a more thorough decomposition; omit otherwise.
+       planners: 1 | 2 | 3
      }
    })
    ```

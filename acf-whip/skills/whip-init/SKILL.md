@@ -163,6 +163,20 @@ ensure_gitignore '.acfwhip/run/' 'ACF Whip /go run state (per-task harness scrip
 ensure_gitignore '.acfwhip/specs/' 'ACF Whip materialized task specs (non-files stores)'
 ```
 
+**Recommended project setting (not written by this skill).** On a large backlog the store walk and
+the integrity battery each take minutes, and the Bash tool's default timeout can kill them mid-walk —
+which returns partial output that reads like an empty backlog. `/go` now asks for an explicit
+per-command timeout, which covers the orchestrator. For interactive work on a big board, tell the
+operator they may also want these in `.claude/settings.json`:
+
+```json
+{ "env": { "BASH_DEFAULT_TIMEOUT_MS": "300000", "BASH_MAX_TIMEOUT_MS": "600000" } }
+```
+
+Do **not** write that file from this skill: it is the operator's, it is frequently
+git-ignored, and silently editing a user's settings to make a plugin work is the wrong trade. Say what
+the values are and why, and let them decide.
+
 > **Never gitignore `.acfwhip/` wholesale.** `.acfwhip/config` is a COMMITTED file and is the
 > namespace source of truth whose values *overwrite* inherited env (`ACFW_STORE`,
 > `ACFW_WORKTREE_DIR`, `ACFW_BRANCH_PREFIX`). Ignoring the whole directory would silently revert

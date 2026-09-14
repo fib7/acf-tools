@@ -23,7 +23,7 @@ if (!scope || !pluginRoot || !trunkRoot) {
 // ---- shell helpers (these strings land in agent prompts; agents run the bash) ----
 const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 // Task-store backend (3.1.0): 'files' authors straight into .backlog/pending/ and commits (byte-
-// identical to 3.0.x); any other backend authors into a .acfwhip/staging/ scratch dir and the single
+// identical to 3.0.x); any other backend authors into a .acfwhip/run/staging/ scratch dir and the single
 // writer ingests each file into the store via `acfw-store create` (dep-stamp folded into --set).
 const store = (args && args.store) || 'files'
 const filesStore = store === 'files'
@@ -36,12 +36,26 @@ const SHELL_MODEL = (args && args.shellModel) || 'haiku'
 // judgement calls with several defensible answers, which is the one place in /task where
 // generate-then-judge beats one shot.
 const PLANNERS = (args && typeof args.planners === 'number') ? Math.max(1, Math.min(3, args.planners)) : 2
-const AUTHOR_DIR = filesStore ? `.backlog/pending` : `.acfwhip/staging`
+// Non-files stores author into a scratch dir before the single writer ingests them. It used to be
+// .acfwhip/staging/, which whip-init gitignores nowhere — so every /task run on a non-files backend
+// left untracked scratch files in the consumer's tree, and `git status` never came back clean.
+// Relocating it under the already-ignored .acfwhip/run/ namespace is the fix: one less ignore pattern
+// to add, and it works on every project already initialised, including ones that never re-run
+// /whip-init. (.acfwhip/ must never be ignored wholesale — config/ and integrated/ are committed.)
+const AUTHOR_DIR = filesStore ? `.backlog/pending` : `.acfwhip/run/staging`
 
 // ---- enums (mirror task-template.md / task-engineer-pattern.md) ----
 const SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/
-const ID_RE = /^(feature|bug|infra|test|docs|refactor|data|ml)-[0-9]{1,4}-[a-z0-9]+(-[a-z0-9]+)*$/
-const CATEGORIES = ['feature', 'bug', 'infra', 'test', 'docs', 'refactor', 'data', 'ml']
+// Task-id category vocabulary. Mirrored by ACFW_ID_CATEGORIES in skills/whip-doctor/bin/doctor.sh —
+// the two are the same regex and drifted apart once already, so change them together. The list now
+// spans the conventional-commit types beyond the original eight, because teams put the originating
+// ticket's category in the id and an unrecognised prefix was rejected outright.
+const CATEGORIES = ['feature', 'bug', 'infra', 'test', 'docs', 'refactor', 'data', 'ml', 'chore', 'perf', 'ci', 'build', 'style']
+// The sequence number is [0-9]+, not [0-9]{1,4}: a five-digit ticket number in the id was rejected
+// here while doctor.sh's slug derivation silently TRUNCATED it to four, so two tasks whose ids
+// differed only in the fifth digit derived the same worktree slug. Nothing derives ordering from
+// this segment, so there is no reason to bound it.
+const ID_RE = new RegExp(`^(${CATEGORIES.join('|')})-[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$`)
 const PRIORITIES = ['blocker', 'critical', 'high', 'medium', 'low']
 // The valid set of agents is the project's REAL registry (.claude/agents/*.md), discovered at runtime
 // below — NOT a hardcoded list. A static list drifts from what whip-init/whip-add-agents actually
@@ -53,7 +67,7 @@ const TASK_STUB = {
   additionalProperties: false,
   required: ['id', 'title', 'category', 'priority', 'assignedAgent', 'isCodeMutating', 'worktreeSlug', 'prGroup', 'touchesGlobs', 'dependencies', 'estimatedHours', 'what', 'why', 'constraints', 'outOfScope'],
   properties: {
-    id: { type: 'string', description: 'category-NNN-descriptive-name, kebab-case; NNN zero-padded; category in feature|bug|infra|test|docs|refactor|data|ml' },
+    id: { type: 'string', description: `category-NNN-descriptive-name, kebab-case; NNN zero-padded; category one of ${CATEGORIES.join('|')}` },
     title: { type: 'string', description: 'Clear human task title' },
     category: { type: 'string', enum: CATEGORIES },
     priority: { type: 'string', enum: PRIORITIES },
@@ -529,7 +543,14 @@ if (writtenFiles.length && !filesStore) {
   writeResult = await agent(
     `You are the single backlog writer. ${ENV} Working at the trunk repo root ${sq(trunkRoot)}.
 
-These task documents were just authored under ${AUTHOR_DIR}/ and must be ingested into the '${store}' task store. Run these commands IN ORDER, one at a time (each creates one task in the store, then removes the staged file; a "already exists" failure with exit code 4 means a duplicate id — record it in note and continue):
+These task documents were just authored under ${AUTHOR_DIR}/ and must be ingested into the '${store}' task store.
+
+FIRST, make sure the scratch namespace is ignored — a project initialised before this directory
+existed has no rule for it, and a half-ingested run would otherwise leave untracked files behind:
+
+  cd ${sq(trunkRoot)} && grep -qxF '.acfwhip/run/' .gitignore 2>/dev/null || printf '\n# ACF Whip /go run state (per-task harness scripts, stage ledgers, /task staging)\n.acfwhip/run/\n' >> .gitignore
+
+THEN run these commands IN ORDER, one at a time (each creates one task in the store, then removes the staged file; a "already exists" failure with exit code 4 means a duplicate id — record it in note and continue):
 ${createLines}
 
 Return the WriteResult: committed = true when every create succeeded, commitSha "n/a", files = the staged basenames, note = any failures.`,

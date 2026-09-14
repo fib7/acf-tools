@@ -187,6 +187,8 @@ legacy loop has). Prefer it.
    | `escalate` | `true` | `false` reverts to byte-identical 3.1.0 single-agent dispatch. **Reach for this first if a run looks hung** — expect roughly 2-4× the per-iteration wall clock at the default depth. |
    | `escalateReview` | `false` | Turns on the multi-lens review panel. Off by default because it is the only *subtractive* seam: it can reject work that would otherwise have shipped, against a hard 3-rejection terminal. |
    | `maxAmend` | `2` | Repair rounds when an authored harness throws. Two convergence gates usually cut it to one. |
+| `maxReject` | `3` | How many rejections a task may take before the orchestrator blocks it for redesign. Raise it for exploratory work; lower it to fail fast. Bound at all four decision sites (scheduler, retry self-heal, needsOperator report, and the architect's attempt briefing), so a run under a non-default cap stays internally consistent — and the value is echoed in the run report. |
+| `maxBlock` | `3` | How many times a specialist may re-block the same task before it stops being re-unblocked and is surfaced for an operator. |
    | `agentBudget` | `8` | Agent ceiling for one harness (enforced inside the child, not advisory). |
    | `agentCap` | `1000` | The run's total agent budget. Drives the FULL → LEAN → DIRECT → CLOSE ladder. |
    | `shellModel` | `haiku` | Model for the deterministic shell-runner agents. |

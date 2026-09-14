@@ -524,6 +524,18 @@ function reconcileIntegrationTallies(integratedStems, rejectedStems, attemptedIn
 }
 // </scheduler-pure> ==========================================================================
 
+// Runtime retry caps. MAX_REJECT_RETRY / MAX_BLOCK_RETRY stay INSIDE the pure block as the defaults
+// (phase2-scheduler.test.mjs extracts that block verbatim and must keep working standalone); the
+// operator override is resolved out here, where `args` is legal.
+//
+// planUnblockAndTimeout already accepted o.maxReject/o.maxBlock and the production caller already
+// passed the constants — but that is only ONE of four decision sites. The rejected->pending self-heal,
+// the needsOperator classification and the architect's attempt-history briefing each read the
+// constant directly, so binding the scheduler alone would produce an incoherent run: a task retried
+// past a lowered cap, then reported as if it had not been.
+const REJECT_CAP = (args && Number.isInteger(args.maxReject) && args.maxReject >= 1) ? args.maxReject : MAX_REJECT_RETRY
+const BLOCK_CAP = (args && Number.isInteger(args.maxBlock) && args.maxBlock >= 1) ? args.maxBlock : MAX_BLOCK_RETRY
+
 // ============================ agent prompt builders ============================
 const NO_BACKLOG_WRITES = filesStore
   ? 'Do code work ONLY inside the worktree. Do NOT move task files between .backlog/ folders and do NOT commit any .backlog/ change — the orchestrator is the single writer of .backlog/.'
@@ -969,7 +981,7 @@ ${amendBlock}
   installed agentTypes  ${REGISTRY.join(', ') || '(none)'}
       ^ the COMPLETE set your script may dispatch. There are no others. Read any of
         ${trunkRoot}/.claude/agents/<name>.md to learn what a specialist is actually for.
-  attempt history ..... rejectionCount=${ctx.rejectionCount}/${MAX_REJECT_RETRY}   blockCount=${ctx.blockCount}/${MAX_BLOCK_RETRY}
+  attempt history ..... rejectionCount=${ctx.rejectionCount}/${REJECT_CAP}   blockCount=${ctx.blockCount}/${BLOCK_CAP}
   ledger generation ... ${ctx.attemptKey}       (NEVER derive your own)
   your ceiling ........ ${budget} agent() calls TOTAL, at most ${ctx.fanoutMax} per fan-out
 
@@ -980,7 +992,7 @@ ${amendBlock}
 3. **The task's Transition Log and every review comment in the document.** If rejectionCount or
    blockCount is above zero, THIS TASK HAS ALREADY FAILED and a reviewer wrote down WHY, right there.
    That text is the most valuable input you have. A retry harness that does not begin by consuming it
-   is negligent — there are only ${MAX_REJECT_RETRY} rejections before this task is blocked permanently.
+   is negligent — there are only ${REJECT_CAP} rejections before this task is blocked permanently.
 4. The real code in ${trunkRoot} that the Touches Globs actually name — how the neighbouring code is
    structured and how it is tested.
 5. The project's quality gates: docs/development/quality-gates-*.md plus the repo's own config
@@ -1291,6 +1303,14 @@ phase('Bootstrap')
 const boot = await safeAgent(
   `${ENV}
 Bootstrap the acf-whip orchestrator at trunk root ${sq(trunkRoot)}.
+
+SHELL TIMEOUT: the store walk and the integrity battery are O(backlog), and on a large board either
+can run for minutes. Your Bash tool's DEFAULT timeout is short enough to kill them mid-walk, and a
+killed command returns partial or empty output that is indistinguishable from an empty backlog — so
+pass an explicit timeout of at least 300000 ms (5 minutes) on every acfw-store command below. If one
+is killed anyway, say so in your result rather than reporting what the truncated output appeared to
+show.
+
 1. Run-lock check: run  find ${sq(RUN_LOCK_DIR)} -maxdepth 1 -name ${RUN_LOCK_BASE} -mmin -${LOCK_FRESH_MIN}  — if it prints a path, set lockFresh true and stop (do not run the doctor). Otherwise set lockFresh false (a "No such file or directory" error also means false).
 2. Detached HEAD check: run  git -C ${sq(trunkRoot)} symbolic-ref --quiet HEAD  — if it FAILS, set detached true and stop (do not run the doctor).
 3. If a branch is checked out: apply repairable integrity issues, then re-scan:
@@ -1397,6 +1417,14 @@ while (iter < MAX_ITER) {
   // ---- scan (read-only) + doctor-lite + heartbeat ----
   const scanPrompt = `${ENV}
 Iteration ${iter} of the acf-whip orchestrator. Do three things and return the result:
+
+SHELL TIMEOUT: the store walk and the integrity battery are O(backlog), and on a large board either
+can run for minutes. Your Bash tool's DEFAULT timeout is short enough to kill them mid-walk, and a
+killed command returns partial or empty output that is indistinguishable from an empty backlog — so
+pass an explicit timeout of at least 300000 ms (5 minutes) on every acfw-store command below. If one
+is killed anyway, say so in your result rather than reporting what the truncated output appeared to
+show.
+
 1. Read-only snapshot:  bash ${sq(STORE)} snapshot --digest --mode ${mode}  — its stdout is a single JSON object. Put that stdout VERBATIM (copy it exactly, add nothing) into snapshotJson.
 2. Integrity recheck (report-only):  bash ${sq(STORE)} doctor --quiet --active-only  — set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (verbatim FATAL| lines).
 3. Heartbeat (best-effort, NOT committed): write a small JSON file at ${sq(RUN_LOCK)} (create its parent directory first if missing) containing {"iteration":${iter},"mode":"${mode}","ts":"<output of: date -u +%Y-%m-%dT%H:%M:%SZ>"}. If the write fails, ignore it.
@@ -1474,8 +1502,8 @@ Return the ScanResult.`
   // (retro I5A). Reused below for the pre-move batch.
   const { unblockActions, timeoutActions, freshInProgress } = planUnblockAndTimeout(sched, idx, {
     timeoutH: (snap.inProgressTimeoutHours != null ? snap.inProgressTimeoutHours : DEFAULT_TIMEOUT_H),
-    maxReject: MAX_REJECT_RETRY,
-    maxBlock: MAX_BLOCK_RETRY,
+    maxReject: REJECT_CAP,
+    maxBlock: BLOCK_CAP,
     parked: parkedThisRun,
     trunkRoot,
   })
@@ -1560,8 +1588,8 @@ Return the ScanResult.`
   // rejection self-heal (writer pre-move): rejected with count < bound -> retry (pending); else -> blocked.
   const rejected = sched.filter((t) => t.folder === 'rejected')
   const rejectActions = rejected.map((t) =>
-    (t.rejectionCount < MAX_REJECT_RETRY)
-      ? { stem: t.stem, toState: 'pending', agent: 'orchestrator', notes: `retry (rejection ${t.rejectionCount}/${MAX_REJECT_RETRY})`, inc: 0 }
+    (t.rejectionCount < REJECT_CAP)
+      ? { stem: t.stem, toState: 'pending', agent: 'orchestrator', notes: `retry (rejection ${t.rejectionCount}/${REJECT_CAP})`, inc: 0 }
       : { stem: t.stem, toState: 'blocked', agent: 'orchestrator', notes: `max rejections (${t.rejectionCount}) — blocked for redesign`, inc: 0 },
   )
 
@@ -1940,7 +1968,7 @@ const { integrated, rejectedAtIntegration, reconciled } = reconcileIntegrationTa
 // with the missing-task hint when the specialist provided one.
 const capParked = ((finalSnap && finalSnap.tasks) || [])
   .filter((t) => (!runScope || runScope.has(t.stem)))
-  .filter((t) => t.folder === 'blocked' && ((t.blockCount || 0) >= MAX_BLOCK_RETRY || (t.rejectionCount || 0) >= MAX_REJECT_RETRY))
+  .filter((t) => t.folder === 'blocked' && ((t.blockCount || 0) >= BLOCK_CAP || (t.rejectionCount || 0) >= REJECT_CAP))
   .map((t) => ({ stem: t.stem, blockCount: t.blockCount || 0, rejectionCount: t.rejectionCount || 0, needsTask: parkedNeeds.get(t.stem) || '' }))
 const capParkedStems = new Set(capParked.map((n) => n.stem))
 const depParked = [...parkedThisRun].filter((s) => !capParkedStems.has(s)).map((s) => ({ stem: s, blockCount: 0, rejectionCount: 0, needsTask: parkedNeeds.get(s) || '' }))
@@ -1971,6 +1999,8 @@ return {
   // Whether harnesses were authored by the dedicated persona or by the default agent. Without this a
   // run that silently degraded is indistinguishable from one that did not.
   workflowArchitectInstalled: registryHas('workflow-architect'),
+  maxReject: REJECT_CAP,
+  maxBlock: BLOCK_CAP,
   lanes: LANES,
   escalation: {
     enabled: ESCALATE,

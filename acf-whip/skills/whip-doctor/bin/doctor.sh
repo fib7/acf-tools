@@ -180,14 +180,39 @@ emit_accepted_stub_tsv() {
 # or invalid. A DISTINCT per-task slug is intentional — one worktree branch per task maximizes
 # parallel dispatch. Tasks that genuinely share a file surface are surfaced by the separate
 # cross-slug-glob-overlap WARN, not silently serialized here.
+# Task-id category vocabulary. Kept in ONE place here and mirrored by ID_RE/CATEGORIES in
+# workflows/whip-task.workflow.js — the two are the same regex and drifted apart once already.
+# Conventional-commit types beyond the original eight are included because teams put the originating
+# ticket category in the id, and an unrecognised prefix used to fall through to the give-up branch.
+ACFW_ID_CATEGORIES='feature|bug|infra|test|docs|refactor|data|ml|chore|perf|ci|build|style'
+
 derive_slug() { # <id>
   local id="$1" tail head
-  tail=$(printf '%s' "$id" | sed -E 's/^(feature|bug|infra|test|docs|refactor|data|ml)-[0-9]{1,4}-//')
+  # The sequence number is [0-9]+ and ANCHORED on both sides. It used to be [0-9]{1,4} followed by
+  # an unanchored `.*`, so a five-digit id matched a PREFIX of its own digit run: bug-62015-alpha and
+  # bug-62017-beta both derived `bug-6201`. Two tasks on one worktree branch, silently — which is the
+  # one thing the per-task slug exists to prevent.
+  tail=$(printf '%s' "$id" | sed -E "s/^($ACFW_ID_CATEGORIES)-[0-9]+-//")
   if [ "$tail" != "$id" ] && printf '%s' "$tail" | grep -qE '^[a-z0-9]+(-[a-z0-9]+)*$'; then
     printf '%s' "$tail"; return
   fi
-  head=$(printf '%s' "$id" | sed -E 's/^((feature|bug|infra|test|docs|refactor|data|ml)-[0-9]{1,4}).*/\1/')
+  # Fallback: the <category>-<NNN> head, but ONLY when the id is exactly that (optionally followed by
+  # a `-`-separated tail). An id this pattern cannot fully account for gives up and returns itself —
+  # a slug that is wrong-but-unique is recoverable; two tasks sharing one is not.
+  head=$(printf '%s' "$id" | sed -E "s/^(($ACFW_ID_CATEGORIES)-[0-9]+)(-.*)?\$/\1/")
   if [ -n "$head" ] && [ "$head" != "$id" ]; then printf '%s' "$head"; else printf '%s' "$id"; fi
+}
+
+# Within-run dedup: two ids that derive the same slug must not both get it written. The second and
+# later collisions are reported instead of repaired — picking a disambiguated slug here would invent
+# a branch name the task document never states, and the operator needs to see the id collision.
+ACFW_DERIVED_SLUGS=""
+derive_slug_unique() { # <id> -> slug, or empty when it would collide
+  local d; d=$(derive_slug "$1")
+  if printf '%s' "$ACFW_DERIVED_SLUGS" | grep -qxF "$d"; then printf ''; return 1; fi
+  ACFW_DERIVED_SLUGS="$ACFW_DERIVED_SLUGS$d
+"
+  printf '%s' "$d"
 }
 
 # Write a derived slug into the task file: replace an empty "- **Worktree**:" line if one exists,
@@ -317,8 +342,11 @@ for st in $LOOP_FOLDERS; do
       if [ "$folder" = "accepted" ]; then
         emit WARN missing-worktree-slug "$stem" "accepted task has no Worktree: slug (historical; advisory)"
       elif [ -n "$id" ]; then
-        derived=$(derive_slug "$id")
-        if [ "$FIX" = "1" ]; then
+        if ! derived=$(derive_slug_unique "$id"); then
+          emit FATAL duplicate-derived-slug "$stem" "id '$id' derives a worktree slug already claimed by another task this scan — give one of them an explicit, distinct Worktree: slug"
+          derived=""
+        fi
+        if [ -n "$derived" ] && [ "$FIX" = "1" ]; then
           write_slug "$f" "$folder" "$stem" "$derived"
           slug="$derived"   # use the derived slug for this task's remaining checks (TSV, registry)
           emit REPAIRABLE missing-worktree-slug "$stem" "derived '$derived' from id and wrote it into the task"

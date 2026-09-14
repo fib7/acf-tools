@@ -139,5 +139,35 @@ const ungenerated = wanted.filter((a) => !templateNames.some((t) => t.includes(`
 check(`every agent the orchestrator selects has a shipped template${ungenerated.length ? ` — missing: ${ungenerated.join(', ')}` : ''} (wanted: ${wanted.join(', ')})`,
   ungenerated.length === 0)
 
+// ---------------------------------------------------------------------------
+// 6. The task-id vocabulary exists in TWO implementations — CATEGORIES/ID_RE in
+// workflows/whip-task.workflow.js (which decides what /task may CREATE) and ACFW_ID_CATEGORIES in
+// skills/whip-doctor/bin/doctor.sh (which decides what a worktree slug is DERIVED from). They are
+// the same regex written twice, they drifted apart once, and the consequence of drift is not a
+// rejected id: doctor.sh's derivation silently truncated a five-digit sequence number, so two tasks
+// differing only in the fifth digit derived the SAME worktree slug. Pin them to each other.
+const TASK_JS = readFileSync(join(ROOT, 'workflows', 'whip-task.workflow.js'), 'utf8')
+const DOCTOR_SH = readFileSync(join(ROOT, 'skills', 'whip-doctor', 'bin', 'doctor.sh'), 'utf8')
+
+const jsCats = (TASK_JS.match(/const CATEGORIES = \[([^\]]*)\]/) || [])[1]
+const jsList = jsCats ? jsCats.split(',').map((x) => x.trim().replace(/^'|'$/g, '')).filter(Boolean) : []
+const shCats = (DOCTOR_SH.match(/ACFW_ID_CATEGORIES='([^']*)'/) || [])[1]
+const shList = shCats ? shCats.split('|') : []
+
+check(`both implementations declare the vocabulary (js=${jsList.length}, sh=${shList.length})`,
+  jsList.length > 0 && shList.length > 0)
+check(`the two vocabularies are identical${jsList.join('|') !== shList.join('|') ? ` — js=[${jsList.join('|')}] sh=[${shList.join('|')}]` : ''}`,
+  jsList.join('|') === shList.join('|'))
+
+// The sequence number must be unbounded in BOTH, or one of them truncates what the other accepts.
+check('the id regex does not bound the sequence number (a bounded one truncates in derive_slug)',
+  /\[0-9\]\+-/.test(TASK_JS.match(/const ID_RE = new RegExp\(`([^`]*)`\)/)?.[1] || ''))
+check('derive_slug does not bound the sequence number either',
+  !/ACFW_ID_CATEGORIES\)-\[0-9\]\{/.test(DOCTOR_SH) && /\$ACFW_ID_CATEGORIES\)-\[0-9\]\+-/.test(DOCTOR_SH))
+
+// And the schema description must be generated from the list, not restated as prose.
+check('the id schema description is interpolated from CATEGORIES, not hardcoded',
+  /category one of \$\{CATEGORIES\.join/.test(TASK_JS))
+
 console.log(`\nphase17-template-drift: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL === 0 ? 0 : 1)
