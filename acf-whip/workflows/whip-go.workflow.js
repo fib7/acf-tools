@@ -1436,7 +1436,13 @@ Return the ScanResult.`
   lastSnapshot = snap
   if (snap.branchPrefix) branchPrefix = snap.branchPrefix
   const tasks = snap.tasks || []
-  const idx = indexTasks(tasks, snap.satisfiedDeps)
+  // `inactive` (draft/archive) is UNION'd into the dependency index and nowhere else. The dispatcher's
+  // enricher splits it out of tasks[] so a scoped run's denominator and the per-task batteries see only
+  // work the scheduler can act on — but depsSatisfied treats an unresolvable token as dangling and
+  // refuses to dispatch, so dropping these from the index would turn "gated behind a draft" into
+  // "silently never dispatched". They can never be terminal (isTerminal is false for both states), so
+  // a dependent still waits; it just waits legibly.
+  const idx = indexTasks(tasks.concat(snap.inactive || []), snap.satisfiedDeps)
   // Run scope (3.2.3). The INDEX stays whole — dependency resolution must still see out-of-scope
   // tasks, because depsSatisfied treats an unresolvable dep token as dangling and refuses to
   // dispatch (conservative by design). Only the SCHEDULING VIEW narrows; `sched` replaces `tasks`
@@ -1467,8 +1473,9 @@ Return the ScanResult.`
   // ---- terminal + stall (computed from scan-backlog's COUNTS, not tasks[]) ----
   // tasks[] is now the bounded WORKING SET (scan-backlog collapses terminal/historical accepted into
   // counts so the snapshot stays small enough for the agent to echo reliably). So completion is
-  // measured over counts.total — which is already ACTIVE-only (draft/ and archive/ are excluded at
-  // the scanner) — against the runtime-terminal count, which mirrors isTerminal exactly.
+  // measured over counts.total — which is already ACTIVE-only (the files scanner never emits draft/
+  // archive, and for every other backend the dispatcher's enricher splits them into inactive[]) —
+  // against the runtime-terminal count, which mirrors isTerminal exactly.
   // No silent fallback: a snapshot missing these counts means scan/workflow version skew; counting
   // isTerminal over the collapsed working set would UNDERcount and stall forever as 'no-progress'
   // instead of 'complete'. Abort loudly instead.
@@ -1887,7 +1894,7 @@ Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}
   if (!snap2) snap2 = lastSnapshot
   finalSnap = snap2 || lastSnapshot
   if (snap2) {
-    const idx2 = indexTasks(snap2.tasks || [], snap2.satisfiedDeps)
+    const idx2 = indexTasks((snap2.tasks || []).concat(snap2.inactive || []), snap2.satisfiedDeps)
     const left = topoIntegrationOrder((snap2.tasks || []).filter((t) => t.folder === 'accepted' && t.slug && t.slug !== 'none' && !t.hasIntegratedAt && t.hasWorktreeBranch && !integratedStems.includes(t.stem) && (!runScope || runScope.has(t.stem))), idx2)
     for (const t of left) {
       // single defensive pass: an exit-7 here is intentionally left for the next /go run (no resolver post-loop)

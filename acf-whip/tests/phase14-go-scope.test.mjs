@@ -169,7 +169,17 @@ const sorted = (set) => [...set].sort()
   // refuses to dispatch, so indexing the narrowed view would strand every scoped task with an
   // out-of-scope dependency.
   check('index is built from the full task set, not the scoped view',
-    text.includes('const idx = indexTasks(tasks, snap.satisfiedDeps)') && !text.includes('indexTasks(sched'))
+    /const idx = indexTasks\(tasks\b[\s\S]{0,80}?snap\.satisfiedDeps\)/.test(text) && !text.includes('indexTasks(sched'))
+  // ...and wider still than tasks[]: the dispatcher's enricher splits draft/archive into inactive[],
+  // which must be resolvable or a scoped task depending on a draft is stranded with no explanation.
+  check('the index unions inactive[] (draft/archive stay resolvable)',
+    /indexTasks\(tasks\.concat\(snap\.inactive \|\| \[\]\)/.test(text))
+  check('the drain index unions it too',
+    /indexTasks\(\(snap2\.tasks \|\| \[\]\)\.concat\(snap2\.inactive \|\| \[\]\)/.test(text))
+  // inactive[] must NOT reach the scheduling view, or a scoped run counts a draft in its denominator
+  // and terminal === total is unreachable (isTerminal is false for draft and archive alike).
+  check('inactive[] never reaches the scheduling view',
+    !/sched = .*inactive/.test(text) && !/tasks\.concat\(snap\.inactive[^)]*\)\s*\n?\s*const scoped/.test(text))
 
   // THE denominator trap: completion for a scoped run must be counted over its own set.
   check('scoped completion counts its own set, not snap.counts',

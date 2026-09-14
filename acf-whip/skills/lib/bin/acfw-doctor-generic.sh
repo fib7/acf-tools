@@ -107,7 +107,11 @@ done < <(printf '%s' "$SNAP" | jq -r '.tasks[]? |
 # ---- cross-task graph in awk — the SAME program as doctor.sh:333-381, fed the same
 # 11-column TSV, so scheduler/doctor dep semantics can never fork between backends.
 # integGate (col 8) folds the ledger oracle in, exactly like doctor.sh:311-312.
-printf '%s' "$SNAP" | jq -r '.tasks[]? |
+# inactive[] (draft/archive) is appended so resolve() can SEE those stems. They are registered as
+# resolvable and nothing else: never pending, never a glob contender, never a cycle participant.
+# Without them a task depending on a draft reports FATAL|dangling-dep — "this dep does not exist" —
+# when the dep exists and is simply still behind the human gate. Different problem, different remedy.
+printf '%s' "$SNAP" | jq -r '(.tasks[]? , .inactive[]?) |
   [.stem, .folder, (.id // ""), (.status // ""), (.slug // ""), (.agent // ""),
    ((.deps // []) | if length == 0 then "none" else join(",") end),
    (if (.hasIntegratedAt // false) then "ledger" else (.integratedAt // "") end),
@@ -122,6 +126,7 @@ function resolve(d,   s){ if(d in stems) return d; for(s in stems){ if(index(s,d
   stems[stem]=1; state[stem]=folder; slugOf[stem]=slug; integOf[stem]=integ; depsOf[stem]=deps; globsOf[stem]=globs; hasBranchOf[stem]=hasBranch;
   if(id!=""){ idcount[id]++ }
   if(folder=="pending"){ pend[stem]=1 }
+  if(folder=="draft" || folder=="archive"){ inert[stem]=1 }
 }
 END{
   for(i in idcount) if(idcount[i]>1) print "WARN|duplicate-id|" i "|ID appears on " idcount[i] " tasks (quarantine: de-dup; run continues)";
@@ -132,6 +137,10 @@ END{
       if(d=="" || d=="none") continue;
       r=resolve(d);
       if(r==""){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|dangling-dep|" s "|depends on " d " which has no task"; continue }
+      # The dep EXISTS but is behind the human gate / retired. The scheduler already refuses to
+      # dispatch (isTerminal is false for both), so this is not a gate FATAL — it is the reason a task
+      # will sit in pending forever, which an operator otherwise has to work out from silence.
+      if(r in inert && !(s in inert)){ print "WARN|dep-inactive|" s "|depends on " r ", which is in " state[r] " — it will never be dispatched until that task is moved to pending"; continue }
       adj[s]=adj[s]" "r; indeg[r]++;
       # mode!="override": in override mode the operator integrates, so no marker is ever written and
       # accepted-but-unintegrated is the normal end state of every task. The scheduler already relaxes

@@ -13,7 +13,9 @@
 #   top level: trunk identity, branchPrefix/worktreeDir, inProgressTimeoutHours,
 #              worktrees[], and the integrated/terminal/runtimeTerminal counts model
 #              (scan-backlog.sh:300-322) recomputed from the enriched tasks.
-# Counts are recomputed from tasks[] — a raw snapshot MUST list every active task.
+# Counts are recomputed from tasks[] — a raw snapshot MUST list every active task. Tasks in `draft`
+# or `archive` are split out into `inactive[]`: resolvable for dependency purposes, never scheduled,
+# never counted, never checked per-task.
 #
 # Requires jq: enrichment only ever runs behind a non-files adapter, and every one of
 # those already declares jq as a dependency. Diagnostics to stderr; JSON to stdout.
@@ -80,7 +82,24 @@ jq \
             | (($now - $then) / 3600 | floor))
       end;
 
-  (.tasks // []) as $rawTasks
+  # ACTIVE WORKING SET. `tasks[]` is what the scheduler plans over and what the doctor batteries check
+  # per task; it spans the seven ACTIVE states only. `draft` is the human gate and `archive` is retired
+  # — neither can be dispatched, transitioned or integrated. The files scanner has always excluded them
+  # (scan-backlog.sh ACTIVE), but every API adapter lists them, so on those backends they leaked into
+  # both: a scoped run counted them in its denominator and could never reach terminal === total, and
+  # the per-task battery raised findings against cards nothing will ever touch.
+  #
+  # They are NOT dropped. Dependency resolution must still see them, or a pending task depending on a
+  # draft flips from "gated, and you can see why" to FATAL|dangling-dep. They move to `inactive[]`,
+  # which the graph passes register as resolvable stems but never schedule.
+  def isactive: ((.folder // "") | IN("pending","in-progress","completed","in-review","blocked","rejected","accepted"));
+  ((.tasks // []) | map(select(isactive))) as $rawTasks
+  | ((.tasks // []) | map(select(isactive | not))) as $rawInactive
+  | ($rawInactive | map(. + {
+      isCodeMutating: codemut,
+      hasIntegratedAt: (.stem | IN($ik[])),
+      hasWorktreeBranch: (codemut and ((.slug // "") | IN($wt[])))
+    })) as $inactive
   | ($rawTasks | map(. + {
       integratedAt: (.integratedAt // ""),
       hasIntegratedAt: (.stem | IN($ik[])),
@@ -132,6 +151,9 @@ jq \
         "total": ($p + $ip + $c + $ir + $b + $r + $a)
       },
       tasks: $tasks,
+      # Resolvable but never scheduled. Consumers that resolve dependency tokens MUST union this with
+      # tasks[]; consumers that plan, count or check per-task invariants MUST NOT.
+      inactive: $inactive,
       satisfiedDeps: (.satisfiedDeps // []),
       worktrees: ($wts | map(. + {isLive: (.slug | IN($live[]))}))
     }

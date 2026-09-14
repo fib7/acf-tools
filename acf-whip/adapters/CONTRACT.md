@@ -63,6 +63,17 @@ Capability flags: `snapshot-enriched`, `stage`, `update-field`, `update-body`, `
 ### `snapshot [--digest] [--counts-only] [--mode default|override]`
 One BacklogSnapshot JSON object. Adapter-owned fields per task: `stem`, `id`, `folder` (whip state), `status`, `slug` (worktree), `agent`, `priority`, `deps[]` (stems), `touchesGlobs[]`, `rejectionCount` (number), `blockCount` (number), `lastTransitionTs` (`YYYY-MM-DD HH:MM:SS` UTC), `hasCleanCheckoutToken` (bool), plus top-level `counts{<state>:n,...}` and `generatedAt`. `--digest`/`--counts-only`/`--mode` may be treated as hints (a full snapshot is always acceptable).
 
+**`tasks[]` is the ACTIVE working set**: the seven states the scheduler can act on (`pending`,
+`in-progress`, `completed`, `in-review`, `blocked`, `rejected`, `accepted`). `draft` and `archive`
+belong in a sibling **`inactive[]`** array of the same shape. An adapter may simply list everything in
+`tasks[]` — the dispatcher's enricher performs the split — but an adapter with `snapshot-enriched`
+owns it, because nothing downstream will do it for them. The distinction is load-bearing in three
+places: a scoped run counts `tasks[]` as its completion denominator and `isTerminal` is false for both
+inactive states, so a draft in there makes `terminal === total` unreachable; the per-task doctor
+battery raises findings against every entry; and `inactive[]` is still unioned into the dependency
+index, so a task depending on a draft reports `WARN|dep-inactive` (gated, with the remedy) instead of
+`FATAL|dangling-dep` (a lie — the dep exists).
+
 Adapters **without** `snapshot-enriched` emit `"raw":true` and omit git-derived facts (`trunkSha`, `hasIntegratedAt`, `hasWorktreeBranch`, `worktrees[]`, `isCodeMutating`, `ageHours`, integrated/terminal counts) — the dispatcher fills them. Adapters must **not** emit `store`; the dispatcher injects it. The `files` snapshot (see `skills/go/bin/scan-backlog.sh`) is the reference shape.
 
 ### `read [--body] [--materialize DIR] <key>`
