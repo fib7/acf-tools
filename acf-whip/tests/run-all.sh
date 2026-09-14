@@ -30,6 +30,7 @@ phase10-validate-child
 phase11-checkout-reentrancy
 phase12-multica-transition-log
 phase13-integration-mode
+phase18-artifact-provenance
 phase9-adapter-multica
 phase9-adapter-linear
 $OPTIONAL

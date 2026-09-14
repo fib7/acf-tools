@@ -163,6 +163,18 @@ ensure_gitignore '.acfwhip/run/' 'ACF Whip /go run state (per-task harness scrip
 ensure_gitignore '.acfwhip/specs/' 'ACF Whip materialized task specs (non-files stores)'
 ```
 
+**Managed documents refresh themselves.** `docs/acf/style/task-descriptions.md`,
+`docs/acf/backlog/task-template.md` and `docs/acf/backlog/workflow.md` are plugin-owned. The
+SessionStart hook stamps each one with the plugin version on install and, on later sessions, refreshes
+any copy whose content matches a version this plugin has shipped — i.e. one that is merely stale. A
+copy that has been **edited locally is never overwritten**; the hook reports that it is behind and
+leaves the decision to the operator. So do not re-copy these here, and never overwrite one by hand.
+
+If a managed document changes in the plugin, regenerate the pristine-content manifest before release:
+`bash skills/lib/bin/acfw-gen-digests.sh`. Without it a freshly shipped file is unrecognisable on the
+next session and every consumer is permanently classed as "edited" —
+`tests/phase18-artifact-provenance.test.sh` fails when that happens.
+
 **Recommended project setting (not written by this skill).** On a large backlog the store walk and
 the integrity battery each take minutes, and the Bash tool's default timeout can kill them mid-walk —
 which returns partial output that reads like an empty backlog. `/go` now asks for an explicit

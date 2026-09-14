@@ -3,30 +3,100 @@
 ACF Whip SessionStart Hook
 Ensures task description style guide, task template, and workflow docs are initialized.
 """
+import hashlib
 import json
 import sys
 from pathlib import Path
 
 
-def check_and_copy(plugin_path: Path, target_path: Path) -> bool:
-    """
-    Check if target exists, if not copy from plugin content.
+# Documents this plugin owns and installs into a consumer project. Keep in sync with the ARTIFACTS
+# list in skills/lib/bin/acfw-gen-digests.sh (tests/phase18-artifact-provenance.test.mjs asserts it).
+MANAGED = [
+    ("content/style/task-descriptions.md", "docs/acf/style/task-descriptions.md"),
+    ("content/backlog/task-template.md", "docs/acf/backlog/task-template.md"),
+    ("content/backlog/workflow.md", "docs/acf/backlog/workflow.md"),
+]
 
-    Args:
-        plugin_path: Path to file in plugin content directory
-        target_path: Path where file should exist in project
+STAMP_PREFIX = "<!-- acf-whip-artifact: "
 
-    Returns:
-        True if file was copied, False if it already existed
+
+def plugin_version(plugin_root: Path) -> str:
+    """Version from the plugin manifest; '0.0.0' if it cannot be read."""
+    try:
+        with open(plugin_root / ".claude-plugin" / "plugin.json", encoding="utf-8") as f:
+            return str(json.load(f).get("version", "0.0.0"))
+    except Exception:
+        return "0.0.0"
+
+
+def strip_stamp(text: str) -> str:
+    """Drop a leading provenance stamp so content compares equal across versions.
+
+    The stamp is added at install time, so a stamped local file and the unstamped plugin source must
+    hash the same or every managed file would look edited the moment we started stamping.
     """
-    if not target_path.exists():
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(plugin_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        with open(target_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        return True  # Was copied
-    return False  # Already exists
+    if text.startswith(STAMP_PREFIX):
+        nl = text.find("\n")
+        if nl != -1:
+            return text[nl + 1:].lstrip("\n")
+    return text
+
+
+def digest(text: str) -> str:
+    return hashlib.sha256(strip_stamp(text).encode("utf-8")).hexdigest()
+
+
+def known_digests(plugin_root: Path):
+    """Every content this plugin has ever shipped, per managed source path.
+
+    This is what makes the mechanism work on the release that introduces it. A stamp-only design
+    upgrades nobody the first time: every existing copy predates stamping, an unstamped file must
+    never be clobbered, and so the fix reaches no one — the same failure as the drift it addresses.
+    Recognising a pristine file by CONTENT sidesteps that entirely.
+    """
+    try:
+        with open(plugin_root / "content" / ".digests.json", encoding="utf-8") as f:
+            return json.load(f).get("artifacts", {})
+    except Exception:
+        return {}
+
+
+def sync_artifact(plugin_root: Path, src_rel: str, dest_rel: str, version: str, known):
+    """Install, refresh, or report one managed artifact. Never overwrites an edited file.
+
+    Returns one of: 'installed' | 'refreshed' | 'current' | ('stale-edited', local_version).
+    """
+    src = plugin_root / src_rel
+    dest = Path(dest_rel)
+    try:
+        source_text = src.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    stamped = "{}{} v{} -->\n".format(STAMP_PREFIX, src_rel, version) + source_text
+
+    if not dest.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(stamped, encoding="utf-8")
+        return "installed"
+
+    local_text = dest.read_text(encoding="utf-8")
+    if digest(local_text) == digest(source_text):
+        # Same content. Add the stamp if this copy predates stamping, so later sessions are cheap.
+        if not local_text.startswith(STAMP_PREFIX):
+            dest.write_text(stamped, encoding="utf-8")
+        return "current"
+
+    if digest(local_text) in known.get(src_rel, []):
+        # Unedited, just old: a version we shipped. Safe to replace — and this is the ONLY branch
+        # that can act on a project that predates stamping.
+        dest.write_text(stamped, encoding="utf-8")
+        return "refreshed"
+
+    # Edited locally. Never clobber someone's own document; say it is behind and let them decide.
+    head = local_text.split("\n", 1)[0]
+    local_v = head.split(" v")[-1].replace(" -->", "") if head.startswith(STAMP_PREFIX) else "unstamped"
+    return ("stale-edited", local_v)
 
 
 def main() -> None:
@@ -34,23 +104,32 @@ def main() -> None:
     try:
         plugin_root = Path(__file__).parent.parent.parent
 
-        # 1. Check/copy task description style guide
-        check_and_copy(
-            plugin_root / "content" / "style" / "task-descriptions.md",
-            Path("docs/acf/style/task-descriptions.md")
-        )
+        # 1-3. Keep the plugin-owned documents in sync. These used to be copied once and never looked
+        # at again, so a defect corrected here aged in place in every consumer project and was
+        # attributed to their own documentation. Refresh what is unedited; never touch what is not.
+        version = plugin_version(plugin_root)
+        known = known_digests(plugin_root)
+        refreshed, stale = [], []
+        for src_rel, dest_rel in MANAGED:
+            outcome = sync_artifact(plugin_root, src_rel, dest_rel, version, known)
+            if outcome == "refreshed":
+                refreshed.append(dest_rel)
+            elif isinstance(outcome, tuple):
+                stale.append((dest_rel, outcome[1]))
 
-        # 2. Check/copy task template
-        check_and_copy(
-            plugin_root / "content" / "backlog" / "task-template.md",
-            Path("docs/acf/backlog/task-template.md")
-        )
-
-        # 3. Check/copy workflow documentation
-        check_and_copy(
-            plugin_root / "content" / "backlog" / "workflow.md",
-            Path("docs/acf/backlog/workflow.md")
-        )
+        artifact_notice = ""
+        if refreshed:
+            artifact_notice += (
+                "\n\n📄 acf-whip refreshed {} unmodified document(s) to v{}: {}.\n".format(
+                    len(refreshed), version, ", ".join(refreshed))
+            )
+        if stale:
+            artifact_notice += (
+                "\n\n⚠️ acf-whip documents below the installed plugin version (v{}) that you have "
+                "EDITED, so they were left alone: {}.\nThey may contradict the current runtime — "
+                "compare against the plugin's copy under content/ and merge what you want.\n".format(
+                    version, ", ".join("{} ({})".format(d, v) for d, v in stale))
+            )
 
         # 4. Warn if no task store is initialized. The store is pluggable (3.1.0): the default
         # files backend lives at .backlog/; any other backend is declared by an ACFW_STORE= key
@@ -87,9 +166,9 @@ The following style guide is MANDATORY for all task descriptions. task-engineer 
 {style_guide}
 
 **Enforcement**: Every task description will be validated against these rules. Violations result in immediate rejection.
-{backlog_warning}"""
+{backlog_warning}{artifact_notice}"""
         else:
-            additional_context = f"# ACF Whip Initialized\n\nRun /whip-init to set up backlog workflow.{backlog_warning}"
+            additional_context = f"# ACF Whip Initialized\n\nRun /whip-init to set up backlog workflow.{backlog_warning}{artifact_notice}"
 
         # 6. Output SessionStart hook JSON
         result = {

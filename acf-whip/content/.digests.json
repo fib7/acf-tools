@@ -1,0 +1,38 @@
+{
+  "_comment": "sha256 of every version of each managed artifact this plugin has shipped. A consumer copy matching any of these is unedited-and-stale, so it is safe to refresh; one matching none was edited by hand and is never overwritten. Regenerate with skills/lib/bin/acfw-gen-digests.sh.",
+  "artifacts": {
+    "content/style/task-descriptions.md": [
+      "05b261d474525d0210fb5c59469d70a5a0bef35dbd85a9e177c3dce41b3ba2b5",
+      "0c4b92a40d193c235b1a138fe9e22d8a9e9b95576203d11235d2c0f9836ef67d"
+    ],
+    "content/backlog/task-template.md": [
+      "8f4c665a5f5a839866020d92d56ed83adc554b2163707dc84cff117fcc172e06",
+      "607856a08f150a8e1df3ce403f0c58ad84459241a3cbab29ccc77d2cdb62c0eb",
+      "f5d89dde3cd1aa3b1b724ec2cc1a4240061390d171f05d10acac5d2d993483c6",
+      "cf9a98b058832acdee67578cc4dc155dc8d0641a3a6f43b41c204afe7feb784b",
+      "fc5d55ae37a75db55f0f83063dc0b2eb493fa1db65780e7100bd415c53ec2d1c",
+      "4b97e99b894c80f43933e15c2e5e0ccdb7aca3bad04c07218e5cbf40393b6d62",
+      "ff730122bb4eb0f446225609d28994632042f6ab67218a9681c5564315509be5",
+      "31b188e001227adeb112c53078ec34c62575283e71aa192db30605ac318e9744",
+      "088b535a6dc93a76ac5b243a0ebea130241f497d7cddf07e06a62207f9b05a03"
+    ],
+    "content/backlog/workflow.md": [
+      "b48e476d23d70cf4a9c145846adc29894d5edf7e026d5ab0cf4186f0f58b326e",
+      "a79bc2300df5cda1c332b5eceb5198f645186288399cf4be2574f2ff2b5465f5",
+      "1591e9abdc1a2e6921bb411dac510f4a51c9de7a957d41143d5047c8152f561d",
+      "b8315d0d6c9f696d4ed6cb240c1fb5734d01e9ae340393b8ee34cceab591bdba",
+      "3a2871ba7041ed0ae3e85d25507ba0c20230d34b44e45bc85fad582d50295a00",
+      "14bf124b9b540e5f63fc4ab80d3a312bcfc8bfd76460fe777e4902b86870885c",
+      "bbd08f96e3c67c50773664067408ada764ee39dd019245f0e72926e1f869e829",
+      "296fe55045257e55cdb807afdc37a0af6266e5f83110f766c5c9ce8063203aea",
+      "58368c9dedd4023aac6dbb0fe487c970e37224106617a006475fd44033b9fd4a",
+      "461d734bb377abc11e647ff111f1cc616f6e1523b0d49718347c558b29e123f8",
+      "ec1f7dc2d7933f4de73884113dadaee38351d626fc22f6c8f7f6b59004356fa7",
+      "cd92933912b952c8220f9091d74683590cbc639c68887263f0c37f5dd659d855",
+      "f30b1c7e856aab5fe3c40dff8a6f918db6969bac7c25404148b5358b2e343803",
+      "d29d557d9f01c1d63cbd65a7520d45e98ea70b6c190405a82368c2040453dfdd",
+      "96851d644344ac199172ae949e01f4e1639709160bc75c0601c32cccd77c8c82",
+      "19c4056408e7ee83e4515582738df0c55ecf8b8af30e8818342435fa256e6cab"
+    ]
+  }
+}
