@@ -10,11 +10,17 @@ from pathlib import Path
 
 
 # Documents this plugin owns and installs into a consumer project. Keep in sync with the ARTIFACTS
-# list in skills/lib/bin/acfw-gen-digests.sh (tests/phase18-artifact-provenance.test.mjs asserts it).
+# list in skills/lib/bin/acfw-gen-digests.sh (tests/phase18-artifact-provenance.test.sh asserts it).
 MANAGED = [
     ("content/style/task-descriptions.md", "docs/acf/style/task-descriptions.md"),
     ("content/backlog/task-template.md", "docs/acf/backlog/task-template.md"),
     ("content/backlog/workflow.md", "docs/acf/backlog/workflow.md"),
+    # whip-init installs six documents; this list carried three. The runbook has no placeholders and
+    # is copied verbatim, it changed in 3.0.1 / 3.1.0 / 3.2.2, and it is what a human reads mid-
+    # recovery — so a pre-LP-CAS copy telling an operator to rebase a worktree branch could age in
+    # place forever with nothing able to correct it. That is the exact defect class this mechanism
+    # exists for, and the document where being wrong costs the most.
+    ("content/backlog/recovery-runbook.md", "docs/acf/backlog/recovery-runbook.md"),
 ]
 
 STAMP_PREFIX = "<!-- acf-whip-artifact: "
@@ -173,12 +179,34 @@ def main() -> None:
         else:
             backlog_warning = "\n\n⚠️ **WARNING**: no acf-whip task store found (no `.backlog/` directory and no `ACFW_STORE` config). Run `/whip-init` to initialize the backlog workflow, install agents, and configure quality gates.\n"
 
-        # 5. Build context with style guide for immediate injection
+        # 5. Build context with style guide for immediate injection.
+        # GUARDED, exactly like every managed artifact above — and for the same reason, because this
+        # is the SAME FILE as MANAGED[0]. The per-artifact guard added around sync_artifact does not
+        # reach this second read, so one cp1252 smart quote pasted into the document the refresh
+        # mechanism invites consumers to edit raised UnicodeDecodeError inside main()'s single try.
+        # That catch-all replaces the WHOLE payload with an errno string: the mandatory style-guide
+        # injection, the store warning and the "could not sync" notice all vanish together, on every
+        # session, permanently. A hook that cannot break a session must not be selective about what
+        # it survives, so the fallbacks are broad on purpose.
         style_guide_path = Path("docs/acf/style/task-descriptions.md")
+        style_guide = None
         if style_guide_path.exists():
-            with open(style_guide_path, 'r', encoding='utf-8') as f:
-                style_guide = f.read()
-
+            try:
+                style_guide = style_guide_path.read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001 - non-blocking by contract
+                # The project's copy is unreadable; the plugin's own is the same document minus any
+                # local edits, and an unguided task-engineer is worse than a slightly stale guide.
+                try:
+                    style_guide = (plugin_root / "content" / "style" / "task-descriptions.md").read_text(encoding="utf-8")
+                    artifact_notice += (
+                        "\n\n⚠️ acf-whip could not read `docs/acf/style/task-descriptions.md` (check that it is "
+                        "UTF-8); the plugin's own copy was injected instead, so local edits to it are not in "
+                        "effect this session.\n")
+                except Exception:  # noqa: BLE001 - non-blocking by contract
+                    artifact_notice += (
+                        "\n\n⚠️ acf-whip could not read the task-description style guide from this project or "
+                        "from the plugin; task descriptions are UNGUIDED this session.\n")
+        if style_guide is not None:
             additional_context = f"""# ACF Task Description Style Guide (Enforcement Active)
 
 The following style guide is MANDATORY for all task descriptions. task-engineer and /task command MUST enforce these rules.

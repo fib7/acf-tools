@@ -93,6 +93,34 @@ check "...and the style guide still reaches the session" "printf '%s' \"\$OUT5\"
 check "...and the undecodable file is named, not silently skipped" "printf '%s' \"\$OUT5\" | grep -q 'workflow.md'"
 check "...and the file itself is left untouched" "grep -q 'smart quote' \"$P5/$DEST_REL\""
 
+# --- 5b. every managed destination, not only the one that is read once -----------------
+# P5 above puts its bad bytes in workflow.md — the one managed document main() does NOT read a
+# second time, which is why it passed while the defect was live. The style guide IS read twice: it
+# is MANAGED[0] and it is also the payload's body, and that second read sat outside the per-artifact
+# guard, inside main()'s single try. One bad byte there replaced the ENTIRE additionalContext with
+# an errno string — dropping the mandatory style guide, the store warning and the sync notice
+# together, on every session, permanently. So every destination gets the fixture, not a chosen one.
+DESTS=$(python3 - "$HOOK" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+for m in re.finditer(r'\("content/[^"]+",\s*"([^"]+)"\)', src):
+    print(m.group(1))
+PY
+)
+for dest in $DESTS; do
+  PB="$WORK/bad-$(printf '%s' "$dest" | tr '/.' '__')"
+  mkdir -p "$PB/$(dirname "$dest")"
+  printf '# Doc\n\nsmart quote: \223hello\224\n' > "$PB/$dest"
+  OUTB=$(run_hook "$PB" 2>/dev/null); RCB=$?
+  check "bad bytes in $dest: the session is not broken" "[ $RCB -eq 0 ]"
+  check "bad bytes in $dest: the store warning still reaches the session" \
+    "printf '%s' \"\$OUTB\" | grep -q 'no acf-whip task store found'"
+  check "bad bytes in $dest: task descriptions are still governed" \
+    "printf '%s' \"\$OUTB\" | grep -qE 'Enforcement Active|UNGUIDED this session'"
+  check "bad bytes in $dest: the edited file is left untouched" \
+    "grep -q 'smart quote' \"$PB/$dest\""
+done
+
 # --- 6. the manifest must cover what is shipped now ------------------------------------
 # If it does not, a freshly installed file is unrecognisable on the next session and every consumer
 # is permanently classed as "edited". This is what forces acfw-gen-digests.sh to be re-run.

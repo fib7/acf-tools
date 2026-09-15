@@ -29,6 +29,7 @@ ARTIFACTS="
 content/style/task-descriptions.md
 content/backlog/task-template.md
 content/backlog/workflow.md
+content/backlog/recovery-runbook.md
 "
 
 sha() { shasum -a 256 | cut -d' ' -f1; }
