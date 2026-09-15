@@ -67,7 +67,22 @@ cannot read, and a battery that could not run reports `FATAL|doctor-unavailable`
 The plugin also stops shipping documents it can never correct: installed copies that are unedited
 refresh themselves, recognised by content digest rather than by a version stamp they predate, and
 edited ones are reported rather than clobbered. `workflow-architect` — selected by `/go` since 3.2.0,
-documented in three places, created by no installer — finally exists. See `acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
+documented in three places, created by no installer — finally exists.
+
+**3.3.1 closes two ways to lose work on the default `files` store**, found by auditing the 3.3.0 tree
+itself and neither a regression from it. LP-CAS's `land()` resynced the *whole* root checkout after a
+compare-and-swap, excluding only `.backlog/` — but a `Worktree: none` task edits tracked files in that
+tree by design and runs *concurrently* with the integrate pass, so its deliverable was reverted
+mid-flight and the task was then reported accepted with none of its content anywhere. And
+`doctor --fix` chose a duplicated task's survivor from an unvalidated `Status` read: when that read
+came back empty, nothing matched, and it deleted every copy — including, via an `|| rm -f` fallback,
+an untracked one with no history to recover from, erasing the FATAL that should have stopped the run
+`/go` was about to start. Both now refuse rather than guess. Also fixed: a lost clean-checkout token
+was a permanent fixed point in `in-review/` (its only writer runs at dispatch, so no later review
+could restore it); a scoped `/go` on a card in no recognised state reported "Backlog 100% terminal";
+and the legacy fallback loop built one integrate queue and iterated another, so it integrated nothing
+at all. `--digest` remains a no-op on every non-`files` backend and is staged for 3.4.0. See
+`acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
 
 **Plugin architecture**: Each plugin is fully self-contained with no cross-dependencies. Users can install any combination.
 

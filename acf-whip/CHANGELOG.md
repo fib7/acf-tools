@@ -2,6 +2,121 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.3.1 — two ways to lose work on the default backend
+
+3.3.0 was audited in its own right after release, subsystem by subsystem, with every candidate
+defect handed to an independent agent whose job was to refute it. Seventeen survived. **Two of them
+lose work on the default `files` store, with no operator error involved, and neither is a regression
+from that release — both predate it.** The rest are the same pattern 3.3.0 named and did not finish
+draining: a guard, a flag or a test that answers a question it could not actually ask.
+
+**The integrator reverted work it never landed.** After a compare-and-swap onto trunk, `land()`
+resynced the root checkout with `checkout --no-overlay -- . ':(exclude).backlog'` — the whole tree.
+The exclusion spared uncommitted task-file state, which is what it was added for, and nothing else.
+A `Worktree: none` task edits tracked files in that same tree by design, and it does so
+*concurrently*: `/go` starts the prior-integrate pass as a floating promise and awaits it only after
+the dispatch barrier that runs the direct queue. So a direct task's deliverable was reverted
+mid-flight, the backlog writer then staged an unchanged file, the committed-deliverable check passed
+against that file's pre-existing history, and the task was reported **accepted and integrated with
+none of its content anywhere**. Nothing was logged. The pathspec is now the landing's own
+`OBSERVED..NEW` diff; an empty diff skips the checkout rather than degrading to `-- .`, which is why
+the guard is a shell test and not an `xargs -r` pipeline (BSD `xargs` has no `-r`). Where a path this
+landing *does* change is also dirty the overwrite is unavoidable, but it is reported with a
+`stash create` snapshot — a commit object that touches neither the working tree nor `refs/stash`, so
+it cannot race a sibling stage the way `clean-checkout.sh`'s `stash push -u` would.
+
+**`doctor --fix` deleted every copy of a duplicated task.** The `dup-folder` repair picked the
+survivor by reading `Status` from the first-listed copy and removing everything that did not match
+it. That read was never validated, and it has two ways to come back empty: an unparseable `Status`
+line — the same malformed copy whose status-sync repair is skipped — or a detail string the `sed`
+cannot match, which returns the whole detail and makes the probe path one that does not exist. With
+an empty keeper no folder ever matched, the skip never fired, and the loop `git rm`'d all of them;
+the `|| rm -f` fallback then unlinked an untracked copy outright, with no history to recover it
+from. `/go` runs `doctor --fix` at bootstrap with its output discarded, so this also erased the FATAL
+that should have stopped the run before it dispatched. A repair that cannot identify the survivor is
+not repairable: it emits `FATAL|dup-folder-unresolvable` and leaves every copy intact. The repair had
+**no test at all**; it has five now.
+
+**A lost clean-checkout token was a permanent fixed point.** A missing token on a task that *does*
+have a worktree branch is mechanical, so the review gate left it in `in-review/` for the next
+iteration. But nothing in the loop can write a token: `clean-checkout.sh` is its only writer and it
+runs at dispatch, and the reviewer is explicitly forbidden from writing one. So the task sat in
+`in-review/` across every future run, the run ended `no-progress` with committed work never
+integrated, and the slug claim starved every same-slug sibling for the whole run, every run. The arm
+re-reviews once — enough when the cause was a lost `append_log_row` race — then parks the task in
+`blocked/` as `needsOperator`, charging no rejection for a fault the orchestrator could not write its
+way out of. Its most common cause is fixed at the source: `clean-checkout.sh` discarded the store's
+return code, sent the adapter's diagnosis to `/dev/null` and exited 0, while on a non-`files` store
+that call is the **only** durable write of the token. It now retries the contract's transient code
+and only that one, and exits 6 rather than printing a worktree path as though the token were
+recorded. Linear's `issue_has_token` was the one `gql` caller in that file not propagating
+`GQL_ERRCODE`, so a single 429 read as "this specialist never entered a worktree"; multica's two paid
+fallbacks had the same shape, having been missed in 3.3.0 because they answer through the token list
+rather than through the metadata helpers that release made tri-state.
+
+**A scoped `/go` called an unknown state complete.** `expandScope` refused a seed by enumerating
+`draft` and `archive`, but the enricher defines the inactive set by *exclusion* — so a card whose
+state is absent or out of vocabulary has no folder at all and sailed through. The scheduling view
+came back empty, and an empty scoped view reports complete: "Backlog 100% terminal", zero agents,
+`integrated: []`. Byte-for-byte the failure already fixed once for `draft`. The scheduling view is
+passed in and asked directly now; terminal seeds stay exempt so scoping to collapsed-accepted work
+still resolves.
+
+**The legacy loop integrated nothing.** Step 4.5a filled `INTEGRATE_QUEUE`; Step 4.5b iterated
+`SORTED_QUEUE`, which is assigned nowhere in the plugin — so `integrate-lpcas.sh` never ran, no
+ledger marker ever landed, the terminal count could never reach total, and every deliverable stayed
+on an unmerged branch. This is the fallback path 3.3.0 deliberately routes operators into when the
+Workflow tool refuses a launch. Step 4.5a also promised a topological sort in prose and did not
+perform one; it does now, with a cycle emitting its members in input order rather than stranding
+them. The static gate that should have caught this enumerated two variable names; it derives them
+from the skills now, and on the previous tree it names `INTEGRATE_QUEUE`.
+
+**One unreadable document blanked the whole session payload.** 3.3.0 guarded the artifact sync loop
+because the hook had just gained destination-side I/O. It did not cover the second read: `main()`
+opens `docs/acf/style/task-descriptions.md` again to build the payload body, inside its single `try`
+— and that file is the *first entry in the managed list*, the document the refresh mechanism
+explicitly invites consumers to edit. One cp1252 smart quote and the catch-all replaced the entire
+`additionalContext` with an errno string, dropping the mandatory style guide, the task-store warning
+and the could-not-sync notice together, on every session, permanently. The existing bad-byte fixture
+wrote to `workflow.md`, the one managed document *not* read twice, which is why it passed while this
+was live; there is a fixture per managed destination now. The recovery runbook also joins the managed
+set — `whip-init` installs six documents and that list carried three, so a pre-LP-CAS runbook telling
+an operator to rebase a worktree branch could age in place forever.
+
+**Also**: `--quiet` was honoured by the adapter half of a merged doctor report and nowhere else, so
+hundreds of advisory WARNs went through the scan agent every iteration against the bound
+`workflow.md` states as a requirement — it is peeked rather than consumed now, filtered at print
+time, with the tallies over the unfiltered set so it can never change the gate decision;
+`ACFW_INPROGRESS_TIMEOUT_HOURS` had its documented env-over-config precedence inverted by the same
+source-the-config trap the file documents nine lines above for `ACFW_INTEGRATION_MODE`, so one run
+could time a task out in the scheduler while its own doctor reported nothing; an `agentCap` at or
+below the fixed 150-agent reserve made the CLOSE rung fire at *zero* agents used, reporting
+`agent-cap-reached` and "Nothing lost." for a run that dispatched nothing — and that rung is not
+gated on `ESCALATE`, so `escalate: false` hit it too; `research-agent-pattern.md` told non-code
+agents the materialized spec is "a materialized copy the orchestrator syncs back", which nothing
+does, so an agent that believed it lost its whole deliverable; and `/whip-add-agents` re-rendered the
+265-line sample over `.backlog/README.md` to change one line, replacing the team's gate commands and
+thresholds while reporting only "(agent list updated)".
+
+**`beads` is no longer the backend nothing can test.** multica funnels every call through
+`ACFW_MULTICA_BIN` and linear through `ACFW_LINEAR_TRANSPORT`, which is what let 3.3.0 run the frozen
+conformance spec offline against a fake CLI. beads resolved `bd` straight from `PATH`. It has the
+seam now, and a static gate holds all three — the fake `bd` that makes its suite run offline is the
+remaining work, and the seam is what unblocks it.
+
+**Two tests in this release could not fail.** Linear's "`--quiet` keeps every FATAL" compared 0 to 0,
+because no fixture in that suite ever produced a FATAL — reverting the adapter's `--quiet` branch to
+its v3.2.3 shape still went ALL GREEN. And the small-cap escalation test asserted that a cap of 10
+makes the ladder "fire immediately", which was the defect stated as a requirement. Every fix above
+has an assertion verified to go red when the fix is reverted.
+
+Deferred deliberately: `--digest` is a no-op on every non-`files` backend (the dispatcher never
+passes the flag to the enricher, and the enricher never collapses terminal-accepted into
+`satisfiedDeps` the way the `files` scanner does), so a large board relays its whole snapshot through
+one agent's structured output. The fix is not patch-sized — it needs flag plumbing, a three-way split
+so an accepted-but-unintegrated task stays a full object, and counts taken before the collapse — and
+it lands in 3.4.0 with the `--only` filter, which shares its measurement.
+
 ## 3.3.0 — the non-`files` backends stop being invisible
 
 Every defect in this release was found against a live non-`files` store, and they share one cause:
