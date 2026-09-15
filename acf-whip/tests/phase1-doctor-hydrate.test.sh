@@ -755,6 +755,60 @@ check "files store WITH .backlog/: unchanged (exit 0, ok=true)" "[ $SG_OK_RC -eq
 ( cd "$SG" && git worktree remove --force .worktree/sg1 >/dev/null 2>&1 ) || true
 rm -rf "$SG"
 
+# ---- dup-folder repair: it must never delete every copy ---------------------------------------
+# `keep` is a raw field read of the FIRST-listed copy's Status. When that read yields "" — an
+# unparseable Status line, or a detail string the sed could not match — the old repair compared it
+# against every ACTIVE folder, matched none, and `git rm`'d all of them; the `|| rm -f` fallback
+# then unlinked an untracked copy outright. /go runs `doctor --fix` at bootstrap with its output
+# discarded, so this also erased the FATAL that should have stopped the run.
+echo "== dup-folder --fix =="
+DUPR="$WORK/duprepo"; git init -q -b trunk "$DUPR"
+( cd "$DUPR" && git config user.email t@t && git config user.name t \
+  && mkdir -p .backlog/pending .backlog/completed .claude/agents \
+  && echo x > .claude/agents/go-engineer.md && echo seed > seed )
+dupmk(){ # <repo> <folder> <stem> <status>
+  cat > "$1/.backlog/$2/$3.md" <<EOF
+# Task: $3
+
+## Metadata
+
+- **ID**: $3
+- **Status**: $4
+- **Assigned Agent**: go-engineer
+- **Worktree**: $3
+- **Dependencies**: none
+- **Rejection Count**: 0
+
+## Transition Log
+EOF
+}
+# (a) UNRESOLVABLE: no copy's Status names a folder the stem is actually in.
+dupmk "$DUPR" pending   dbad ""
+dupmk "$DUPR" completed dbad ""
+# (b) RESOLVABLE: the ordinary duplicate the repair exists for.
+dupmk "$DUPR" pending   dok  pending
+dupmk "$DUPR" completed dok  pending
+( cd "$DUPR" && git add -A >/dev/null && git commit -qm dupseed >/dev/null )
+DUP_OUT=$(bash "$DOC" --fix "$DUPR" 2>&1)
+check "dup-folder: unresolvable keeper refuses with a typed FATAL" \
+  "echo \"\$DUP_OUT\" | grep -q '^FATAL|dup-folder-unresolvable|dbad|'"
+check "dup-folder: BOTH copies survive when the keeper cannot be identified" \
+  "[ -f '$DUPR/.backlog/pending/dbad.md' ] && [ -f '$DUPR/.backlog/completed/dbad.md' ]"
+check "dup-folder: the refusal is counted in the summary (the gate can see it)" \
+  "echo \"\$DUP_OUT\" | grep -q 'ok=false'"
+check "dup-folder: a resolvable duplicate is still deduped to one copy" \
+  "[ \$(ls '$DUPR/.backlog/pending/dok.md' '$DUPR/.backlog/completed/dok.md' 2>/dev/null | wc -l) -eq 1 ]"
+
+# (c) An UNTRACKED duplicate is never unlinked: git rm refusing means there is no history to
+# recover it from, so the old `|| rm -f` fallback destroyed the only copy that existed.
+dupmk "$DUPR" pending dunt pending
+( cd "$DUPR" && git add .backlog/pending/dunt.md >/dev/null && git commit -qm dunt >/dev/null )
+dupmk "$DUPR" completed dunt completed   # Status already matches its folder, so the status-sync
+                                         # repair does not fire and git-add it first; stays untracked.
+DUP2_OUT=$(bash "$DOC" --fix "$DUPR" 2>&1)
+check "dup-folder: an untracked duplicate is left in place, with a WARN" \
+  "[ -f '$DUPR/.backlog/completed/dunt.md' ] && echo \"\$DUP2_OUT\" | grep -q '^WARN|dup-folder-untracked|dunt|'"
+
 echo ""
 echo "==================================================="
 echo "Phase 1 doctor+hydrate test: $PASS passed, $FAIL failed"

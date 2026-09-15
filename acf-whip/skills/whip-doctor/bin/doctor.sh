@@ -577,11 +577,32 @@ END{
 # ---- dup-folder repair (after awk reported) ----
 if [ "$FIX" = "1" ]; then
   grep '^REPAIRABLE|dup-folder|' "$FINDINGS" | while IFS='|' read -r _sev _code stem _detail; do
-    rep="$BL/$(echo "$_detail" | sed -E 's/.*folders://' | awk '{print $1}')/$stem.md"
+    # Iterate the folders THIS STEM WAS REPORTED IN, not every active folder, and keep the one its
+    # own Status names. Both halves are load-bearing.
+    _folders=$(echo "$_detail" | sed -E 's/.*folders:[[:space:]]*//')
+    rep="$BL/$(printf '%s' "$_folders" | awk '{print $1}')/$stem.md"
     keep=$(field "$rep" "Status")
-    for fol in $ACTIVE; do
+    # THE KEEPER MUST BE ONE OF THOSE FOLDERS. `keep` is an unvalidated field read: an unparseable
+    # Status line — the same malformed copy whose status-sync repair above is skipped — or a detail
+    # string the sed cannot match (it then returns the whole detail, making `rep` a path that does
+    # not exist) both yield "". With the old `for fol in $ACTIVE`, no $fol ever equalled "", the
+    # `continue` never fired, and the repair deleted EVERY copy; the `|| rm -f` fallback then
+    # unlinked an untracked one outright, with no git history to recover it from. /go runs
+    # `doctor --fix` at bootstrap with its output discarded, so this also erased the very FATAL
+    # that should have stopped the run. Refuse instead: a repair that cannot identify the survivor
+    # is not repairable.
+    _keepable=0
+    for fol in $_folders; do [ "$fol" = "$keep" ] && _keepable=1; done
+    if [ "$_keepable" != "1" ]; then
+      emit "FATAL" "dup-folder-unresolvable" "$stem" "present in folders:$_folders but its Status field reads '${keep:-<unreadable>}', which is not one of them, so no copy can be chosen as the survivor. Every copy is intact. Resolve by hand, then re-run --fix."
+      continue
+    fi
+    for fol in $_folders; do
       [ "$fol" = "$keep" ] && continue
-      [ -f "$BL/$fol/$stem.md" ] && { git_with_lock_backoff -C "$REPO_ROOT" rm -q -- ".backlog/$fol/$stem.md" >/dev/null 2>&1 || rm -f "$BL/$fol/$stem.md"; }
+      # NO `|| rm -f` FALLBACK. `git rm` failing here means the path is not tracked, and unlinking
+      # an untracked task file destroys the only copy of it that exists anywhere.
+      [ -f "$BL/$fol/$stem.md" ] && { git_with_lock_backoff -C "$REPO_ROOT" rm -q -- ".backlog/$fol/$stem.md" >/dev/null 2>&1 \
+        || emit "WARN" "dup-folder-untracked" "$stem" "left .backlog/$fol/$stem.md in place: git will not remove it, so it is untracked and deleting it would destroy the only copy. Remove it by hand once you have confirmed .backlog/$keep/$stem.md is the one you want."; }
     done
     commit_fix ".backlog" "doctor: dedup $stem to .backlog/$keep/"
   done
