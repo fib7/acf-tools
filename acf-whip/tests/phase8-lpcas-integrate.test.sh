@@ -219,6 +219,55 @@ check "k_resync: the uncommitted clean-checkout token SURVIVED the resync" \
 check "k_resync: root index is NOT desynced from trunk" \
   "[ -z \"\$(git -C '$REPO' diff --cached --name-only -- . ':(exclude).backlog')\" ]"
 
+
+# ---- (12) The resync must not revert work the landing never touched --------------------------
+# whip-go starts the prior-integrate pass as a floating promise and awaits it only AFTER the
+# dispatch barrier that runs directQ, so a `Worktree: none` task is editing tracked files in the
+# trunk root WHILE this runs. `checkout --no-overlay -- .` reverted all of it: the writer then
+# staged an unchanged file and the task was reported accepted with none of its content anywhere.
+# The pathspec is now the landing's own OBSERVED..NEW diff, so a concurrent edit elsewhere lives.
+printf 'committed\n' > "$REPO/untouched.txt"; printf 'v1\n' > "$REPO/landed.txt"
+git -C "$REPO" add -A >/dev/null 2>&1; git -C "$REPO" commit -qm "seed concurrency fixture" >/dev/null 2>&1
+mktask k_concurrent
+CWT="$WORK/cand-k_concurrent"; rm -rf "$CWT"
+git -C "$REPO" worktree add --detach -q "$CWT" trunk
+printf 'v2\n' > "$CWT/landed.txt"
+git -C "$CWT" add -A; git -C "$CWT" commit -q -m "feat: k_concurrent"
+git -C "$REPO" update-ref "refs/acfw/patch/k_concurrent" "$(git -C "$CWT" rev-parse HEAD)"
+git -C "$REPO" worktree remove --force "$CWT"
+# A direct (Worktree: none) task's in-flight edit to a tracked root file this landing does not touch.
+printf 'DIRECT TASK DELIVERABLE\n' > "$REPO/untouched.txt"
+run_iw bash "$IW" "$(TF k_concurrent)"
+check "k_concurrent integrates"                      "[ $RC -eq 0 ]"
+check "k_concurrent: a concurrent direct task's uncommitted work SURVIVES the resync" \
+  "[ \"\$(cat '$REPO/untouched.txt')\" = 'DIRECT TASK DELIVERABLE' ]"
+check "k_concurrent: the landing's own change still reached the root worktree" \
+  "[ \"\$(cat '$REPO/landed.txt')\" = 'v2' ]"
+check "k_concurrent: root index is NOT desynced from trunk" \
+  "[ -z \"\$(git -C '$REPO' diff --cached --name-only -- . ':(exclude).backlog')\" ]"
+
+# ---- (13) The residual same-file case is reported and recoverable, never silent ---------------
+git -C "$REPO" checkout -q -- untouched.txt 2>/dev/null || true
+printf 'v2\n' > "$REPO/contended.txt"
+git -C "$REPO" add -A >/dev/null 2>&1; git -C "$REPO" commit -qm "seed contended fixture" >/dev/null 2>&1
+mktask k_contended
+DWT="$WORK/cand-k_contended"; rm -rf "$DWT"
+git -C "$REPO" worktree add --detach -q "$DWT" trunk
+printf 'landed\n' > "$DWT/contended.txt"
+git -C "$DWT" add -A; git -C "$DWT" commit -q -m "feat: k_contended"
+git -C "$REPO" update-ref "refs/acfw/patch/k_contended" "$(git -C "$DWT" rev-parse HEAD)"
+git -C "$REPO" worktree remove --force "$DWT"
+printf 'UNCOMMITTED ON THE CONTENDED PATH\n' > "$REPO/contended.txt"
+run_iw bash "$IW" "$(TF k_contended)"
+check "k_contended integrates"                       "[ $RC -eq 0 ]"
+check "k_contended: the overwrite is REPORTED, not silent" \
+  "grep -q 'overwrote uncommitted work' '$WORK/iw.err'"
+check "k_contended: the WARN carries a recoverable stash snapshot oid" \
+  "grep -qE 'Snapshot: [0-9a-f]{7,}' '$WORK/iw.err'"
+check "k_contended: the snapshot object really holds the overwritten content" \
+  "git -C '$REPO' show \"\$(grep -oE 'Snapshot: [0-9a-f]{7,}' '$WORK/iw.err' | head -1 | cut -d' ' -f2):contended.txt\" 2>/dev/null | grep -q UNCOMMITTED"
+check "k_contended: stash create did NOT touch refs/stash (a sibling stage's stack is untouched)" \
+  "! git -C '$REPO' rev-parse --verify -q refs/stash >/dev/null"
 echo ""
 echo "phase8-lpcas-integrate: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

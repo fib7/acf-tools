@@ -117,7 +117,7 @@ OBSERVED=$(acfw_live_trunk "$ROOT" "$TRUNK") || { emit "stall trunk-unobservable
 # OBSERVED, rejecting both a concurrent advance and an external rewind (the latter would otherwise
 # be masked by a fast-forward). On success ROOT (the trunk checkout) is resynced to the new tip.
 land() { # <new-oid>
-  local NEW="$1"
+  local NEW="$1" _p _dirty _snap
   if git -C "$ROOT" update-ref "refs/heads/$TRUNK" "$NEW" "$OBSERVED" 2>/dev/null; then
     # Resync ROOT in TWO steps, and never with `reset --hard`. Two defects motivated the split:
     #
@@ -147,8 +147,34 @@ land() { # <new-oid>
     # resurrected on disk as an invisible `??` (doctor.sh's dirty-trunk-root check skips `??`).
     # Doing the checkout first — while the deleted path is still tracked at OBSERVED — lets
     # --no-overlay actually delete it. Verified: a rename lands as one file, not two.
-    git_with_lock_backoff -C "$ROOT" checkout --no-overlay -q "$TRUNK" -- . ':(exclude).backlog' >/dev/null 2>&1 \
-      || echo "WARN: root worktree resync incomplete after landing $KEY (the index is still repaired below). Run: git -C $ROOT checkout --no-overlay -q $TRUNK -- . ':(exclude).backlog'" >&2
+    #
+    # (c) THE PATHSPEC IS THIS LANDING'S OWN DIFF, not `.`, and that is correctness rather than
+    #     economy. `-- .` reverts the ENTIRE root working tree, and a `Worktree: none` task edits
+    #     tracked files in that very tree by design. Those agents run CONCURRENTLY with this code:
+    #     whip-go.workflow.js starts the prior-integrate pass as a floating promise and awaits it
+    #     only AFTER the dispatch barrier that runs directQ, so a direct task's uncommitted work was
+    #     reverted mid-flight; the writer then staged an unchanged file, the committed-deliverable
+    #     check passed against the file's pre-existing history, and the task was reported accepted
+    #     with none of its content anywhere. Restricting the checkout to the paths OBSERVED..NEW
+    #     actually touched resyncs everything this landing changed and nothing it did not.
+    CHANGED_PATHS=()
+    while IFS= read -r -d '' _p; do CHANGED_PATHS+=("$_p"); done < <(
+      git -C "$ROOT" diff --name-only -z "$OBSERVED" "$NEW" -- . ':(exclude).backlog' 2>/dev/null)
+    # An EMPTY pathspec means `-- .`, i.e. (c) restored in full, so the guard is structural. It is a
+    # shell test and not an `xargs -r` pipeline because BSD xargs has no -r and would run git anyway.
+    if [ ${#CHANGED_PATHS[@]} -gt 0 ]; then
+      # Snapshot uncommitted work on the paths about to be overwritten — the residual same-file case
+      # (c) cannot avoid. `stash create` writes a commit object and touches NEITHER the working tree
+      # NOR refs/stash, so unlike clean-checkout.sh's `stash push -u` it cannot sweep up, or race, a
+      # sibling stage's work. Reported, never auto-applied: the operator owns the merge.
+      _dirty=$(git -C "$ROOT" status --porcelain -- "${CHANGED_PATHS[@]}" 2>/dev/null)
+      if [ -n "$_dirty" ]; then
+        _snap=$(git -C "$ROOT" stash create "acf-whip pre-land $KEY" 2>/dev/null || true)
+        echo "WARN: landing $KEY overwrote uncommitted work in $ROOT on $(printf '%s\n' "$_dirty" | grep -c .) path(s) it also changed. Snapshot: ${_snap:-UNAVAILABLE}. Recover: git -C $ROOT stash apply ${_snap:-<none>}" >&2
+      fi
+      git_with_lock_backoff -C "$ROOT" checkout --no-overlay -q "$TRUNK" -- "${CHANGED_PATHS[@]}" >/dev/null 2>&1 \
+        || echo "WARN: root worktree resync incomplete after landing $KEY (the index is still repaired below). Run: git -C $ROOT checkout --no-overlay -q $TRUNK -- \$(git -C $ROOT diff --name-only $OBSERVED $NEW -- . ':(exclude).backlog')" >&2
+    fi
     # The index repair is the one that must not be skipped, so it runs unconditionally and its
     # failure is fatal: a stale index is what forges a tree-reverting commit (a) above.
     if ! git_with_lock_backoff -C "$ROOT" reset --mixed "$TRUNK" >/dev/null 2>&1; then
