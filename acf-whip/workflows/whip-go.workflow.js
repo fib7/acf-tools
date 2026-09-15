@@ -282,16 +282,25 @@ function depsSatisfied(t, idx) {
 // PURE: no clock, no closure beyond `mode` (reached via isTerminal), so the <scheduler-pure>
 // extraction in tests/phase2-scheduler.test.mjs keeps working. `seed` is a parameter, never `args`.
 const INACTIVE_STATES = ['draft', 'archive']
-function expandScope(seed, idx) {
+function expandScope(seed, idx, activeStems) {
   const scope = new Set(), added = [], unresolved = [], inactiveSeeds = [], stack = []
+  // The index resolves non-schedulable tasks (dependency resolution needs them) but they are absent
+  // from tasks[]. A seed naming one produces an EMPTY scheduling view, and an empty scoped view
+  // reports `complete` — "Backlog 100% terminal", zero agents, integrated:[].
+  //
+  // ENUMERATING ['draft','archive'] DOES NOT COVER THAT. acfw-enrich-snapshot.sh defines inactive by
+  // EXCLUSION — anything outside the seven active states — so on a non-`files` store a card whose
+  // whip_state is absent or out of vocabulary (WARN|invalid-state, quarantine by construction since
+  // 3.3.0) has folder "" and sailed straight through this guard, reproducing the exact failure that
+  // was already fixed once for draft. The caller's active set IS the question, so ask it directly;
+  // the enumeration stays as the fallback so a two-arg caller keeps its current meaning.
+  const schedulable = (t) => (activeStems ? activeStems.has(t.stem) : INACTIVE_STATES.indexOf(t.folder) < 0)
   for (const tok of (seed || [])) {
     const t = idx.resolve(tok)
     if (!t) { unresolved.push(tok); continue }
-    // The index resolves draft/archive tasks (dependency resolution needs them), but they are not
-    // schedulable and are absent from tasks[]. A seed naming one would produce an EMPTY scheduling
-    // view, and an empty scoped view reports `complete` — so asking to run a draft task used to
-    // answer "Backlog 100% terminal" instead of saying the task is not actionable.
-    if (INACTIVE_STATES.indexOf(t.folder) >= 0) { inactiveSeeds.push(`${t.stem} (${t.folder})`); continue }
+    // Terminal seeds are exempt: a collapsed-accepted stem is synthesized, never in tasks[], and is
+    // neutral to both sides of the completion count — rejecting it would break scoping to done work.
+    if (!isTerminal(t) && !schedulable(t)) { inactiveSeeds.push(`${t.stem} (${t.folder || 'no state'})`); continue }
     stack.push(t.stem)
   }
   while (stack.length) {
@@ -1436,6 +1445,8 @@ let prevTerminal = -1
 const integratedStems = []
 const rejectedStems = []
 const autoRejectedStems = [] // review-time clean-checkout auto-rejects; rejectedStems only ever held integrateOne's
+const tokenStrandSeen = new Map()  // stem -> times this run hit the missing-token MECHANISM arm
+const tokenStrandedStems = []      // stems parked because the token never came back (see that arm)
 const attemptedIntegrate = new Set() // every stem handed to integrateOne — used to reconcile the report
                                      // against disk (WS5 / retro #9): an attempted stem now in rejected/
                                      // was rejected at integration even if the agent failed to emit it.
@@ -1522,10 +1533,12 @@ Return the ScanResult.`
   // tasks, because depsSatisfied treats an unresolvable dep token as dangling and refuses to
   // dispatch (conservative by design). Only the SCHEDULING VIEW narrows; `sched` replaces `tasks`
   // at every planning site below, and nowhere else.
-  const scoped = ONLY ? expandScope(ONLY, idx) : null
+  // tasks[] IS the scheduling view, so its stems are exactly what can be dispatched. Passing it makes
+  // the guard below answer the real question instead of a two-value enumeration of it.
+  const scoped = ONLY ? expandScope(ONLY, idx, new Set(tasks.map((t) => t.stem))) : null
   if (scoped && scoped.inactiveSeeds.length) {
     stopReason = 'scope-not-actionable'
-    return { aborted: true, reason: `/go was scoped to tasks that are not actionable: ${scoped.inactiveSeeds.join(', ')}. A draft task is behind the human gate and an archived one is retired; neither can be dispatched. Move it to pending first (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+    return { aborted: true, reason: `/go was scoped to tasks that are not actionable: ${scoped.inactiveSeeds.join(', ')}. A draft task is behind the human gate, an archived one is retired, and one in no recognised state is quarantined — none can be dispatched. Give it a schedulable state (pending) first (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
   }
   if (scoped && scoped.unresolved.length) {
     stopReason = 'scope-unresolved'
@@ -1776,7 +1789,25 @@ Return the ScanResult.`
     // => mechanism, retried. No branch at all => nothing was ever checked out => a real quality reject.
     if (!isNone && tokenObserved && t.hasCleanCheckoutToken === false) {
       if (t.hasWorktreeBranch) {
-        log(`↷ ${t.stem}: clean-checkout token missing but ${branchPrefix}/${t.slug} exists — mechanism, left in-review/ for re-review`)
+        // BOUNDED, because "leave it for re-review" has no one to re-review it INTO a token.
+        // clean-checkout.sh is the token's only writer and it runs at DISPATCH, not at review; the
+        // reviewer is explicitly forbidden from writing one (reviewerPrompt's PRE-STEP-0). So an
+        // unbounded arm is a fixed point: the task sits in in-review/ across every future run, the
+        // run ends no-progress with committed work never integrated, and claim(t.slug) starves every
+        // same-slug sibling for the whole run, every run. Re-review once — the token is usually back
+        // next iteration when the cause was a lost append_log_row race — then park it.
+        const seen = (tokenStrandSeen.get(t.stem) || 0) + 1
+        tokenStrandSeen.set(t.stem, seen)
+        if (seen < 2) {
+          log(`↷ ${t.stem}: clean-checkout token missing but ${branchPrefix}/${t.slug} exists — mechanism, left in-review/ for re-review`)
+          return
+        }
+        log(`⚠ ${t.stem}: clean-checkout token still missing after ${seen} reviews — parking in blocked/ for an operator instead of re-reviewing forever`)
+        tokenStrandedStems.push(t.stem)
+        // inc: 0 — this is mechanical. Charging a life for a token the orchestrator itself could not
+        // write would spend the task's three rejections on a fault it never caused.
+        await streamWrite([{ stem: t.stem, toState: 'blocked', agent: 'orchestrator', notes: `clean-checkout token absent on ${seen} consecutive reviews while ${branchPrefix}/${t.slug} exists. The token's only writer runs at dispatch, so no further review can restore it — verify the branch, then re-run /go to re-dispatch.`, inc: 0 }], `review#${iter}:${t.stem}`)
+        productiveDispatch = true
         return
       }
       // The ONLY state change in this function that used to be silent: no log line, and absent from
@@ -2016,7 +2047,13 @@ const capParked = ((finalSnap && finalSnap.tasks) || [])
   .map((t) => ({ stem: t.stem, blockCount: t.blockCount || 0, rejectionCount: t.rejectionCount || 0, needsTask: parkedNeeds.get(t.stem) || '' }))
 const capParkedStems = new Set(capParked.map((n) => n.stem))
 const depParked = [...parkedThisRun].filter((s) => !capParkedStems.has(s)).map((s) => ({ stem: s, blockCount: 0, rejectionCount: 0, needsTask: parkedNeeds.get(s) || '' }))
-const needsOperator = [...capParked, ...depParked]
+// A token-stranded task is parked in blocked/ with its counts untouched, so it matches neither the
+// cap filter above nor parkedThisRun. Surface it on its own or the one class of park the operator
+// cannot fix from the task file alone would be the one class the report omits.
+const alreadyParked = new Set([...capParkedStems, ...parkedThisRun])
+const tokenParked = [...new Set(tokenStrandedStems)].filter((s) => !alreadyParked.has(s))
+  .map((s) => ({ stem: s, blockCount: 0, rejectionCount: 0, needsTask: 'clean-checkout token never restored — verify the worktree branch, then re-run /go to re-dispatch' }))
+const needsOperator = [...capParked, ...depParked, ...tokenParked]
 return {
   completed: stopReason === 'complete',
   stopReason, // complete | no-progress | max-iterations | scan-degraded | agent-cap-reached | (aborts return earlier)

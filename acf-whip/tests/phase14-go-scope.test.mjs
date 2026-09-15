@@ -141,6 +141,42 @@ const sorted = (set) => [...set].sort()
     check('a collapsed-accepted seed contributes its stem', r.scope.has('done-long-ago'))
   }
 
+
+  // -- a seed outside the SCHEDULING VIEW is refused, however it got there --
+  // The enricher defines inactive by EXCLUSION, so "not schedulable" is not the two folders the
+  // runtime used to enumerate. A multica card whose whip_state is absent or out of vocabulary has
+  // folder "" and is WARN-only quarantine by design — it sailed through the enumeration, produced an
+  // empty scheduling view, and the empty view reported `complete`: zero agents, integrated:[],
+  // "Backlog 100% terminal". Byte-for-byte the failure already fixed once for draft.
+  {
+    const live = T({ stem: 'live', folder: 'pending' })
+    const orphan = T({ stem: 'orphan', folder: '' })          // out-of-vocabulary whip_state
+    const draft = T({ stem: 'draftish', folder: 'draft' })
+    const idx = indexTasks([live, orphan, draft], [])
+    const active = new Set(['live'])                          // tasks[] = the scheduling view
+    const r = expandScope(['orphan'], idx, active)
+    check('a seed in no recognised state is NOT actionable', r.inactiveSeeds.length === 1)
+    check('...and never reaches the scope', r.scope.size === 0)
+    check('...and names the state it is in', /orphan \(no state\)/.test(r.inactiveSeeds[0]))
+    check('draft is still refused when the active set is supplied',
+      expandScope(['draftish'], idx, active).inactiveSeeds.length === 1)
+    check('a schedulable seed is unaffected by the active set',
+      sorted(expandScope(['live'], idx, active).scope).join() === 'live')
+    // Without the active set the two-arg form must keep its 3.2.3 meaning exactly.
+    check('two-arg fallback still refuses draft', expandScope(['draftish'], idx).inactiveSeeds.length === 1)
+    check('two-arg fallback still admits an unknown state (documented fallback, not a regression)',
+      expandScope(['orphan'], idx).scope.has('orphan'))
+  }
+
+  // -- a TERMINAL seed is exempt from the active-set screen --
+  // A collapsed-accepted stem is synthesized, is never in tasks[], and is neutral to both sides of
+  // the completion count. Screening it would break scoping /go to already-finished work.
+  {
+    const idx = indexTasks([T({ stem: 'live', folder: 'pending' })], [{ stem: 'done-long-ago', id: 'MUL-1.1' }])
+    const r = expandScope(['done-long-ago'], idx, new Set(['live']))
+    check('a collapsed-accepted seed survives the active-set screen', r.scope.has('done-long-ago'))
+    check('...and is not reported as not-actionable', r.inactiveSeeds.length === 0)
+  }
   // -- duplicates and empties --
   {
     const idx = indexTasks([T({ stem: 'a', folder: 'pending' })], [])
