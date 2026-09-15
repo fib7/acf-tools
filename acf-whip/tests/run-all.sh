@@ -142,6 +142,21 @@ for a in adapters/*/acfw-store-*; do
     printf '  %-34s FAIL  (syntax error or not chmod +x)\n' "$(basename "$a")"; STATIC_FAIL=1
   fi
 done
+# Every adapter that shells out to a backend CLI must resolve it through an ENV SEAM, not from PATH
+# directly. That seam is the whole reason multica's suite could stop being green-by-absence in 3.3.0:
+# a fake CLI injected at ACFW_MULTICA_BIN runs the frozen conformance spec with no server. beads had
+# no seam, which is why it is still the one backend that cannot be exercised offline at all.
+SEAM_FAIL=0
+for a in adapters/*/acfw-store-*; do
+  case "$(basename "$a")" in
+    *-files) continue ;;   # no external CLI: it reads .backlog/ directly
+  esac
+  if ! grep -qE '\$\{ACFW_[A-Z]+_(BIN|TRANSPORT)' "$a" 2>/dev/null; then
+    printf '  %-34s FAIL  (%s resolves its backend CLI with no ACFW_*_BIN seam — it cannot be tested offline)\n' \
+      'adapter-binary-seam' "$(basename "$a")"; SEAM_FAIL=1; STATIC_FAIL=1
+  fi
+done
+[ "$SEAM_FAIL" -eq 0 ] && printf '  %-34s ok    (every API adapter resolves its CLI through an env seam)\n' 'adapter-binary-seam'
 # The legacy loops in the SKILL.md files are shell a model executes verbatim, and they are the ONLY
 # path when the Workflow tool is unavailable or refused — so they must run on the oldest bash we
 # support. macOS ships 3.2, where `declare -A` fails outright with "declare: -A: invalid option" and

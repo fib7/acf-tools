@@ -21,7 +21,9 @@
 # Invoked by skills/lib/bin/acfw-store (the dispatcher), which exports:
 #   ACFW_TRUNK_ROOT, ACFW_TRUNK_BRANCH, ACFW_STORE_CONFIG, ACFW_CONTRACT_VERSION,
 #   ACFW_PLUGIN_LIB. Direct invocation works too (env falls back to git rev-parse).
-# Backend env: ACFW_BEADS_PREFIX (issue-id prefix; default "whip").
+# Backend env: ACFW_BEADS_PREFIX (issue-id prefix; default "whip");
+#              ACFW_BEADS_BIN (path to the bd CLI; default: `bd` from PATH). The injection seam
+#              an offline conformance run needs, matching ACFW_MULTICA_BIN / ACFW_LINEAR_TRANSPORT.
 #
 # Contract exit codes: 0 ok/noop · 2 usage · 3 not-found/ambiguous · 4 conflict
 # (duplicate key) · 5 backend unavailable · 7 invalid state/value · 8 policy refusal
@@ -59,10 +61,21 @@ SUB="${1:-}"
 
 # ---- backend availability --------------------------------------------------
 
-BD="$(command -v bd 2>/dev/null || true)"
+# ACFW_BEADS_BIN is the injection seam every other API adapter already has — multica's
+# ACFW_MULTICA_BIN and linear's ACFW_LINEAR_TRANSPORT — and its absence is why beads is the last
+# backend that cannot be exercised without a live, cgo-built, Dolt-backed `bd`. A seam costs nothing
+# and is what an offline conformance run needs; the fake CLI itself is separate work.
+BD="${ACFW_BEADS_BIN:-}"
+[ -n "$BD" ] || BD="$(command -v bd 2>/dev/null || true)"
+# An explicitly injected path must be executable; falling back to PATH would silently test the
+# operator's real `bd` against a fixture that expects the fake, which is worse than failing here.
+if [ -n "${ACFW_BEADS_BIN:-}" ] && [ ! -x "$BD" ]; then
+  echo "FATAL: ACFW_BEADS_BIN='$ACFW_BEADS_BIN' is not an executable file." >&2
+  exit 5
+fi
 if [ -z "$BD" ]; then
   echo "FATAL: 'bd' (beads) not found on PATH — the beads backend is unavailable." >&2
-  echo "       Install beads or switch ACFW_STORE back to files." >&2
+  echo "       Install beads, set ACFW_BEADS_BIN, or switch ACFW_STORE back to files." >&2
   exit 5
 fi
 command -v jq >/dev/null 2>&1 || { echo "FATAL: 'jq' not found on PATH — required by the beads adapter." >&2; exit 5; }
