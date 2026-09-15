@@ -18,6 +18,12 @@ model: sonnet
 color: purple
 ---
 
+> **Task-store note.** `TASK_FILE` is a path the orchestrator hands you — always use the path you were
+> given rather than constructing one. Paths written as `.backlog/<state>/…` are the **default `files`
+> task-store backend**; on `beads`, `multica`, `linear` or a third-party adapter there is no
+> `.backlog/` directory at all and the orchestrator materializes the task document elsewhere. Nothing
+> about your job changes: you never move the task file on any backend.
+
 # Research Agent: Evidence-Based Analysis & Documentation
 
 **MANDATORY**: Follow communication style guidelines in `docs/acf/style/research-documents.md` (or `docs/acf/research-communication-style.md`) for ALL research documentation.
@@ -226,9 +232,21 @@ Leave `deliverable_files` empty only when the entire deliverable lives inside th
 ### What belongs in the task document
 
 Write your findings, evidence and recommendation into the task document at the path the orchestrator
-gave you as `TASK_FILE`. That path is backend-dependent — on the default `files` store it is a real
-file under `.backlog/`; on another backend it is a materialized copy the orchestrator syncs back —
-so always use the path you were given rather than constructing one.
+gave you as `TASK_FILE` — always the path you were given, never one you construct.
+
+**On the default `files` store that path is the live task document and writing to it is durable.
+On every other backend it is a READ-ONLY materialized copy: nothing syncs it back, and the next
+`read --materialize` overwrites it.** So on a non-`files` store, a finding that exists only in
+`TASK_FILE` is lost. Put the deliverable where it survives:
+
+- **The research document itself** goes in a real repository file — `docs/`, `notes/`, wherever the
+  task says — and **that path goes in `deliverable_files`**. This is the durable artifact.
+- **A short summary for the reviewer** goes through the store, not the file:
+  `bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" comment <stem> "…"`.
+
+Check which backend you are on with `bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" info`
+if you need to; writing the document to a repository file and listing it is correct on **all** of
+them, so when in doubt, do that.
 
 ---
 

@@ -792,17 +792,33 @@ CI MUST run all quality gates on every PR:
 
 #### A. Update `.backlog/README.md`
 
-Regenerate with new agent list:
+Update the agent list **in place**. Do NOT re-render the template over an existing README:
+`.backlog/README.md` is a document the project owns and edits — its gate commands, coverage
+thresholds and evidence rules are the team's, not the sample's — and rewriting all of it to change
+one line silently replaced them with the generic defaults, reporting only "(agent list updated)".
+The placeholder is also gone after the first render, so re-rendering is not even idempotent.
 
 ```python
 # Scan .claude/agents/
 agents = glob(".claude/agents/*.md")
 agent_names = [basename(a).replace(".md", "") for a in agents]
+line = "- **" + ", ".join(agent_names) + "**: Specialist implementation agents"
 
-# Update README
-template = read("${CLAUDE_PLUGIN_ROOT}/content/backlog/README.sample.md")
-updated = template.replace("{{IMPLEMENTER_AGENTS}}", ", ".join(agent_names))
-write(".backlog/README.md", updated)
+if exists(".backlog/README.md"):
+    # Replace ONLY the agent-roster line; everything else is the project's.
+    body = read(".backlog/README.md")
+    new_body, n = re.subn(r"^- \*\*.*\*\*: Specialist implementation agents$",
+                          line, body, count=1, flags=re.M)
+    if n:
+        write(".backlog/README.md", new_body)
+    else:
+        # The line was renamed or removed by the project. Say so; do not "repair" it by clobbering.
+        report("`.backlog/README.md` has no agent-roster line to update — add this line yourself "
+               "if you want it tracked:\n    " + line)
+else:
+    # No README yet: the full template is correct, and there is nothing to lose.
+    template = read("${CLAUDE_PLUGIN_ROOT}/content/backlog/README.sample.md")
+    write(".backlog/README.md", template.replace("{{IMPLEMENTER_AGENTS}}", ", ".join(agent_names)))
 ```
 
 #### B. Update `CLAUDE.md` (if exists)

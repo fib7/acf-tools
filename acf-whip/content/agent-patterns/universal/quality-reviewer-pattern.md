@@ -34,6 +34,12 @@ model: sonnet
 color: red
 ---
 
+> **Task-store note.** `TASK_FILE` is a path the orchestrator hands you — always use the path you were
+> given rather than constructing one. Paths written as `.backlog/<state>/…` are the **default `files`
+> task-store backend**; on `beads`, `multica`, `linear` or a third-party adapter there is no
+> `.backlog/` directory at all and the orchestrator materializes the task document elsewhere. Nothing
+> about your job changes: you never move the task file on any backend.
+
 # 🚨 MANDATORY FIRST STEP: Read Your Documentation
 
 **CRITICAL**: Before executing ANY review, you MUST:

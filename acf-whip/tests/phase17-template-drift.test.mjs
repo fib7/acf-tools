@@ -255,5 +255,53 @@ check(`whip-task's recon queries union inactive[]${bareTasksQueries.length ? ` �
 check('...and they do query both arrays',
   (TASKJS.match(/\(\.tasks\[\]\?, \.inactive\[\]\?\)/g) || []).length >= 2)
 
+
+// ---- no template may promise a sync-back the runtime does not perform ----------------------
+// research-agent-pattern.md told non-code agents the materialized spec is "a materialized copy the
+// orchestrator syncs back". `update-body` is invoked NOWHERE in workflows/ or skills/, the path is
+// gitignored, and the next `read --materialize` truncates it — so a research agent that believed it
+// lost its entire deliverable and was rejected each round. The claim is pinned to the runtime: if a
+// real sync-back is ever wired up, this assertion stops firing on its own.
+{
+  const RUNTIME = [
+    readFileSync(join(ROOT, 'workflows', 'whip-go.workflow.js'), 'utf8'),
+    readFileSync(join(ROOT, 'workflows', 'whip-task.workflow.js'), 'utf8'),
+  ].join('\n')
+  const syncBackExists = /update-body/.test(RUNTIME)
+  const claimants = AGENT_TEMPLATES.filter((p) => /syncs? back/i.test(readFileSync(p, 'utf8')))
+  check(
+    `no shipped template claims a sync-back while the runtime has none${claimants.length ? ` — ${claimants.map((p) => relative(ROOT, p)).join(', ')}` : ''}`,
+    syncBackExists || claimants.length === 0,
+  )
+  // Any template that TELLS AN AGENT ABOUT A TASK FILE must say the path is backend-dependent —
+  // otherwise an agent on a non-files store is never told the document it was handed is a read-only
+  // copy. Templates that never mention one (lean-architect, precommit, retro, workflow-architect)
+  // are correctly silent, so the predicate is "mentions a task path", not "is a universal".
+  const mentionsTaskPath = (src) => /TASK_FILE|\.backlog\//.test(src)
+  const missing = AGENT_TEMPLATES.filter((p) => {
+    const src = readFileSync(p, 'utf8')
+    return mentionsTaskPath(src) && !/Task-store note/.test(src)
+  })
+  check(
+    `every template that names a task path carries the task-store note${missing.length ? ` — missing: ${missing.map((p) => relative(ROOT, p)).join(', ')}` : ''}`,
+    missing.length === 0,
+  )
+}
+
+// ---- the installers must not rewrite a document the project owns ---------------------------
+// .backlog/README.md carries the team's gate commands, coverage thresholds and evidence rules.
+// /whip-add-agents re-rendered the 265-line sample over it to change one line, reporting only
+// "(agent list updated)", while the SessionStart hook builds a whole digest manifest to avoid
+// exactly that for three sibling documents.
+{
+  for (const skill of ['whip-add-agents', 'whip-init']) {
+    const src = readFileSync(join(ROOT, 'skills', skill, 'SKILL.md'), 'utf8')
+    const guarded = /exists\("\.backlog\/README\.md"\)/.test(src)
+      || /does not already exist/.test(src)
+      || /[Nn]ever overwrite an existing `?\.backlog\/README\.md/.test(src)
+    check(`${skill} does not blind-write .backlog/README.md`, guarded)
+  }
+}
+
 console.log(`\nphase17-template-drift: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL === 0 ? 0 : 1)

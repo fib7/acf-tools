@@ -170,10 +170,12 @@ pending → in-progress → completed → in-review → [accepted | rejected]
 ### 🪝 SessionStart Hook
 
 **Passive documentation setup** (runs automatically on every session):
-- Copies `task-descriptions.md` to `docs/acf/style/` (if missing)
-- Copies `task-template.md` to `docs/acf/backlog/` (if missing)
-- Copies `workflow.md` to `docs/acf/backlog/` (if missing)
-- Generates `.backlog/README.md` **only if `.backlog/` directory already exists**
+- Installs the plugin-owned documents it does not find: `task-descriptions.md` into
+  `docs/acf/style/`, and `task-template.md`, `workflow.md` and `recovery-runbook.md` into
+  `docs/acf/backlog/`
+- **Refreshes** a copy it already installed when that copy is unedited — recognised by content
+  digest (`content/.digests.json`), not by a version stamp the copy may predate. An edited copy is
+  never overwritten; it is reported as behind so you can merge what you want
 - Injects style guide into session context for enforcement
 
 ⚠️ **SessionStart hook does NOT create `.backlog/` structure or install agents.** Run `/whip-init` for complete initialization.
@@ -930,8 +932,10 @@ def main():
     return hookSpecificOutput with style guide enforcement
 ```
 
-`.backlog/README.md` is created once by `/whip-init` and never rewritten by the
-SessionStart hook — user edits are preserved across sessions.
+`.backlog/README.md` is created once by `/whip-init` and is never rewritten wholesale
+afterwards — not by the SessionStart hook, and not by `/whip-add-agents`, which updates
+only its agent-roster line in place. Your gate commands, coverage thresholds and evidence
+rules are yours, and they survive every re-run.
 
 ---
 

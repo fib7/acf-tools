@@ -556,11 +556,15 @@ echo "✅ Generated ${#created_specialists[@]} specialist manifests: ${created_s
 
 Trigger README generation with installed agents:
 ```bash
-# SessionStart hook pattern
 # Scans .claude/agents/*.md
 # Replaces {{IMPLEMENTER_AGENTS}} in template
-# Writes customized .backlog/README.md
+# Writes customized .backlog/README.md — ONLY when .backlog/README.md does not already exist
 ```
+
+**Never overwrite an existing `.backlog/README.md`.** Re-running `/whip-init` on a live project must
+not replace the team's gate commands, coverage thresholds and evidence rules with the sample's
+defaults. If it exists, update the agent-roster line in place exactly as `/whip-add-agents` does, and
+leave the rest of the document alone.
 
 ### Step 8.25: Initialize CLAUDE.md if Missing
 
