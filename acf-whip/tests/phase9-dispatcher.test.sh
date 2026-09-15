@@ -209,6 +209,33 @@ check "adapter that could not run -> ok=false" "printf '%s' \"\$D_U\" | grep -q 
 check "adapter that could not run -> exit 1 (the gate refuses)" "[ \$D_U_RC -eq 1 ]"
 check "the finding names the adapter exit code" "printf '%s' \"\$D_U\" | grep -q 'exit 5'"
 
+
+# ---- --quiet must reach the GENERIC half too --------------------------------------------------
+# The flag was forwarded to the adapter and nowhere else: acfw-doctor-generic.sh was invoked with no
+# flags and the merge awk printed every line it produced. On an override-mode board that is hundreds
+# of advisory WARNs per iteration, through the scan agent, against the bound workflow.md states as a
+# requirement. Semantics are doctor.sh's: FATAL always flows, BREAKDOWN and SUMMARY always print,
+# and the counts are taken over the unfiltered set so the gate decision cannot change.
+unset STUB_DOCTOR_RC
+export STUB_DOCTOR='FATAL|stub-fatal|t1|a real finding
+WARN|stub-warn-a|t2|advisory one
+WARN|stub-warn-b|t3|advisory two
+REPAIRABLE|stub-rep|t4|advisory three'
+Q_V=$(bash "$STORE" doctor 2>/dev/null) || true
+Q_Q=$(bash "$STORE" doctor --quiet 2>/dev/null) || true
+check "verbose really does carry advisories (guards against a vacuous compare)" \
+  "[ \$(printf '%s\n' \"\$Q_V\" | grep -cE '^(WARN|REPAIRABLE)\|') -ge 2 ]"
+check "--quiet suppresses the advisory dump on the merged path" \
+  "[ \$(printf '%s\n' \"\$Q_Q\" | grep -cE '^(WARN|REPAIRABLE)\|') -eq 0 ]"
+check "--quiet keeps every FATAL (the gate decision)" \
+  "[ \$(printf '%s\n' \"\$Q_Q\" | grep -c '^FATAL|') -eq \$(printf '%s\n' \"\$Q_V\" | grep -c '^FATAL|') ]"
+check "--quiet still emits the SUMMARY" "printf '%s\n' \"\$Q_Q\" | grep -q '^SUMMARY|'"
+check "--quiet counts advisories it did not print (counts over the unfiltered set)" \
+  "[ \"\$(printf '%s\n' \"\$Q_Q\" | sed -n 's/^SUMMARY|fatal=[0-9]*|repairable=\\([0-9]*\\)|.*/\\1/p')\" = \"\$(printf '%s\n' \"\$Q_V\" | sed -n 's/^SUMMARY|fatal=[0-9]*|repairable=\\([0-9]*\\)|.*/\\1/p')\" ]"
+check "--quiet and verbose agree on ok=" \
+  "[ \"\$(printf '%s\n' \"\$Q_Q\" | sed -n 's/.*|ok=\\(.*\\)/\\1/p' | tail -1)\" = \"\$(printf '%s\n' \"\$Q_V\" | sed -n 's/.*|ok=\\(.*\\)/\\1/p' | tail -1)\" ]"
+unset STUB_DOCTOR
+
 # A snapshot the dispatcher cannot obtain means the GRAPH invariants are unverified, not clean.
 unset STUB_DOCTOR_RC; export STUB_DOCTOR='SUMMARY|fatal=0|repairable=0|warn=0|ok=true'
 cat > "$WORK/nosnap" <<'EOF'

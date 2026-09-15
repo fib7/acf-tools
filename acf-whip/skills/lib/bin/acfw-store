@@ -149,12 +149,19 @@ case "$SUB" in
     # battery and once more below for the generic graph battery — and /go's per-iteration scan has a
     # fresh snapshot in hand at that exact moment. Consumed here, never forwarded to the adapter.
     DOC_SNAP=""
+    DOC_QUIET=0
     DOC_ARGS=()
     while [ $# -gt 0 ]; do
       case "$1" in
         --snapshot) [ $# -ge 2 ] || { echo "FATAL: --snapshot requires a FILE" >&2; exit 2; }
                     DOC_SNAP="$2"; shift 2 ;;
         --snapshot=*) DOC_SNAP="${1#--snapshot=}"; shift ;;
+        # PEEKED, NOT CONSUMED. --quiet honoured only the adapter's half: the generic battery was
+        # invoked with no flags and the merge awk below printed every line it produced, so on an
+        # override-mode board hundreds of advisory WARNs went through the scan agent every iteration
+        # — the exact bound content/backlog/workflow.md states as a requirement. Stripping the flag
+        # the way --snapshot is stripped would un-quiet the adapter instead, so it is forwarded too.
+        --quiet) DOC_QUIET=1; DOC_ARGS[${#DOC_ARGS[@]}]="$1"; shift ;;
         *) DOC_ARGS[${#DOC_ARGS[@]}]="$1"; shift ;;
       esac
     done
@@ -209,8 +216,12 @@ case "$SUB" in
     else
       printf 'FATAL|snapshot-unavailable|-|the generic graph/git battery could not run: the %s snapshot failed — the graph invariants (dangling/cyclic deps, duplicate ids, cross-slug integration) are UNVERIFIED\n' "$STORE" >> "$MERGED"
     fi
-    awk -F'|' '
-      /^(FATAL|REPAIRABLE|WARN)\|/ { print; sev[$1]++; code[$2]++ }
+    # Counting is separate from printing, and deliberately so: the tallies run over the UNFILTERED
+    # set, so --quiet changes what an operator reads and never what the gate decides. Same semantics
+    # as doctor.sh, which is the reference — FATAL lines always flow, BREAKDOWN and SUMMARY always
+    # print, and only the per-finding advisory dump is suppressed.
+    awk -F'|' -v quiet="$DOC_QUIET" '
+      /^(FATAL|REPAIRABLE|WARN)\|/ { if (!quiet || $1 == "FATAL") print; sev[$1]++; code[$2]++ }
       END {
         line=""
         for (c in code) line = line (line=="" ? "" : "|") c "=" code[c]

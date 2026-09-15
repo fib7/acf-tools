@@ -98,16 +98,27 @@ fi
 # documented env > config precedence. "" and "default" are equivalent here — only "override" relaxes.
 MODE=$(acfw_resolve_integration_mode "$REPO_ROOT") || exit 2
 [ -n "$MODE_ARG" ] && MODE="$MODE_ARG"
+# Timeout precedence: env var > committed config (.acfwhip/config > .backlog/.acfw-config) > default 8h.
+# RESOLVED HERE, ABOVE acfw_load_namespace, and read rather than sourced — the same trap :96 documents
+# for ACFW_INTEGRATION_MODE, which was hoisted for exactly this reason. acfw_load_namespace SOURCES the
+# config into this shell, so an inherited ACFW_INPROGRESS_TIMEOUT_HOURS was overwritten by the config's
+# own value before the old code below ever looked at it: config beat env, the documented precedence
+# inverted, and a project whose config said 1h had the scheduler time a task out at 1h while the same
+# iteration's doctor, still on 8h, reported no stale-in-progress at all.
+TIMEOUT_H="${ACFW_INPROGRESS_TIMEOUT_HOURS:-}"
+[ -n "$TIMEOUT_H" ] || TIMEOUT_H=$(acfw_config_get "$REPO_ROOT" ACFW_INPROGRESS_TIMEOUT_HOURS)
+# A non-numeric value (a stray unit like "8h", or a trailing "# comment") reaches an arithmetic
+# comparison far below and aborts the whole scan there, with nothing naming the key that did it.
+case "$TIMEOUT_H" in
+  ''|*[!0-9]*)
+    [ -n "$TIMEOUT_H" ] && echo "WARN: ACFW_INPROGRESS_TIMEOUT_HOURS='$TIMEOUT_H' is not a whole number of hours; using 8." >&2
+    TIMEOUT_H=8 ;;
+esac
 acfw_load_namespace "$REPO_ROOT"   # sets ACFW_WORKTREE_DIR / ACFW_BRANCH_PREFIX (worktree ownership)
 ACTIVE="pending in-progress completed in-review blocked rejected accepted"
 # Non-accepted active folders: in --active-only mode the full per-file pass runs only over these
 # (accepted is fed to the awk graph as a cheap batched stub — see emit_accepted_stub_tsv).
 ACTIVE_NONACC="pending in-progress completed in-review blocked rejected"
-# Timeout precedence: env var > committed config (.acfwhip/config > .backlog/.acfw-config) > default 8h.
-ENV_TIMEOUT="${ACFW_INPROGRESS_TIMEOUT_HOURS:-}"
-ACFW_CFG_FILE=$(acfw_resolve_config_file "$REPO_ROOT" || true)
-[ -n "$ACFW_CFG_FILE" ] && . "$ACFW_CFG_FILE" 2>/dev/null
-TIMEOUT_H="${ENV_TIMEOUT:-${ACFW_INPROGRESS_TIMEOUT_HOURS:-8}}"
 
 FINDINGS=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor.XXXXXX")
 TSV=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-tsv.XXXXXX")

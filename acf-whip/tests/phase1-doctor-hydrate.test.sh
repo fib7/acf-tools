@@ -755,6 +755,54 @@ check "files store WITH .backlog/: unchanged (exit 0, ok=true)" "[ $SG_OK_RC -eq
 ( cd "$SG" && git worktree remove --force .worktree/sg1 >/dev/null 2>&1 ) || true
 rm -rf "$SG"
 
+# ---- ACFW_INPROGRESS_TIMEOUT_HOURS: env must beat config ---------------------------------------
+# acfw_load_namespace SOURCES the config into the caller's shell, so an inherited env var was
+# overwritten by the config's own value before the old code read it — config beat env, inverting the
+# precedence the header documents. The result on a whip-init'd project: the scheduler timed a task
+# out at the configured hour while the same iteration's doctor, still on the 8h default, emitted no
+# stale-in-progress at all, so the two halves of one run disagreed about whether a task was stuck.
+echo "== in-progress timeout precedence =="
+TMO="$WORK/tmorepo"; git init -q -b trunk "$TMO"
+( cd "$TMO" && git config user.email t@t && git config user.name t \
+  && mkdir -p .backlog/in-progress .acfwhip .claude/agents \
+  && echo x > .claude/agents/go-engineer.md && echo seed > seed )
+FOUR_H_AGO=$(date -u -v-4H +"%Y-%m-%d %H:%M:%S" 2>/dev/null || date -u -d "4 hours ago" +"%Y-%m-%d %H:%M:%S")
+cat > "$TMO/.backlog/in-progress/stale-probe.md" <<EOF
+# Task: stale-probe
+
+## Metadata
+
+- **ID**: stale-probe
+- **Status**: in-progress
+- **Assigned Agent**: go-engineer
+- **Worktree**: stale-probe
+- **Dependencies**: none
+- **Rejection Count**: 0
+
+## Transition Log
+
+| $FOUR_H_AGO | pending | in-progress | orchestrator | dispatch |
+EOF
+( cd "$TMO" && git add -A >/dev/null && git commit -qm tmo >/dev/null )
+tmo_warn() { bash "$DOC" "$TMO" 2>/dev/null | grep -c '^WARN|stale-in-progress|' || true; }
+
+printf 'ACFW_INPROGRESS_TIMEOUT_HOURS=1\n' > "$TMO/.acfwhip/config"
+T_CFG_ONLY=$(tmo_warn)
+T_ENV_WINS=$(ACFW_INPROGRESS_TIMEOUT_HOURS=9 tmo_warn)
+printf 'ACFW_INPROGRESS_TIMEOUT_HOURS=9\n' > "$TMO/.acfwhip/config"
+T_ENV_WINS_LOW=$(ACFW_INPROGRESS_TIMEOUT_HOURS=1 tmo_warn)
+rm -f "$TMO/.acfwhip/config"
+T_DEFAULT=$(tmo_warn)
+
+check "config alone sets the timeout (1h: a 4h task is stale)"        "[ \"${T_CFG_ONLY:-0}\" -ge 1 ]"
+check "env BEATS config upward (config 1h, env 9h: not stale)"        "[ \"${T_ENV_WINS:-0}\" -eq 0 ]"
+check "env BEATS config downward (config 9h, env 1h: stale)"          "[ \"${T_ENV_WINS_LOW:-0}\" -ge 1 ]"
+check "neither set falls back to the 8h default (a 4h task is fine)"  "[ \"${T_DEFAULT:-0}\" -eq 0 ]"
+printf 'ACFW_INPROGRESS_TIMEOUT_HOURS=8h\n' > "$TMO/.acfwhip/config"
+T_BOGUS=$(bash "$DOC" "$TMO" 2>&1 >/dev/null | grep -c 'not a whole number' || true)
+check "a non-numeric config value is named, not carried into the arithmetic" "[ \"${T_BOGUS:-0}\" -ge 1 ]"
+rm -f "$TMO/.acfwhip/config"
+
 # ---- dup-folder repair: it must never delete every copy ---------------------------------------
 # `keep` is a raw field read of the FIRST-listed copy's Status. When that read yields "" — an
 # unparseable Status line, or a detail string the sed could not match — the old repair compared it
