@@ -249,10 +249,19 @@ async function runGo(cfg) {
     r.logs.length >= 0 && r.report.stopReason !== undefined)
 }
 {
-  // A cap so small the ladder must fire immediately: the run must still terminate and report.
+  // A cap far below the reserve: the run must still terminate, report, and ACTUALLY TRY.
+  // This used to assert that the ladder "fires immediately", which was only ever true because
+  // CAP_RESERVE was a fixed 150 against an operator-settable cap — so `used >= cap - reserve` held
+  // at used === 0 and the CLOSE rung emptied both queues before the pre-move. The run then reported
+  // agent-cap-reached with agentsUsed 2/100 and "Nothing lost.", which is a clean stop that
+  // dispatched nothing. Firing immediately was the defect, not the contract.
   const r = await runGo({ tasks: [{ stem: 't1', slug: 's1' }], goArgs: { agentCap: 10 } })
   check('7d inside the reserve, dispatch degrades instead of dying', !!r.report)
-  check('7e the ladder is visible in the report', r.report.escalation.fellBack >= 1 || r.report.stopReason === 'agent-cap-reached')
+  check('7e the ladder is still reportable at a small cap',
+    r.report.escalation && typeof r.report.escalation.fellBack === 'number')
+  check('7f a small cap does not stop the run before it dispatched anything',
+    r.report.stopReason !== 'agent-cap-reached' || r.report.agentsUsed > 0)
+  check('7g ...and the task was actually attempted', r.calls.writer.length > 0 || r.report.agentsUsed > 0)
 }
 
 // ============================ 8. the kill switch ============================
@@ -304,6 +313,29 @@ async function runGo(cfg) {
 {
   const r = await runGo({ onWorkflow: () => null })
   check('11d a null child return is also transient', !!r.report)
+}
+
+// ---------------------------------------------------------------------------------------------
+// 12. A small agentCap must not make the run stop before it starts.
+// CAP_RESERVE is a fixed 150 while agentCap is operator-settable with no documented floor, so any
+// cap <= 150 made `used >= cap - reserve` true at used === 0. The CLOSE rung emptied both queues
+// before the pre-move and the run reported agent-cap-reached with "agentsUsed: 2/100" and
+// "Nothing lost." — a clean stop that dispatched nothing. The rung is not gated on ESCALATE, so
+// `escalate: false` (the first thing skills/go/SKILL.md suggests for a hung run) hit it too.
+// ---------------------------------------------------------------------------------------------
+{
+  const tier = new Function(`${BODY.match(/function escalationTier[\s\S]*?\n}/)[0]}\nreturn escalationTier`)()
+  const RESERVE = Number(BODY.match(/const CAP_RESERVE\s*=\s*(\d+)/)[1])
+
+  check('12a a fresh run at the default cap is FULL', tier(0, 1000, RESERVE) === 'FULL')
+  check('12b a fresh run at a cap of 100 is FULL, not CLOSE', tier(0, 100, RESERVE) === 'FULL')
+  check('12c ...at a cap of 20 too', tier(0, 20, RESERVE) === 'FULL')
+  check('12d ...and at exactly the reserve', tier(0, RESERVE, RESERVE) === 'FULL')
+  check('12e a small cap still reaches CLOSE near its end', tier(19, 20, RESERVE) === 'CLOSE')
+  // The default ladder must be byte-identical: this fix may not move the boundary anyone relies on.
+  check('12f the default cap still closes at exactly cap-reserve', tier(1000 - RESERVE, 1000, RESERVE) === 'CLOSE')
+  check('12g ...and does not close one agent earlier', tier(1000 - RESERVE - 1, 1000, RESERVE) === 'DIRECT')
+  check('12h cap<=0 is still guarded (a NaN compare would read DIRECT)', tier(0, 0, RESERVE) === 'FULL')
 }
 
 console.log(`\nphase11-escalation: ${PASS} passed, ${FAIL} failed`)

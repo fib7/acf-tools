@@ -464,7 +464,15 @@ function coerceResolveResult(raw) {
 // pre-wave counter, and the ladder could never fire mid-wave.
 function escalationTier(used, cap, reserve) {
   if (!cap || cap <= 0) return 'FULL'
-  if (used >= cap - reserve) return 'CLOSE'
+  // The reserve is a FRACTION of a small cap, not a constant. agentCap is operator-settable with no
+  // documented floor while CAP_RESERVE is fixed at 150, so any cap <= 150 made `used >= cap - reserve`
+  // true at used === 0: the CLOSE rung emptied both queues before the pre-move, and the run reported
+  // agent-cap-reached with "agentsUsed: 2/100" and "Nothing lost." — a clean stop that dispatched
+  // nothing. That rung is not gated on ESCALATE either, so `escalate: false` — the first thing the
+  // skill suggests for a hung run — hit it too. Identical to the old behaviour at the 1000 default
+  // and for every cap above the reserve.
+  const r = cap > reserve ? reserve : Math.max(1, Math.floor(cap * 0.15))
+  if (used >= cap - r) return 'CLOSE'
   const frac = used / cap
   if (frac < 0.50) return 'FULL'
   if (frac < 0.70) return 'LEAN'
