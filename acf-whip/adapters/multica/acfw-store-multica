@@ -733,7 +733,8 @@ cmd_snapshot() {
   # collect_whip_issues already emits `.description` inline for every issue — so one jq pass over the
   # JSONL answers the question for the whole board with zero extra calls and zero per-id jq (the old
   # loop re-parsed the entire JSONL once per in-review task, which is quadratic in board size).
-  local toks free_ids id desc
+  local toks free_ids id desc unknown_toks tok_unknown
+  unknown_toks=""; tok_unknown=0
   free_ids=$(jq -rs --arg tok "$CLEAN_CHECKOUT_TOKEN" \
     'map(select((.description // "") | contains($tok)) | .id) | .[]' "$jsonl")
   toks="$free_ids"
@@ -752,19 +753,42 @@ cmd_snapshot() {
                      and (((.description // "") | contains($tok)) | not))
             | {id: .id, empty: (((.description // "") | length) == 0)})
         | .[] | .id' "$jsonl"); do
-    desc=""
+    # A FAILED read is not an absent token. Both fallbacks folded a backend error into the same
+    # value a genuine miss produces, so one timeout here reads downstream as "this specialist never
+    # ran clean-checkout" — which costs the task a skipped review or one of its three lives at the
+    # deterministic auto-reject. The metadata helpers were made tri-state in 3.3.0 for exactly this;
+    # these two reads were missed because they answer through $toks rather than through a helper.
+    desc=""; tok_unknown=0
     multica_call issue get "$id" --output json
-    [ "$MC_RC" -eq 0 ] && desc=$(printf '%s' "$MC_OUT" | jq -r '.description // ""' 2>/dev/null)
+    if [ "$MC_RC" -eq 0 ]; then
+      desc=$(printf '%s' "$MC_OUT" | jq -r '.description // ""' 2>/dev/null)
+    else
+      tok_unknown=1
+    fi
     if printf '%s' "$desc" | grep -qF "$CLEAN_CHECKOUT_TOKEN"; then
       toks="$toks$id"$'\n'
       continue
     fi
     multica_call issue comment list "$id" --full --output json
-    if [ "$MC_RC" -eq 0 ] && printf '%s' "$MC_OUT" | jq -r '.[].content // ""' 2>/dev/null | grep -qF "$CLEAN_CHECKOUT_TOKEN"; then
-      toks="$toks$id"$'\n'
+    if [ "$MC_RC" -eq 0 ]; then
+      if printf '%s' "$MC_OUT" | jq -r '.[].content // ""' 2>/dev/null | grep -qF "$CLEAN_CHECKOUT_TOKEN"; then
+        toks="$toks$id"$'\n'
+        continue
+      fi
+      # A comment list that SUCCEEDED and carried no token is a definite absence, whichever way the
+      # description read went — the comment scan is the authoritative legacy location.
+      tok_unknown=0
+    else
+      tok_unknown=1
     fi
+    if [ "$tok_unknown" -eq 1 ]; then unknown_toks="$unknown_toks$id"$'\n'; fi
   done
   local tok_json; tok_json=$(printf '%s' "$toks" | jq -Rn '[inputs | select(length > 0)]')
+  # `grep -c .` prints 0 and exits 1 on empty input; take the count from stdout, discard the status.
+  local n_unknown; n_unknown=$(printf '%s' "$unknown_toks" | grep -c . || true)
+  if [ "${n_unknown:-0}" -gt 0 ]; then
+    echo "WARN: clean-checkout token could not be read for $n_unknown task(s); they are reported as having no token. Re-run the snapshot before trusting a review decision on them." >&2
+  fi
 
   jq -rs --argjson tok "$tok_json" --arg gen "$(date -u +"%Y-%m-%d %H:%M:%S")" '
     def splitlist: (. // "") | split(",") | map(gsub("^\\s+";"") | gsub("\\s+$";"")) | map(select(. != "" and . != "none"));

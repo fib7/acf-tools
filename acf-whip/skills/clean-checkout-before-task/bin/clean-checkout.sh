@@ -27,7 +27,9 @@
 #   2  branch in use elsewhere (lock held by another agent — defer, try another task)
 #   3  worktree exists but on the wrong branch (manual intervention)
 #   5  trunk branch not resolvable (detached HEAD)
-#  99  lock contention persisted past backoff (transient; retry next iteration)
+#   6  the durable clean-checkout token could not be written to a non-files task store (retry)
+#  99  lock contention persisted past backoff, or a store adapter answered "could not determine"
+#      (adapters/CONTRACT.md's transient code) — transient either way; retry next iteration
 
 set -u
 
@@ -142,8 +144,28 @@ append_log_row "$TASK_FILE" "$LINE" \
 case "$TASK_FILE" in
   */.backlog/*) : ;;
   *)
-    bash "$SCRIPT_DIR/../../lib/bin/acfw-store" log-event "$TASK_ID" --row "$LINE" >/dev/null 2>&1 \
-      || echo "WARN: could not record the clean-checkout token in the task store for $TASK_ID (the reviewer may auto-reject)" >&2
+    # STRICT, and the strictness is the point. On a non-`files` store this is the ONLY durable write
+    # of the token: the append above landed in a materialized spec that the next `read --materialize`
+    # truncates. A swallowed failure here therefore does not merely risk an auto-reject — it produces
+    # a task no later review can rescue, because clean-checkout runs at DISPATCH and nothing else
+    # ever writes a token. That is the in-review/ fixed point whip-go now has to park tasks out of.
+    # The old form discarded the return code, sent the adapter's own diagnosis to /dev/null, and
+    # exited 0 — so the one failure that matters was the one nobody could see.
+    _cc_rc=0
+    for _cc_try in 1 2; do
+      bash "$SCRIPT_DIR/../../lib/bin/acfw-store" log-event "$TASK_ID" --row "$LINE" >/dev/null
+      _cc_rc=$?
+      # 99 ONLY: the contract's "could not determine / transient" (adapters/CONTRACT.md). Every other
+      # non-zero is a definite refusal and retrying it just doubles the latency before the same answer.
+      [ "$_cc_rc" -eq 99 ] || break
+      [ "$_cc_try" -eq 1 ] && sleep 1
+    done
+    if [ "$_cc_rc" -ne 0 ]; then
+      echo "FATAL: could not record the clean-checkout token in the task store for $TASK_ID (rc=$_cc_rc)." >&2
+      echo "       The worktree is ready, but without the durable token the review gate cannot tell this" >&2
+      echo "       task from one that never entered a worktree. Stopping so the next iteration retries." >&2
+      exit 6
+    fi
     ;;
 esac
 
