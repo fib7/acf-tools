@@ -168,10 +168,19 @@ fi
 # tree: with the only read of DIRECT_DISPATCH deleted — the exact regression this guards — the gate
 # did not fire. Dropping `|| echo 0` alone is not enough either: an absent or renamed SKILL.md would
 # leave R empty and short-circuit the same way.
-for v in DISPATCH_QUEUE DIRECT_DISPATCH; do
-  if grep -q "$v+=(" skills/go/SKILL.md 2>/dev/null && ! grep -q "\${$v\[@\]" skills/go/SKILL.md 2>/dev/null; then
-    printf '  %-34s FAIL  (%s is appended to but never read)\n' 'skill-shell-portability' "$v"; SH_FAIL=1
-  fi
+# The name list is DERIVED from the skill, not enumerated here. Enumerating it is how the gate missed
+# the defect it exists to catch: INTEGRATE_QUEUE was filled and never read while Step 4.5b iterated
+# SORTED_QUEUE, which nothing assigned — so the legacy fallback loop, the one operators are routed
+# into when the Workflow tool is unavailable, integrated nothing at all, silently, and every
+# deliverable stayed on an unmerged branch. A gate that only looks at the two names someone happened
+# to write down can never see the third.
+for sk in skills/go/SKILL.md skills/task/SKILL.md; do
+  [ -f "$sk" ] || continue
+  for v in $(grep -oE '\b[A-Z_][A-Z0-9_]*\+=\(' "$sk" 2>/dev/null | sed 's/+=(//' | sort -u); do
+    if ! grep -q "\${$v\[@\]" "$sk" 2>/dev/null; then
+      printf '  %-34s FAIL  (%s is appended to but never read in %s)\n' 'skill-shell-portability' "$v" "$sk"; SH_FAIL=1
+    fi
+  done
 done
 [ "$SH_FAIL" -eq 0 ] && printf '  %-34s ok    (bash 3.2 safe; no write-only arrays)\n' 'skill-shell-portability'
 [ "$SH_FAIL" -eq 0 ] || STATIC_FAIL=1

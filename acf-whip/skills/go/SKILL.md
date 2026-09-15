@@ -895,6 +895,43 @@ for f in .backlog/accepted/*.md; do
   acfw_is_integrated "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH" "$(basename "$f" .md)" && continue
   git -C "$ACFW_TRUNK_ROOT" show-ref --verify --quiet "refs/heads/worktree/$slug" && INTEGRATE_QUEUE+=("$f")
 done
+
+# Kahn over the dep edges AMONG QUEUE MEMBERS ONLY: a dep outside the queue is either already
+# integrated (skipped above) or not a candidate, so it imposes no ordering here. `< <(...)` and not
+# a pipe — a pipeline runs the `while` in a subshell, so SORTED_QUEUE would be empty in the caller
+# and Step 4.5b would integrate nothing, which is the shape of the bug this block fixes.
+declare -a SORTED_QUEUE
+SORTED_QUEUE=()
+if [ ${#INTEGRATE_QUEUE[@]} -gt 0 ]; then
+  while IFS= read -r line; do
+    [ -n "$line" ] && SORTED_QUEUE+=("$line")
+  done < <(
+    for f in "${INTEGRATE_QUEUE[@]}"; do
+      printf '%s\t%s\t%s\n' "$(basename "$f" .md)" "$f" \
+        "$(grep -E '^- \*\*Dependencies\*\*:' "$f" | head -1 | sed -E 's/.*Dependencies\*\*:[[:space:]]*//')"
+    done | awk -F'\t' '
+      { stem[NR]=$1; file[NR]=$2; deps[NR]=$3; n=NR; idx[$1]=NR }
+      END {
+        for (i=1;i<=n;i++) {
+          m=split(deps[i], d, ",")
+          for (k=1;k<=m;k++) {
+            gsub(/^[ \t]+|[ \t]+$/, "", d[k])
+            if (d[k]=="" || d[k]=="none" || !(d[k] in idx)) continue
+            j=idx[d[k]]; edge[j,++out[j]]=i; indeg[i]++
+          }
+        }
+        qn=0; for (i=1;i<=n;i++) if (indeg[i]+0==0) q[++qn]=i
+        head=1; emitted=0
+        while (head<=qn) {
+          i=q[head++]; print file[i]; placed[i]=1; emitted++
+          for (k=1;k<=out[i]+0;k++) { j=edge[i,k]; if (--indeg[j]==0) q[++qn]=j }
+        }
+        # A cycle would strand its members. doctor already FATALs on a real one, so emit the
+        # remainder in input order: degrade to unsorted, never to dropped deliverables.
+        if (emitted<n) for (i=1;i<=n;i++) if (!(i in placed)) print file[i]
+      }'
+  )
+fi
 ```
 
 ### Step 4.5b: Integrate sequentially
@@ -903,7 +940,7 @@ done
 
 ```bash
 LP="${CLAUDE_PLUGIN_ROOT}/skills/integrate-lpcas/bin/integrate-lpcas.sh"
-for task_file in "${SORTED_QUEUE[@]}"; do
+for task_file in ${SORTED_QUEUE[@]+"${SORTED_QUEUE[@]}"}; do
   OUT=$(bash "$LP" "$task_file"); rc=$?
   # rc 7: OUT carries `worktree:`, `assigned_agent:`, and a `conflicted_files:` block. Dispatch that
   # agent into that worktree as a conflict resolver (see below), then resume the SAME attempt:
