@@ -271,6 +271,24 @@ HAS_TOK=$(printf '%s' "$SNAP" | node -e 'let d="";process.stdin.on("data",c=>d+=
 if [ "$HAS_TOK" = "false" ]; then ok "snapshot token scan returns a correct boolean (lin-up in-review, no token → false)"; else bad "snapshot hasCleanCheckoutToken for lin-up = $HAS_TOK (want false)"; fi
 
 echo
+
+# (F) --quiet must not swallow the gate decision. DONE LAST: it corrupts the fixture board.
+# The assertion this replaces compared 0 to 0 — no fixture in this suite ever produced a FATAL, so
+# reverting the adapter's --quiet branch to "suppress everything" still went ALL GREEN, while in
+# production acfw-store recomputes ok= from the lines it receives and would hand /go's startup hard
+# gate ok=true on a FATAL board. multica got the inducer plus an anti-vacuity check in 3.3.0; linear
+# did not. Blank one key attachment's metadata to trip the adapter's missing-metadata FATAL.
+BLANK_URL=$(kurl lin-up)
+jq --arg u "$BLANK_URL" '(.attachments[] | select(.url==$u) | .metadata) = {}' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+LF=$("$ADAPTER" doctor 2>/dev/null);         LF_N=$(printf '%s\n' "$LF" | grep -c '^FATAL|' || true); LF_N=${LF_N//[^0-9]/}
+LQ=$("$ADAPTER" doctor --quiet 2>/dev/null); LQ_N=$(printf '%s\n' "$LQ" | grep -c '^FATAL|' || true); LQ_N=${LQ_N//[^0-9]/}
+if [ "${LF_N:-0}" -ge 1 ]; then ok "the fixture really does carry a native FATAL (guards against a vacuous compare)"; else bad "fixture produced no FATAL (LF_N=$LF_N) — the --quiet compare below would be vacuous"; fi
+if [ "${LQ_N:-0}" -eq "${LF_N:-0}" ]; then ok "--quiet keeps every FATAL the verbose run reported"; else bad "--quiet FATAL count=$LQ_N verbose=$LF_N"; fi
+if ! printf '%s\n' "$LQ" | grep -qE '^(WARN|REPAIRABLE)\|'; then ok "--quiet still suppresses the advisories"; else bad "--quiet leaked an advisory line"; fi
+LF_OK=$(printf '%s\n' "$LF" | sed -n 's/.*|ok=\(.*\)/\1/p' | tail -1)
+LQ_OK=$(printf '%s\n' "$LQ" | sed -n 's/.*|ok=\(.*\)/\1/p' | tail -1)
+if [ "$LF_OK" = "$LQ_OK" ]; then ok "--quiet and verbose agree on ok="; else bad "ok= disagrees: verbose='$LF_OK' quiet='$LQ_OK'"; fi
+
 echo "phase9-adapter-linear: conformance rc=$CONF_RC; linear-specific $PASS passed, $FAIL failed"
 
 # ---- 3. live path (guarded) ------------------------------------------------
