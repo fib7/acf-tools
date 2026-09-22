@@ -2,6 +2,187 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.4.0 — the snapshot stops going through an agent, and a bare `/go` stops meaning "everyone's board"
+
+Four things a team running a large shared board reported, and the defects underneath each.
+
+### The snapshot must not transit an LLM unbounded
+
+**The failure.** A `/go` scoped to five task ids stopped with "/go was scoped to tasks that do not
+exist in the backlog", naming three that were all present. The board had several hundred cards and its snapshot
+was several hundred KB. `/go`'s scan agent reads the store walk's stdout with its Bash tool and copies it
+into one schema string; on that payload the copy came back short — valid JSON, two of five tasks —
+and nothing checked. The scheduler planned over a board that did not exist, could not find the ids it
+had been handed, and refused. An operator reading that message goes looking for a typo they did not
+make. Raising `shellModel` does not fix this; it moves the cliff.
+
+**Narrow it, in the store.** `acfw-store snapshot --only <key>...` emits the **closure** of the named
+tasks — the seeds plus every dependency that is not accepted-terminal — so a five-task run relays five
+records whatever the board's size. It is implemented once as a dispatcher post-stage
+(`skills/lib/bin/acfw-scope-snapshot.sh`) over the final enriched JSON, so every backend gets it
+without forking, and an adapter only sees `--only` when it declares the new `snapshot-only`
+capability: a raw adapter must keep listing everything, because the closure walk and the store-wide
+`counts` are computed from the full set and narrowing at the adapter would make both wrong, silently.
+The same stage finally gives the raw adapters a **real `--digest`** (terminal-accepted dependency
+targets collapse to `satisfiedDeps`, non-targets drop to counts, accepted-but-unintegrated stays
+whole) — it had been a documented no-op on every non-`files` backend since 3.1.0, which is what let a
+lived-in board relay every card it had. Seed resolution is exact id → stem → **backend id** (so
+`/go MUL-4821` works) → *unique* stem prefix; an ambiguous prefix is reported with its candidates and
+never resolved by first match, which on a large board silently picks whichever card was listed first.
+
+**Prove it arrived.** Every snapshot now leads with a `relay` header: per-array entry counts plus the
+UTF-8 byte sum of every stem. The consumer recomputes both. A count alone is forgeable by a model that
+tidies a header it can see, so the byte sum is a second, content-derived number; first-key placement
+means a tail-elided echo still carries the expectation it fails. A short relay routes into the
+existing retry → text-fallback ladder and, if it stays short, ends the run as **`relay-truncated`**
+with the honest remedy — never as a missing id. What it proves is bounded and written down: no entry
+dropped, added, or replaced by one of a different stem length; an equal-length substitution passes,
+which is deliberate, because a length sum is the strongest check jq, bash and JS can all compute
+identically and truncation is the demonstrated failure mode where substitution is not. The ids a
+caller actually named get a stronger guarantee: every seed the store resolved must be exactly present
+in the relayed index, or the run refuses as a relay failure rather than accusing the operator of a
+typo. The doctor's findings ride the same hop, so `SUMMARY|fatal=N` is cross-checked against the lines
+relayed — a dropped FATAL would silently un-hold the task it names.
+
+`--full-to` tees the pre-narrowing snapshot so `doctor --snapshot` reads the scheduler's own store
+walk instead of taking a second one, which on a live shared board could straddle a colleague's
+transition.
+
+**Two defects found while building it, both live before 3.4.0.** A `blocked` dependency was not pulled
+into a scope, because `isTerminal` calls blocked terminal — but a blocked task is *retryable*, and the
+pass that lifts it runs over the scope, so it could never be lifted, its dependent could never
+dispatch, and the run exited `no-progress` with the requested task untouched. And a scoped run's
+`noGain` counter only reset when `terminal` rose; a finished task collapses out of the working set, so
+seventeen same-slug tasks exhausted the fifteen-iteration budget and exited `no-progress` with the
+work done. On `files`, `/go <a-finished-task>` reported the id as nonexistent — the digest drops a
+terminal accepted task nothing depends on, so the seed is now retained through the collapse.
+
+### One malformed card no longer blocks everyone's runs
+
+A single long-cancelled card with a hand-edited state blocked every `/go` for a whole team, including
+runs scoped to tasks that never touched it. The integrity gate ran before anything else, read the
+whole board, and treated every FATAL the same way.
+
+FATALs now have two scopes. **Repo-scoped** ones — detached HEAD, a worktree on the wrong branch, a
+battery that could not run, an unreadable backend — abort exactly as before. **Task-scoped** ones hold
+out that task: never dispatched, never transitioned, never integrated, still gating its dependents,
+and named in the report. The rest of the board runs. A finding whose task field names nothing the
+scheduler can act on gates nothing at all and is reported as `fatalsNotGating` — aborting for those
+would reinstate the board-wide gate being removed. Matching is by exact whip key; `CONTRACT.md` now
+makes field 3 a routing decision rather than a label, because a prefix or a slug matched loosely
+would attach a finding to the wrong task, which is the one way per-task quarantine is less safe than
+aborting.
+
+Holding a task out changes what "done" means, so there is a new terminal reason: **`partial`**, with
+`completed: false` and a `heldOut[]` naming each task and why (`quarantined`, `paused`, `vanished`).
+A run that finished everything it was *allowed* to touch has not finished the backlog, and an operator
+must not have to infer the difference. `gated[]` explains a `no-progress` exit by naming the
+dependency each pending task is waiting on, instead of pointing at folders it is not in.
+
+Three consequences worth stating: a held-out task keeps its worktree slug reserved, because freeing it
+would let a same-slug sibling's `clean-checkout` sweep its uncommitted work into the shared stash; the
+quarantine is recomputed every iteration, so a card an operator fixes mid-run comes straight back; and
+the post-loop drain applies it too, or the one pass that exists to catch stragglers would integrate
+the very task the gate refused. Quarantine is workflow-only — the legacy markdown loop still refuses
+on any FATAL, and `skills/go/SKILL.md` says so and why.
+
+### A bare `/go` runs your focus
+
+`/go` with no arguments meant "the whole backlog". On a checkout whose backlog is its own that is what
+the operator meant. On a shared board it never is, so the only safe habit was naming ids every time —
+the ergonomic complaint that started this. Dropping arguments entirely would have removed selective
+launch, which is worse.
+
+The **focus** is the missing third option: a small, per-checkout list of the tasks you are working on,
+which a bare `/go` runs. `/task` sets it to the tasks it just created — chained onto each `create` with
+`&&`, so a create that fails with a duplicate id never enters it — which makes the ordinary path, plan
+→ `/task` → `/go`, need no arguments at all while still running only your own work. `/whip-focus`
+manages it by hand. It is gitignored per-checkout state, because a focus is one person's selection and
+never a fact about the project: two people on one board have two focuses.
+
+It holds script-resolved stems only. `set`/`add` resolve every token through the store and refuse the
+whole operation — writing nothing — if any is unknown or an ambiguous prefix; a focus holding raw
+arguments would inherit every ambiguity of the thing typed, and a selection that silently changes
+meaning is worse than no selection. Adding to a focus whose every task is done replaces it, or
+finished work would ride into the next run's scope forever.
+
+With no focus, a bare `/go` follows a per-store policy: `files` drains the whole backlog exactly as
+before, while every shared API-backed store **refuses** and names the three ways forward. `/go --all`
+is always the explicit "yes, everything". An explicit `/go <ids>` never writes the focus — making a
+one-off selection the standing default would mean the next bare `/go` ran something nobody chose.
+
+**Pausing is now a state.** `/whip-move <task> draft` pauses and `archive` cancels, on every backend:
+inert to the scheduler, still resolvable as dependencies, so a dependent reads as gated rather than
+dangling. Dropping from a focus is documented as *not* pausing — a scoped run pulls in unmet
+dependencies, so a dropped task something else needs comes straight back. And on multica,
+`doctor --fix` no longer overwrites a human hold: a native `blocked`/`cancelled` against a runnable
+whip state was treated as drift and repaired, so every `/go` bootstrap silently un-parked every card
+the team had parked. It is `WARN|native-hold` now, with the remedy named, and left alone.
+
+### Agents are routed by what they do
+
+Routing was one knob (`shellModel`) and otherwise silence. In `/task` exactly one call took the cheap
+tier: the agent-registry `ls`, both single-writer calls — whose prompts are a fixed list of
+`acfw-store create` lines — and the report-only doctor all inherited the session model, paying
+frontier generation cost to echo command output. And specialists and reviewers ignored the `model:`
+frontmatter of the agents the project installed, which is exactly where a project says "this kind of
+work runs on that model".
+
+Tiers are named for what the agent does: **shell** (runs a fixed command, copies stdout into a schema
+— one helper applies it, so a new stage cannot forget), **judge** (`/task` planners, judge, critic),
+**author** (task documents), and the `agentType` classes, which now route by the installed agent's
+declared model. The architect and the conflict resolver stay on the session model deliberately: one
+authors executable harnesses, the other resolves real merge conflicts. Resolution is env >
+`.acfwhip/config` > default (`ACFW_MODEL_SHELL`/`_JUDGE`/`_AUTHOR`), so a team pins its cost policy
+once per repo; judge and author ship unset, inheriting the session model exactly as before. Both
+reports gain `models` and `agentsByTier` — the 3.2.0 lesson, that a run which silently degraded is
+indistinguishable from one that did not, applies to cost as much as to depth.
+
+A shell-tier `effort` knob exists and ships **unset**: Haiku is absent from the documented
+effort-support table and the effect of a low setting on verbatim-copy fidelity is undocumented, so it
+is an opt-in a team can now measure safely, because a short relay is detected rather than believed.
+
+Raising the shell tier was the workaround suggested for the truncated snapshot. It is the wrong lever
+— it would triple the cost of the most frequent agent class and still fail on a large board — so that
+tier stays cheap and the payload is bounded instead.
+
+### Adjacent defects fixed on the way
+
+- **`cyclic-deps` reported every task a cycle could reach**, not the cycle: the detector peeled nodes
+  with no dependents and reported whatever survived, so on `a→{b,c}, b→a` it named `a`, `b` **and**
+  `c`. Replaced with a Tarjan SCC pass shared by both batteries. This matters more from here on,
+  because an over-broad cycle report now holds healthy cards out of a run rather than merely being noisy.
+- **The orphan reaper destroyed unlanded deliverables.** In default mode every accepted slug counted
+  as spent, so an accepted-but-unintegrated worktree — the drain deliberately leaves an exit-7
+  conflict "for the next `/go` run", and a crash between accept and integrate leaves the same state —
+  had its worktree removed and its branch `-D`'d by the next bootstrap `doctor --fix`. The next scan
+  then read `hasWorktreeBranch=false`, called the task terminal, and the deliverable was gone with
+  nothing saying so. A slug is spent once its change is on trunk, and both batteries now agree on that.
+- **`dup-folder-unresolvable` was invisible to the gate**: it existed only inside the `--fix` block,
+  whose stdout `/go` discards, so the gate saw `REPAIRABLE|dup-folder`, called the board repairable,
+  and dispatched against a stem no writer can address. Computed in both passes now.
+- **Every pre-dispatch abort releases the run lock.** A run that stopped before dispatching anything
+  left its own heartbeat fresh, so an operator who fixed a typo in ten seconds was refused for the
+  next half hour with "another /go run appears active". Nothing was dispatched; there was nothing to
+  protect. Aborts also carry their `stopReason` now, which `skills/go/SKILL.md` had documented for
+  two releases without it ever being emitted.
+
+### Compatibility
+
+Contract stays v1 and every change is additive: new capability `snapshot-only`, new
+dispatcher-implemented `snapshot --only` / `--full-to`, new snapshot fields `relay{}`, `scope{}`,
+`scopeApplied`, `scopeCounts`, `inactive[]` on `files`, `backendId` in `satisfiedDeps`. A third-party
+adapter that emits no `relay` header is tolerated — the consumer logs once that completeness is
+unverifiable and proceeds, because refusing would brick every such backend on upgrade. `deps[]` are
+still stems: the `backendId` resolver serves SEEDS only, never dependency tokens, which both doctors
+resolve by stem or prefix and would FATAL on a native id. The child-harness skeleton gained args, so
+its contract stamp goes to v2 and a harness authored against the previous skeleton is re-scaffolded
+rather than byte-diffed against a template it predates.
+
+Still open, as in 3.2.3: the run lock is per-checkout and `transition` has no compare-and-swap, so
+`atomic-claim` remains unimplemented. Scoping and the focus narrow what one person's run touches; they
+do not make two concurrent runs against one shared board safe.
+
 ## 3.3.1 — two ways to lose work on the default backend
 
 3.3.0 was audited in its own right after release, subsystem by subsystem, with every candidate

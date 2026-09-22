@@ -33,10 +33,10 @@
 | **acf-nitro** | Cognitive | Parallel execution enforcer | 6 |
 | **acf-mission-control** | Functional | Two-line status line HUD (1M-aware fuel gauge, self-priced cost, rate limits, cache warmth); themeable glyphs (sleek/emoji/nerd/text); self-upgrading | 6 |
 | **acf-librarian** | Functional | Convention enforcement | 9 |
-| **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe; per-task authored child workflows; LP-CAS integration; pluggable task stores: files/beads/multica/linear; scopeable /go; offline contract suite for every backend; self-refreshing installed docs) | 108 |
+| **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe; per-task authored child workflows; LP-CAS integration; pluggable task stores: files/beads/multica/linear; focus-driven bare /go; store-side snapshot narrowing with a verified relay; per-task integrity quarantine; tiered model routing; offline contract suite for every backend) | 117 |
 | **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 17 |
 
-**Total**: 159 plugin files + 13 project/docs files = 172 tracked files.
+**Total**: 168 plugin files + 13 project/docs files = 181 tracked files.
 
 **acf-mission-control** prices sessions itself as of **1.3.0**. Claude Code only knows rates for models it ships, so anything behind a gateway (`nebius/zai-org/GLM-5.2`, `zai-org/GLM-5.2`) reported `$0.00` no matter the spend. The HUD now sums transcript token usage — deduplicated by `requestId`, since Claude Code writes one record per content block and repeats the full usage in each, which inflates naive sums 3-4× — and multiplies it by LiteLLM's rate table, cached under `~/.cache/acf-mission-control/` and refreshed daily in a detached process so the status line never blocks on the network. Provider prefixes are routing, not identity: segments are stripped left to right until an entry matches, then the bare model name is looked up wherever it is published. Self-priced figures are marked `≈`, a trailing `?` flags tokens the table could not price exactly, and `--price-check <model-id>` shows the resolved entry. With no cached table the segment degrades to Claude Code's own figure. **1.3.1** makes that figure the *whole* session: subagent and workflow conversations live in sibling transcripts under `<transcript>/subagents/` and were silently excluded, often most of the spend (a measured session read `≈$6.03` and actually cost `$25.71`). It also stops a zero-rate entry from producing a confident `≈$0.00` that suppressed the fallback, raises `?` when a missing cache rate forces tokens onto the input rate (~4× overstatement, reachable on gateway-served Claude ids), applies published speed multipliers (fast mode bills 2×), resolves context-window variants like `claude-opus-5[1m]`, and splits JSONL on newlines only — `splitlines()` also breaks on U+2028/U+2029/U+0085 and silently dropped those records' tokens.
 
@@ -44,7 +44,7 @@
 
 **3.2.0 replaces the one-agent-per-task leaf.** Until now every dispatched unit — a one-line config bump and a cross-cutting refactor alike — was executed by exactly one `agent()` call, with no depth or fan-out variation. Each unit now runs as **its own nested workflow**, whose harness a **workflow-architect** agent authors for that specific task by filling four marked regions of a locked, byte-diffed skeleton (`skills/lib/child-skeleton.js.tmpl`); a 20-check validator rejects a defective harness *before* any child agent spawns, turning most generated-code throw classes into error strings the architect repairs. Free-form generated scripts were designed and rejected: their keystone defect inverted the durability requirement, making every resumed harness return `'none'` forever. When a harness does throw, a scout reconciles its stage ledger against git — trusting a commit-bearing entry only when an `ACFW-Stage:` trailer confirms it, and resolving every disagreement toward an *informed re-run* rather than a skip — and the amended run replays completed stages in **zero agents**. Repair rounds are granted only when the last one measurably moved something. The default harness is deliberately shallow (checkout → implement → bounded gate loop → adversarial diff review → verify), holding the only three mechanisms a script structurally buys over one strong agent: a schema-*observed* advance condition, a fresh-context reviewer of the diff, and a durable ledger. Exactly one agent may write a worktree at a time and exactly one `clean-checkout` runs per attempt — `clean-checkout.sh` is not reentrant, and its silent `stash push -u` would otherwise sweep a sibling stage's work into the shared `refs/stash`. Implementation and conflict resolution escalate by default; the multi-lens review panel ships **off** (`args.escalateReview`) as the only subtractive seam. Because the runtime caps total agents per run, `/go` degrades FULL → LEAN → DIRECT → CLOSE back to verbatim 3.1.0 dispatch — escalation is a policy, not a guarantee, and the report says which one you got. `args.escalate: false` disables it entirely. 3.2.0 also moves the **multica** adapter's audit trail out of issue comments and into the task document's `## Transition Log` table (shared `append_log_row`, files row shape): on that backend a comment thread is a live agent channel, so orchestrator bookkeeping there landed inside a conversation agents act on — and the move drops a `comment list` per in-review task from `snapshot`, retires materialize's synthesized audit section, and keeps a comment-scan fallback so projects upgrading mid-flight are not auto-rejected. `beads`/`linear` keep comments; `CONTRACT.md` now makes the row's location a per-adapter choice.
 
-**3.2.3 makes `/go` scopeable.** It took the whole backlog or nothing — no argument, env var, config key or adapter flag selected tasks, and `skills/go/SKILL.md` was the only whip skill without an `argument-hint`. That is not ergonomics on a shared backlog: one person's `/go` is everyone's, so teams stop running the shipped orchestrator and hand-author throwaway workflows instead, which needs a frontier model every time. Now `/go api-014-token-refresh ui-021-login-form` runs exactly those, and a natural-language filter (`/go frontend tasks only`, `/go bugfixes`) resolves **in the skill, once, before launch** — matched against the fields every backend's snapshot already projects (`agent`, `slug`, `priority`, `stem`, `touchesGlobs`), shown, and confirmed — so the workflow always receives a concrete stem list and stays deterministic. Two things make it correct rather than merely narrow: the dependency **index stays whole** while only the scheduling view narrows (filtering `tasks[]` would make out-of-scope deps unresolvable, and `depsSatisfied` refuses to dispatch on a dangling token), and **completion is counted over the scope** — reusing the store-wide `snap.counts` would make `terminal === total` unreachable and burn all 15 `NO_GAIN_LIMIT` iterations before exiting `no-progress` with the work done. Unmet transitive deps are pulled in and named; nothing outside the scope is dispatched, transitioned or integrated, including by the post-loop drain. Scoping is not a fix for the shared-backend hazard it exposes: the run lock is still per-checkout and `transition` still has no compare-and-swap, so `atomic-claim` remains unimplemented. See `acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
+**3.2.3 makes `/go` scopeable.** It took the whole backlog or nothing — no argument, env var, config key or adapter flag selected tasks, and `skills/go/SKILL.md` was the only whip skill without an `argument-hint`. That is not ergonomics on a shared backlog: one person's `/go` is everyone's, so teams stop running the shipped orchestrator and hand-author throwaway workflows instead, which needs a frontier model every time. Now `/go api-014-token-refresh ui-021-login-form` runs exactly those, and a natural-language filter (`/go frontend tasks only`, `/go bugfixes`) resolves **in the skill, once, before launch** — matched against the fields every backend's snapshot already projects (`agent`, `slug`, `priority`, `stem`, `touchesGlobs`), shown, and confirmed — so the workflow always receives a concrete stem list and stays deterministic. Two things make it correct rather than merely narrow: the dependency **index stays whole** while only the scheduling view narrows (filtering `tasks[]` would make out-of-scope deps unresolvable, and `depsSatisfied` refuses to dispatch on a dangling token), and **completion is counted over the scope** — reusing the store-wide `snap.counts` would make `terminal === total` unreachable and burn all 15 `NO_GAIN_LIMIT` iterations before exiting `no-progress` with the work done. Unmet transitive deps are pulled in and named; nothing outside the scope is dispatched, transitioned or integrated, including by the post-loop drain. Scoping is not a fix for the shared-backend hazard it exposes: the run lock is still per-checkout and `transition` still has no compare-and-swap, so `atomic-claim` remains unimplemented.
 
 **3.3.0 makes the non-`files` backends visible.** Every defect it fixes was found against a live
 non-`files` store, and they shared one cause: `run-all.sh` marked the three adapter suites OPTIONAL,
@@ -81,8 +81,62 @@ an untracked one with no history to recover from, erasing the FATAL that should 
 was a permanent fixed point in `in-review/` (its only writer runs at dispatch, so no later review
 could restore it); a scoped `/go` on a card in no recognised state reported "Backlog 100% terminal";
 and the legacy fallback loop built one integrate queue and iterated another, so it integrated nothing
-at all. `--digest` remains a no-op on every non-`files` backend and is staged for 3.4.0. See
-`acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
+at all. `--digest` remained a no-op on every non-`files` backend; 3.4.0 fixes it.
+
+**3.4.0 stops the snapshot going through an agent unbounded, and stops a bare `/go` meaning everyone's
+board.** Four things a team running a large shared board reported, and the defects underneath each.
+**The snapshot.** A `/go` scoped to five ids stopped with "tasks that do not exist in the backlog",
+naming three that were all present: the board had several hundred cards, its snapshot several hundred KB, and `/go`'s scan
+agent — which reads the store walk's stdout and copies it into one schema string — returned two of
+five. Valid JSON, nothing checked. `acfw-store snapshot --only <key>…` now emits the **closure** of the
+named tasks (seeds plus every dependency that is not accepted-terminal) as a dispatcher post-stage
+(`skills/lib/bin/acfw-scope-snapshot.sh`) over the enriched JSON, so a five-task run relays five
+records whatever the board's size; the same stage gives raw adapters a **real `--digest`**, a
+documented no-op on every non-`files` backend since 3.1.0. `--only` reaches an adapter only under the
+new `snapshot-only` capability — a raw adapter must keep listing everything, because the closure and
+the store-wide counts are computed from the full set. Seeds resolve exact id → stem → **backend id**
+(`/go MUL-4821` works) → *unique* prefix, and an ambiguous prefix is reported with candidates rather
+than resolved by first match. Every snapshot then leads with a `relay` header (per-array counts plus
+the UTF-8 byte sum of every stem) that the orchestrator recomputes: a count alone is forgeable by a
+model tidying a header it can see. A short relay ends the run as **`relay-truncated`** with the honest
+remedy, never as a missing id, and the ids a caller named get a stronger guarantee still — every seed
+the store resolved must be exactly present in the relayed index. The doctor's findings ride the same
+hop, so `fatal=N` is cross-checked against the lines relayed; a dropped FATAL would silently un-hold
+its task. `--full-to` tees the pre-narrowing snapshot so `doctor --snapshot` reads the scheduler's own
+store walk. Two live defects surfaced building it: a `blocked` dependency was never pulled into a
+scope (it is *retryable*, and the pass that lifts it runs over the scope, so it could never be
+lifted), and `noGain` only reset when `terminal` rose — a finished task collapses out of the working
+set, so seventeen same-slug tasks exhausted the budget and exited `no-progress` with the work done.
+**The gate.** One long-cancelled card with a hand-edited state blocked every `/go` for a whole team.
+FATALs now have two scopes: **repo-scoped** (detached HEAD, a worktree on the wrong branch, an
+unreadable store) abort as before; **task-scoped** hold out that one task — never dispatched, never
+integrated, still gating its dependents, its worktree slug still reserved — and the rest of the board
+runs. A finding naming nothing the scheduler can act on gates nothing (`fatalsNotGating`). Field 3 of
+a doctor line is now a routing decision in `CONTRACT.md`, matched exactly, because a loose match would
+attach a finding to the wrong task. Holding work out changes what done means, so there is a new
+terminal reason **`partial`** with `completed: false` and a `heldOut[]`; `gated[]` explains a
+`no-progress` exit by naming the dependency each pending task waits on. Quarantine is workflow-only —
+the legacy markdown loop still refuses on any FATAL, and the skill says so.
+**The focus.** A bare `/go` now runs a small, per-checkout list of *your* tasks. `/task` sets it to
+what it just created, chained onto each `create` with `&&` so a failed create never enters it, making
+plan → `/task` → `/go` argument-free while still running only your own work; `/whip-focus` manages it
+by hand. It holds script-resolved stems only and refuses the whole operation on an unknown or
+ambiguous token. With no focus, `files` drains the backlog unchanged while every shared API-backed
+store **refuses** and names the three ways forward; `/go --all` is the explicit "everything", and an
+explicit `/go <ids>` never writes the focus. Pausing became a real state on every backend
+(`/whip-move <task> draft`, `archive` to cancel), and multica's `doctor --fix` no longer overwrites a
+human hold — it had been un-parking every card the team parked, on every bootstrap.
+**The cost.** Agents route by tier: cheap for fixed-command shell runners (in `/task` the registry
+`ls`, both writers and the doctor had been paying frontier rates to echo command output), the
+project's declared per-agent `model:` for specialists and reviewers, session model for the architect
+and the conflict resolver. Pinned once per repo; both reports carry `models` and `agentsByTier`.
+Raising the shell tier was the suggested workaround for the truncated snapshot — the wrong lever, so
+that tier stays cheap and the payload is bounded instead. Adjacent fixes: `cyclic-deps` reported every
+task a cycle could *reach* (now Tarjan SCC in both batteries); the orphan reaper destroyed
+accepted-but-unintegrated worktrees on the next bootstrap `--fix`; `dup-folder-unresolvable` was
+invisible to the gate that reads it; and every pre-dispatch abort now releases the run lock instead of
+holding it for half an hour after dispatching nothing. See `acf-whip/CHANGELOG.md` for version history
+and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
 
 **Plugin architecture**: Each plugin is fully self-contained with no cross-dependencies. Users can install any combination.
 
@@ -102,7 +156,7 @@ acf-tools/
 ├── acf-nitro/                       # Parallel enforcement (6 files)
 ├── acf-mission-control/             # Status HUD (6 files)
 ├── acf-librarian/                   # Convention enforcement (9 files)
-├── acf-whip/                        # Workflow automation, workflow-native (108 files; skills/ + workflows/ + adapters/ + tests/)
+├── acf-whip/                        # Workflow automation, workflow-native (117 files; skills/ + workflows/ + adapters/ + tests/)
 └── acf-advisor/                     # Second-opinion LLM client (17 files)
 ```
 
@@ -454,6 +508,6 @@ The plugins themselves CREATE documentation when installed in user projects:
 ---
 
 **Repository Version**: v1.0
-**Last Updated**: 2026-09-13
+**Last Updated**: 2026-09-22
 **Marketplace Plugins**: 7
-**Total Files**: 172 (tracked)
+**Total Files**: 181 (tracked)
