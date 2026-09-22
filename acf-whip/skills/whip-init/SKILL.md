@@ -159,7 +159,7 @@ ensure_gitignore() { # <pattern> <comment>
 }
 ensure_gitignore "${WT_DIR%/}/" 'ACF Whip per-task worktrees (clean-checkout-before-task)'
 ensure_gitignore '.backlog/.acfw-run.json' 'ACF Whip /go run heartbeat'
-ensure_gitignore '.acfwhip/run/' 'ACF Whip /go run state (per-task harness scripts and stage ledgers)'
+ensure_gitignore '.acfwhip/run/' 'ACF Whip /go run state (per-task harness scripts, stage ledgers, /task staging, the run focus)'
 ensure_gitignore '.acfwhip/specs/' 'ACF Whip materialized task specs (non-files stores)'
 ```
 

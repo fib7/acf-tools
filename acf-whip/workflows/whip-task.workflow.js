@@ -28,6 +28,12 @@ const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 const store = (args && args.store) || 'files'
 const filesStore = store === 'files'
 const STORE = `${pluginRoot}/skills/lib/bin/acfw-store`
+// The run focus (3.4.0): the tasks a bare `/go` runs in THIS checkout. /task sets it to what it just
+// created, so the common path — plan, /task, /go — needs no arguments and still runs only your own
+// work. Chained onto each `create` with && rather than written in one go at the end: a create that
+// fails with a duplicate id must not put that id in the focus, and shell semantics decide that more
+// reliably than an agent re-reading which of its commands succeeded.
+const FOCUS = `${pluginRoot}/skills/lib/bin/acfw-focus`
 const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=${sq(trunkBranch)}; export ACFW_STORE=${sq(store)};`
 // ============================ model routing (3.4.0) ============================
 // Same three-tier policy as /go, and for the same reason: an agent is routed by what it DOES.
@@ -566,7 +572,7 @@ if (writtenFiles.length && !filesStore) {
   // stamp below — the store copy, not the authored line, is what /go schedules from).
   const createLines = writtenTasks.map((t) => {
     const deps = (Array.isArray(t.dependencies) ? t.dependencies : []).join(', ') || 'none'
-    return `  bash ${sq(STORE)} create --file ${sq(`${trunkRoot}/${AUTHOR_DIR}/${t.filename}`)} --folder pending --set ${sq(`Dependencies=${deps}`)} && rm -f ${sq(`${trunkRoot}/${AUTHOR_DIR}/${t.filename}`)}`
+    return `  bash ${sq(STORE)} create --file ${sq(`${trunkRoot}/${AUTHOR_DIR}/${t.filename}`)} --folder pending --set ${sq(`Dependencies=${deps}`)} && rm -f ${sq(`${trunkRoot}/${AUTHOR_DIR}/${t.filename}`)} && bash ${sq(FOCUS)} add --no-resolve --by task ${sq(t.id)}`
   }).join('\n')
   writeResult = await agent(
     `You are the single backlog writer. ${ENV} Working at the trunk repo root ${sq(trunkRoot)}.
@@ -611,6 +617,8 @@ ${depStamps}
 4. Stage ONLY those files:  git add ${writtenFiles.map((f) => `.backlog/pending/${sq(f)}`).join(' ')}
 5. Commit once:  git commit -q -m "task: create ${writtenFiles.length} backlog task(s) [${[...new Set(writtenTasks.map((t) => t.worktreeSlug))].join(', ')}]"
 6. Capture the new HEAD sha:  git rev-parse HEAD
+7. Point this checkout's run focus at the tasks you just created, so a bare /go runs them and nothing else (best-effort — if it fails, say so in note and continue; the tasks are already committed):
+   bash ${sq(FOCUS)} add --no-resolve --by task ${writtenTasks.map((t) => sq(t.id)).join(' ')}
 
 Make NO other edit to the files. Do NOT touch any other path. Return the WriteResult.`,
     shellOpts({ label: 'write:commit', phase: 'Write', schema: WRITE_RESULT }),
@@ -652,7 +660,8 @@ return {
   // because a config pin was misspelled is otherwise indistinguishable from one that honoured it.
   models: { shell: SHELL_MODEL, judge: MODELS.judge || null, author: MODELS.author || null, efforts: { shell: EFFORTS.shell || null } },
   agentsByTier,
+  focus: { count: writtenTasks.length, note: 'a bare /go runs these and nothing else; /go --all runs the whole backlog' },
   nextStep: critique.length
-    ? `Run /go to execute the backlog. NOTE: ${critique.length} advisory critique(s) were left unresolved — review them before running /go.`
-    : 'Run /go to execute the backlog.',
+    ? `Run /go — it runs these ${writtenTasks.length} task(s) as your focus. NOTE: ${critique.length} advisory critique(s) were left unresolved — review them first.`
+    : `Run /go — it runs these ${writtenTasks.length} task(s) as your focus (/go --all runs the whole backlog).`,
 }

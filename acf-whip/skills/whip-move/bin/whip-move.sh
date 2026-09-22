@@ -29,7 +29,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPLY="$SCRIPT_DIR/../../go/bin/apply-transition.sh"
 . "$SCRIPT_DIR/../../lib/acfw-git.sh"
 
-VALID_STATES="pending in-progress completed in-review accepted rejected blocked"
+# draft and archive (3.4.0) are the PAUSE and CANCEL states, and they are the supported way to park
+# work on every backend. Both were already in the store vocabulary and both are already understood by
+# the whole system — the scheduler never dispatches them, the enricher keeps them resolvable for
+# dependency lookups without scheduling them, and the doctor reports a dependent as gated rather than
+# dangling. What was missing was a way to REACH them without hand-editing a card.
+#
+# This matters because the alternatives people reach for are worse. Dropping a task from a run focus
+# does not pause it: a scoped run pulls in unmet dependencies, so it comes straight back. Setting a
+# native "blocked"/"cancelled" status on an API-backed board does not pause it either — whip reads its
+# own metadata, not the native status — and until 3.4.0 `doctor --fix` would rewrite that native
+# status back on the next bootstrap. Pausing is a STATE, and this is how you set it.
+VALID_STATES="pending in-progress completed in-review accepted rejected blocked draft archive"
 
 TASK=""
 TO_STATE=""

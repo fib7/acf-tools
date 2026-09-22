@@ -287,6 +287,36 @@ DOC=$("$ADAPTER" doctor 2>/dev/null); DOC_RC=$?
 check "an out-of-vocabulary state is WARN, not FATAL" "printf '%s\n' \"\$DOC\" | grep -q '^WARN|invalid-state|'"
 check "...and therefore does not fail the gate" "[ $DOC_RC -eq 0 ]"
 check "...and names the remedy" "printf '%s\n' \"\$DOC\" | grep -q 'transition s-002-b archive'"
+# ---- a human HOLD is an instruction, not drift (3.4.0) ----------------------------------------
+# `/go` runs `doctor --fix` at bootstrap. Repairing a native blocked/cancelled back to the whip state
+# meant every run silently un-parked every card the team had parked — the board-level equivalent of
+# reverting someone's work. It is reported and left alone now, with the supported way to park a task
+# named in the finding.
+HOLD_UUID=$(jq -r '.issues | to_entries[] | select(.value.metadata.whip_key=="s-001-a") | .key' "$SNP")
+ACFW_MULTICA_BIN="$FAKE" "$FAKE" issue metadata set "$HOLD_UUID" --key whip_state --value pending --type string >/dev/null
+jq --arg u "$HOLD_UUID" '.issues[$u].status = "cancelled"' "$SNP" > "$SNP.t" && mv "$SNP.t" "$SNP"
+DOCH=$("$ADAPTER" doctor 2>/dev/null)
+check "a natively cancelled card whose whip_state is runnable is a HOLD, not drift" \
+  "printf '%s\n' \"\$DOCH\" | grep -q '^WARN|native-hold|s-001-a|'"
+check "...never REPAIRABLE (that is what made --fix overwrite it)" \
+  "! printf '%s\n' \"\$DOCH\" | grep -q '^REPAIRABLE|status-drift|s-001-a|'"
+check "...and it names the supported way to park a task" \
+  "printf '%s\n' \"\$DOCH\" | grep -q 'transition s-001-a draft'"
+"$ADAPTER" doctor --fix >/dev/null 2>&1
+AFTER=$(jq -r --arg u "$HOLD_UUID" '.issues[$u].status' "$SNP")
+check "--fix leaves the human hold in place" "[ \"\$AFTER\" = 'cancelled' ]"
+# ...while ordinary drift (native status behind an ordinary whip state) is still repaired.
+DRIFT_UUID=$(jq -r '.issues | to_entries[] | select(.value.metadata.whip_key=="s-002-b") | .key' "$SNP")
+jq --arg u "$DRIFT_UUID" '.issues[$u].status = "todo" | .issues[$u].metadata.whip_state = "in-progress"' "$SNP" > "$SNP.t" && mv "$SNP.t" "$SNP"
+DOCD=$("$ADAPTER" doctor 2>/dev/null)
+check "ordinary status drift is still REPAIRABLE" \
+  "printf '%s\n' \"\$DOCD\" | grep -q '^REPAIRABLE|status-drift|s-002-b|'"
+"$ADAPTER" doctor --fix >/dev/null 2>&1
+DAFTER=$(jq -r --arg u "$DRIFT_UUID" '.issues[$u].status' "$SNP")
+check "...and --fix still repairs it" "[ \"\$DAFTER\" = 'in_progress' ]"
+# restore the fixture for the assertions that follow
+jq --arg u "$DRIFT_UUID" '.issues[$u].metadata.whip_state = "in-external-review"' "$SNP" > "$SNP.t" && mv "$SNP.t" "$SNP"
+
 DOCQ=$("$ADAPTER" doctor --quiet 2>/dev/null)
 check "--quiet drops the advisory but keeps the SUMMARY" \
   "! printf '%s\n' \"\$DOCQ\" | grep -q '^WARN|' && printf '%s\n' \"\$DOCQ\" | grep -q '^SUMMARY|'"

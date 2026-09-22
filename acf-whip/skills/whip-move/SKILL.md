@@ -1,7 +1,7 @@
 ---
 name: whip-move
-description: Safely move ONE acf-whip backlog task between state folders (or set Integrated-At / add a Dependency) without hand-editing files. Resolves a task by stem/id and runs the validated apply-transition.sh writer — atomic Status sync + Transition Log row + commit — so manual close-out after a crash is a one-liner, not raw perl/sed. Use for last-mile reconciliation; run /whip-doctor after.
-argument-hint: "<task> <state> [--reason ..] [--integrated-at SHA] [--add-dep ID]"
+description: Safely move ONE acf-whip backlog task between state folders — including `draft` to PAUSE it and `archive` to CANCEL it, the supported way to park work on every backend (or set Integrated-At / add a Dependency) without hand-editing files. Resolves a task by stem/id and runs the validated apply-transition.sh writer — atomic Status sync + Transition Log row + commit — so manual close-out after a crash is a one-liner, not raw perl/sed. Use for last-mile reconciliation; run /whip-doctor after.
+argument-hint: "<task> <state: pending|in-progress|completed|in-review|accepted|rejected|blocked|draft|archive> [--reason ..] [--integrated-at SHA] [--add-dep ID]"
 allowed-tools:
   - Bash
   - Read
@@ -29,8 +29,17 @@ bash "${CLAUDE_PLUGIN_ROOT}/skills/whip-move/bin/whip-move.sh" <TASK> <TO_STATE>
 
 - `<TASK>` — task stem, id, or a **unique prefix** (resolved across all `.backlog/<state>/`
   folders; ambiguous matches are refused with the candidate list).
-- `<TO_STATE>` — `pending | in-progress | completed | in-review | accepted | rejected | blocked`.
-  Pass the task's **current** state to apply field edits without moving it.
+- `<TO_STATE>` — `pending | in-progress | completed | in-review | accepted | rejected | blocked |
+  draft | archive`. Pass the task's **current** state to apply field edits without moving it.
+
+  **`draft` is PAUSE and `archive` is CANCEL** — the supported way to park work on every backend.
+  Both are inert to the scheduler (nothing dispatches, transitions or integrates them) while staying
+  resolvable as dependencies, so a dependent is reported as *gated, and here is why* rather than as a
+  dangling reference. Reach for these instead of the two things that look like they should work and
+  do not: dropping a task from a run focus does not pause it (a scoped run pulls in unmet
+  dependencies, so it comes straight back), and setting a native `blocked`/`cancelled` status on an
+  API-backed board does not pause it either — whip reads its own metadata, not the native status.
+  Bring a paused task back with `pending`.
 
 ### Flags
 

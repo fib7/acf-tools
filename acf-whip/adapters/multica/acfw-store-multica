@@ -855,7 +855,19 @@ cmd_doctor() {
        | "FATAL|duplicate-key|\(.[0].metadata.whip_key)|\(length) issues share this whip_key"),
     (.[] | select((.metadata.whip_state // "") as $s | (states | index($s)) == null)
        | "WARN|invalid-state|\(.metadata.whip_key)|whip_state=\(.metadata.whip_state // "<none>") is outside the whip vocabulary; no scheduler path can dispatch, transition or integrate it. Retire it with: acfw-store transition \(.metadata.whip_key) archive"),
-    (.[] | select((.metadata.whip_state // "") as $s | (nstat[$s] // "") as $w | ($w != "" and .status != $w))
+    # Status drift, split by DIRECTION (3.4.0). Drift where the native status is an ordinary workflow
+    # state is a bookkeeping slip and is repaired as before. Drift where a human has put the card on
+    # HOLD — native blocked or cancelled, while whip_state still says it is runnable — is not drift at
+    # all: it is an instruction, and the old repair overwrote it. `/go` runs `doctor --fix` at
+    # bootstrap, so every run silently un-parked every card the team had parked, which is exactly the
+    # behaviour that teaches people the tool cannot be trusted with their board. Report it, name the
+    # supported way to park a task in the whip state vocabulary, and never write over it.
+    # (No apostrophes in this block: it lives inside a single-quoted jq program.)
+    (.[] | select((.metadata.whip_state // "") as $s | (nstat[$s] // "") as $w | (.status // "") as $ns
+                  | ($w != "" and $ns != $w and ($ns == "blocked" or $ns == "cancelled")))
+       | "WARN|native-hold|\(.metadata.whip_key)|native status is \(.status) but whip_state=\(.metadata.whip_state) is runnable. Treating the hold as intentional and NOT repairing it. To park this task where the scheduler and the doctor both understand it: acfw-store transition \(.metadata.whip_key) draft   (or archive to retire it)"),
+    (.[] | select((.metadata.whip_state // "") as $s | (nstat[$s] // "") as $w | (.status // "") as $ns
+                  | ($w != "" and $ns != $w and $ns != "blocked" and $ns != "cancelled"))
        | "REPAIRABLE|status-drift|\(.metadata.whip_key)|native=\(.status) want=\(nstat[.metadata.whip_state])"),
     (.[] | select((.metadata.whip_rejections | type) != "number")
        | "REPAIRABLE|bad-rejections|\(.metadata.whip_key)|whip_rejections is not a number"),

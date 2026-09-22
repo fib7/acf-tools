@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# acfw-focus — the run focus: what a bare `/go` runs (acf-whip 3.4.0).
+#
+# WHY THIS EXISTS
+# ---------------
+# `/go` with no arguments meant "the whole backlog". On a checkout whose backlog is its own that is
+# what the operator meant. On a SHARED board it never is: one person's bare `/go` would be everyone's,
+# so teams stop running the shipped orchestrator and hand-author throwaway ones instead. Naming ids
+# every time is the workaround, and it is the thing people actually complain about.
+#
+# The focus is the missing third option: a small, per-checkout list of the tasks *I* am working on,
+# which a bare `/go` runs. `/task` sets it to the tasks it just created, so the common path —
+# plan, /task, /go — needs no arguments at all and still runs only your own work.
+#
+# WHAT IT IS NOT
+# --------------
+# Not a pause mechanism. Dropping a task from a focus does not stop it running: a scoped run pulls in
+# unmet dependencies, so a dropped task that something in the focus depends on comes straight back.
+# Pausing is a STATE — `whip-move <key> draft` — and cancelling is `archive`. Those are refusals the
+# scheduler and the doctor both understand; a focus is only a selection.
+#
+# Not shared state. It lives under .acfwhip/run/ (gitignored) because it is one person's current
+# selection in one checkout, never a fact about the project. Two people sharing a board have two
+# focuses, which is the entire point.
+#
+# FORMAT — plain text, no jq, bash 3.2:
+#   # store=<backend>     refuse to use a focus written against a different store
+#   # setBy=task|focus    who wrote it (shown to the operator before a bare /go launches)
+#   # ts=<UTC>            when
+#   <stem>                one exact, script-resolved stem per line
+#
+# Stems only, and only ones the STORE resolved. A focus holding raw argv would inherit every
+# ambiguity of the thing typed — a prefix that matched one task today and two tomorrow, a typo that
+# resolved to a neighbour — and a selection that silently changes meaning is worse than no selection.
+#
+# Usage:
+#   acfw-focus show [--live]            print the focus (with --live: each task's current state)
+#   acfw-focus set  <tok>...            replace the focus (resolves every token first)
+#   acfw-focus add  <tok>...            add to it (replaces outright when every existing entry is done)
+#   acfw-focus drop <tok>...            remove entries (matched as stem, id, or the literal line)
+#   acfw-focus clear                    remove the focus entirely
+#   acfw-focus path                     print the focus file path
+# Flags: --no-resolve (skip store resolution; the /task writer only) --by <who> (stamp setBy)
+# Exit:  0 ok · 2 usage · 3 a token did not resolve (nothing written) · 5 store unreachable
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$LIB_DIR/acfw-git.sh"
+
+REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+[ -n "$REPO_ROOT" ] || { echo "FATAL: not inside a git repo and ACFW_TRUNK_ROOT unset" >&2; exit 2; }
+
+STORE_BIN="$SCRIPT_DIR/acfw-store"
+STORE=$(acfw_resolve_store "$REPO_ROOT")
+FOCUS=$(acfw_focus_path "$REPO_ROOT")
+FOCUS_DIR=$(dirname "$FOCUS")
+
+SUB="${1:-show}"
+[ $# -gt 0 ] && shift
+
+NO_RESOLVE=0
+BY="focus"
+TOKENS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-resolve) NO_RESOLVE=1; shift ;;
+    --by) [ $# -ge 2 ] || { echo "FATAL: --by requires a value" >&2; exit 2; }; BY="$2"; shift 2 ;;
+    --by=*) BY="${1#--by=}"; shift ;;
+    --live) LIVE=1; shift ;;
+    --) shift; while [ $# -gt 0 ]; do TOKENS[${#TOKENS[@]}]="$1"; shift; done ;;
+    -*) echo "FATAL: unknown flag '$1'" >&2; exit 2 ;;
+    *) TOKENS[${#TOKENS[@]}]="$1"; shift ;;
+  esac
+done
+LIVE="${LIVE:-0}"
+
+# ---- read: stems only, comments and blanks stripped -------------------------------------------
+read_stems() { [ -r "$FOCUS" ] || return 0; grep -v '^[[:space:]]*#' "$FOCUS" 2>/dev/null | grep -v '^[[:space:]]*$' || true; }
+header_get() { [ -r "$FOCUS" ] || return 0; sed -n "s/^# $1=//p" "$FOCUS" 2>/dev/null | head -1; }
+
+# A focus written against a different backend describes tasks that do not exist here. Refuse rather
+# than run something: the stems may even collide, which is worse than not resolving at all.
+assert_store_match() {
+  local was
+  was=$(header_get store)
+  [ -z "$was" ] && return 0
+  [ "$was" = "$STORE" ] && return 0
+  echo "FATAL: the focus at $FOCUS was written for the '$was' store, but this checkout uses '$STORE'. Run: acfw-focus clear" >&2
+  exit 2
+}
+
+# ---- gitignore guard ---------------------------------------------------------------------------
+# A focus is one person's selection; committing it would make it everyone's, which is the failure
+# this feature exists to prevent. whip-init writes this ignore rule, but a project that adopted the
+# plugin before it existed (or removed the line) would silently start tracking it.
+ensure_ignored() {
+  mkdir -p "$FOCUS_DIR" 2>/dev/null || true
+  if ! git -C "$REPO_ROOT" check-ignore -q ".acfwhip/run/" 2>/dev/null; then
+    grep -qxF '.acfwhip/run/' "$REPO_ROOT/.gitignore" 2>/dev/null \
+      || printf '\n# ACF Whip /go run state (per-task harness scripts, stage ledgers, /task staging, the run focus)\n.acfwhip/run/\n' >> "$REPO_ROOT/.gitignore"
+  fi
+  if ! git -C "$REPO_ROOT" check-ignore -q ".acfwhip/run/" 2>/dev/null; then
+    echo "FATAL: .acfwhip/run/ is not gitignored and the rule could not be added. A focus is per-person state and must never be committed. Add '.acfwhip/run/' to .gitignore, then retry." >&2
+    exit 2
+  fi
+}
+
+# ---- resolution ---------------------------------------------------------------------------------
+# Tokens resolve through the STORE (`snapshot --only`), which answers over the whole board and refuses
+# an ambiguous prefix instead of guessing. RESOLVED/UNRESOLVED are filled; nothing is written unless
+# every token resolved.
+RESOLVED=""
+UNRESOLVED=""
+resolve_tokens() {
+  local out rc
+  RESOLVED=""; UNRESOLVED=""
+  [ ${#TOKENS[@]} -gt 0 ] || return 0
+  if [ "$NO_RESOLVE" = "1" ]; then
+    local t
+    for t in "${TOKENS[@]}"; do RESOLVED="$RESOLVED$t
+"; done
+    return 0
+  fi
+  local args=(snapshot)
+  local t
+  for t in "${TOKENS[@]}"; do args[${#args[@]}]="--only"; args[${#args[@]}]="$t"; done
+  out=$(bash "$STORE_BIN" "${args[@]}" 2>/dev/null); rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    echo "FATAL: could not read the task store to resolve these tasks (acfw-store snapshot exited $rc). Fix the backend and retry, or pass --no-resolve if you are certain of the stems." >&2
+    exit 5
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    # No jq (the files backend runs without it). Parse the two fields we need with sed: the resolved
+    # map's values, and the unresolved list. Deliberately narrow — a parse miss must look like "did
+    # not resolve", never like "resolved to something".
+    RESOLVED=$(printf '%s' "$out" | tr ',' '\n' | sed -n 's/.*"resolved":{*"[^"]*":"\([^"]*\)".*/\1/p; s/^"\([^"]*\)":"\([^"]*\)"}*$/\2/p' | grep -v '^$' | sort -u)
+    UNRESOLVED=$(printf '%s' "$out" | sed -n 's/.*"unresolved":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '"' | grep -v '^$' || true)
+  else
+    RESOLVED=$(printf '%s' "$out" | jq -r '(.scope.resolved // {}) | to_entries[] | .value' 2>/dev/null | grep -v '^$' | sort -u)
+    UNRESOLVED=$(printf '%s' "$out" | jq -r '((.scope.unresolved // []) + ((.scope.ambiguous // []) | map(.tok + " (matches " + ((.candidates // []) | join(", ")) + ")"))) []' 2>/dev/null || true)
+  fi
+  if [ -n "$UNRESOLVED" ]; then
+    echo "FATAL: these do not resolve to exactly one task, so the focus was NOT changed:" >&2
+    printf '  %s\n' $UNRESOLVED >&2
+    echo "A focus holds exact stems only — a token that is ambiguous today would silently select a different task tomorrow." >&2
+    exit 3
+  fi
+}
+
+write_focus() { # <stems on stdin>
+  local tmp ts
+  ensure_ignored
+  ts=$(date -u +"%Y-%m-%d %H:%M:%S")
+  tmp="$FOCUS.tmp.$$"
+  {
+    printf '# acf-whip run focus — what a bare `/go` runs in THIS checkout. Not committed, not shared.\n'
+    printf '# store=%s\n' "$STORE"
+    printf '# setBy=%s\n' "$BY"
+    printf '# ts=%s UTC\n' "$ts"
+    cat
+  } > "$tmp" || { rm -f "$tmp"; echo "FATAL: could not write $tmp" >&2; exit 2; }
+  mv -f "$tmp" "$FOCUS" || { rm -f "$tmp"; echo "FATAL: could not install $FOCUS" >&2; exit 2; }
+}
+
+case "$SUB" in
+  path) printf '%s\n' "$FOCUS" ;;
+
+  show)
+    if [ ! -r "$FOCUS" ]; then echo "no focus set (bare /go has no saved selection in this checkout)"; exit 0; fi
+    assert_store_match
+    STEMS=$(read_stems)
+    if [ -z "$STEMS" ]; then echo "focus file exists but is empty"; exit 0; fi
+    printf 'focus: %s task(s), set by %s at %s\n' "$(printf '%s\n' "$STEMS" | grep -c '[^[:space:]]')" "$(header_get setBy)" "$(header_get ts)"
+    if [ "$LIVE" = "1" ] && command -v jq >/dev/null 2>&1; then
+      # --live costs one store read and answers the question an operator actually has before a run:
+      # is any of this still worth running?
+      A=(snapshot); while IFS= read -r st; do [ -n "$st" ] && { A[${#A[@]}]="--only"; A[${#A[@]}]="$st"; }; done <<EOF
+$STEMS
+EOF
+      SNAP=$(bash "$STORE_BIN" "${A[@]}" 2>/dev/null || true)
+      while IFS= read -r st; do
+        [ -z "$st" ] && continue
+        FOLD=$(printf '%s' "$SNAP" | jq -r --arg s "$st" '((.tasks // []) + (.inactive // []))[] | select(.stem == $s) | .folder' 2>/dev/null | head -1)
+        [ -n "$FOLD" ] || FOLD=$(printf '%s' "$SNAP" | jq -r --arg s "$st" 'if ((.satisfiedDeps // []) | map(.stem) | index($s)) then "accepted (integrated)" else empty end' 2>/dev/null | head -1)
+        printf '  %-48s %s\n' "$st" "${FOLD:-<not found>}"
+      done <<EOF
+$STEMS
+EOF
+    else
+      printf '  %s\n' $STEMS
+    fi
+    ;;
+
+  set)
+    [ ${#TOKENS[@]} -gt 0 ] || { echo "FATAL: usage: acfw-focus set <task>..." >&2; exit 2; }
+    resolve_tokens
+    printf '%s\n' "$RESOLVED" | grep -v '^$' | sort -u | write_focus
+    printf 'focus set: %s task(s)\n' "$(printf '%s\n' "$RESOLVED" | grep -c '[^[:space:]]')"
+    ;;
+
+  add)
+    [ ${#TOKENS[@]} -gt 0 ] || { echo "FATAL: usage: acfw-focus add <task>..." >&2; exit 2; }
+    [ -r "$FOCUS" ] && assert_store_match
+    resolve_tokens
+    EXISTING=$(read_stems)
+    # A focus every entry of which is DONE is spent, and appending to it would quietly carry finished
+    # work into the next run's scope forever. Replace it instead — that is what an operator starting
+    # new work means. Only when the store can answer: with no jq, or an unreachable store, append
+    # (adding is always safe; discarding a selection on a guess is not).
+    REPLACE=0
+    if [ -n "$EXISTING" ] && [ "$NO_RESOLVE" != "1" ] && command -v jq >/dev/null 2>&1; then
+      A=(snapshot); while IFS= read -r st; do [ -n "$st" ] && { A[${#A[@]}]="--only"; A[${#A[@]}]="$st"; }; done <<EOF
+$EXISTING
+EOF
+      SNAP=$(bash "$STORE_BIN" "${A[@]}" 2>/dev/null || true)
+      if [ -n "$SNAP" ]; then
+        # Filter by the focus stems explicitly. `--only` narrows tasks[] on the API-backed stores but
+        # NOT on files, whose scanner keeps the whole active board and reports the scope separately —
+        # so counting "non-accepted tasks in the payload" would answer a question about the BOARD and
+        # replace a live focus whenever any other card on it was still pending.
+        STEM_JSON=$(printf '%s\n' "$EXISTING" | grep -v '^$' | jq -R . | jq -sc .)
+        LIVE_LEFT=$(printf '%s' "$SNAP" | jq -r --argjson want "$STEM_JSON" \
+          '[((.tasks // []) + (.inactive // []))[] | select((.stem // "") | IN($want[])) | select((.folder // "") != "accepted")] | length' 2>/dev/null || echo 1)
+        [ "${LIVE_LEFT:-1}" = "0" ] && REPLACE=1
+      fi
+    fi
+    if [ "$REPLACE" = "1" ]; then
+      printf '%s\n' "$RESOLVED" | grep -v '^$' | sort -u | write_focus
+      printf 'focus replaced (every previous task was already done): %s task(s)\n' "$(printf '%s\n' "$RESOLVED" | grep -c '[^[:space:]]')"
+    else
+      printf '%s\n%s\n' "$EXISTING" "$RESOLVED" | grep -v '^$' | sort -u | write_focus
+      printf 'focus now: %s task(s)\n' "$(read_stems | grep -c '[^[:space:]]')"
+    fi
+    ;;
+
+  drop)
+    [ ${#TOKENS[@]} -gt 0 ] || { echo "FATAL: usage: acfw-focus drop <task>..." >&2; exit 2; }
+    [ -r "$FOCUS" ] || { echo "no focus set"; exit 0; }
+    assert_store_match
+    KEEP=$(read_stems)
+    for t in "${TOKENS[@]}"; do
+      KEEP=$(printf '%s\n' "$KEEP" | grep -vxF "$t" || true)
+    done
+    printf '%s\n' "$KEEP" | grep -v '^$' | write_focus
+    printf 'focus now: %s task(s). NOTE: dropping is not pausing — a dropped task that something in the focus depends on is pulled back in. To pause: whip-move <task> draft\n' "$(read_stems | grep -c '[^[:space:]]')"
+    ;;
+
+  clear)
+    rm -f "$FOCUS"
+    echo "focus cleared (bare /go now follows the store's bare-go policy: acfw-store info)"
+    ;;
+
+  *)
+    echo "FATAL: unknown subcommand '$SUB' (expected: show | set | add | drop | clear | path)" >&2
+    exit 2 ;;
+esac

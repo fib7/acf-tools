@@ -1,7 +1,7 @@
 ---
 name: go
 description: Continuous backlog execution until 100% tasks reach terminal states (accepted/blocked)
-argument-hint: "[task-ids | filter description]"
+argument-hint: "[--all | task-ids | filter description]   (no args = your focus)"
 allowed-tools:
   - Bash
   - Glob
@@ -13,8 +13,9 @@ allowed-tools:
 
 # /go - Continuous Backlog Execution
 
-Fire-and-forget automation. Processes the ENTIRE backlog without manual intervention until 100%
-complete — or, when given arguments, exactly the subset you name (see **Run scope** below).
+Fire-and-forget automation. Runs your tasks to completion without manual intervention — your saved
+**focus** when you give no arguments, exactly what you name when you do, and the whole backlog on
+`/go --all` (see **Run scope** below).
 
 ## State Machine (User-Specified)
 
@@ -43,20 +44,37 @@ Execute backlog continuously:
 
 ## Run scope
 
-`/go` with no arguments drains the whole backlog. With arguments it runs **only** what you name:
-
 ```
-/go                                          every actionable task (unchanged)
+/go                                          your FOCUS — the tasks /task last created, or the ones
+                                             you selected with /whip-focus
+/go --all                                    every actionable task in the backlog
 /go api-014-token-refresh ui-021-login-form  exactly those two, plus their unmet dependencies
+/go MUL-4821                                 native backend ids work too
 /go frontend tasks only                      everything a frontend agent owns
 /go bugfixes                                 the fix/bug tasks
 /go high priority backend                    any predicate over the backlog
 ```
 
-Both forms resolve to the same thing before launch: a concrete list of task stems
-(`args.only`). Ids go straight through; a natural-language filter is matched against the task
-store in **step 3** below, shown to you, and confirmed once. The orchestrator itself is
-deterministic either way — it never re-interprets your words mid-run, and the set cannot drift.
+**A bare `/go` runs your focus.** The focus is a small, per-checkout list of the tasks *you* are
+working on. `/task` sets it to the tasks it just created, so the ordinary path — plan, `/task`,
+`/go` — needs no arguments at all and still runs only your own work. `/whip-focus` manages it by
+hand. It is never committed and never shared: two people on one board have two focuses, which is the
+whole point.
+
+**With no focus set**, what a bare `/go` does is a per-store policy (`bareGo`, from `acfw-store
+info`). On the `files` backend the backlog is this checkout's own, so it drains the whole thing,
+unchanged. On a shared API-backed board it does **not**: one person's bare `/go` would be everyone's,
+so it says what would run and asks you to choose. `/go --all` is always the explicit "yes, everything".
+
+Every form resolves to the same thing before launch: a concrete list of task stems (`args.only`).
+Ids go straight through; a natural-language filter is matched against the task store in **step 3**
+below, shown to you, and confirmed once. The orchestrator itself is deterministic either way — it
+never re-interprets your words mid-run, and the set cannot drift.
+
+**Pausing is not a focus operation.** Dropping a task from a focus does not stop it running: a scoped
+run pulls in unmet dependencies, so a dropped task something else needs comes straight back. To park
+a task where the scheduler and the doctor both understand it: `/whip-move <task> draft` (pause) or
+`/whip-move <task> archive` (cancel).
 
 Three properties worth knowing:
 
@@ -120,9 +138,33 @@ legacy loop has). Prefer it.
    If `TRUNK_BRANCH` is empty, STOP — `/go` requires a branch checked out at the repo root.
    The `acfw-store info` line reports the active **task-store backend** (`store`, default `files`),
    its adapter, and the run-lock path (`runLock`) — pass both through in step 4.
-3. **Resolve the run scope** from whatever the user typed after `/go`. Three branches:
+3. **Resolve the run scope** from whatever the user typed after `/go`. Four branches, in this order:
 
-   **(a) No arguments** — omit `only` entirely. Full-backlog behaviour, unchanged.
+   **(0) `--all`** — omit `only` entirely. The whole backlog, explicitly. This always bypasses the
+   focus and the `bareGo` policy; it is how you say "yes, everything" on a shared board.
+
+   **(a) No arguments** — the FOCUS branch. Step 2's `acfw-store info` already told you
+   `focusCount`, `focusFile` and `bareGo`.
+
+   - **`focusCount` > 0** — read it and check it is still worth running, in one call:
+     ```bash
+     bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-focus" show --live
+     ```
+     If every task is already terminal, **do not launch**. Say so and give the three ways forward:
+     `/whip-focus clear`, `/task <scope>` to create new work, or `/go --all`. Otherwise show the
+     list with each task's live state and the `set by … at …` line, take **one confirmation**, and
+     launch with `only: [<the stems>]`, `scopeSource: "focus"`, and
+     `scopeFilter: "focus set by <setBy> <ts>"`. The confirmation matters because a focus is
+     *standing* state — it may have been set by a `/task` run hours ago, or in another session.
+   - **`focusCount` is 0 and `bareGo` is `all`** (the `files` default) — omit `only`. Full-backlog
+     behaviour, unchanged from every release before 3.4.0.
+   - **`focusCount` is 0 and `bareGo` is `refuse`** (the default on every shared, API-backed store) —
+     **do not launch.** Report how many tasks are actionable (`acfw-store snapshot --digest`, count
+     `counts.pending` + `counts.rejected`) and offer exactly three options: name the ids
+     (`/go <ids>`), set a focus (`/task …`, or `/whip-focus set <ids>`), or run everything
+     (`/go --all`). Do not pick one for them. On a board several people share, a bare `/go` that
+     drains the whole thing is one person deciding for everyone, which is the failure this branch
+     exists to prevent.
 
    **(b) The arguments are task ids or stems** (they match the backlog's id/stem shape, e.g.
    `api-014-token-refresh`, `add-login-form`) — pass them straight through as `only: ["api-014-token-refresh", ...]`.
@@ -153,6 +195,12 @@ legacy loop has). Prefer it.
    Scope is resolved **once, at launch**: the workflow receives a fixed stem list, so tasks created
    while the run is in flight do not join it. Unmet dependencies of a scoped task *are* pulled in
    automatically by the orchestrator and named in the run log.
+
+   **Branches (b) and (c) never write the focus.** An explicit `/go <ids>` is a one-off selection,
+   and silently making it the new standing default would mean the next bare `/go` ran something the
+   operator never chose — and, once those tasks finished, would keep reporting "nothing to do"
+   against a stale list. Only `/task` and `/whip-focus` set a focus. Pass `scopeSource: "args"` for
+   both branches.
 4. Launch the orchestrator (it runs in the background; bootstrap runs a doctor `--fix` hard gate and
    the loop re-checks integrity every iteration):
    ```
@@ -160,8 +208,13 @@ legacy loop has). Prefer it.
      name: "acf-whip:whip-go",
      args: { pluginRoot: "<PLUGIN_ROOT>", trunkRoot: "<TRUNK_ROOT>", trunkBranch: "<TRUNK_BRANCH>",
              mode: "default" | "override", store: "<info.store>", runLockPath: "<info.runLock>",
-             // step 3, both branches (b) and (c); OMIT both when the user gave no arguments
-             only: ["<stem-or-id>", ...], scopeFilter: "<the user's words, verbatim>" }
+             // step 3, branches (a-with-focus), (b) and (c). OMIT all three on branch (0) --all and
+             // on a bare /go with no focus under bareGo=all.
+             only: ["<stem-or-id>", ...], scopeFilter: "<the user's words, verbatim>",
+             scopeSource: "focus" | "args",
+             // step 2's `acfw-store info` resolved these from env > .acfwhip/config > defaults.
+             // Pass the object through verbatim; omit it only if `info` predates 3.4.0.
+             models: <info.models> }
    })
    ```
 
@@ -191,12 +244,29 @@ legacy loop has). Prefer it.
 | `maxBlock` | `3` | How many times a specialist may re-block the same task before it stops being re-unblocked and is surfaced for an operator. |
    | `agentBudget` | `8` | Agent ceiling for one harness (enforced inside the child, not advisory). |
    | `agentCap` | `1000` | The run's total agent budget. Drives the FULL → LEAN → DIRECT → CLOSE ladder. |
-   | `shellModel` | `haiku` | Model for the deterministic shell-runner agents. |
+   | `shellModel` | `haiku` | Alias for `models.shell`, kept for compatibility. |
+
+   **Model routing (3.4.0).** Agents are routed by what they DO. Pass `models` through from
+   `acfw-store info`; a project pins it once in `.acfwhip/config` (`ACFW_MODEL_SHELL`,
+   `ACFW_MODEL_JUDGE`, `ACFW_MODEL_AUTHOR`) rather than per invocation.
+
+   | Tier | Default | What it covers |
+   |------|---------|----------------|
+   | `models.shell` | `haiku` | Bootstrap, scan, the single writer, integrate, drain, scout, harness validator, unlock — every agent that runs a fixed command and copies stdout into a schema. |
+   | `models.judge` | *(session)* | `/task` planners, the judge, the critic. |
+   | `models.author` | *(session)* | `/task` task-document authors. |
+   | *(per agent)* | *(their frontmatter)* | Specialists and reviewers run on the `model:` declared in `.claude/agents/<name>.md`, when it declares one. |
+   | *(fixed)* | *(session)* | The workflow architect and the conflict resolver. Not knobs. |
+
+   `efforts.shell` pins reasoning effort for the shell tier. It ships unset deliberately — Haiku is
+   absent from the documented effort-support table — and the run report echoes every tier, so you can
+   measure a change rather than assume it. The report's `agentsByTier` says what each tier spent.
 
    **Run-scope args (3.2.3).** Both come from step 3 and are omitted together on a full-backlog run:
 
    | Arg | Default | Effect |
    |-----|---------|--------|
+   | `scopeSource` | `"args"` when `only` is set | `"focus"` marks a bare-`/go` run of the saved focus. It changes one decision: a paused or retired member of a FOCUS is skipped and reported, while one named EXPLICITLY aborts the run — you asked for a task that cannot run. |
    | `only` | *(none)* | Task stems/ids to run **instead of** the whole backlog. The orchestrator plans, transitions, integrates and counts completion over just these, plus any **unmet dependencies**, which it pulls in and names in the log. An id that does not exist aborts the run rather than silently running a smaller set. |
    | `scopeFilter` | `""` | The operator's raw words, recorded in the `RunReport` — for a natural-language filter this is the only record of what was actually asked for, since `only` holds the resolved stems. |
    The per-iteration scan runs `acfw-store snapshot --digest` (a small scheduling snapshot — counts +
@@ -207,11 +277,30 @@ legacy loop has). Prefer it.
    `shellModel` arg to override it (e.g. pin to the session model for rollback). Specialists, reviewers,
    and conflict-resolvers always run on the session model.
 5. When it completes, report the returned `RunReport` (completed?, iterations, finalCounts,
-   integrated[], stopReason). If it returns `aborted: true` (detached HEAD, an unrepairable FATAL, or
-   `stopReason: 'scope-unresolved'` — an id in `only` that matches no task), surface the reason +
-   fatals and STOP. On a scoped run also report `scopeResolved`, so the operator sees which tasks
-   actually ran and which dependencies were pulled in. Re-running `/go` is the documented resume — git + the task
+   integrated[], stopReason). If it returns `aborted: true`, surface `reason` + `fatals` and STOP.
+   On a scoped run also report `scopeResolved`, so the operator sees which tasks actually ran and
+   which dependencies were pulled in. Re-running `/go` is the documented resume — git + the task
    store (`.backlog/` on the default files backend) are the only durable state.
+
+   **Three fields change what you should say, and none of them is `completed` alone:**
+   - **`heldOut[]`** — tasks the run REFUSED to touch: `quarantined` (a task-level integrity FATAL),
+     `paused` (an inactive member of a focus), or `vanished` (someone retired it mid-run). Name them.
+     A run with anything held out inside its scope reports `stopReason: 'partial'` and
+     `completed: false` — it finished everything it was *allowed* to touch, which is not the same as
+     finishing the backlog, and the difference is exactly what an operator must not have to infer.
+   - **`fatalsNotGating[]`** — integrity findings that name nothing this run could act on. Mention
+     the count and point at `/whip-doctor`; do **not** treat them as failures. A single malformed
+     card no longer stops runs that never touch it.
+   - **`relay{}`** — whether the snapshot hop was verified. `stopReason: 'relay-truncated'` means the
+     board was read correctly but the snapshot could not be relayed intact through the scan agent:
+     nothing was mis-scheduled and nothing is lost. Tell the operator to narrow the run (`/go <ids>`,
+     or set a focus) or raise `models.shell`. Never report it as missing task ids.
+
+   `stopReason: 'scope-unresolved'` still means an id in `only` matched no task — but only when the
+   store itself could not resolve it. A resolved id absent from the relayed snapshot is reported as a
+   relay failure instead, because "check the ids" is the wrong thing to tell someone whose ids were
+   fine. `'gated[]'` explains a `no-progress` exit by naming the dependency each pending task is
+   waiting on.
 
    Also surface `escalation{}` and `agentsUsed`/`agentCap`. They are how an operator tells a fully
    escalated run from one that silently degraded to 3.1.0 dispatch — the two are otherwise
@@ -225,8 +314,16 @@ legacy loop has). Prefer it.
 5. Do **not** also run the legacy loop below — the workflow replaces it.
 
 **Only if the `Workflow` tool is NOT available** (dynamic workflows disabled, or older Claude Code):
-run the legacy single-context loop below. It enforces the same doctor gate and slug rules, but the
-loop lives in your context (and grows it).
+run the legacy single-context loop below. It enforces the same slug rules, but the loop lives in your
+context (and grows it).
+
+**The legacy loop's integrity gate is STRICTER**, and deliberately so: it refuses on ANY FATAL, where
+the orchestrator holds out only the task a task-level finding names. Per-task quarantine needs an
+index to attribute a finding to a task and a place to record what was held out — both of which are
+script state the prose loop does not have. Guessing which findings are safe to ignore, by hand, in
+your context, is exactly the failure mode the classification exists to remove. If a single malformed
+card is blocking this path, fix or retire it (`/whip-move <task> archive`) rather than working around
+the gate.
 
 **Run scope on the legacy path.** That loop is prose you execute, not a script taking args, so a scope
 cannot be threaded into it mechanically. Resolve it exactly as in step 3, then treat the resolved stem
