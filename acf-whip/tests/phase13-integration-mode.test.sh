@@ -147,9 +147,27 @@ check "override --fix: worktree/depslug branch survives" "git -C '$REPO' show-re
 check "override --fix: the worktree dir survives" "[ -d '$REPO/.worktree/depslug' ]"
 check "override --fix: not reported as an orphan at all" "! echo \"\$OUT\" | grep -q 'orphaned-worktree|depslug'"
 
+# 3.4.0: this fixture is accepted with a LIVE branch and NO ledger marker — i.e. its change has not
+# landed. Default mode used to reap it here, and that was a work-loss path, not a cleanup: the drain
+# deliberately leaves an exit-7 conflict "for the next /go run", and a crash between accept and
+# integrate leaves the same state. The very next bootstrap `doctor --fix` removed the worktree and
+# -D'd the branch; the following scan then read hasWorktreeBranch=false, called the task terminal,
+# and the deliverable was gone with nothing anywhere saying so. A slug is spent once its change is ON
+# TRUNK, not once the task is accepted.
 OUT=$(bash "$DOC" --mode default --fix "$REPO")
-check "default --fix: accepted worktree IS reaped (unchanged behavior)" "! git -C '$REPO' show-ref --verify --quiet refs/heads/worktree/depslug"
-check "default --fix: reap is reported" "echo \"\$OUT\" | grep -q 'orphaned-worktree|depslug'"
+check "default --fix: an accepted-but-UNINTEGRATED worktree survives (it is the only copy)" "git -C '$REPO' show-ref --verify --quiet refs/heads/worktree/depslug"
+check "default --fix: its directory survives too" "[ -d '$REPO/.worktree/depslug' ]"
+check "default --fix: and it is not reported as an orphan" "! echo \"\$OUT\" | grep -q 'orphaned-worktree|depslug'"
+
+# ...but once the change IS on trunk the slug is genuinely spent, and the reaper must still reap it.
+git -C "$REPO" worktree remove --force "$REPO/.worktree/depslug" >/dev/null 2>&1 || true
+git -C "$REPO" branch -D worktree/depslug >/dev/null 2>&1 || true
+mktask accepted dep-base depslug accepted go-engineer none "deadbeef" 0 "src/base/**"
+git add -A; git commit -qm integratedmarker
+git -C "$REPO" worktree add -q "$REPO/.worktree/depslug" -b worktree/depslug trunk 2>/dev/null
+OUT=$(bash "$DOC" --mode default --fix "$REPO")
+check "default --fix: an INTEGRATED accepted worktree is still reaped" "! git -C '$REPO' show-ref --verify --quiet refs/heads/worktree/depslug"
+check "default --fix: that reap is reported" "echo \"\$OUT\" | grep -q 'orphaned-worktree|depslug'"
 rm -f .backlog/accepted/dep-base.md; git add -A; git commit -qm cleanupcrossslug
 
 echo "== E: env pin survives acfw_load_namespace sourcing the config =="

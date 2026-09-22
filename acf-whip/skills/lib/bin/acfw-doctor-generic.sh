@@ -145,6 +145,31 @@ function resolve(d,   s){
   for(s in stems){ if(index(s,d)==1){ rcache[d]=s; return s } }
   rcache[d]=""; return ""
 }
+
+# Tarjan strongly-connected components. The previous detector peeled nodes with no DEPENDENTS and
+# reported whatever survived — which reports every node a cycle can REACH, not the cycle. On
+# a->{b,c}, b->a, the peel names a, b AND c, so an innocent dependency of a cycle member was gated
+# with the same FATAL as the cycle itself. Under per-task quarantine that mistake is no longer merely
+# noisy: it holds a healthy task out of the run. Only members of a non-trivial SCC (or a self-loop)
+# are in a cycle, and that is exactly what this computes.
+# (No apostrophes in this block: it lives inside a single-quoted awk program.)
+function scc_visit(v,   i, m, aa, w, cnt, comp, bb) {
+  tj_idx++; tj_num[v]=tj_idx; tj_low[v]=tj_idx
+  tj_sp++; tj_stack[tj_sp]=v; tj_on[v]=1
+  m=split(adj[v], aa, " ")
+  for(i=1;i<=m;i++){
+    w=aa[i]
+    if(w=="" || !(w in stems)) continue
+    if(!(w in tj_num)){ scc_visit(w); if(tj_low[w]<tj_low[v]) tj_low[v]=tj_low[w] }
+    else if(w in tj_on){ if(tj_num[w]<tj_low[v]) tj_low[v]=tj_num[w] }
+  }
+  if(tj_low[v]==tj_num[v]){
+    cnt=0
+    do { w=tj_stack[tj_sp]; tj_sp--; delete tj_on[w]; cnt++; comp[cnt]=w } while(w!=v)
+    if(cnt>1){ for(i=1;i<=cnt;i++) incycle[comp[i]]=1 }
+    else { m=split(adj[v], bb, " "); for(i=1;i<=m;i++) if(bb[i]==v) incycle[v]=1 }
+  }
+}
 {
   stem=$1; folder=$2; id=$3; slug=$5; deps=$7; integ=$8; globs=$9; hasBranch=$11;
   stems[stem]=1; state[stem]=folder; slugOf[stem]=slug; integOf[stem]=integ; depsOf[stem]=deps; globsOf[stem]=globs; hasBranchOf[stem]=hasBranch;
@@ -185,12 +210,9 @@ END{
           print "FATAL|cross-slug-dep-not-integrated|" s "|dispatched (" state[s] ") but cross-slug dep " r " is not accepted+integrated";
     }
   }
-  changed=1;
-  while(changed){ changed=0;
-    for(s in stems){ if(removed[s]) continue;
-      if((s in indeg ? indeg[s] : 0) <= 0){ removed[s]=1; changed=1;
-        m=split(adj[s], aa, " "); for(k=1;k<=m;k++){ t=aa[k]; if(t!="") indeg[t]-- } } } }
-  for(s in stems) if(!removed[s]){ sev=(state[s]=="accepted" || (s in inert))?"WARN":"FATAL"; print sev "|cyclic-deps|" s "|participates in a dependency cycle"; }
+  tj_idx=0; tj_sp=0;
+  for(s in stems) if(!(s in tj_num)) scc_visit(s);
+  for(s in stems) if(s in incycle){ sev=(state[s]=="accepted" || (s in inert))?"WARN":"FATAL"; print sev "|cyclic-deps|" s "|participates in a dependency cycle"; }
 
   # Contended globs, BY INDEX. This was a double loop over every pair of pending tasks with a nested
   # glob comparison — O(P^2 * G^2) — and it emitted one WARN per overlapping PAIR, so a handful of
@@ -216,9 +238,17 @@ END{
 # In override mode an accepted task's worktree branch is the operator's only copy of the deliverable
 # (nothing landed, nothing was pushed), so it is live, not orphaned. This script never reaps, so the
 # stake here is only a spurious WARN — but it must read the same as doctor.sh, which does reap.
+# Mirrors doctor.sh exactly, including the accepted-but-unintegrated case: this battery only
+# reports, but it must not call a worktree orphaned that the reaping battery calls live, or the two
+# tools disagree about the one thing that can destroy a deliverable. "Landed" means the LP-CAS ledger
+# marker (the authoritative oracle) OR an Integrated-At the operator set by hand — `whip-move
+# --integrated-at <sha>` is the documented ack for a pre-ledger integration, and doctor.sh's integGate
+# accepts it, so this must too.
 LIVE_SLUGS=$(printf '%s' "$SNAP" | jq -r --arg mode "$MODE" '.tasks[]? |
   select(.folder=="pending" or .folder=="in-progress" or .folder=="completed" or .folder=="in-review"
-         or ($mode=="override" and .folder=="accepted")) | .slug // ""' | sort -u)
+         or ($mode=="override" and .folder=="accepted")
+         or (.folder=="accepted" and ((.hasIntegratedAt // false) | not) and ((.integratedAt // "") == "") and (.hasWorktreeBranch // false)))
+  | .slug // ""' | sort -u)
 if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
   while IFS= read -r wt; do
     [ -z "$wt" ] && continue

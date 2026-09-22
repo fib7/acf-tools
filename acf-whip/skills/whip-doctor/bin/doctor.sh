@@ -520,6 +520,31 @@ function resolve(d,   s){
   for(s in stems){ if(index(s,d)==1){ rcache[d]=s; return s } }
   rcache[d]=""; return ""
 }
+
+# Tarjan strongly-connected components. The previous detector peeled nodes with no DEPENDENTS and
+# reported whatever survived — which reports every node a cycle can REACH, not the cycle. On
+# a->{b,c}, b->a, the peel names a, b AND c, so an innocent dependency of a cycle member was gated
+# with the same FATAL as the cycle itself. Under per-task quarantine that mistake is no longer merely
+# noisy: it holds a healthy task out of the run. Only members of a non-trivial SCC (or a self-loop)
+# are in a cycle, and that is exactly what this computes.
+# (No apostrophes in this block: it lives inside a single-quoted awk program.)
+function scc_visit(v,   i, m, aa, w, cnt, comp, bb) {
+  tj_idx++; tj_num[v]=tj_idx; tj_low[v]=tj_idx
+  tj_sp++; tj_stack[tj_sp]=v; tj_on[v]=1
+  m=split(adj[v], aa, " ")
+  for(i=1;i<=m;i++){
+    w=aa[i]
+    if(w=="" || !(w in stems)) continue
+    if(!(w in tj_num)){ scc_visit(w); if(tj_low[w]<tj_low[v]) tj_low[v]=tj_low[w] }
+    else if(w in tj_on){ if(tj_num[w]<tj_low[v]) tj_low[v]=tj_num[w] }
+  }
+  if(tj_low[v]==tj_num[v]){
+    cnt=0
+    do { w=tj_stack[tj_sp]; tj_sp--; delete tj_on[w]; cnt++; comp[cnt]=w } while(w!=v)
+    if(cnt>1){ for(i=1;i<=cnt;i++) incycle[comp[i]]=1 }
+    else { m=split(adj[v], bb, " "); for(i=1;i<=m;i++) if(bb[i]==v) incycle[v]=1 }
+  }
+}
 {
   stem=$1; folder=$2; id=$3; slug=$5; deps=$7; integ=$8; globs=$9; hasBranch=$11;
   stems[stem]=1; state[stem]=folder; slugOf[stem]=slug; integOf[stem]=integ; depsOf[stem]=deps; globsOf[stem]=globs; hasBranchOf[stem]=hasBranch;
@@ -558,12 +583,9 @@ END{
           print "FATAL|cross-slug-dep-not-integrated|" s "|dispatched (" state[s] ") but cross-slug dep " r " is not accepted+integrated";
     }
   }
-  changed=1;
-  while(changed){ changed=0;
-    for(s in stems){ if(removed[s]) continue;
-      if((s in indeg ? indeg[s] : 0) <= 0){ removed[s]=1; changed=1;
-        m=split(adj[s], aa, " "); for(k=1;k<=m;k++){ t=aa[k]; if(t!="") indeg[t]-- } } } }
-  for(s in stems) if(!removed[s]){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|cyclic-deps|" s "|participates in a dependency cycle"; }
+  tj_idx=0; tj_sp=0;
+  for(s in stems) if(!(s in tj_num)) scc_visit(s);
+  for(s in stems) if(s in incycle){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|cyclic-deps|" s "|participates in a dependency cycle"; }
 
   # Contended globs, BY INDEX. This was a double loop over every pair of pending tasks with a nested
   # glob comparison — O(P^2 * G^2) — and it emitted one WARN per overlapping PAIR, so a handful of
@@ -585,9 +607,28 @@ END{
   }
 }' "$TSV" >> "$FINDINGS"
 
+# ---- dup-folder: identify the survivor (report-only AND fix) ----
+# Keepability is computed in BOTH passes, because an unresolvable duplicate is a FATAL and the gate
+# that decides whether to dispatch only ever reads the report-only pass. It used to be computed
+# exclusively inside --fix — whose stdout /go discards — so the gate saw the REPAIRABLE|dup-folder
+# line alone, concluded the board was repairable, and dispatched against a stem no writer can address.
+# Snapshot the lines first: `emit` appends to $FINDINGS, which is the file being read.
+DUP_LINES=$(grep '^REPAIRABLE|dup-folder|' "$FINDINGS" || true)
+if [ -n "$DUP_LINES" ]; then
+  printf '%s\n' "$DUP_LINES" | while IFS='|' read -r _sev _code stem _detail; do
+    [ -n "$stem" ] || continue
+    _folders=$(echo "$_detail" | sed -E 's/.*folders:[[:space:]]*//')
+    rep="$BL/$(printf '%s' "$_folders" | awk '{print $1}')/$stem.md"
+    keep=$(field "$rep" "Status")
+    _keepable=0
+    for fol in $_folders; do [ "$fol" = "$keep" ] && _keepable=1; done
+    [ "$_keepable" = "1" ] || emit "FATAL" "dup-folder-unresolvable" "$stem" "present in folders:$_folders but its Status field reads '${keep:-<unreadable>}', which is not one of them, so no copy can be chosen as the survivor. Every copy is intact. Resolve by hand, then re-run --fix."
+  done
+fi
+
 # ---- dup-folder repair (after awk reported) ----
-if [ "$FIX" = "1" ]; then
-  grep '^REPAIRABLE|dup-folder|' "$FINDINGS" | while IFS='|' read -r _sev _code stem _detail; do
+if [ "$FIX" = "1" ] && [ -n "$DUP_LINES" ]; then
+  printf '%s\n' "$DUP_LINES" | while IFS='|' read -r _sev _code stem _detail; do
     # Iterate the folders THIS STEM WAS REPORTED IN, not every active folder, and keep the one its
     # own Status names. Both halves are load-bearing.
     _folders=$(echo "$_detail" | sed -E 's/.*folders:[[:space:]]*//')
@@ -604,10 +645,8 @@ if [ "$FIX" = "1" ]; then
     # is not repairable.
     _keepable=0
     for fol in $_folders; do [ "$fol" = "$keep" ] && _keepable=1; done
-    if [ "$_keepable" != "1" ]; then
-      emit "FATAL" "dup-folder-unresolvable" "$stem" "present in folders:$_folders but its Status field reads '${keep:-<unreadable>}', which is not one of them, so no copy can be chosen as the survivor. Every copy is intact. Resolve by hand, then re-run --fix."
-      continue
-    fi
+    # Already reported as FATAL|dup-folder-unresolvable by the pass above — just refuse to repair.
+    [ "$_keepable" = "1" ] || continue
     for fol in $_folders; do
       [ "$fol" = "$keep" ] && continue
       # NO `|| rm -f` FALLBACK. `git rm` failing here means the path is not tracked, and unlinking
@@ -627,7 +666,17 @@ fi
 # `branch -D` below) destroys unreviewed work whose sole home is that branch, and it happens on the
 # next /go bootstrap, i.e. before anyone notices. Keep accepted slugs live while the operator owns
 # integration; they stop being live when the task leaves accepted/.
-LIVE_SLUGS=$(awk -F'\t' -v mode="$MODE" '$2=="pending"||$2=="in-progress"||$2=="completed"||$2=="in-review"||(mode=="override"&&$2=="accepted"){print $5}' "$TSV" | sort -u)
+# An ACCEPTED task whose change has NOT landed is live in BOTH modes. Override was already covered
+# (nothing ever lands there, so its branch is the only copy). Default was not — and the gap is a
+# work-loss path, not an inefficiency: a task accepted but not yet integrated (the drain deliberately
+# leaves an exit-7 conflict "for the next /go run"; a crash between accept and integrate does the
+# same) had its worktree removed and its branch -D'd by the very next bootstrap `doctor --fix`. The
+# following scan then reads hasWorktreeBranch=false, calls the task terminal, and the deliverable is
+# gone with nothing anywhere saying so. A slug is spent only once its change is ON trunk, which is
+# exactly what column 8 (integGate: Integrated-At or the ledger marker) records.
+LIVE_SLUGS=$(awk -F'\t' -v mode="$MODE" '
+  $2=="pending"||$2=="in-progress"||$2=="completed"||$2=="in-review" {print $5; next}
+  $2=="accepted" && (mode=="override" || ($8=="" && $11=="1")) {print $5}' "$TSV" | sort -u)
 if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
   while IFS= read -r wt; do
     [ -z "$wt" ] && continue
