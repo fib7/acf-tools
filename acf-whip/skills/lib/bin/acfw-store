@@ -46,8 +46,25 @@ jesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\00
 
 if [ "$SUB" = "info" ]; then
   ADAPTER=$(acfw_locate_adapter "$STORE" "$REPO_ROOT" || true)
-  printf '{"store":"%s","configFile":"%s","adapter":"%s","runLock":"%s","integrationMode":"%s","contractVersion":%s}\n' \
-    "$(jesc "$STORE")" "$(jesc "$CFG")" "$(jesc "$ADAPTER")" "$(jesc "$RUN_LOCK")" "$(jesc "$MODE")" "$ACFW_CONTRACT_VERSION"
+  # 3.4.0: the run focus (what a bare /go runs), the bare-/go policy when there is none, and the
+  # per-tier model routing. All resolved here so both skills read one source instead of each
+  # re-deriving precedence — and so a bad pin fails on the first dispatcher call of a run.
+  BARE_GO=$(acfw_resolve_bare_go "$REPO_ROOT" "$STORE") || exit 2
+  FOCUS_FILE=$(acfw_focus_path "$REPO_ROOT")
+  FOCUS_COUNT=0
+  if [ -r "$FOCUS_FILE" ]; then
+    FOCUS_COUNT=$(grep -cv '^[[:space:]]*\(#.*\)\?$' "$FOCUS_FILE" 2>/dev/null || echo 0)
+    FOCUS_COUNT=${FOCUS_COUNT//[^0-9]/}
+  fi
+  MODELS=$(acfw_resolve_models "$REPO_ROOT")
+  M_SHELL=${MODELS%%"$(printf '\t')"*}
+  M_REST=${MODELS#*"$(printf '\t')"}
+  M_JUDGE=${M_REST%%"$(printf '\t')"*}
+  M_AUTHOR=${M_REST#*"$(printf '\t')"}
+  printf '{"store":"%s","configFile":"%s","adapter":"%s","runLock":"%s","integrationMode":"%s","bareGo":"%s","focusFile":"%s","focusCount":%s,"models":{"shell":"%s","judge":"%s","author":"%s"},"contractVersion":%s}\n' \
+    "$(jesc "$STORE")" "$(jesc "$CFG")" "$(jesc "$ADAPTER")" "$(jesc "$RUN_LOCK")" "$(jesc "$MODE")" \
+    "$(jesc "$BARE_GO")" "$(jesc "$FOCUS_FILE")" "${FOCUS_COUNT:-0}" \
+    "$(jesc "$M_SHELL")" "$(jesc "$M_JUDGE")" "$(jesc "$M_AUTHOR")" "$ACFW_CONTRACT_VERSION"
   exit 0
 fi
 

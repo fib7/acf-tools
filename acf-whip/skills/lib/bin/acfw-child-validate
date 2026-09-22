@@ -23,7 +23,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MJS="$SCRIPT_DIR/acfw-child-validate.mjs"
 SCAFFOLD="$SCRIPT_DIR/acfw-child-scaffold"
-CONTRACT='acfw-child-contract: v1'
+CONTRACT='acfw-child-contract: v2'
 MAX_BYTES=524288
 
 TARGET="${1:-}"; TRUNK="${2:-}"

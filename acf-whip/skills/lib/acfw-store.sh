@@ -86,6 +86,56 @@ acfw_resolve_integration_mode() { # <repo-root>
   esac
 }
 
+# acfw_resolve_models <repo-root> — print "shell<TAB>judge<TAB>author": the model each AGENT TIER
+# runs on, resolved env > config > default. One knob per tier instead of one knob for everything.
+#
+# The tiers are about what the agent DOES, not about who calls it:
+#   shell  — runs a fixed command and copies its stdout into a schema. Zero reasoning, and by far the
+#            most frequent class, so it defaults to a fast/cheap model (haiku). Raising this tier was
+#            the workaround suggested for the truncated-snapshot failure; it is the wrong lever —
+#            bounding the payload is the fix, and this tier stays cheap because of it.
+#   judge  — decomposition planners, the judge that picks between them, the critic. Real reasoning.
+#   author — the agents that write task documents. Real reasoning.
+# Specialists and reviewers are NOT here: they route by the `model:` frontmatter of the agent the
+# project installed, which is where a project already expresses "this work runs on that model".
+# Unset means "inherit the session model", which is the right default for anything that reasons.
+acfw_resolve_models() { # <repo-root>
+  local root="${1:-}" shell judge author
+  shell="${ACFW_MODEL_SHELL:-}";  [ -n "$shell" ]  || shell=$(acfw_config_get "$root" ACFW_MODEL_SHELL)
+  judge="${ACFW_MODEL_JUDGE:-}";  [ -n "$judge" ]  || judge=$(acfw_config_get "$root" ACFW_MODEL_JUDGE)
+  author="${ACFW_MODEL_AUTHOR:-}"; [ -n "$author" ] || author=$(acfw_config_get "$root" ACFW_MODEL_AUTHOR)
+  [ -n "$shell" ] || shell=haiku
+  printf '%s\t%s\t%s' "$shell" "$judge" "$author"
+}
+
+# acfw_resolve_bare_go <repo-root> [store] — print 'all' or 'refuse': what a bare `/go` with no saved
+# focus does. On the files backend the backlog is this checkout's own, so draining it is what the
+# operator meant and the default stays 'all' (byte-identical to every release before 3.4.0). On a
+# shared API-backed board it is emphatically not: one person's bare `/go` would be everyone's, which
+# is how teams end up hand-authoring throwaway orchestrators instead of running the shipped one. There
+# the default is 'refuse' — say what would run and make the operator choose. Pinnable either way.
+acfw_resolve_bare_go() { # <repo-root> [store]
+  local root="${1:-}" store="${2:-}" v
+  [ -n "$store" ] || store=$(acfw_resolve_store "$root")
+  v="${ACFW_GO_BARE:-}"
+  [ -n "$v" ] || v=$(acfw_config_get "$root" ACFW_GO_BARE)
+  if [ -z "$v" ]; then
+    if [ "$store" = "files" ]; then v=all; else v=refuse; fi
+  fi
+  case "$v" in
+    all|refuse) printf '%s' "$v" ;;
+    *) echo "FATAL: unrecognized ACFW_GO_BARE='$v' (expected 'all' or 'refuse'). Refusing to guess: this key decides whether a bare /go drains the whole shared board." >&2
+       return 2 ;;
+  esac
+}
+
+# acfw_focus_path <repo-root> — print the per-checkout run focus file. Untracked by construction:
+# .acfwhip/run/ is gitignored, and a focus is one person's current selection in one checkout, never
+# a fact about the project.
+acfw_focus_path() { # <repo-root>
+  printf '%s/.acfwhip/run/focus' "${1:-}"
+}
+
 # acfw_run_lock_path <repo-root> [store] — print the /go run-lock (heartbeat) path.
 # files keeps the historical .backlog/.acfw-run.json (already gitignored by whip-init);
 # every other backend has no .backlog/, so the lock lives under .acfwhip/run/ (gitignored,

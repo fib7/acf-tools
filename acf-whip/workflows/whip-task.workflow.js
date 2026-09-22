@@ -29,9 +29,36 @@ const store = (args && args.store) || 'files'
 const filesStore = store === 'files'
 const STORE = `${pluginRoot}/skills/lib/bin/acfw-store`
 const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=${sq(trunkBranch)}; export ACFW_STORE=${sq(store)};`
-// Deterministic shell-runner model, same policy as /go: agents that only run a fixed command and copy
-// its stdout into a schema do zero reasoning. Planners, the judge and the critic stay on the session model.
-const SHELL_MODEL = (args && args.shellModel) || 'haiku'
+// ============================ model routing (3.4.0) ============================
+// Same three-tier policy as /go, and for the same reason: an agent is routed by what it DOES.
+//
+//   SHELL  — runs a fixed command and copies its stdout into a schema. Zero reasoning. Until 3.4.0
+//            exactly ONE call here took this tier (recon:backlog), while the agent-registry `ls`, BOTH
+//            single-writer calls (whose prompts are a fixed list of `acfw-store create` lines) and the
+//            report-only doctor all inherited the session model — paying frontier generation cost to
+//            echo command output. They take the shell tier now.
+//   JUDGE  — the competing planners, the judge between them, the completeness critic. Real judgement:
+//            the slug partition and the dependency graph have several defensible answers.
+//   AUTHOR — the task-engineer agents that write each task document. Real writing.
+//
+// judge/author ship UNSET, which inherits the session model exactly as before. A project that wants a
+// cheaper decomposition pins them once in .acfwhip/config; the skill passes them through.
+const MODELS = (args && args.models && typeof args.models === 'object') ? args.models : {}
+const SHELL_MODEL = (args && args.shellModel) || MODELS.shell || 'haiku'
+const EFFORTS = (args && args.efforts && typeof args.efforts === 'object') ? args.efforts : {}
+const agentsByTier = { shell: 0, judge: 0, author: 0 }
+function shellOpts(o) {
+  const out = Object.assign({}, o, { model: SHELL_MODEL })
+  if (EFFORTS.shell) out.effort = EFFORTS.shell
+  agentsByTier.shell++
+  return out
+}
+function tierOpts(o, tier) {
+  const out = Object.assign({}, o)
+  if (MODELS[tier]) out.model = MODELS[tier]
+  if (agentsByTier[tier] != null) agentsByTier[tier]++
+  return out
+}
 // How many independent planners compete. The slug partition and the dependency graph are genuine
 // judgement calls with several defensible answers, which is the one place in /task where
 // generate-then-judge beats one shot.
@@ -180,7 +207,7 @@ const reg = await agent(
   `List this project's installed specialist agents. Run exactly:
   ls -1 ${sq(trunkRoot)}/.claude/agents/*.md 2>/dev/null | sed -E 's#.*/##; s#\\.md$##'
 Return the basenames (no .md extension, no directory path) as agents[]. If the directory is missing or empty, return an empty array.`,
-  { label: 'discover-agents', phase: 'Decompose', schema: REGISTRY },
+  shellOpts({ label: 'discover-agents', phase: 'Decompose', schema: REGISTRY }),
 )
 const registeredAgents = (reg && Array.isArray(reg.agents)) ? reg.agents : []
 // Empty registry: abort before writing any files. validatePlan can only check assignedAgent against
@@ -245,7 +272,7 @@ ${filesStore
     ? `     cd ${sq(trunkRoot)} && grep -rhoE '^- \\*\\*Worktree\\*\\*: .*' .backlog 2>/dev/null | sed -E 's/^- \\*\\*Worktree\\*\\*: *//' | tr -d ' ' | sort -u`
     : `     cd ${sq(trunkRoot)} && bash ${sq(STORE)} snapshot 2>/dev/null | jq -r '(.tasks[]?, .inactive[]?) | .slug' 2>/dev/null | sort -u`}
 3. Live worktree branches:  git -C ${sq(trunkRoot)} worktree list --porcelain | sed -n 's#^branch refs/heads/##p'
-Return the ReconBacklog.`, { label: 'recon:backlog', phase: 'Recon', schema: RECON_BACKLOG, model: SHELL_MODEL }),
+Return the ReconBacklog.`, shellOpts({ label: 'recon:backlog', phase: 'Recon', schema: RECON_BACKLOG })),
 
   () => agent(`${ENV}
 Read-only reconnaissance of the CODE SURFACE this scope touches. Change nothing, write nothing.
@@ -329,7 +356,7 @@ Read, if present, ${sq(trunkRoot)}/docs/acf/style/task-descriptions.md and ${sq(
 
 Then return a DecompositionPlan. Do NOT write any files — another stage does that. Return ONLY the structured plan.
 ${PLAN_RULES}${fix}`,
-    { label: extraDefects && extraDefects.length ? `plan:retry${idx}` : `plan:${idx}`, phase: 'Decompose', schema: DECOMPOSITION_PLAN, agentType: 'task-engineer' },
+    tierOpts({ label: extraDefects && extraDefects.length ? `plan:retry${idx}` : `plan:${idx}`, phase: 'Decompose', schema: DECOMPOSITION_PLAN, agentType: 'task-engineer' }, 'judge'),
   )
 }
 
@@ -375,7 +402,7 @@ JUDGE ON THESE, in order:
    the doctor's cross-slug overlap check is inert against invented globs.
 
 Return the index of the plan you adopt and one line on why.`,
-    { label: 'judge:plan', phase: 'Decompose', schema: JUDGE, agentType: 'task-engineer' },
+    tierOpts({ label: 'judge:plan', phase: 'Decompose', schema: JUDGE, agentType: 'task-engineer' }, 'judge'),
   )
   const pick = (j && Number.isInteger(j.choice) && valid[j.choice]) ? valid[j.choice] : valid[0]
   planResult = pick.plan
@@ -437,7 +464,7 @@ Report ONLY defects you can name concretely. Look for:
   * HOW-level prescription in a description (banned: algorithms, code, library mandates)
 
 Return an empty array if the plan is sound. Do NOT invent defects to look thorough.`,
-    { label: 'critic:completeness', phase: 'Decompose', schema: CRITIC, agentType: 'task-engineer' },
+    tierOpts({ label: 'critic:completeness', phase: 'Decompose', schema: CRITIC, agentType: 'task-engineer' }, 'judge'),
   )
   critique = (c && Array.isArray(c.defects)) ? c.defects.filter((d) => typeof d === 'string' && d.trim()) : []
   if (critique.length) {
@@ -517,7 +544,7 @@ Write to EXACTLY this filename — do NOT rename it or add a descriptive suffix;
 ${TEMPLATE_CONTRACT}
 
 Return the AuthoredTask structured result (its id MUST be "${t.id}" and its filename MUST be "${t.filename}").`,
-      { label: `author:${t.id}`, phase: 'Author', schema: AUTHORED, agentType: 'task-engineer' },
+      tierOpts({ label: `author:${t.id}`, phase: 'Author', schema: AUTHORED, agentType: 'task-engineer' }, 'author'),
     ),
   ),
 )).filter(Boolean)
@@ -555,7 +582,7 @@ THEN run these commands IN ORDER, one at a time (each creates one task in the st
 ${createLines}
 
 Return the WriteResult: committed = true when every create succeeded, commitSha "n/a", files = the staged basenames, note = any failures.`,
-    { label: 'write:ingest', phase: 'Write', schema: WRITE_RESULT },
+    shellOpts({ label: 'write:ingest', phase: 'Write', schema: WRITE_RESULT }),
   )
 } else if (writtenFiles.length) {
   // The dependency graph was validated in JS (in-plan, acyclic, no self-edges) and is authoritative.
@@ -586,7 +613,7 @@ ${depStamps}
 6. Capture the new HEAD sha:  git rev-parse HEAD
 
 Make NO other edit to the files. Do NOT touch any other path. Return the WriteResult.`,
-    { label: 'write:commit', phase: 'Write', schema: WRITE_RESULT },
+    shellOpts({ label: 'write:commit', phase: 'Write', schema: WRITE_RESULT }),
   )
 }
 
@@ -597,7 +624,7 @@ const doctor = await agent(
   `Run the acf-whip integrity doctor (report-only) and return its result. ${ENV}
 Run exactly:  bash ${sq(STORE)} doctor
 Capture stdout. The last line is "SUMMARY|fatal=N|repairable=N|warn=N|ok=true|false". Lines beginning FATAL| are fatal; lines beginning WARN| or REPAIRABLE| are non-fatal. Return the DoctorReport with ok = (the SUMMARY ok field is true), summaryLine = the verbatim SUMMARY line, fatals = the verbatim FATAL lines, warns = the verbatim WARN+REPAIRABLE lines.`,
-  { label: 'verify:doctor', phase: 'Verify', schema: DOCTOR_REPORT },
+  shellOpts({ label: 'verify:doctor', phase: 'Verify', schema: DOCTOR_REPORT }),
 )
 
 // ============================ REPORT ============================
@@ -620,6 +647,11 @@ return {
   failedAuthors: failedAuthors.map((a) => ({ id: a.id, note: a.note })),
   commit: { committed: writeResult.committed, sha: writeResult.commitSha, note: writeResult.note },
   doctor: { ok: doctor && doctor.ok, summary: doctor && doctor.summaryLine, fatals: (doctor && doctor.fatals) || [] },
+  // 3.4.0 cost legibility, same contract as /go's RunReport: which model each tier ran on and how
+  // many agents each tier spent. A decomposition that silently ran every planner on the session model
+  // because a config pin was misspelled is otherwise indistinguishable from one that honoured it.
+  models: { shell: SHELL_MODEL, judge: MODELS.judge || null, author: MODELS.author || null, efforts: { shell: EFFORTS.shell || null } },
+  agentsByTier,
   nextStep: critique.length
     ? `Run /go to execute the backlog. NOTE: ${critique.length} advisory critique(s) were left unresolved — review them before running /go.`
     : 'Run /go to execute the backlog.',

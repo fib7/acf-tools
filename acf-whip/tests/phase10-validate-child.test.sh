@@ -135,7 +135,7 @@ esac
 cp "$WORK/h.js" "$WORK/n.js"
 python3 -c "
 s=open('$WORK/n.js').read()
-s=s.replace('acfw-child-contract: v1', 'acfw-child-contract: v0')
+s=s.replace('acfw-child-contract: v2', 'acfw-child-contract: v0')
 open('$WORK/n.js','w').write(s)"
 case "$(verdict "$WORK/n.js" impl)" in
   rejected:V-CONTRACT*skew*) ok "a stale contract stamp reports skeleton-version-skew" ;;

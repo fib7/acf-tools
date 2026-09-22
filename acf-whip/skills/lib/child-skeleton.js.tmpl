@@ -1,4 +1,4 @@
-// ==== ACFW CHILD SKELETON — acfw-child-contract: v1 ====
+// ==== ACFW CHILD SKELETON — acfw-child-contract: v2 ====
 // Written by acfw-child-scaffold. Edit ONLY between the // <acfw-*> ... // </acfw-*> marker pairs.
 // acfw-child-validate byte-diffs every locked segment against the shipped template; /go REFUSES to run
 // a file whose locked segments differ. The durability machinery below cannot be authored away.
@@ -18,6 +18,13 @@ const BASE = A.basePrompt || ''            // the verbatim 3.1.x seam prompt —
 const RESULT = A.resultSchema || null      // ACFW_RESULT, passed as data (a child cannot import)
 const LENS = A.lensSchema || null
 const SHELL = A.shellModel || 'haiku'
+// Reasoning effort for the shell tier (unset = inherit). Pinned by the parent, never by the architect.
+const SHELL_EFFORT = A.shellEffort || ''
+// Per-agentType models, from the frontmatter of the agents the PROJECT installed. The parent reads
+// the registry once and hands the map down, so a child dispatches an implementer on the model its
+// project declared for that agent instead of whatever the runtime resolves for an agentType inside a
+// workflow (which is undocumented). An agent absent from the map inherits the session model.
+const AGENT_MODELS = (A.agentModels && typeof A.agentModels === 'object') ? A.agentModels : {}
 const BUDGET = (typeof A.agentBudget === 'number' && A.agentBudget > 0) ? A.agentBudget : 8
 const FANOUT = (typeof A.fanoutMax === 'number' && A.fanoutMax > 0) ? A.fanoutMax : 1
 const REGISTRY = Array.isArray(A.registry) ? A.registry : []
@@ -95,8 +102,13 @@ async function runStage(spec) {
   if (spec.schema) o.schema = spec.schema
   if (spec.effort) o.effort = spec.effort
   if (spec.model) o.model = spec.model
+  // Shell-tier stages take the parent's pinned effort unless the stage set one itself.
+  if (spec.model === SHELL && SHELL_EFFORT && !o.effort) o.effort = SHELL_EFFORT
   // An unknown agentType throws "agent type 'X' not found" at the runtime, and the architect cannot fix
   // a value the PARENT injected. Drop it with a log instead of turning it into a repairable defect.
+  // An agentType stage runs on the model the PROJECT declared for that agent, when it declares one
+  // and the stage did not pin its own. Explicit beats implicit: the choice shows up in the run report.
+  if (spec.agentType && spec.agentType !== 'none' && !o.model && AGENT_MODELS[spec.agentType]) o.model = AGENT_MODELS[spec.agentType]
   if (spec.agentType && spec.agentType !== 'none') {
     if (REGISTRY.indexOf(spec.agentType) >= 0) o.agentType = spec.agentType
     else log(`⚠ ${STEM}/${key} — agentType '${spec.agentType}' is not installed; running without it`)

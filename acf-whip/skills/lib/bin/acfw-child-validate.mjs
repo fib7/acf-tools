@@ -16,7 +16,7 @@ import { readFileSync, statSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 
 const MAX_BYTES = 524288
-const CONTRACT = 'acfw-child-contract: v1'
+const CONTRACT = 'acfw-child-contract: v2'
 
 const errors = [], warnings = []
 const err = (m) => errors.push(m)

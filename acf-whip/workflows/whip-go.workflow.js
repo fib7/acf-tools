@@ -103,14 +103,54 @@ const materializeCmd = (t) => `bash ${sq(STORE)} read --materialize ${sq(SPECS_D
 const MAX_ITER = 1000
 const NO_GAIN_LIMIT = 15 // iterations with no terminal gain (perpetual-retry guard); well below MAX_ITER
 
-// Model for the DETERMINISTIC shell-runner agents (bootstrap, scan, the single backlog writer,
-// integrate, drain). These agents do ZERO reasoning — they run a fixed bash command and copy its
-// stdout into a schema — so they run on a fast/cheap model instead of the session model (every one
-// inherited Opus before, paying Opus generation cost for a verbatim echo). The specialist/reviewer/
-// direct and conflict-resolver dispatches do REAL work and are deliberately LEFT on the session model
-// + their agentType (see the no-model comments at those call sites). Overridable via args.shellModel
-// (set it to roll back to the session model if a model ever mis-handles the digest echo).
-const SHELL_MODEL = (args && args.shellModel) || 'haiku'
+// ============================ model routing (3.4.0) ============================
+// Agents are routed by what they DO, not by who calls them. Three tiers, three reasons:
+//
+//   * SHELL — bootstrap, scan, the single backlog writer, integrate, drain, the scout, the harness
+//     validator, the WIP snapshot, unlock. Each runs a fixed bash command and copies its stdout into
+//     a schema. Zero reasoning, and by far the most frequent class, so it runs on a fast/cheap model
+//     rather than inheriting the session model and paying frontier generation cost for a verbatim
+//     echo. Raising THIS tier was the suggested workaround for the truncated-snapshot failure; it is
+//     the wrong lever — bounding the payload is the fix, and this tier stays cheap because of it.
+//   * SPECIALIST / REVIEW — every agentType dispatch. These route by the `model:` frontmatter of the
+//     agent the PROJECT installed, which is where a project already says "this kind of work runs on
+//     that model". The bootstrap reads the registry and hands back the map; each call passes the
+//     model explicitly, so the choice lands in the run report instead of being buried in whatever
+//     the runtime happens to resolve (which is undocumented for agentType inside a workflow).
+//   * ARCHITECT / RESOLVER — not knobs. One authors executable harnesses, the other resolves real
+//     merge conflicts. Both stay on the session model deliberately.
+//
+// Resolution is env > .acfwhip/config > default, surfaced by `acfw-store info` and passed in by the
+// skill, so a team pins its cost policy once per repo instead of per invocation.
+const MODELS = (args && args.models && typeof args.models === 'object') ? args.models : {}
+const SHELL_MODEL = (args && args.shellModel) || MODELS.shell || 'haiku'
+// Reasoning effort for the shell tier. Ships UNSET: Haiku is absent from the documented effort
+// support table, and the effect of a low setting on verbatim-copy fidelity is undocumented — so this
+// is an opt-in a team can measure, safely, now that a short relay is detected rather than believed.
+const EFFORTS = (args && args.efforts && typeof args.efforts === 'object') ? args.efforts : {}
+// Per-agentType models, discovered at bootstrap from .claude/agents/*.md frontmatter.
+let agentModels = {}
+// Which tier each agent this run spent belongs to. Without it, a run that quietly routed every
+// specialist to the session model is indistinguishable from one that honoured the project's
+// frontmatter — the same argument that put `escalation` in the report, applied to cost.
+const agentsByTier = { shell: 0, specialist: 0, review: 0, architect: 0, resolver: 0 }
+// THE single place a shell-tier call gets its model (and, when pinned, its effort). One helper, so a
+// new shell stage cannot silently inherit the session model by forgetting the option.
+function shellOpts(o) {
+  const out = Object.assign({}, o, { model: SHELL_MODEL })
+  if (EFFORTS.shell) out.effort = EFFORTS.shell
+  agentsByTier.shell++
+  return out
+}
+// Options for an agentType dispatch: the project's declared model for that agent, when it declares
+// one. Omitted otherwise, which inherits the session model exactly as before.
+function typedOpts(o, tier) {
+  const out = Object.assign({}, o)
+  const m = out.agentType && agentModels[out.agentType]
+  if (m) out.model = m
+  if (tier && agentsByTier[tier] != null) agentsByTier[tier]++
+  return out
+}
 
 // ============================ 3.2.0: per-task authored child workflows ============================
 // Every dispatched unit runs as its OWN nested workflow — a bespoke harness a workflow-architect agent
@@ -176,6 +216,8 @@ const byPriorityThenStem = (a, b) => (prank(a.priority) - prank(b.priority)) || 
 const BOOTSTRAP = {
   type: 'object', additionalProperties: false,
   required: ['detached', 'lockFresh', 'doctorOk', 'doctorSummary', 'fatals', 'cpuCores', 'agents', 'scaffoldOk'],
+  // agentModels is deliberately NOT required: a bootstrap from an older cached plugin, or a project
+  // with no frontmatter models at all, must still satisfy the schema. Absent => route nothing.
   properties: {
     detached: { type: 'boolean', description: 'true if HEAD is detached at the trunk root' },
     lockFresh: { type: 'boolean', description: 'true if the run-lock heartbeat file exists AND was modified within the freshness window (another /go is live)' },
@@ -184,6 +226,7 @@ const BOOTSTRAP = {
     fatals: { type: 'array', items: { type: 'string' }, description: 'verbatim FATAL|... lines remaining after --fix' },
     cpuCores: { type: 'integer', description: 'core count from the sysctl/nproc step; 0 if it could not be determined' },
     agents: { type: 'array', items: { type: 'string' }, description: 'the project\'s INSTALLED agent names from .claude/agents/*.md, without the .md suffix' },
+    agentModels: { type: 'array', items: { type: 'string' }, description: 'for each installed agent that DECLARES a model in its frontmatter, the line "<agent-name>=<model>". Agents with no model: line are omitted entirely — omission means "inherit the session model", which is not the same as any particular model.' },
     scaffoldOk: { type: 'boolean', description: 'true if the child-workflow scaffold probe printed a skeleton' },
   },
 }
@@ -981,7 +1024,7 @@ async function textScanFallback(label) {
       `${ENV}
 Run EXACTLY:  bash ${sq(STORE)} snapshot --digest --mode ${mode}${ONLY_FLAGS}
 Output its stdout — a single JSON object — as your ENTIRE final message. No prose, no markdown fences, nothing else. Copy it exactly: it carries a "relay" header stating how many entries it contains, and a payload that does not match is refused.`,
-      { label, phase: 'Iterate', model: SHELL_MODEL },
+      shellOpts({ label, phase: 'Iterate' }),
     )
   } catch (e) { return null }
   const snap = extractJson(txt)
@@ -997,7 +1040,7 @@ Output its stdout — a single JSON object — as your ENTIRE final message. No 
 async function unlock(phaseName) {
   try {
     await agentC(`Run exactly this command and report nothing else:  rm -f ${sq(RUN_LOCK)}`,
-      { label: 'unlock', phase: phaseName || 'Iterate', model: SHELL_MODEL })
+      shellOpts({ label: 'unlock', phase: phaseName || 'Iterate' }))
   } catch (e) { /* lock expires on its own */ }
 }
 
@@ -1036,7 +1079,7 @@ ${lines}
 Then run exactly once (best-effort — ignore any failure):  mkdir -p ${sq(RUN_LOCK_DIR)} && touch ${sq(RUN_LOCK)}
 
 Capture each transition call's stdout (an "ok:", "noop:" or "warn:" line) into applied[]. If any call errors, record it in applied[] and continue with the rest. Return the WriteResult.`,
-    { label, phase: 'Iterate', schema: WRITE_BATCH, model: SHELL_MODEL },
+    shellOpts({ label, phase: 'Iterate', schema: WRITE_BATCH }),
     () => ({ applied: [], note: 'writer agent non-emit after retries — transitions deferred to next iteration' }),
   )
 }
@@ -1149,7 +1192,7 @@ Copy values EXACTLY. Do not summarize, repair, or pretty-print any JSON. Return 
 }
 
 async function scout(ctx) {
-  const r = await safeAgent(scoutPrompt(ctx), { label: `scout:${ctx.kind}:${ctx.key}`, phase: ctx.phase, schema: SCOUT, model: SHELL_MODEL }, () => null)
+  const r = await safeAgent(scoutPrompt(ctx), shellOpts({ label: `scout:${ctx.kind}:${ctx.key}`, phase: ctx.phase, schema: SCOUT }), () => null)
   const empty = { worktree: '', worktreeExists: false, commits: [], trailers: [], dirty: [], stashes: [], stages: [], names: [], priorStages: {}, dropped: [], note: 'scout non-emit' }
   if (!r) return empty
   const stages = (r.stages || []).map((s) => {
@@ -1423,7 +1466,7 @@ function childArgs(ctx, budget, prior, round) {
     stem: ctx.stem, slug: ctx.slug, branch: ctx.branch, forkbaseRef: ctx.forkbaseRef,
     taskPath: ctx.taskPath, ledgerDir: ctx.ledgerDir, ledgerBin: LEDGER_BIN, runLock: RUN_LOCK,
     basePrompt: ctx.basePrompt, resultSchema: ACFW_RESULT, lensSchema: REVIEW_LENS,
-    shellModel: SHELL_MODEL, agentBudget: budget, fanoutMax: ctx.fanoutMax,
+    shellModel: SHELL_MODEL, shellEffort: EFFORTS.shell || '', agentModels, agentBudget: budget, fanoutMax: ctx.fanoutMax,
     registry: REGISTRY, agentType: ctx.agent && ctx.agent !== 'none' ? ctx.agent : '',
     git: { commits: prior.commits, dirty: prior.dirty, worktree: prior.worktree },
     trunkRoot, cleanCheckout: CLEAN_CHECKOUT, priorStages: prior.priorStages,
@@ -1455,7 +1498,7 @@ Preserve in-flight work before a fallback dispatch. In ${sq(prior.worktree)} run
   git -C ${sq(prior.worktree)} commit -q -m 'wip: harness partial (acf-whip fallback)' || true
   git -C ${sq(prior.worktree)} status --porcelain
 Report the final porcelain output. Change nothing else. Never run clean-checkout, stash, reset or rebase.`,
-    { label: `wip:${ctx.key}`, phase: ctx.phase, schema: WIPRESULT, model: SHELL_MODEL }, () => null)
+    shellOpts({ label: `wip:${ctx.key}`, phase: ctx.phase, schema: WIPRESULT }), () => null)
   log(`  ${ctx.stem}: committed ${prior.dirty.length} in-flight path(s) as WIP before the fallback dispatch`)
 }
 
@@ -1488,6 +1531,7 @@ async function runAuthoredUnit(ctx) {
         archMissingLogged = true
         log('⚠ no workflow-architect agent installed — harnesses are being authored by the default agent (run /whip-init to install it: content/agent-patterns/universal/workflow-architect-pattern.md)')
       }
+      agentsByTier.architect++
       const a = await safeAgent(architectPrompt(ctx, budget, round, lastErr, prior), aopts, () => null)
       if (!a || a.wrote !== true) { esc.fellBack++; return { via: 'legacy', why: 'architect wrote no script', prior } }
       if (a.refuse === 'unrepairable') { esc.fellBack++; return { via: 'legacy', why: `architect declined: ${a.summary}`, prior } }
@@ -1499,7 +1543,7 @@ async function runAuthoredUnit(ctx) {
       // ---- 2. PRE-FLIGHT. The parent has no filesystem and cannot compile the child itself, so an
       //         agent runs the validator binary. Most throw classes never become throws.
       const v = await safeAgent(validatePrompt(ctx, prior.names),
-        { label: `val:${ctx.kind}:${ctx.key}:${round}`, phase: ctx.phase, schema: VALIDATE, model: SHELL_MODEL },
+        shellOpts({ label: `val:${ctx.kind}:${ctx.key}:${round}`, phase: ctx.phase, schema: VALIDATE }),
         () => ({ ok: false, parser: 'none', errors: ['validator agent non-emit'], warnings: [], stageCount: 0, mutatingStages: 0 }))
       if (!v.ok) {
         esc.preflight++
@@ -1582,9 +1626,10 @@ show.
    From the second run capture: doctorOk (SUMMARY ok=true), doctorSummary (the verbatim SUMMARY line), fatals (verbatim FATAL| lines).
 4. Core count (for the child-workflow concurrency bound):  sysctl -n hw.ncpu 2>/dev/null || nproc  -> cpuCores (0 if neither works).
 5. Installed agent registry:  ls -1 ${sq(trunkRoot)}/.claude/agents/*.md 2>/dev/null | sed -E 's#.*/##; s#\\.md$##'  -> agents (an empty list is not an error).
+5b. Declared models:  grep -l '^model:' ${sq(trunkRoot)}/.claude/agents/*.md 2>/dev/null | while read -r f; do printf '%s=%s\\n' "$(basename "$f" .md)" "$(sed -n 's/^model:[[:space:]]*//p' "$f" | head -1)"; done  -> agentModels, one "name=model" line each. Omit any agent with no model: line — omission means "inherit the session model". An empty list is not an error.
 6. Child-workflow tooling probe:  bash ${sq(SCAFFOLD)} --stdout --kind impl --stem probe --meta-name probe >/dev/null 2>&1 && echo yes || echo no  -> scaffoldOk.
 Return the BootstrapResult.`,
-  { label: 'bootstrap', phase: 'Bootstrap', schema: BOOTSTRAP, model: SHELL_MODEL },
+  shellOpts({ label: 'bootstrap', phase: 'Bootstrap', schema: BOOTSTRAP }),
   () => null,
 )
 if (!boot) {
@@ -1651,6 +1696,21 @@ function releaseLane() {
 }
 
 REGISTRY = Array.isArray(boot.agents) ? boot.agents.filter((s) => typeof s === 'string' && s) : []
+// Per-agent model routing, from the frontmatter of the agents the PROJECT installed. Parsed from
+// "name=model" lines rather than a nested object because the bootstrap relays through one schema and
+// a flat string array is the shape a shell-runner echoes most reliably. An agent absent from the map
+// inherits the session model, which is the correct default for anything that reasons.
+agentModels = {}
+for (const line of (Array.isArray(boot.agentModels) ? boot.agentModels : [])) {
+  const i = String(line || '').indexOf('=')
+  if (i <= 0) continue
+  const name = String(line).slice(0, i).trim()
+  const m = String(line).slice(i + 1).trim()
+  if (name && m) agentModels[name] = m
+}
+if (Object.keys(agentModels).length) {
+  log(`model routing: ${Object.keys(agentModels).length} installed agent(s) declare a model — honouring each (shell tier: ${SHELL_MODEL}${EFFORTS.shell ? `, effort ${EFFORTS.shell}` : ''})`)
+}
 if (ESCALATE && !REGISTRY.length) {
   ESCALATE = false
   log('⚑ escalation off — .claude/agents/ is empty, so an authored harness would have no specialist to dispatch. Run /whip-add-agents.')
@@ -1722,7 +1782,7 @@ show.
 2. Integrity recheck (report-only): the previous step wrote the FULL snapshot to ${sq(FULL_SNAP)}. If that file exists and is non-empty, run  bash ${sq(STORE)} doctor --quiet --active-only --snapshot ${sq(FULL_SNAP)}  so the battery reads the same store walk step 1 did; otherwise run  bash ${sq(STORE)} doctor --quiet --active-only  . Either way set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (EVERY verbatim FATAL| line — the SUMMARY's fatal=N is cross-checked against how many you return).
 3. Heartbeat (best-effort, NOT committed): write a small JSON file at ${sq(RUN_LOCK)} (create its parent directory first if missing) containing {"iteration":${iter},"mode":"${mode}","ts":"<output of: date -u +%Y-%m-%dT%H:%M:%SZ>"}. If the write fails, ignore it.
 Return the ScanResult.`
-  let scan = await safeAgent(scanPrompt, { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT, model: SHELL_MODEL }, () => null)
+  let scan = await safeAgent(scanPrompt, shellOpts({ label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT }), () => null)
 
   // A doctor battery that could not RUN is still an immediate stop: the board is unverified rather
   // than known-bad, and that verdict needs no index to reach. REPORTED findings are NOT decided here
@@ -1761,7 +1821,7 @@ Return the ScanResult.`
     // One schema re-scan on a garbled/truncated echo before falling back: the snapshot is relayed by an
     // agent echoing scan-backlog's stdout verbatim, so a single bad echo should not derail a long run.
     log(`iter ${iter}: snapshot ${relayShort ? 'incomplete' : 'JSON unparseable'} — re-scanning once`)
-    scan = await safeAgent(scanPrompt, { label: `scan#${iter}:retry`, phase: 'Iterate', schema: SCAN_RESULT, model: SHELL_MODEL }, () => null)
+    scan = await safeAgent(scanPrompt, shellOpts({ label: `scan#${iter}:retry`, phase: 'Iterate', schema: SCAN_RESULT }), () => null)
     if (scan && !scan.doctorOk) {
       const ab2 = await unavailableAbort(scan, ' (on scan retry)')
       if (ab2) return ab2
@@ -2130,7 +2190,7 @@ Return the ScanResult.`
   async function integrateOne(t, opts) {
     const noEscalate = !!(opts && opts.noEscalate)
     attemptedIntegrate.add(t.stem)
-    let r = await safeAgent(integratePrompt(t, false), { label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate agent non-emit — left accepted, retry next iteration'))
+    let r = await safeAgent(integratePrompt(t, false), shellOpts({ label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT }), integTransient('integrate agent non-emit — left accepted, retry next iteration'))
     if (r && r.outcome === 'resolver-needed') {
       log(`integrate ${t.slug}: conflict — dispatching resolver ${r.resolverAgent || t.agent || '(default)'}`)
       // NO model: here — the conflict resolver does REAL merge-conflict reasoning; session model + agentType.
@@ -2154,7 +2214,9 @@ Return the ScanResult.`
         // runs on the serializeIntegrate chain whose promise is awaited at the end of the iteration.
         // An unhandled non-emit here used to abort the whole run.
         try {
-          await agentC(resolverPrompt(t, r), ropts)
+          // Counted, never re-modelled: conflict resolution is real reasoning on a mid-cherry-pick
+          // tree and stays on the session model (or the resolver agent's own declared one).
+          await agentC(resolverPrompt(t, r), typedOpts(ropts, 'resolver'))
         } catch (e) {
           log(`WARN resolve ${t.slug}: resolver agent non-emit (${String((e && e.message) || e).slice(0, 160)}) — conflict left unresolved, retried next iteration`)
         }
@@ -2167,7 +2229,7 @@ Return the ScanResult.`
       } else {
         log(`  resolve ${t.slug}: ${resolved.staged} path(s) staged by the harness`)
       }
-      r = await safeAgent(integratePrompt(t, true), { label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
+      r = await safeAgent(integratePrompt(t, true), shellOpts({ label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT }), integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
     }
     if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); integratedThisIter++; log(`✓ integrated ${t.stem}`) }
     else if (r && r.outcome === 'rejected') {
@@ -2256,10 +2318,10 @@ Return the ScanResult.`
       const rctx = childCtx('review', t, rprompt, 'in-review', 1)
       const res = await runAuthoredUnit(rctx)
       if (res.via === 'workflow') rr = coerceAcfwResult(res.raw, ['accepted', 'rejected', 'none'])
-      if (!rr) rr = await agentC(rprompt, { label: `review:${t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' })
+      if (!rr) rr = await agentC(rprompt, typedOpts({ label: `review:${t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' }, 'review'))
     } else {
       // Reviewers ALWAYS run as quality-reviewer (independent review — never the implementer's agent).
-      rr = await agentC(rprompt, { label: `review:${isNone ? t.stem : t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' })
+      rr = await agentC(rprompt, typedOpts({ label: `review:${isNone ? t.stem : t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' }, 'review'))
     }
     const rv = reviewVerdict(rr)
     if (rv.mechanism) { log(`↷ ${t.stem}: review reported a MECHANISM fault (${(rr.notes || '').slice(0, 120)}) — left in-review/, no rejection charged`); return }
@@ -2276,11 +2338,16 @@ Return the ScanResult.`
   async function processUnit(d) {
     if (d.kind === 'review') return runReviewAndIntegrate(d.t) // already in in-review/ (premove)
     const prompt = d.kind === 'direct' ? directPrompt(d.t) : specialistPrompt(d.t)
-    // NO model: specialists/direct do REAL work — keep the session model (+ agentType). Only the
-    // deterministic shell-runners (scan, writer, integrate, bootstrap, drain) use SHELL_MODEL.
-    const opts = { label: `${d.kind}:${d.t.slug === 'none' ? d.t.stem : d.t.slug}`, phase: 'Iterate', schema: ACFW_RESULT }
+    // Specialists/direct do REAL work, so they never take the shell tier. They DO take the model the
+    // project declared for that agent in .claude/agents/<name>.md — that file is where a project
+    // already expresses "this kind of work runs on that model", and honouring it explicitly puts the
+    // choice in the run report instead of leaving it to whatever the runtime resolves for an
+    // agentType inside a workflow (which is undocumented). No frontmatter model => session model,
+    // exactly as before.
+    const baseOpts = { label: `${d.kind}:${d.t.slug === 'none' ? d.t.stem : d.t.slug}`, phase: 'Iterate', schema: ACFW_RESULT }
     const at = d.t.agent
-    if (at && at !== 'none') opts.agentType = at
+    if (at && at !== 'none') baseOpts.agentType = at
+    const opts = typedOpts(baseOpts, 'specialist')
 
     // SEAM (i): the task runs as its OWN authored child workflow. runAuthoredUnit never throws; on any
     // exhaustion it returns via:'legacy' and we make the EXACT 3.1.0 call below, whose throw maps to
@@ -2451,7 +2518,7 @@ if (mode === 'default' && lastSnapshot) {
   const rescan = await safeAgent(
     `${ENV}
 Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}${ONLY_FLAGS}  and return its stdout VERBATIM in snapshotJson — copy it exactly, add nothing, drop nothing (set doctorOk true, doctorSummary "drain", doctorFatals []).`,
-    { label: 'drain:scan', phase: 'Drain', schema: SCAN_RESULT, model: SHELL_MODEL },
+    shellOpts({ label: 'drain:scan', phase: 'Drain', schema: SCAN_RESULT }),
     () => null,
   )
   let snap2 = null
@@ -2485,7 +2552,7 @@ Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}
     for (const t of left) {
       // single defensive pass: an exit-7 here is intentionally left for the next /go run (no resolver post-loop)
       attemptedIntegrate.add(t.stem)
-      const r = await safeAgent(integratePrompt(t, false), { label: `drain:${t.slug}`, phase: 'Drain', schema: INTEGRATE_RESULT, model: SHELL_MODEL }, () => ({ outcome: 'transient', note: 'drain integrate non-emit' }))
+      const r = await safeAgent(integratePrompt(t, false), shellOpts({ label: `drain:${t.slug}`, phase: 'Drain', schema: INTEGRATE_RESULT }), () => ({ outcome: 'transient', note: 'drain integrate non-emit' }))
       if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); drained++ }
     }
   }
@@ -2566,6 +2633,12 @@ return {
   // Whether harnesses were authored by the dedicated persona or by the default agent. Without this a
   // run that silently degraded is indistinguishable from one that did not.
   workflowArchitectInstalled: registryHas('workflow-architect'),
+  // 3.4.0 cost legibility. Which model each TIER ran on, and how many agents each tier spent. A run
+  // that silently routed every specialist to the session model — because the project declares no
+  // frontmatter models, or because an older bootstrap relayed none — is otherwise indistinguishable
+  // from one that honoured them, and the bill is the only place the difference shows up.
+  models: { shell: SHELL_MODEL, judge: MODELS.judge || null, author: MODELS.author || null, agentModels, efforts: { shell: EFFORTS.shell || null } },
+  agentsByTier,
   maxReject: REJECT_CAP,
   maxBlock: BLOCK_CAP,
   lanes: LANES,
