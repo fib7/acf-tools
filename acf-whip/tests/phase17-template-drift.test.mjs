@@ -303,5 +303,82 @@ check('...and they do query both arrays',
   }
 }
 
+// ---- 3.4.0 surfaces the skills must actually document ---------------------------------------
+// Each of these is a promise the plugin makes in one place and keeps in another. A skill that stops
+// naming one does not break a run; it makes the feature undiscoverable, which is how `/go` ended up
+// with no argument-hint for a whole release while being scopeable.
+{
+  const go = readFileSync(join(ROOT, 'skills', 'go', 'SKILL.md'), 'utf8')
+  check('/go advertises --all in its argument-hint', /argument-hint:.*--all/.test(go))
+  check('/go advertises that no args means the focus', /argument-hint:.*focus/.test(go))
+  check('/go documents the bare-go refusal on a shared store', /bareGo/.test(go) && /refuse/.test(go))
+  check('/go documents the held-out tasks a run reports', /heldOut/.test(go))
+  check('/go documents that a short relay is NOT a missing id', /relay-truncated/.test(go))
+  check('/go documents that an explicit scope never writes the focus',
+    /never (touch|write)/.test(go) && /focus/.test(go))
+  check('/go says the legacy loop keeps the stricter gate', /legacy loop.{0,400}refuse|refuses on ANY FATAL/s.test(go))
+
+  const move = readFileSync(join(ROOT, 'skills', 'whip-move', 'SKILL.md'), 'utf8')
+  check('/whip-move lists draft and archive as states', /draft/.test(move) && /archive/.test(move))
+  check('...and says which is pause and which is cancel', /PAUSE/.test(move) && /CANCEL/.test(move))
+  check('...and warns that dropping from a focus is not pausing', /focus does not pause|dropping a task from a run focus does not pause/i.test(move))
+
+  const focus = readFileSync(join(ROOT, 'skills', 'whip-focus', 'SKILL.md'), 'utf8')
+  check('/whip-focus exists and has an argument-hint', /argument-hint:/.test(focus))
+  check('...and points at whip-move for pausing', /whip-move/.test(focus))
+
+  const task = readFileSync(join(ROOT, 'skills', 'task', 'SKILL.md'), 'utf8')
+  check('/task says it sets the focus', /focus/.test(task))
+
+  const doctor = readFileSync(join(ROOT, 'skills', 'whip-doctor', 'SKILL.md'), 'utf8')
+  check('/whip-doctor no longer lists status-vs-folder mismatch as FATAL',
+    !/FATAL.{0,200}status-vs-folder mismatch/s.test(doctor))
+  check('...and documents the repo/task FATAL split', /Repo-scoped/.test(doctor) && /Task-scoped/.test(doctor))
+  check('...and documents native-hold', /native hold|native-hold/.test(doctor))
+}
+
+// ---- the /task writers must carry the focus chain and the ignore rule ------------------------
+// Both are shell-semantics guarantees, not agent judgement: a create that fails must not put its id
+// in the focus, and a project that predates .acfwhip/run/ must not start tracking it.
+{
+  const src = readFileSync(join(ROOT, 'workflows', 'whip-task.workflow.js'), 'utf8')
+  check('the focus binary is resolved from the plugin root, not hand-spelled in a prompt',
+    /const FOCUS = `\$\{pluginRoot\}\/skills\/lib\/bin\/acfw-focus`/.test(src))
+  check('both /task writers chain the focus update',
+    (src.match(/\$\{sq\(FOCUS\)\} add --no-resolve --by task/g) || []).length === 2)
+  // Chained with && onto each create, not run once at the end: a create that fails with a duplicate
+  // id must not put that id in the focus, and shell semantics decide that more reliably than an
+  // agent re-reading which of its own commands succeeded.
+  check('the non-files writer chains it onto each create (so a failed create is excluded)',
+    /create --file[\s\S]{0,200}&& rm -f[\s\S]{0,60}&& bash \$\{sq\(FOCUS\)\} add --no-resolve/.test(src))
+  check('the writer prompt still ensures .acfwhip/run/ is gitignored', /grep -qxF '\.acfwhip\/run\/' \.gitignore/.test(src))
+}
+
+// ---- every new suite is REQUIRED, never optional ---------------------------------------------
+// 3.3.0's lesson: a suite marked OPTIONAL skipped without a live server and a SKIP counted as a
+// pass, so three adapters were green by absence for two releases.
+{
+  const runAll = readFileSync(join(ROOT, 'tests', 'run-all.sh'), 'utf8')
+  const optional = (runAll.match(/^OPTIONAL="([\s\S]*?)"/m) || [, ''])[1]
+  for (const suite of ['phase18-focus', 'phase19-files-only', 'phase19-doctor-graph', 'phase19-relay',
+    'phase19-quarantine', 'phase19-routing']) {
+    check(`${suite} is registered`, new RegExp(`^${suite}$`, 'm').test(runAll))
+    check(`...and is not OPTIONAL`, !new RegExp(`\\b${suite}\\b`).test(optional))
+  }
+}
+
+// ---- managed content digests must cover what shipped -----------------------------------------
+// An installed copy is refreshed only when its sha256 matches a version this plugin has shipped.
+// Editing a managed document without regenerating the manifest makes every installed copy read as
+// hand-edited, so it is never refreshed again.
+{
+  const manifest = JSON.parse(readFileSync(join(ROOT, 'content', '.digests.json'), 'utf8'))
+  const { createHash } = await import('node:crypto')
+  for (const [rel, digests] of Object.entries(manifest.artifacts)) {
+    const sha = createHash('sha256').update(readFileSync(join(ROOT, rel))).digest('hex')
+    check(`${rel} — the shipped file's digest is in the manifest`, digests.includes(sha))
+  }
+}
+
 console.log(`\nphase17-template-drift: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL === 0 ? 0 : 1)

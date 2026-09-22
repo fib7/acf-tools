@@ -29,6 +29,23 @@ acfw-store-<backend> <subcommand> [args...]
 ```
 
 **Dispatcher-implemented flags** (consumed by `skills/lib/bin/acfw-store`, never forwarded to an adapter):
+
+`snapshot --only <key>` (repeatable) narrows the emitted view to the **closure** of the named tasks —
+the seeds plus every dependency that is not accepted-terminal — so a five-task run relays five records
+instead of the whole board. `snapshot --full-to FILE` tees the pre-narrowing snapshot to a file.
+Both are implemented once, in the dispatcher, over the final enriched JSON.
+
+`--only` reaches an adapter **only** when it declares `snapshot-only`. A raw adapter must keep listing
+everything: the closure walk and the store-wide `counts` are computed from the full set, and narrowing
+at the adapter would make both wrong, silently. Declare `snapshot-only` only if you also own
+`snapshot-enriched` and can resolve seeds against states your enriched output no longer contains
+(the `files` scanner does: its digest collapses terminal-accepted tasks, so a seed naming one has to
+be RETAINED or the caller is told their id does not exist).
+
+Seed resolution order is **exact `id` → exact `stem` → exact `backendId` → UNIQUE stem prefix**. An
+ambiguous prefix is reported in `scope.ambiguous` with its candidates, never resolved by first match:
+on a large board first-match silently selects whichever card was listed first.
+
 `doctor --snapshot FILE` reuses a snapshot the caller already holds instead of taking a second one —
 on a backend without `doctor-complete` every `doctor` otherwise enumerates the store twice, once in
 the adapter's own battery and once for the generic graph battery. The file must be a **full**
@@ -68,7 +85,7 @@ Backend-specific env (`BD_*`, `ACFW_BEADS_*`, `MULTICA_*`, …) passes through u
 ```json
 {"backend":"<name>","contractVersion":1,"commitsToGit":<bool>,"capabilities":["snapshot","read","create","transition",...]}
 ```
-Capability flags: `snapshot-enriched`, `stage`, `update-field`, `update-body`, `log-event`, `comment`, `doctor`, `doctor-fix`, `doctor-complete`, `init`, `sync`, `atomic-claim`, `token-all-states`. **`token-all-states`** = `snapshot.hasCleanCheckoutToken` is answered for EVERY task state. Declare it when the answer is free (multica reads it out of the description it already fetched). Withhold it when each answer costs a request and you bound the paid set to the states where a wrong answer costs something now — `in-progress`, `completed`, `in-review` — as linear does. The declaration is what lets a consumer tell "no token" from "not scanned": without it the dispatcher sets `"tokenAllStates": false` on the snapshot and the generic doctor suppresses its accepted-without-token WARN, which would otherwise stand permanently against every finished task. `commitsToGit` = state writes produce trunk commits (files: true).
+Capability flags: `snapshot-enriched`, `snapshot-only`, `stage`, `update-field`, `update-body`, `log-event`, `comment`, `doctor`, `doctor-fix`, `doctor-complete`, `init`, `sync`, `atomic-claim`, `token-all-states`. **`token-all-states`** = `snapshot.hasCleanCheckoutToken` is answered for EVERY task state. Declare it when the answer is free (multica reads it out of the description it already fetched). Withhold it when each answer costs a request and you bound the paid set to the states where a wrong answer costs something now — `in-progress`, `completed`, `in-review` — as linear does. The declaration is what lets a consumer tell "no token" from "not scanned": without it the dispatcher sets `"tokenAllStates": false` on the snapshot and the generic doctor suppresses its accepted-without-token WARN, which would otherwise stand permanently against every finished task. **`snapshot-only`** = the adapter implements `--only` itself. Declare it only alongside `snapshot-enriched`, and only if you can resolve seeds against states your enriched output no longer contains — otherwise let the dispatcher narrow, which every raw adapter does for free. `commitsToGit` = state writes produce trunk commits (files: true).
 
 ### `snapshot [--digest] [--counts-only] [--mode default|override]`
 One BacklogSnapshot JSON object. Adapter-owned fields per task: `stem`, `id`, `folder` (whip state), `status`, `slug` (worktree), `agent`, `priority`, `deps[]` (stems), `touchesGlobs[]`, `rejectionCount` (number), `blockCount` (number), `lastTransitionTs` (`YYYY-MM-DD HH:MM:SS` UTC), `hasCleanCheckoutToken` (bool), plus top-level `counts{<state>:n,...}` and `generatedAt`. `--digest`/`--counts-only`/`--mode` may be treated as hints (a full snapshot is always acceptable).
@@ -93,6 +110,51 @@ index, so a task depending on a draft reports `WARN|dep-inactive` (gated, with t
 `FATAL|dangling-dep` (a lie — the dep exists).
 
 Adapters **without** `snapshot-enriched` emit `"raw":true` and omit git-derived facts (`trunkSha`, `hasIntegratedAt`, `hasWorktreeBranch`, `worktrees[]`, `isCodeMutating`, `ageHours`, integrated/terminal counts) — the dispatcher fills them. Adapters must **not** emit `store`; the dispatcher injects it. The `files` snapshot (see `skills/go/bin/scan-backlog.sh`) is the reference shape.
+
+#### `relay{}` — proving the payload arrived whole
+
+Every snapshot the dispatcher emits carries a `relay` header as its **first** key:
+
+```json
+{"relay":{"n":12,"tasks":9,"inactive":1,"sat":2,"bytes":214}, ...}
+```
+
+`n` is the total entry count across `tasks`/`inactive`/`satisfiedDeps`, the three named fields are the
+per-array counts, and `bytes` is the sum of the UTF-8 byte lengths of every `stem` in them.
+
+This exists because the snapshot is produced by a script but **delivered by an agent**: `/go`'s
+shell-runner reads the store walk's stdout and copies it into one schema string. That echo can come
+back short — valid JSON, fewer tasks — and a shortened board is indistinguishable from a small one.
+The consumer recomputes both numbers and refuses a mismatch. A count alone is forgeable by a model
+that tidies a header it can see; the byte sum is a second, content-derived number. First-key placement
+means a tail-elided echo still carries the expectation it fails.
+
+It proves no entry was dropped, added, or replaced by one of a different stem length. It does **not**
+prove stem identity — an equal-length substitution passes — which is deliberate: a length sum is the
+strongest check jq, bash and JS can all compute identically and cheaply, and truncation is the
+demonstrated failure mode where substitution is not.
+
+A raw adapter emits nothing here; the dispatcher's post-stage adds it. An adapter with
+`snapshot-enriched` SHOULD emit it (absent is tolerated — a consumer logs once that completeness is
+unverifiable and proceeds, because refusing would brick every third-party backend on upgrade).
+
+#### `scope{}` — what a narrowed snapshot resolved
+
+Present only when `--only` was given, alongside `"scopeApplied": true` and a `scopeCounts` computed
+over the narrowed view (store-wide `counts` is **never** narrowed — the doctor, the report and an
+unscoped completion test all read it):
+
+```json
+{"scope":{"seeds":["MUL-4821"],"resolved":{"MUL-4821":"ui-021-login"},"unresolved":[],
+          "ambiguous":[{"tok":"ui-021","candidates":["ui-021-login","ui-021-logout"]}],
+          "inactiveSeeds":[{"stem":"doc-009","folder":"draft"}],"added":["api-014-token"]}}
+```
+
+A seed that exists but is paused or retired belongs in `inactiveSeeds`, never `unresolved` — "paused"
+and "does not exist" deserve opposite answers. `added` names the dependencies pulled into the closure.
+The closure keeps every dependency that is **not accepted-terminal**, including `blocked` and
+`rejected` ones: those are retryable, and the pass that lifts them runs over the scope, so leaving one
+out means it can never be lifted and its dependent can never dispatch.
 
 ### `read [--body] [--materialize DIR] <key>`
 ```json
@@ -122,7 +184,7 @@ Output: `ok:`/`noop:`/`warn:` lines (echoed verbatim into run reports).
 | `update-body <key>` | Replace the task document/description from stdin. Refuse empty input. |
 | `log-event <key> --row "\| ... \|"` | Append one machine-greppable event row (the `clean-checkout \| ok` token). Must surface in later `snapshot.hasCleanCheckoutToken` — **in every task state, not only the review ones**. The field is a flat per-task boolean with no state qualifier: `false` means "this task has no token", and a consumer cannot tell a real absence from a state the adapter declined to scan. Two consumers depend on it: the review gate auto-rejects on `false`, and the generic doctor WARNs on an accepted task without one. Where an answer costs a request, bound the PAID set to the states where a wrong answer costs something now (`in-progress`, `completed`, `in-review`) rather than narrowing the field itself — never buy `accepted` coverage with an N+1 over a monotonically growing backlog. |
 | `comment <key> [--author A]` | Free-form evidence/review note from stdin. |
-| `doctor [--fix] [--quiet] [--active-only]` | Store-native integrity findings: `SEV\|code\|task\|detail` lines + `SUMMARY\|fatal=N\|repairable=N\|warn=N\|ok=bool`. Exit 0 iff no FATAL. **`--quiet` suppresses the ADVISORY dump (WARN/REPAIRABLE), never the gate decision: every `FATAL\|` line MUST still be printed.** Without `doctor-complete` the dispatcher recomputes `ok=` from the lines it receives, so an adapter that swallows its FATALs under `--quiet` reports a clean board to `/go`'s startup gate while the verbose operator path shows the same FATAL — two tools disagreeing about one backlog. **Exit status is load-bearing**: `0` = ran, clean; `1` = ran, found FATALs (already emitted as lines); anything else = the battery COULD NOT RUN, and the dispatcher turns that into `FATAL\|doctor-unavailable` rather than silence, because absence of findings is not health. `doctor-complete` = covers the full battery (files); without it the dispatcher merges in the generic graph/git checks. |
+| `doctor [--fix] [--quiet] [--active-only]` | Store-native integrity findings: `SEV\|code\|task\|detail` lines + `SUMMARY\|fatal=N\|repairable=N\|warn=N\|ok=bool`. Exit 0 iff no FATAL. **Field 3 is a routing decision, not a label** (3.4.0): a task-scoped finding MUST carry the exact whip key, and a store- or repo-scoped one MUST carry `-` or `(repo)`. `/go` classifies on it — a repo-scoped FATAL aborts the run, a task-scoped one holds out only that task, and a key matching nothing in the snapshot is reported but gates nothing. Matching is EXACT: a prefix or a slug in field 3 would attach the finding to the wrong task, which is the one way per-task quarantine is less safe than aborting. **Never repair a human hold**: if the native status expresses a deliberate pause or cancellation while the whip state is runnable, report it (`WARN\|native-hold\|<key>\|...`, naming `transition <key> draft`) and leave it — `/go` runs `--fix` at bootstrap, so repairing it un-parks every card the team parked, on every run. **`--quiet` suppresses the ADVISORY dump (WARN/REPAIRABLE), never the gate decision: every `FATAL\|` line MUST still be printed.** Without `doctor-complete` the dispatcher recomputes `ok=` from the lines it receives, so an adapter that swallows its FATALs under `--quiet` reports a clean board to `/go`'s startup gate while the verbose operator path shows the same FATAL — two tools disagreeing about one backlog. **Exit status is load-bearing**: `0` = ran, clean; `1` = ran, found FATALs (already emitted as lines); anything else = the battery COULD NOT RUN, and the dispatcher turns that into `FATAL\|doctor-unavailable` rather than silence, because absence of findings is not health. `doctor-complete` = covers the full battery (files); without it the dispatcher merges in the generic graph/git checks. |
 | `sync` | Durability flush (beads: `bd export` JSONL — bd's own `export.auto` defaults to false, so this is the only thing that refreshes the mirror). Best-effort; dispatcher never fails on it. |
 
 ## Conformance

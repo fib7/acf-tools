@@ -76,9 +76,20 @@ The `store` field in snapshots is always injected by the dispatcher — adapters
 
 **Snapshot → scheduler.** `acfw-store snapshot` = adapter emits the raw BacklogSnapshot (per-task
 `stem/folder/deps/slug/counters/...` from its backend) → dispatcher injects `store` and enriches
-with git facts → the pure-JS scheduler in `whip-go.workflow.js` partitions by worktree slug and
-gates on dependencies exactly as on files. Readiness is always computed whip-side; no backend's
-native "ready"/"blocked" logic is trusted.
+with git facts → **narrows and collapses** (`acfw-scope-snapshot.sh`: `--only` closure, real
+`--digest`, the `relay` header) → the pure-JS scheduler in `whip-go.workflow.js` partitions by
+worktree slug and gates on dependencies exactly as on files. Readiness is always computed whip-side;
+no backend's native "ready"/"blocked" logic is trusted.
+
+**Why the narrowing is the dispatcher's job (3.4.0).** The snapshot is produced by a script but
+DELIVERED by an agent — `/go`'s shell-runner copies the store walk's stdout into one schema string —
+so the payload has to fit what a model will echo reliably. `--digest` was a documented no-op on every
+raw adapter, so a lived-in board relayed every card it had, and a short echo is valid JSON and
+indistinguishable from a smaller board. Both halves of the fix live here rather than in each adapter:
+a raw adapter keeps listing everything (the closure walk and the store-wide counts need the full set),
+and the dispatcher narrows once, for every backend, and states what it emitted. An adapter opts out
+only by declaring `snapshot-only`, which means "I resolve seeds myself, including against states my
+own output no longer contains".
 
 **Transition → audit.** Every state write goes through `acfw-store transition <stem> <state>
 [AGENT] [NOTES] [RINC] [BINC]` — same positional tail on every backend. The adapter applies the

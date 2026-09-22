@@ -56,12 +56,23 @@ script, not in your context.
        // default; 1 skips the panel entirely, which is the right call for a small, well-understood
        // scope where the judge round is most of the cost. Pass it when the user asks for a faster
        // or a more thorough decomposition; omit otherwise.
-       planners: 1 | 2 | 3
+       planners: 1 | 2 | 3,
+       // OPTIONAL (3.4.0). Per-tier model routing, resolved by step 1's `acfw-store info` from
+       // env > .acfwhip/config > defaults. Pass the object through verbatim; omit it if `info`
+       // predates 3.4.0. `models.shell` (default haiku) covers the agents that only run a fixed
+       // command and copy stdout into a schema — the registry ls, both writers, the doctor.
+       // `models.judge` (planners, judge, critic) and `models.author` (task documents) ship unset,
+       // which inherits the session model.
+       models: <info.models>
      }
    })
    ```
 3. When it completes, report the returned summary: created task ids + slugs + dependencies, the
-   commit sha, and the doctor verdict. If it returns `aborted: true`, surface the `defects` list and
+   commit sha, and the doctor verdict. Also say that a bare `/go` will now run exactly these tasks
+   (the run returns `focus{}`): `/task` points this checkout's run focus at what it just created, so
+   the operator never has to name ids for the work they just planned. `/go --all` remains the way to
+   run the whole backlog. `models`/`agentsByTier` report which tier ran how many agents.
+   If it returns `aborted: true`, surface the `defects` list and
    **STOP** — do NOT hand-write task files to route around the validation gate. If it returns
    `error`, **or the `Workflow` call is refused outright**, fall back to the legacy path below — a
    denied tool call returns no value at all, so the `error` branch never sees it. Never retry with

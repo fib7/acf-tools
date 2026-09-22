@@ -28,6 +28,48 @@ review → binary accept/reject (no partial credit)
 
 ## Features
 
+### 🎯 A bare `/go` runs YOUR tasks (3.4.0)
+
+`/task` points this checkout's **focus** at the tasks it just created, and a bare `/go` runs the
+focus. The ordinary path — plan → `/task` → `/go` — needs no arguments and still runs only your own
+work. `/whip-focus` manages the list by hand; it is gitignored per-checkout state, so two people on
+one board have two focuses.
+
+```
+/go                              your focus
+/go --all                        the whole backlog, explicitly
+/go api-014-token MUL-4821       exactly these (stems, ids, native ids, unique prefixes)
+/go frontend tasks only          a natural-language filter, resolved and confirmed before launch
+/whip-move <task> draft          pause it   (archive = cancel) — on every backend
+```
+
+With no focus set, a bare `/go` drains the backlog on the `files` store (unchanged) and **refuses**
+on a shared API-backed board, naming the three ways forward. One person's bare `/go` should never be
+everyone's.
+
+### 📦 The snapshot is narrowed in the store, and verified on arrival (3.4.0)
+
+`/go`'s scan agent relays the store walk into the orchestrator. On a large board that relay could come
+back short — valid JSON, fewer tasks — and the run would report the ids it was given as nonexistent.
+Now `--only` emits just the **closure** of the named tasks (seeds plus their unmet dependencies), a
+real `--digest` collapses finished work on **every** backend rather than only `files`, and every
+snapshot carries a `relay` header the orchestrator recomputes. A short relay stops the run as
+`relay-truncated` with the honest remedy; it is never reported as a missing id.
+
+### 🩹 One malformed card no longer blocks the team (3.4.0)
+
+An integrity FATAL used to stop the run. Now only **repo-scoped** ones do (detached HEAD, a worktree
+on the wrong branch, an unreadable store). A **task-scoped** finding holds out that one task — never
+dispatched, never integrated, still gating its dependents — and the rest of the board runs. The run
+reports `partial`, never `complete`, and `heldOut[]` names what it refused to touch and why.
+
+### 💸 Agents route by tier, and the run says what it spent (3.4.0)
+
+Fixed-command shell runners (scan, writers, integrate, doctor) run on a cheap model; specialists and
+reviewers run on the model the project declared in `.claude/agents/<name>.md`; the architect and the
+conflict resolver stay on the session model. Pin it once per repo (`ACFW_MODEL_SHELL`, `_JUDGE`,
+`_AUTHOR`). Every run reports `models` and `agentsByTier`.
+
 ### 🔥 Hostile Task Style Enforcement
 
 **MANDATORY compliance** with `docs/acf/style/task-descriptions.md`:
