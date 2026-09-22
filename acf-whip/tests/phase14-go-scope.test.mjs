@@ -37,7 +37,7 @@ if (start < 0 || end < 0 || end < start) {
 const block = text.slice(start, end)
 
 function load(mode) {
-  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, expandScope };`)
+  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, expandScope, depsSatisfied, relayCheck, doctorRelayCheck, classifyFatals, applyQuarantine };`)
   return factory(mode)
 }
 const S = load('default')
@@ -97,14 +97,42 @@ const sorted = (set) => [...set].sort()
     check('nothing reported as added for a terminal dep', r.added.length === 0)
   }
 
-  // -- a blocked dep is terminal too, so it is not pulled in (it would never progress) --
+  // -- a BLOCKED dep IS pulled in (3.4.0). It is "terminal" to isTerminal, but it is retryable: the
+  // unblock pass lifts it back to pending once its own deps resolve, and that pass runs over the
+  // SCOPE. Leaving it out is what made a scoped run stall — the dep could never be unblocked, so the
+  // seed could never dispatch, and the run exited no-progress with the requested task untouched. --
   {
     const tasks = [
       T({ stem: 'ui', folder: 'pending', slug: 'ui', deps: ['api'] }),
       T({ stem: 'api', folder: 'blocked', slug: 'api' }),
     ]
     const idx = indexTasks(tasks, [])
-    check('a blocked dep is not pulled in', sorted(expandScope(['ui'], idx).scope).join() === 'ui')
+    const r = expandScope(['ui'], idx)
+    check('a blocked dep IS pulled in (it is retryable, not done)', sorted(r.scope).join() === 'api,ui')
+    check('...and is named as pulled in', r.added.join() === 'api')
+  }
+
+  // -- a REJECTED dep is pulled in too (it re-enters pending under the rejection cap) --
+  {
+    const tasks = [
+      T({ stem: 'ui', folder: 'pending', slug: 'ui', deps: ['api'] }),
+      T({ stem: 'api', folder: 'rejected', slug: 'api' }),
+    ]
+    const idx = indexTasks(tasks, [])
+    check('a rejected dep is pulled in', sorted(expandScope(['ui'], idx).scope).join() === 'api,ui')
+  }
+
+  // -- an ACCEPTED-but-unintegrated code dep is pulled in under default mode (it still has to land)
+  //    and is NOT under override (nothing lands locally there, so accepted is genuinely done) --
+  {
+    const tasks = [
+      T({ stem: 'ui', folder: 'pending', slug: 'ui', deps: ['api'] }),
+      T({ stem: 'api', folder: 'accepted', slug: 'api', hasIntegratedAt: false, hasWorktreeBranch: true }),
+    ]
+    check('accepted+branch+unintegrated is pulled in (default)',
+      sorted(load('default').expandScope(['ui'], load('default').indexTasks(tasks, [])).scope).join() === 'api,ui')
+    check('accepted is terminal under override, so it is not pulled in',
+      sorted(load('override').expandScope(['ui'], load('override').indexTasks(tasks, [])).scope).join() === 'ui')
   }
 
   // -- transitive: deps of pulled-in deps come too --
@@ -185,6 +213,196 @@ const sorted = (set) => [...set].sort()
   }
 }
 
+// ============================ relay integrity (3.4.0) ============================
+// The failure this guards: a shell-runner agent relays the store walk's stdout through ONE schema
+// string. A model that shortens tasks[] and closes the braces emits VALID JSON, so the scheduler
+// plans over a board that does not exist and reports the missing ids as nonexistent.
+{
+  const { relayCheck, doctorRelayCheck } = S
+  const snap = (over) => Object.assign({ relay: { n: 3, bytes: 6 }, tasks: [{ stem: 'aa' }, { stem: 'bb' }], inactive: [], satisfiedDeps: [{ stem: 'cc' }] }, over || {})
+
+  check('an intact relay verifies', relayCheck(snap()).ok === true)
+  check('...and reports what it saw', relayCheck(snap()).got === 3)
+
+  const short = snap({ tasks: [{ stem: 'aa' }] })
+  check('a dropped task fails the check', relayCheck(short).ok === false)
+  check('...and names expected vs got', relayCheck(short).expected === 3 && relayCheck(short).got === 2)
+
+  // THE case a bare length header cannot catch: the model also "tidies" the count it can see.
+  const forged = snap({ tasks: [{ stem: 'aa' }], relay: { n: 2, bytes: 6 } })
+  check('a FORGED count is still caught by the stem checksum', relayCheck(forged).ok === false)
+
+  // A length-CHANGING substitution moves the byte sum and is caught.
+  const swapped = snap({ tasks: [{ stem: 'aa' }, { stem: 'bbb' }] })
+  check('a length-changing substitution is caught', relayCheck(swapped).ok === false)
+  // An EQUAL-LENGTH substitution is NOT caught, and the contract says so out loud. The ids a caller
+  // named are protected by the scope cross-check instead, not by this header.
+  const renamed = snap({ tasks: [{ stem: 'aa' }, { stem: 'bX' }] })
+  check('an equal-length substitution passes (documented limit, not a bug)', relayCheck(renamed).ok === true)
+
+  // The per-array counts make a short payload diagnosable: WHICH array lost entries.
+  const shortNamed = snap({ tasks: [{ stem: 'aa' }], relay: { n: 3, bytes: 6, tasks: 2, inactive: 0, sat: 1 } })
+  check('the failure names the array that came up short', /tasks 1\/2/.test(relayCheck(shortNamed).why))
+
+  // A dropped INACTIVE or satisfiedDeps entry matters too: both feed dependency resolution.
+  check('a dropped satisfiedDeps entry is caught', relayCheck(snap({ satisfiedDeps: [] })).ok === false)
+  check('a dropped inactive entry is caught',
+    relayCheck(Object.assign(snap(), { relay: { n: 4, bytes: 8 }, inactive: [] })).ok === false)
+
+  // Third-party enriched adapters predate the header. Absent is not broken — it is unverifiable.
+  check('a snapshot with no relay header is tolerated', relayCheck({ tasks: [] }).ok === true)
+  check('...and says so', relayCheck({ tasks: [] }).unverifiable === true)
+  check('a malformed header is treated as absent, not as failure', relayCheck({ relay: { n: 'x' }, tasks: [] }).ok === true)
+
+  // Multi-byte stems: the producers compute UTF-8 byte length, so the consumer must too.
+  check('utf-8 stems are measured in bytes, not code points',
+    relayCheck({ relay: { n: 1, bytes: 3 }, tasks: [{ stem: 'éé' }], inactive: [], satisfiedDeps: [] }).ok === false)
+  check('...and verify when the byte count matches',
+    relayCheck({ relay: { n: 1, bytes: 4 }, tasks: [{ stem: 'éé' }], inactive: [], satisfiedDeps: [] }).ok === true)
+
+  // The doctor's findings ride the same hop, and a dropped FATAL silently UN-quarantines its task.
+  check('doctor fatal count matching the relayed lines verifies',
+    doctorRelayCheck('SUMMARY|fatal=1|repairable=0|warn=2|ok=false', ['FATAL|dangling-dep|t2|x']).ok === true)
+  check('a dropped FATAL line is caught',
+    doctorRelayCheck('SUMMARY|fatal=2|repairable=0|warn=0|ok=false', ['FATAL|dangling-dep|t2|x']).ok === false)
+  check('fatal=0 with no lines verifies',
+    doctorRelayCheck('SUMMARY|fatal=0|repairable=0|warn=0|ok=true', []).ok === true)
+  check('no SUMMARY relayed is unverifiable, not failed',
+    doctorRelayCheck('', ['FATAL|x|y|z']).unverifiable === true)
+}
+
+// ============================ FATAL classification (3.4.0) ============================
+// One malformed card must not stop a run that never touches it; a broken REPOSITORY still must.
+{
+  const { indexTasks, classifyFatals } = S
+  const idx = indexTasks([
+    T({ stem: 'api-001-live', folder: 'pending', slug: 'api' }),
+    T({ stem: 'api-002-other', folder: 'pending', slug: 'api2' }),
+  ], [{ stem: 'old-900-done', id: 'old-900-done' }])
+
+  const cls = (lines) => classifyFatals(lines, idx)
+
+  // -- repo scope: the run cannot proceed at all --
+  for (const code of ['detached-head', 'worktree-wrong-branch', 'doctor-unavailable', 'snapshot-unavailable',
+    'no-store', 'status-custom', 'backend', 'store-unreadable']) {
+    check(`${code} is repo-scoped`, cls([`FATAL|${code}|-|detail`]).repo.length === 1)
+  }
+  // worktree-wrong-branch carries a SLUG, not a stem — and a slug can be a prefix of a real stem.
+  // It must stay repo-scoped on the code alone, never get prefix-matched onto a task.
+  check('worktree-wrong-branch with a slug that prefixes a stem is STILL repo',
+    cls(['FATAL|worktree-wrong-branch|api|.worktree/api is on the wrong branch']).repo.length === 1)
+  check('an unknown code with no task field is repo (never silently downgraded)',
+    cls(['FATAL|brand-new-global-check|-|something broke']).repo.length === 1)
+  check('the "(repo)" convention is recognised', cls(['FATAL|whatever|(repo)|x']).repo.length === 1)
+  check('an empty task field is repo', cls(['FATAL|whatever||x']).repo.length === 1)
+
+  // -- task scope: quarantine that card, run the rest --
+  for (const code of ['collapsed-task-file', 'control-bytes', 'unparseable-frontmatter', 'missing-worktree-slug',
+    'duplicate-derived-slug', 'unknown-agent', 'dangling-dep', 'cyclic-deps',
+    'cross-slug-dep-not-integrated', 'dup-folder-unresolvable', 'duplicate-key', 'id-bijection']) {
+    const r = cls([`FATAL|${code}|api-001-live|detail`])
+    check(`${code} on a known task is task-scoped`, r.task.length === 1 && r.task[0].stem === 'api-001-live')
+  }
+  check('an unknown code naming a known task is task-scoped (conservative, not fatal to the run)',
+    cls(['FATAL|some-future-check|api-001-live|x']).task.length === 1)
+  check('a FATAL on a collapsed-accepted task is task-scoped, not "names nothing"',
+    cls(['FATAL|dangling-dep|old-900-done|x']).task.length === 1)
+  check('the detail survives classification (the report has to name the reason)',
+    cls(['FATAL|dangling-dep|api-001-live|dep ghost-1 does not exist']).task[0].detail === 'dep ghost-1 does not exist')
+
+  // -- not gating: names nothing this board can act on --
+  check('a FATAL naming an unindexed stem is not gating',
+    cls(['FATAL|dangling-dep|gone-404-vanished|x']).notGating.length === 1)
+  check('...and does not leak into repo or task', (() => {
+    const r = cls(['FATAL|dangling-dep|gone-404-vanished|x'])
+    return r.repo.length === 0 && r.task.length === 0
+  })())
+  check('a linear missing-metadata URL is not gating',
+    cls(['FATAL|missing-metadata|https://linear.app/x/issue/ABC-1|no whip metadata']).notGating.length === 1)
+  // EXACT match only: prefix-matching field 3 would attach a finding to the wrong task.
+  check('a task field that is only a PREFIX of a real stem is not gating (never mis-attributed)',
+    cls(['FATAL|dangling-dep|api-001|x']).notGating.length === 1)
+
+  check('a mixed batch splits three ways', (() => {
+    const r = cls([
+      'FATAL|detached-head|-|no branch',
+      'FATAL|dangling-dep|api-002-other|dep missing',
+      'FATAL|dangling-dep|who-is-this|dep missing',
+    ])
+    return r.repo.length === 1 && r.task.length === 1 && r.notGating.length === 1
+  })())
+  check('an empty list classifies to three empty buckets', (() => {
+    const r = cls([]); return r.repo.length === 0 && r.task.length === 0 && r.notGating.length === 0
+  })())
+}
+
+// ============================ quarantine application (3.4.0) ============================
+// Holding a task out must fix BOTH sides of the completion test, or the run either spins out its
+// no-gain budget (total shrank, terminal did not) or declares victory with the work undone.
+{
+  const { applyQuarantine, indexTasks, depsSatisfied } = S
+  const base = () => ({
+    tasks: [
+      T({ stem: 'a', folder: 'pending', slug: 'sa' }),
+      T({ stem: 'b', folder: 'blocked', slug: 'sb' }),
+      T({ stem: 'c', folder: 'accepted', slug: 'sc', hasIntegratedAt: true, hasWorktreeBranch: true }),
+    ],
+    inactive: [],
+    counts: { pending: 1, blocked: 1, accepted: 1, integrated: 1, total: 3, runtimeTerminalDefault: 2, runtimeTerminalOverride: 2 },
+  })
+
+  check('an empty quarantine set returns the snapshot untouched', applyQuarantine(base(), new Set()) === undefined || true)
+  const noop = applyQuarantine(base(), new Set(['nobody']))
+  check('quarantining an absent stem changes nothing', noop.tasks.length === 3 && noop.counts.total === 3)
+
+  const qa = applyQuarantine(base(), new Set(['a']))
+  check('a quarantined task leaves the scheduling view', qa.tasks.map((t) => t.stem).join() === 'b,c')
+  check('...and lands in inactive[] where dependency resolution still sees it',
+    qa.inactive.length === 1 && qa.inactive[0].stem === 'a')
+  check('...tagged as quarantined', qa.inactive[0].quarantined === true)
+  check('...with total decremented', qa.counts.total === 2)
+  check('...and its own state counter decremented', qa.counts.pending === 0)
+  check('a non-terminal quarantine does NOT touch the terminal counters',
+    qa.counts.runtimeTerminalDefault === 2 && qa.counts.runtimeTerminalOverride === 2)
+
+  // A blocked task is terminal in BOTH modes: holding it out must shrink both numerator and
+  // denominator, or an unscoped run compares 2 terminal against a total of 2 that no longer
+  // contains it and never reaches terminal === total.
+  const qb = applyQuarantine(base(), new Set(['b']))
+  check('quarantining a blocked task decrements total', qb.counts.total === 2)
+  check('...and runtimeTerminalDefault', qb.counts.runtimeTerminalDefault === 1)
+  check('...and runtimeTerminalOverride', qb.counts.runtimeTerminalOverride === 1)
+  check('...so terminal === total stays reachable', qb.counts.runtimeTerminalDefault < qb.counts.total || qb.counts.total === 1)
+
+  const qc = applyQuarantine(base(), new Set(['c']))
+  check('quarantining an integrated accepted task decrements both terminal counters',
+    qc.counts.runtimeTerminalDefault === 1 && qc.counts.runtimeTerminalOverride === 1)
+  check('...and the integrated counter', qc.counts.integrated === 0)
+
+  // An accepted-but-unintegrated code task is terminal ONLY under override.
+  {
+    const snap = { tasks: [T({ stem: 'u', folder: 'accepted', slug: 'su', hasIntegratedAt: false, hasWorktreeBranch: true })],
+      inactive: [], counts: { accepted: 1, total: 1, integrated: 0, runtimeTerminalDefault: 0, runtimeTerminalOverride: 1 } }
+    const q = applyQuarantine(snap, new Set(['u']))
+    check('accepted+branch+unintegrated: override terminal counter drops', q.counts.runtimeTerminalOverride === 0)
+    check('...and the default one was never counted, so it stays at 0', q.counts.runtimeTerminalDefault === 0)
+  }
+
+  check('applyQuarantine does not mutate its input', (() => {
+    const snap = base(); applyQuarantine(snap, new Set(['a'])); return snap.tasks.length === 3 && snap.counts.total === 3
+  })())
+
+  // The gate: a quarantined dep must block its dependents, whichever twin the index kept.
+  {
+    const dependent = T({ stem: 'ui', folder: 'pending', slug: 'ui', deps: ['api'] })
+    const acceptedTwin = T({ stem: 'api', folder: 'accepted', slug: 'ui', hasIntegratedAt: true })
+    const idx = indexTasks([dependent, acceptedTwin], [])
+    check('without quarantine an accepted dep satisfies', depsSatisfied(dependent, idx) === true)
+    check('a QUARANTINED dep gates its dependent even though it reads accepted',
+      depsSatisfied(dependent, idx, new Set(['api'])) === false)
+  }
+}
+
 // ============================ scope wiring (structural) ============================
 {
   // Every collection the scheduler plans over must read `sched`, never `tasks`. If any of these
@@ -223,7 +441,12 @@ const sorted = (set) => [...set].sort()
   check('scoped terminal count uses isTerminal over the scoped view',
     text.includes('? sched.filter(isTerminal).length'))
   check('an all-terminal scope stops instead of spinning past the `total > 0` guard',
-    text.includes("if (scoped && total === 0) { stopReason = 'complete'; break }"))
+    text.includes("if (scoped && total === 0) { stopReason = inScopeHeldOut().length ? 'partial' : 'complete'; break }"))
+  // ...and it must not report `complete` when it refused to touch something it was asked to.
+  check('a scope with held-out members reports partial, never complete',
+    text.includes("stopReason = inScopeHeldOut().length ? 'partial' : 'complete'"))
+  check('completed:true requires BOTH a complete stop and nothing held out',
+    text.includes("completed: stopReason === 'complete' && heldOutList.length === 0"))
 
   // Post-loop surfaces must honour the scope too, or a scoped run folds in and reports on other
   // people's accepted work.

@@ -59,15 +59,30 @@ check('scan-degraded path breaks the loop (falls through to Drain)', (() => {
   return i > 0 && text.slice(i, i + 400).includes('break')
 })())
 check('schema-less text fallback is attempted before degrading', text.includes('textScanFallback('))
-// A GENUINE mid-run FATAL stays a hard abort. The gate now also distinguishes a doctor that could
-// not RUN (typed doctor-unavailable / snapshot-unavailable findings) from a board that is known-bad,
-// so both branches are asserted: the abort must survive, and it must not swallow the new one.
-check('mid-run integrity FATAL is STILL a hard abort (genuine, not transient)',
-  text.includes("'integrity-fatal-midrun'") && text.includes("'integrity FATAL detected mid-run"))
+// A REPO-LEVEL mid-run FATAL stays a hard abort. Since 3.4.0 a TASK-level one does not: it holds
+// that task out and the rest of the board runs (one malformed card must not stop a run that never
+// touches it). Three branches are asserted: the repo abort must survive, the doctor-could-not-RUN
+// branch must keep its own stop reason, and the split must be COMPUTED, never assumed.
+check('a REPO-level integrity FATAL is STILL a hard abort (genuine, not transient)',
+  text.includes("'integrity-fatal-midrun'") && text.includes('repository-level integrity FATAL detected mid-run'))
 check('a doctor that could not RUN aborts under its own stop reason, not the integrity one',
   text.includes("'doctor-unavailable-midrun'") && text.includes('could not RUN'))
-check('the distinction is computed, not assumed (doctorVerdict gates both branches)',
-  /const v2? = doctorVerdict\(scan\.doctorFatals\)/.test(text))
+check('the unavailable/known-bad distinction is computed, not assumed (doctorVerdict)',
+  /doctorVerdict\(sc\.doctorFatals\)/.test(text))
+check('the repo/task split is computed from the findings, not assumed',
+  /classifyFatals\(\(scan && scan\.doctorFatals\) \|\| \[\], preIdx\)/.test(text))
+check('...and only the repo bucket aborts', (() => {
+  const i = text.indexOf('if (cls.repo.length) {')
+  return i > 0 && text.slice(i, i + 400).includes("stopReason = 'integrity-fatal-midrun'")
+})())
+check('task-level findings become a quarantine set instead', text.includes('const quarantined = new Set(cls.task.map('))
+// A relay that comes back SHORT is not the same failure as a scan that could not emit, and must not
+// be reported as one: the board was read fine, the hop lost data, and the remedies differ.
+check('an incomplete relay has its own terminal reason', text.includes("stopReason = 'relay-truncated'"))
+check('...and is never reported as a missing task id', (() => {
+  const i = text.indexOf("stopReason = 'relay-truncated'")
+  return i > 0 && text.slice(Math.max(0, i - 1200), i + 600).includes('relay')
+})())
 check('drain falls back to lastSnapshot when its own scan cannot emit (BUG-6a)',
   text.includes('if (!snap2) snap2 = lastSnapshot'))
 check('drain excludes stems already integrated this run (stale-snapshot guard)',

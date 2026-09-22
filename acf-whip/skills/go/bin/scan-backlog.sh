@@ -44,12 +44,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COUNTS_ONLY=false
 DIGEST=false
 MODE_ARG=default
+# Run scope (3.4.0). Seeds named by the caller (`/go <ids>`); resolved HERE, against every folder,
+# before any collapse can hide one. The scanner does NOT narrow tasks[] — its digest is already the
+# bounded active working set and the scheduler narrows its own view — but a seed must survive the
+# collapse, or `/go <a-finished-task>` is told the task "does not exist in the backlog".
+ONLY_SEEDS=""
 while [ $# -gt 0 ]; do
   case "${1:-}" in
     --counts-only) COUNTS_ONLY=true; shift;;
     --digest) DIGEST=true; shift;;
     --mode) MODE_ARG="${2:-default}"; shift 2;;
     --mode=*) MODE_ARG="${1#--mode=}"; shift;;
+    --only) [ $# -ge 2 ] || { echo "FATAL: --only requires a task key" >&2; exit 2; }
+            ONLY_SEEDS="$ONLY_SEEDS$2
+"; shift 2;;
+    --only=*) ONLY_SEEDS="$ONLY_SEEDS${1#--only=}
+"; shift;;
     *) break;;
   esac
 done
@@ -67,6 +77,9 @@ if [ "$(acfw_resolve_store "$REPO_ROOT")" != "files" ]; then
   exit 2
 fi
 ACTIVE="pending in-progress completed in-review blocked rejected accepted"
+# Every folder a card can sit in. Seed resolution spans ALL of them — a seed naming a draft or an
+# archived card must be answered "it exists, and here is why it cannot run", never "it does not exist".
+ALL_FOLDERS="pending in-progress completed in-review blocked rejected accepted draft archive"
 # Non-accepted active folders (digest emits these as full objects; accepted is handled separately).
 ACTIVE_NONACC="pending in-progress completed in-review blocked rejected"
 NOW_S=$(date -u +%s)
@@ -202,6 +215,67 @@ c_total=$((c_pending + c_inprogress + c_completed + c_inreview + c_blocked + c_r
 # on trunk, terminal). Membership is a fixed-string whole-line compare (metachar-safe).
 EXISTING_WT_SLUGS=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' "refs/heads/$ACFW_BRANCH_PREFIX/" 2>/dev/null | sed "s#^${ACFW_BRANCH_PREFIX}/##")
 
+# ---- Run scope seed resolution (3.4.0) ---------------------------------------------------------
+# Resolve each --only token to exactly one stem, over EVERY folder, before any collapse runs. The
+# order mirrors indexTasks.resolve in whip-go.workflow.js: exact stem, exact ID field, then a stem
+# prefix — except that an AMBIGUOUS prefix is reported here instead of silently taking the first
+# match. On a large board that difference is the whole point: `feature-231` must not quietly select
+# whichever `feature-231*` the filesystem listed first.
+ACFW_TAB=$(printf '\t')   # field separator for the scope accumulators below
+SCOPE_RESOLVED=""      # lines: <token><TAB><stem>
+SCOPE_UNRESOLVED=""    # lines: <token>
+SCOPE_AMBIGUOUS=""     # lines: <token><TAB><candidate,candidate,...>
+SCOPE_INACTIVE=""      # lines: <stem><TAB><folder>
+SCOPE_SEED_STEMS=""    # lines: <stem>  (resolved, any folder)
+
+if [ -n "$ONLY_SEEDS" ]; then
+  # One pass over the board: stem<TAB>id<TAB>folder for every card, in every folder.
+  SCOPE_INDEX=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-scope.XXXXXX")
+  trap 'rm -f "$IK_FILE" "$SCOPE_INDEX"' EXIT
+  for st in $ALL_FOLDERS; do
+    d="$BL/$st"; [ -d "$d" ] || continue
+    for f in "$d"/*.md; do
+      [ -f "$f" ] || continue
+      case "$(basename "$f")" in README.md) continue;; esac
+      printf '%s\t%s\t%s\n' "$(basename "$f" .md)" "$(field "$f" "ID" | tr -d '[:space:]')" "$st" >> "$SCOPE_INDEX"
+    done
+  done
+  while IFS= read -r tok; do
+    [ -z "$tok" ] && continue
+    hit=$(awk -F'\t' -v t="$tok" '$1 == t {print $1"\t"$3; found=1; exit} END{}' "$SCOPE_INDEX")
+    [ -z "$hit" ] && hit=$(awk -F'\t' -v t="$tok" '$2 != "" && $2 == t {print $1"\t"$3; exit}' "$SCOPE_INDEX")
+    if [ -z "$hit" ]; then
+      cands=$(awk -F'\t' -v t="$tok" 'index($1, t) == 1 {print $1}' "$SCOPE_INDEX")
+      n=$(printf '%s\n' "$cands" | grep -c '[^[:space:]]' || true)
+      if [ "${n:-0}" -eq 1 ]; then
+        cstem=$(printf '%s\n' "$cands" | grep '[^[:space:]]' | head -1)
+        hit=$(awk -F'\t' -v t="$cstem" '$1 == t {print $1"\t"$3; exit}' "$SCOPE_INDEX")
+      elif [ "${n:-0}" -gt 1 ]; then
+        SCOPE_AMBIGUOUS="$SCOPE_AMBIGUOUS$tok$ACFW_TAB$(printf '%s' "$cands" | grep '[^[:space:]]' | paste -sd, -)
+"
+        continue
+      fi
+    fi
+    if [ -z "$hit" ]; then
+      SCOPE_UNRESOLVED="$SCOPE_UNRESOLVED$tok
+"
+      continue
+    fi
+    sstem=${hit%%"$ACFW_TAB"*}; sfold=${hit##*"$ACFW_TAB"}
+    SCOPE_RESOLVED="$SCOPE_RESOLVED$tok$ACFW_TAB$sstem
+"
+    SCOPE_SEED_STEMS="$SCOPE_SEED_STEMS$sstem
+"
+    case " $ACTIVE " in
+      *" $sfold "*) ;;
+      *) SCOPE_INACTIVE="$SCOPE_INACTIVE$sstem$ACFW_TAB$sfold
+" ;;
+    esac
+  done <<EOF
+$ONLY_SEEDS
+EOF
+fi
+
 # Dep-token set for the digest satisfiedDeps filter: the Dependencies tokens referenced by
 # NON-ACCEPTED active tasks (pending/in-progress/completed/in-review/blocked/rejected) — extracted
 # with ONE batched grep (the 240-600x process-spawn win) instead of a per-file field() loop. Scoping
@@ -234,6 +308,13 @@ if [ "$DIGEST" = true ]; then
   # and splits each accepted task into: integration candidate (default mode, live branch, unintegrated)
   # -> full object; terminal dep target -> satisfiedDeps; terminal non-dep-target -> dropped (counts).
   DEP_TOKENS=$(compute_dep_tokens_batched)
+  # A --only SEED is retained exactly like a dependency target. Without this, scoping to a task that
+  # is already finished (terminal accepted, nothing depends on it) collapses it out of the snapshot
+  # entirely, and the orchestrator — which can only see what it was handed — reports the id as one
+  # that "does not exist in the backlog". Retention is the whole fix: a retained seed resolves, is
+  # recognised as terminal, and the run reports the scope complete instead of accusing the operator
+  # of a typo. Over-keeping is harmless here; under-keeping is a false refusal.
+  DEP_TOKENS=$(printf '%s\n%s\n' "$DEP_TOKENS" "$SCOPE_SEED_STEMS" | grep -v '^$' | sort -u)
   ACC_LIST=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-acc.XXXXXX")
   WT_FILE=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-wt.XXXXXX")
   DT_FILE=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-dt.XXXXXX")
@@ -380,6 +461,8 @@ if [ "$COUNTS_ONLY" = "false" ] && [ "$DIGEST" = false ]; then
       done
     done | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$' | grep -vxF 'none' | sort -u
   )
+  # --only seeds are retained in full mode too, for the same reason as in digest mode above.
+  DEP_TOKENS=$(printf '%s\n%s\n' "$DEP_TOKENS" "$SCOPE_SEED_STEMS" | grep -v '^$' | sort -u)
   # Is an accepted task a dependency target? Mirrors indexTasks.resolve: byId, byStem, then stem-prefix.
   is_dep_target() { # <stem> <id>
     local _stem="$1" _id="$2" _tok
@@ -470,8 +553,69 @@ if [ "$COUNTS_ONLY" = "false" ] && [ "$DIGEST" = false ] && [ -d "$REPO_ROOT/.wo
   done < <(find "$REPO_ROOT/$ACFW_WORKTREE_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
 fi
 
+# ---- inactive[] for scoped draft/archive seeds (3.4.0) -----------------------------------------
+# The scanner has never emitted draft/archive cards, and it still does not emit them wholesale. But a
+# seed naming one must come back as a RECOGNISED card in a non-schedulable state, or the orchestrator
+# cannot tell "this is paused" from "this does not exist" — and those two deserve opposite answers.
+INACTIVE_JSON=""
+IFIRST=1
+if [ -n "$SCOPE_INACTIVE" ]; then
+  while IFS="$ACFW_TAB" read -r istem ifold; do
+    [ -z "$istem" ] && continue
+    ifile="$BL/$ifold/$istem.md"
+    [ -f "$ifile" ] || continue
+    iid=$(field "$ifile" "ID" | tr -d '[:space:]')
+    islug=$(field "$ifile" "Worktree" | tr -d '[:space:]')
+    ideps=$(field "$ifile" "Dependencies")
+    if [ "$IFIRST" -eq 1 ]; then IFIRST=0; else INACTIVE_JSON="$INACTIVE_JSON,"; fi
+    INACTIVE_JSON="$INACTIVE_JSON{\"stem\":\"$(jesc "$istem")\",\"id\":\"$(jesc "$iid")\",\"folder\":\"$(jesc "$ifold")\",\"slug\":\"$(jesc "$islug")\",\"deps\":$(jarr "$ideps"),\"touchesGlobs\":[],\"hasIntegratedAt\":false,\"hasWorktreeBranch\":false}"
+  done <<EOF
+$SCOPE_INACTIVE
+EOF
+fi
+
+# ---- scope{} (3.4.0) ---------------------------------------------------------------------------
+SCOPE_JSON=""
+if [ -n "$ONLY_SEEDS" ]; then
+  _seeds=$(printf '%s' "$ONLY_SEEDS" | grep -v '^$' | while IFS= read -r t; do printf '"%s",' "$(jesc "$t")"; done)
+  _res=$(printf '%s' "$SCOPE_RESOLVED" | grep -v '^$' | while IFS="$ACFW_TAB" read -r t st; do printf '"%s":"%s",' "$(jesc "$t")" "$(jesc "$st")"; done)
+  _unres=$(printf '%s' "$SCOPE_UNRESOLVED" | grep -v '^$' | while IFS= read -r t; do printf '"%s",' "$(jesc "$t")"; done)
+  _amb=$(printf '%s' "$SCOPE_AMBIGUOUS" | grep -v '^$' | while IFS="$ACFW_TAB" read -r t cands; do
+    printf '{"tok":"%s","candidates":[' "$(jesc "$t")"
+    # printf '%s\n' (not '%s'): without the trailing newline `read` hits EOF on the LAST candidate
+    # and returns non-zero, so the loop body never runs for it and the ambiguity report silently
+    # names one fewer candidate than it found — the opposite of the point.
+    printf '%s\n' "$cands" | tr ',' '\n' | while IFS= read -r c; do [ -n "$c" ] && printf '"%s",' "$(jesc "$c")"; done | sed 's/,$//'
+    printf ']},'
+  done)
+  _inact=$(printf '%s' "$SCOPE_INACTIVE" | grep -v '^$' | while IFS="$ACFW_TAB" read -r st fo; do printf '{"stem":"%s","folder":"%s"},' "$(jesc "$st")" "$(jesc "$fo")"; done)
+  SCOPE_JSON=",\"scopeApplied\":true,\"scope\":{\"seeds\":[${_seeds%,}],\"resolved\":{${_res%,}},\"unresolved\":[${_unres%,}],\"ambiguous\":[${_amb%,}],\"inactiveSeeds\":[${_inact%,}],\"added\":[]}"
+fi
+
+# ---- relay header (3.4.0) ----------------------------------------------------------------------
+# The snapshot is produced by this script but DELIVERED by an agent echoing its stdout into a schema
+# string. A shortened-but-valid echo parses cleanly and is indistinguishable from a smaller board, so
+# the producer states what it emitted and the consumer proves it received all of it. Counted here,
+# from the assembled JSON, under LC_ALL=C so ${#s} is a BYTE length (what relayCheck expects).
+count_stems() { # <json-array-body> -> one stem per line
+  printf '%s' "$1" | grep -o '"stem":"[^"]*"' | sed 's/^"stem":"//; s/"$//'
+}
+_R_STEMS=$(printf '%s\n%s\n%s\n' "$(count_stems "$TASKS_JSON")" "$(count_stems "$INACTIVE_JSON")" "$(count_stems "$DIGEST_SAT_JSON")" | grep -v '^$' || true)
+R_TASKS=$(count_stems "$TASKS_JSON" | grep -c '[^[:space:]]' || true); R_TASKS=${R_TASKS//[^0-9]/}
+R_INACT=$(count_stems "$INACTIVE_JSON" | grep -c '[^[:space:]]' || true); R_INACT=${R_INACT//[^0-9]/}
+R_SAT=$(count_stems "$DIGEST_SAT_JSON" | grep -c '[^[:space:]]' || true); R_SAT=${R_SAT//[^0-9]/}
+R_N=$(( ${R_TASKS:-0} + ${R_INACT:-0} + ${R_SAT:-0} ))
+R_BYTES=0
+if [ -n "$_R_STEMS" ]; then
+  R_BYTES=$(LC_ALL=C awk '{ n += length($0) } END { print n+0 }' <<EOF
+$_R_STEMS
+EOF
+)
+fi
+
 # ---- Assemble ----
 printf '{'
+printf '"relay":{"n":%d,"tasks":%d,"inactive":%d,"sat":%d,"bytes":%d},' "$R_N" "${R_TASKS:-0}" "${R_INACT:-0}" "${R_SAT:-0}" "$R_BYTES"
 printf '"trunkRoot":"%s",' "$(jesc "$REPO_ROOT")"
 printf '"trunkBranch":"%s",' "$(jesc "$TRUNK_BRANCH")"
 printf '"trunkSha":"%s",' "$(jesc "$TRUNK_SHA")"
@@ -485,6 +629,8 @@ printf '"branchPrefix":"%s",' "$(jesc "$ACFW_BRANCH_PREFIX")"
 printf '"worktreeDir":"%s",' "$(jesc "$ACFW_WORKTREE_DIR")"
 emit_counts
 printf ',"tasks":[%s]' "$TASKS_JSON"
+printf ',"inactive":[%s]' "$INACTIVE_JSON"
 printf ',"satisfiedDeps":[%s]' "$DIGEST_SAT_JSON"
 printf ',"worktrees":[%s]' "$WT_JSON"
+printf '%s' "$SCOPE_JSON"
 printf '}\n'

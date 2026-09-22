@@ -31,6 +31,8 @@ phase11-checkout-reentrancy
 phase12-multica-transition-log
 phase13-integration-mode
 phase18-artifact-provenance
+phase19-files-only
+phase19-doctor-graph
 phase9-adapter-multica
 phase9-adapter-linear
 $OPTIONAL
@@ -42,6 +44,8 @@ phase5-streaming
 phase10-child-skeleton
 phase11-escalation
 phase14-go-scope
+phase19-relay
+phase19-quarantine
 phase15-first-run-autoreject
 phase16-gate-legibility
 phase17-template-drift

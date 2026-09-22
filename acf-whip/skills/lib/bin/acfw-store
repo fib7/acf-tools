@@ -78,6 +78,43 @@ has_cap() { load_caps; printf '%s' "$CAPS" | grep -q "\"$1\""; }
 case "$SUB" in
 
   snapshot)
+    # 3.4.0 dispatcher flags. --only narrows the emitted view to the closure of the named tasks and
+    # --full-to tees the FULL snapshot to a file before any narrowing. Both are implemented HERE, once,
+    # for every backend — an adapter only sees --only when it declares `snapshot-only` (today: files,
+    # whose scanner resolves seeds against folders the enriched JSON no longer contains). A raw adapter
+    # must keep listing everything, because the closure walk and the store-wide counts are computed
+    # from the full set; narrowing at the adapter would make both wrong and silently so.
+    SNAP_ONLY=()
+    FULL_TO=""
+    SNAP_ARGS=()
+    SNAP_DIGEST=0
+    SNAP_MODE=default
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --only)
+          [ $# -ge 2 ] || { echo "FATAL: --only requires a task key" >&2; exit 2; }
+          SNAP_ONLY[${#SNAP_ONLY[@]}]="$2"; shift 2 ;;
+        --only=*)
+          SNAP_ONLY[${#SNAP_ONLY[@]}]="${1#--only=}"; shift ;;
+        --full-to)
+          [ $# -ge 2 ] || { echo "FATAL: --full-to requires a path" >&2; exit 2; }
+          FULL_TO="$2"; shift 2 ;;
+        --full-to=*)
+          FULL_TO="${1#--full-to=}"; shift ;;
+        # --digest and --mode are forwarded AND remembered: the post-stage needs them to know which
+        # collapse to apply and which definition of "terminal" to use.
+        --digest)   SNAP_DIGEST=1; SNAP_ARGS[${#SNAP_ARGS[@]}]="$1"; shift ;;
+        --mode)     SNAP_MODE="${2:-default}"; SNAP_ARGS[${#SNAP_ARGS[@]}]="$1"; SNAP_ARGS[${#SNAP_ARGS[@]}]="${2:-default}"; shift 2 ;;
+        --mode=*)   SNAP_MODE="${1#--mode=}"; SNAP_ARGS[${#SNAP_ARGS[@]}]="$1"; shift ;;
+        *)          SNAP_ARGS[${#SNAP_ARGS[@]}]="$1"; shift ;;
+      esac
+    done
+    [ "$SNAP_MODE" = "override" ] || SNAP_MODE=default
+    set -- ${SNAP_ARGS[@]+"${SNAP_ARGS[@]}"}
+    # Forward --only only to an adapter that implements it.
+    if [ ${#SNAP_ONLY[@]} -gt 0 ] && has_cap snapshot-only; then
+      for _k in "${SNAP_ONLY[@]}"; do set -- "$@" --only "$_k"; done
+    fi
     OUT=$("$ADAPTER" snapshot "$@") || exit $?
     # Additive dispatcher metadata: which store produced this snapshot, and whether its
     # hasCleanCheckoutToken can be trusted in EVERY state. Where an answer costs a request, an adapter
@@ -87,11 +124,35 @@ case "$SUB" in
     TAS=false; has_cap token-all-states && TAS=true
     OUT=$(printf '%s\n' "$OUT" | sed '1s/^{/{"store":"'"$STORE"'","tokenAllStates":'"$TAS"',/')
     if has_cap snapshot-enriched; then
+      # The adapter owns the whole shape (files: scan-backlog.sh, which implements --digest and
+      # --only itself and must run on a machine with no jq). Nothing to add.
+      if [ -n "$FULL_TO" ] && [ ${#SNAP_ONLY[@]} -eq 0 ] && [ "$SNAP_DIGEST" -eq 0 ]; then
+        printf '%s\n' "$OUT" > "$FULL_TO" 2>/dev/null || true
+      fi
       printf '%s\n' "$OUT"
     else
       # Raw adapters know nothing about git: merge in the LP-CAS integration oracle,
       # worktree-branch facts, and the terminal-count model.
-      printf '%s\n' "$OUT" | bash "$LIB_DIR/bin/acfw-enrich-snapshot.sh" "$REPO_ROOT"
+      ENRICHED=$(printf '%s\n' "$OUT" | bash "$LIB_DIR/bin/acfw-enrich-snapshot.sh" "$REPO_ROOT") || exit $?
+      # Tee the FULL snapshot before any narrowing. `doctor --snapshot` refuses a narrowed or digest
+      # snapshot by design (the graph invariants are whole-graph properties), so the file written here
+      # must be the pre-collapse one — that is what lets the scheduler and the doctor observe the SAME
+      # store walk instead of two, which on a live shared board can straddle someone else's transition.
+      if [ -n "$FULL_TO" ]; then
+        printf '%s\n' "$ENRICHED" > "$FULL_TO" 2>/dev/null || true
+      fi
+      if [ ${#SNAP_ONLY[@]} -gt 0 ] || [ "$SNAP_DIGEST" -eq 1 ]; then
+        SCOPE_ARGS=(--mode "$SNAP_MODE")
+        [ "$SNAP_DIGEST" -eq 1 ] && SCOPE_ARGS[${#SCOPE_ARGS[@]}]="--digest"
+        for _k in ${SNAP_ONLY[@]+"${SNAP_ONLY[@]}"}; do
+          SCOPE_ARGS[${#SCOPE_ARGS[@]}]="--only"; SCOPE_ARGS[${#SCOPE_ARGS[@]}]="$_k"
+        done
+        printf '%s\n' "$ENRICHED" | bash "$LIB_DIR/bin/acfw-scope-snapshot.sh" "${SCOPE_ARGS[@]}" "$REPO_ROOT"
+      else
+        # No narrowing asked for, but the relay header still ships: the consumer must be able to prove
+        # it received the whole payload on EVERY path, not only the narrowed ones.
+        printf '%s\n' "$ENRICHED" | bash "$LIB_DIR/bin/acfw-scope-snapshot.sh" --mode "$SNAP_MODE" "$REPO_ROOT"
+      fi
     fi
     ;;
 

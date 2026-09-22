@@ -30,6 +30,12 @@ let branchPrefix = (args && args.branchPrefix) || 'worktree'
 // scheduler stays deterministic and the selected set cannot drift mid-run.
 const ONLY = (args && Array.isArray(args.only) && args.only.length) ? args.only.map(String) : null
 const SCOPE_FILTER = (args && typeof args.scopeFilter === 'string') ? args.scopeFilter : ''
+// Where the scope came from (3.4.0). 'args' = the operator named ids on this invocation; 'focus' =
+// bare `/go` ran the checkout's saved focus; 'all' = unscoped. It changes exactly one decision: an
+// inactive member of an EXPLICIT scope is a refusal (you asked for a task that cannot run), while an
+// inactive member of a FOCUS is a held-out task the run reports and continues past (a focus is a
+// standing list, and pausing one of its tasks must not stop the others).
+const SCOPE_SOURCE = (args && typeof args.scopeSource === 'string' && args.scopeSource) || (ONLY ? 'args' : 'all')
 if (!pluginRoot || !trunkRoot) {
   return { error: 'whip-go.workflow.js requires args.pluginRoot and args.trunkRoot', got: { pluginRoot, trunkRoot } }
 }
@@ -64,6 +70,18 @@ const CLEAN_CHECKOUT = `${pluginRoot}/skills/clean-checkout-before-task/bin/clea
 const RUN_LOCK = (args && args.runLockPath) || `${trunkRoot}/.backlog/.acfw-run.json`
 const RUN_LOCK_DIR = RUN_LOCK.slice(0, RUN_LOCK.lastIndexOf('/'))
 const RUN_LOCK_BASE = RUN_LOCK.slice(RUN_LOCK.lastIndexOf('/') + 1)
+// Full-snapshot tee (3.4.0). The scan writes the PRE-narrowing snapshot here and the doctor reads it
+// back, so the scheduler and the integrity battery observe ONE store walk instead of two. On a shared
+// board two walks can straddle a colleague's transition, and the battery then reports findings about
+// a task the scheduler's own snapshot does not contain — which, under per-task quarantine, means
+// holding out a stem nobody can see. Lives beside the run lock, in the already-gitignored dir.
+const FULL_SNAP = `${RUN_LOCK_DIR}/snap-full.json`
+
+// --only flags for every snapshot call, built once. A scoped run relays O(scope) records instead of
+// the whole board — which is the fix for the failure that started this: a store of several hundred cards whose full
+// snapshot cannot be echoed through one agent response, so the echo was silently short and the ids
+// the operator named were reported as nonexistent.
+const ONLY_FLAGS = ONLY ? ONLY.map((k) => ` --only ${sq(k)}`).join('') : ''
 const LOCK_FRESH_MIN = 30
 
 // Where a dispatched agent READS (and, on files, writes) the task document.
@@ -245,7 +263,10 @@ function indexTasks(tasks, satisfiedDeps) {
     for (const [stem, t] of byStem) if (stem.indexOf(tok) === 0) return t // prefix match (mirrors doctor)
     return satResolve(tok)
   }
-  return { byId, byStem, resolve }
+  // satByStem is exported so classifyFatals can ask "is this key a task this board knows about?"
+  // including the collapsed-accepted entries: a FATAL naming one of those is a real finding about a
+  // real task, just one the digest folded away — it must not be filed as "names nothing".
+  return { byId, byStem, satByStem, resolve }
 }
 function isTerminal(t) {
   if (t.folder === 'blocked') return true
@@ -258,10 +279,17 @@ function isTerminal(t) {
   }
   return false
 }
-function depsSatisfied(t, idx) {
+function depsSatisfied(t, idx, quarantined) {
   for (const depTok of (t.deps || [])) {
     const dep = idx.resolve(depTok)
     if (!dep) return false // dangling — doctor would FATAL; be conservative
+    // A QUARANTINED dep gates its dependents, and this test comes FIRST, before the folder read.
+    // Two twins sharing one whip key collapse to a single index entry (byStem is last-write-wins), so
+    // if the surviving object happens to be the accepted one, a folder-only gate would call a
+    // duplicate-key task "done" and dispatch everything behind it. Keying the refusal on the STEM —
+    // which both twins share and which applyQuarantine holds out — makes the quarantine transitive
+    // through the gate regardless of which object the index kept.
+    if (quarantined && quarantined.has(dep.stem)) return false
     if (dep.folder !== 'accepted') return false
     // A cross-slug code dep blocks only while it is genuinely pending integration: accepted, has a
     // live worktree branch, and not yet integrated. A branchless historical dep is already on trunk
@@ -311,7 +339,15 @@ function expandScope(seed, idx, activeStems) {
     if (!t) continue // collapsed-accepted (synthesized): terminal, nothing to walk
     for (const depTok of (t.deps || [])) {
       const dep = idx.resolve(depTok)
-      if (!dep || scope.has(dep.stem) || isTerminal(dep)) continue
+      if (!dep || scope.has(dep.stem)) continue
+      // PULL IN every dep that is not ACCEPTED-terminal. `isTerminal` alone is the wrong predicate and
+      // wrong in the one direction that loses work: `blocked` is terminal by that definition, but a
+      // blocked dep is RETRYABLE — planUnblockAndTimeout lifts it back to pending once its own deps
+      // resolve, and that pass runs over `sched`, i.e. over the scope. Skipping it here leaves the dep
+      // outside the scheduling view forever, so it can never be unblocked, so the seed that depends on
+      // it never dispatches and the run exits 'no-progress' with the requested task untouched. Only an
+      // ACCEPTED-terminal dep is genuinely done and needs nothing; everything else comes along.
+      if (dep.folder === 'accepted' && isTerminal(dep)) continue
       added.push(dep.stem)
       stack.push(dep.stem)
     }
@@ -360,6 +396,11 @@ function planUnblockAndTimeout(tasks, idx, opts) {
   // DECLARED deps are satisfied (the real blocker is unmodeled), so without this they would be re-unblocked
   // and re-dispatched on a tight loop until Block-Count hit its cap. Parking stops the re-queue immediately.
   const parked = (o.parked instanceof Set) ? o.parked : new Set(o.parked || [])
+  // quarantined (3.4.0): stems held out by a task-level integrity FATAL this iteration. They must gate
+  // their dependents exactly like an unsatisfied dep, so the set is threaded into depsSatisfied rather
+  // than filtered afterwards — an unblock action for a task behind a broken dep is not merely useless,
+  // it moves the card and charges the run an iteration.
+  const quarantined = (o.quarantined instanceof Set) ? o.quarantined : new Set(o.quarantined || [])
   // Actions are STEM-keyed (3.1.0): the store adapter resolves the stem to its current location, so a
   // stale `from` folder can never mis-address a move (strictly more robust on resume than a full path).
   const mk = (t, from, toState, notes) => ({ stem: t.stem, toState, agent: 'orchestrator', notes, inc: 0 })
@@ -372,7 +413,7 @@ function planUnblockAndTimeout(tasks, idx, opts) {
   const unblockActions = tasks
     .filter((t) => t.folder === 'blocked')
     .sort(byPriorityThenStem)
-    .filter((t) => (t.rejectionCount || 0) < maxReject && (t.blockCount || 0) < maxBlock && !parked.has(t.stem) && depsSatisfied(t, idx))
+    .filter((t) => (t.rejectionCount || 0) < maxReject && (t.blockCount || 0) < maxBlock && !parked.has(t.stem) && !quarantined.has(t.stem) && depsSatisfied(t, idx, quarantined))
     .map((t) => mk(t, 'blocked', 'pending', 'dependencies resolved — unblocked'))
 
   // in-progress -> blocked: stale past the operator timeout (ageHours is computed by scan-backlog;
@@ -544,6 +585,161 @@ function reconcileIntegrationTallies(integratedStems, rejectedStems, attemptedIn
   ])]
   const reconciled = integrated.length !== new Set(integratedStems).size || rejectedAtIntegration.length !== new Set(rejectedStems).size
   return { integrated, rejectedAtIntegration, reconciled }
+}
+
+// ============================ 3.4.0: relay integrity ============================
+// The snapshot is produced by a SCRIPT but delivered by an AGENT: a shell-runner reads the store
+// walk's stdout with its Bash tool and copies it into one schema string, which this script parses.
+// That hop is lossy in the one way that reads as data: a model that shortens tasks[] and closes the
+// braces emits VALID JSON, so JSON.parse succeeds and the scheduler plans over a board that does not
+// exist. On a large board that is not hypothetical — it is what made a scoped run report that the
+// requested ids "do not exist in the backlog" when every one of them did.
+//
+// So the producer states what it emitted and the consumer checks. `relay.n` is the total entry count,
+// `relay.tasks`/`inactive`/`sat` are the per-array counts (so a short payload says WHICH array lost
+// entries), and `relay.bytes` is the sum of the UTF-8 byte lengths of every stem across them. The
+// count alone is not enough — a model that truncates may also "tidy" a header it can see — so the
+// byte sum is a second, content-derived number it would have to recompute deliberately to keep
+// consistent. The header is emitted as the FIRST key, so a tail-elided echo still carries the
+// expectation it fails.
+//
+// WHAT THIS PROVES, precisely: no entry was dropped, added, or replaced by one of a different stem
+// length. It does NOT prove stem identity — an equal-length substitution passes. That is deliberate:
+// a length sum is the strongest check all three producers (jq, bash, JS) can compute identically and
+// cheaply, and substitution is not a failure mode of an echoing model, whereas truncation demonstrably
+// is. The ids a caller actually NAMED get a stronger guarantee elsewhere: every seed the script
+// resolved must be exactly present in the relayed index, or the run refuses (see the scope
+// cross-check at the scan site). Do not weaken that check on the strength of this one.
+//
+// PURE: no clock, no I/O. Returns {ok, why, expected, got} — the caller decides the ladder.
+function stemBytes(s) {
+  // UTF-8 byte length without Buffer/TextEncoder (neither is guaranteed in the workflow sandbox, and
+  // the producers compute it in jq (`utf8bytelength`) and bash (`LC_ALL=C ${#stem}`) respectively).
+  let n = 0
+  for (const ch of String(s == null ? '' : s)) {
+    const c = ch.codePointAt(0)
+    n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4
+  }
+  return n
+}
+function relayCheck(snap) {
+  if (!snap || typeof snap !== 'object') return { ok: false, why: 'no snapshot', expected: 0, got: 0 }
+  const r = snap.relay
+  // A snapshot with NO header is not a failure: third-party `snapshot-enriched` adapters predate this
+  // contract and the field is SHOULD, not MUST. Say so once and proceed — refusing here would brick
+  // every such backend on upgrade, which is a worse failure than the one being prevented.
+  if (!r || typeof r !== 'object' || typeof r.n !== 'number' || typeof r.bytes !== 'number') {
+    return { ok: true, unverifiable: true, expected: null, got: null }
+  }
+  const arrs = [['tasks', snap.tasks], ['inactive', snap.inactive], ['sat', snap.satisfiedDeps]]
+  let n = 0, bytes = 0
+  const per = {}
+  for (const [name, a] of arrs) {
+    const list = Array.isArray(a) ? a : []
+    per[name] = list.length
+    n += list.length
+    for (const e of list) bytes += stemBytes(e && e.stem)
+  }
+  if (n !== r.n) {
+    // Name the array that came up short — "tasks 180/400" is actionable; "3 != 4" is not.
+    const which = ['tasks', 'inactive', 'sat']
+      .filter((k) => typeof r[k] === 'number' && r[k] !== per[k])
+      .map((k) => `${k} ${per[k]}/${r[k]}`).join(', ')
+    return { ok: false, why: `entry count ${n} != declared ${r.n}${which ? ` (${which})` : ''}`, expected: r.n, got: n }
+  }
+  if (bytes !== r.bytes) return { ok: false, why: `stem checksum ${bytes} != declared ${r.bytes} (same count, different entries)`, expected: r.n, got: n }
+  return { ok: true, expected: r.n, got: n }
+}
+// The doctor's findings travel the SAME hop as the snapshot, in a sibling field, and a dropped FATAL
+// line is worse than a dropped task: under per-task quarantine a FATAL that never arrives silently
+// UN-quarantines its task and the run dispatches against the exact state the gate exists to refuse.
+// The SUMMARY line carries the count the battery emitted, so cross-check it against what was relayed.
+function doctorRelayCheck(summaryLine, fatals) {
+  const m = /fatal=(\d+)/.exec(String(summaryLine || ''))
+  if (!m) return { ok: true, unverifiable: true } // no SUMMARY relayed (text fallback) — nothing to compare
+  const declared = Number(m[1])
+  const got = Array.isArray(fatals) ? fatals.length : 0
+  if (declared === got) return { ok: true, declared, got }
+  return { ok: false, declared, got, why: `doctor reported fatal=${declared} but ${got} FATAL line(s) were relayed` }
+}
+
+// ============================ 3.4.0: integrity finding classification ============================
+// A FATAL used to mean one thing: stop the run. On a shared board that conflates two unrelated
+// statements — "this repository is not in a state anyone can work in" and "ONE card is malformed" —
+// and the second is far more common. A single long-cancelled card with a hand-edited state blocked
+// every run for a whole team, including runs scoped to tasks that never touched it.
+//
+// Split them. REPO findings still abort. TASK findings hold out that task and let the rest proceed.
+// A finding naming something the scheduler cannot act on at all is NOT GATING — it is reported, never
+// acted on, because aborting for it would reinstate the board-wide gate for an inert card.
+//
+// Matching is by EXACT stem. The doctor's third field is not a typed surface (it carries stems, slugs
+// and URLs depending on the emitter), and prefix-matching it would attach a finding to the wrong task
+// — the one failure mode that would make quarantine less safe than aborting.
+const REPO_FATAL_CODES = [
+  'detached-head',          // no branch at the trunk root: nothing can be transitioned or integrated
+  'worktree-wrong-branch',  // a worktree dir on a foreign branch: affects the dir's slug AND the branch's
+  'doctor-unavailable',     // the battery could not run: findings are UNKNOWN, not absent
+  'snapshot-unavailable',   // ditto for the graph/git battery
+  'no-store',               // beads: the store itself is missing
+  'status-custom',          // beads: the status vocabulary does not match
+  'backend',                // beads: the backend is unreadable
+  'store-unreadable',       // beads: the per-issue battery did not run
+]
+function classifyFatals(lines, idx) {
+  const repo = [], task = [], notGating = []
+  for (const raw of (Array.isArray(lines) ? lines : [])) {
+    const line = String(raw == null ? '' : raw)
+    const parts = line.split('|')
+    const code = (parts[1] || '').trim()
+    const key = (parts[2] || '').trim()
+    const detail = parts.slice(3).join('|').trim()
+    const entry = { line, code, stem: key, detail }
+    // Repo scope by CODE, or by the contract's "no task" convention in field 3. An unrecognised code
+    // with no key is repo too: an unknown global finding must not be silently downgraded.
+    if (REPO_FATAL_CODES.indexOf(code) >= 0 || key === '' || key === '-' || key === '(repo)') { repo.push(entry); continue }
+    // NO INDEX YET (bootstrap runs before the first snapshot). Membership is unknowable, so the only
+    // safe reading is "task-scoped, decide it at iteration 1" — filing it as not-gating would let a
+    // genuine finding through unchecked, and aborting on it would keep the board-wide gate this
+    // release removes. The caller treats this bucket as DEFERRED, not as a quarantine set.
+    if (!idx) { task.push(entry); continue }
+    const hit = idx.byStem && idx.byStem.has(key)
+    const sat = idx.satByStem && idx.satByStem.has(key)
+    if (hit || sat) { task.push(entry); continue }
+    notGating.push(entry)
+  }
+  return { repo, task, notGating }
+}
+
+// Move quarantined tasks OUT of the scheduling view and fix the counts on both sides of the
+// completion test. Leaving them in tasks[] would dispatch them; dropping them without adjusting
+// counts would make `terminal === total` unreachable (unscoped counts come from the store) or
+// reachable too early (scoped counts come from the view). They land in inactive[], where dependency
+// resolution still sees them — so a dependent stays gated legibly instead of reporting a dangling dep.
+// PURE: returns a NEW snapshot object; never mutates the input.
+function applyQuarantine(snap, qset) {
+  if (!snap || !qset || !qset.size) return snap
+  const keep = [], moved = []
+  for (const t of (snap.tasks || [])) {
+    if (qset.has(t.stem)) moved.push(t); else keep.push(t)
+  }
+  if (!moved.length) return snap
+  const counts = Object.assign({}, snap.counts || {})
+  const dec = (k) => { if (typeof counts[k] === 'number') counts[k] = Math.max(0, counts[k] - 1) }
+  for (const t of moved) {
+    dec(t.folder)
+    dec('total')
+    if (t.folder === 'accepted' && t.hasIntegratedAt) dec('integrated')
+    // The runtime-terminal counters mirror isTerminal per mode. Decrement each one exactly when the
+    // moved task was terminal UNDER THAT MODE, or an unscoped run compares a shrunken total against
+    // an unshrunken terminal count and spins out its no-gain budget with nothing left to do.
+    const termDefault = t.folder === 'blocked' || (t.folder === 'accepted' && (t.hasIntegratedAt || t.slug === 'none' || !t.hasWorktreeBranch))
+    const termOverride = t.folder === 'blocked' || t.folder === 'accepted'
+    if (termDefault) dec('runtimeTerminalDefault')
+    if (termOverride) dec('runtimeTerminalOverride')
+  }
+  const qmark = moved.map((t) => Object.assign({}, t, { quarantined: true }))
+  return Object.assign({}, snap, { tasks: keep, inactive: (snap.inactive || []).concat(qmark), counts })
 }
 // </scheduler-pure> ==========================================================================
 
@@ -783,13 +979,26 @@ async function textScanFallback(label) {
   try {
     txt = await agentC(
       `${ENV}
-Run EXACTLY:  bash ${sq(STORE)} snapshot --digest --mode ${mode}
-Output its stdout — a single JSON object — as your ENTIRE final message. No prose, no markdown fences, nothing else.`,
+Run EXACTLY:  bash ${sq(STORE)} snapshot --digest --mode ${mode}${ONLY_FLAGS}
+Output its stdout — a single JSON object — as your ENTIRE final message. No prose, no markdown fences, nothing else. Copy it exactly: it carries a "relay" header stating how many entries it contains, and a payload that does not match is refused.`,
       { label, phase: 'Iterate', model: SHELL_MODEL },
     )
   } catch (e) { return null }
   const snap = extractJson(txt)
   return snap && snap.counts ? snap : null
+}
+
+// Release the run lock. Factored out of the end-of-run path because the ABORT paths need it too:
+// a run that stops before dispatching anything (an unresolvable id, a relay it cannot trust, a
+// repo-level integrity FATAL) used to `return` straight past the unlock, leaving its own heartbeat
+// fresh — so the operator who fixed the typo in ten seconds was refused for the next half hour with
+// "another /go run appears active". Nothing was dispatched; there is nothing to protect.
+// Best-effort by construction: if it fails, the freshness window still expires the lock.
+async function unlock(phaseName) {
+  try {
+    await agentC(`Run exactly this command and report nothing else:  rm -f ${sq(RUN_LOCK)}`,
+      { label: 'unlock', phase: phaseName || 'Iterate', model: SHELL_MODEL })
+  } catch (e) { /* lock expires on its own */ }
 }
 
 // Deliverable paths a NON-CODE task reported (WHIP-08). apply-transition.sh refuses a state path with
@@ -1379,22 +1588,33 @@ Return the BootstrapResult.`,
   () => null,
 )
 if (!boot) {
-  return { aborted: true, reason: 'bootstrap agent never emitted after retries; re-run /go (git + .backlog/ are durable, nothing is lost)', mode }
+  return { aborted: true, stopReason: 'bootstrap-no-emit', reason: 'bootstrap agent never emitted after retries; re-run /go (git + .backlog/ are durable, nothing is lost)', mode }
 }
 if (boot.lockFresh) {
   // Refuse, do not warn: a double-start is unattended by definition, so a console warning protects nothing.
-  return { aborted: true, reason: `another /go run appears active (${RUN_LOCK} touched within ${LOCK_FRESH_MIN}m). Never run two /go against one repo — they collide on slugs and on the shared root index. If the previous run crashed, the lock expires on its own, or clear it now:  rm ${RUN_LOCK}`, mode }
+  return { aborted: true, stopReason: 'run-lock-held', reason: `another /go run appears active (${RUN_LOCK} touched within ${LOCK_FRESH_MIN}m). Never run two /go against one repo — they collide on slugs and on the shared root index. If the previous run crashed, the lock expires on its own, or clear it now:  rm ${RUN_LOCK}`, mode }
 }
 if (boot.detached) {
-  return { aborted: true, reason: 'detached HEAD at trunk root; /go requires a branch checked out at the repo root', mode }
+  return { aborted: true, stopReason: 'detached-head', reason: 'detached HEAD at trunk root; /go requires a branch checked out at the repo root', mode }
 }
 if (!boot.doctorOk) {
   const v = doctorVerdict(boot.fatals)
-  return v.reported
-    ? { aborted: true, reason: 'backlog integrity gate failed; will not dispatch against an inconsistent backlog', mode, doctorSummary: boot.doctorSummary, fatals: boot.fatals }
-    : { aborted: true, reason: `the backlog integrity gate could not RUN, so the board is unverified rather than known-bad — nothing was dispatched. ${v.why}. Fix the store backend (credentials, connectivity, \`acfw-store info\`) and re-run /go; /whip-doctor will not help until the store is reachable.`, mode, doctorUnavailable: true, doctorSummary: boot.doctorSummary, fatals: boot.fatals }
+  if (!v.reported) {
+    return { aborted: true, stopReason: 'doctor-unavailable', reason: `the backlog integrity gate could not RUN, so the board is unverified rather than known-bad — nothing was dispatched. ${v.why}. Fix the store backend (credentials, connectivity, \`acfw-store info\`) and re-run /go; /whip-doctor will not help until the store is reachable.`, mode, doctorUnavailable: true, doctorSummary: boot.doctorSummary, fatals: boot.fatals }
+  }
+  // 3.4.0: only REPO-level findings stop the run here. There is no snapshot yet, so a task-level line
+  // cannot be attributed to a task — it is classified by code and deferred to iteration 1, where the
+  // index exists and the finding either holds ONE task out or turns out to name nothing at all. This
+  // is the gate that made a single long-cancelled card block every run for a whole team; it now
+  // blocks exactly what it can prove is broken about the repository.
+  const bcls = classifyFatals(boot.fatals, null)
+  if (bcls.repo.length) {
+    return { aborted: true, stopReason: 'integrity-fatal-bootstrap', reason: `repository-level integrity gate failed; will not dispatch against an inconsistent checkout (${bcls.repo.map((f) => f.code).join(', ')})`, mode, doctorSummary: boot.doctorSummary, fatals: bcls.repo.map((f) => f.line) }
+  }
+  log(`bootstrap: ${bcls.task.length} task-level integrity finding(s) deferred to the first scan — each will hold out ONE task, not the run. ${boot.doctorSummary}`)
+} else {
+  log(`bootstrap ok — ${boot.doctorSummary}`)
 }
-log(`bootstrap ok — ${boot.doctorSummary}`)
 
 // ---- concurrency bound for nested child workflows (3.2.0) ----
 // The runtime caps CONCURRENT agent() calls at min(16, cores-2) per workflow, and a child shares its
@@ -1466,6 +1686,23 @@ let lastSnapshot = null
 // otherwise a scoped run would fold in, and report on, other people's accepted work.
 let runScope = null
 let stopReason = 'max-iterations'
+// ---- 3.4.0 run-level bookkeeping ----
+let prevTotal = -1          // last iteration's scope denominator; see the noGain guard for why
+let relayWarned = false     // "this store emits no relay header" — say it once, not every iteration
+const relayFailures = []    // {iteration, expected, got, why} for the report
+// heldOut: every task the run REFUSED to touch, and why. A quarantined task (task-level integrity
+// FATAL), a paused one (inactive member of a focus), or a vanished one (in the scope at iteration 1,
+// gone from the board later — someone else moved it). This is what makes `partial` legible: a run
+// that finished everything it could still must not claim the backlog is done.
+const heldOut = new Map()   // stem -> {stem, why, code, detail, firstIter, lastIter}
+const noteHeld = (stem, why, code, detail) => {
+  const prev = heldOut.get(stem)
+  if (prev) { prev.lastIter = iter; return }
+  heldOut.set(stem, { stem, why, code: code || '', detail: detail || '', firstIter: iter, lastIter: iter })
+}
+let lastFatalsNotGating = []  // FATAL lines naming nothing this board can act on — reported, never acted on
+let lastQuarantineKey = ''    // log the quarantine set on change, not every iteration
+let lastGated = []            // pending scope members whose deps are unsatisfied at the last iteration
 
 while (iter < MAX_ITER) {
   iter++
@@ -1481,34 +1718,55 @@ pass an explicit timeout of at least 300000 ms (5 minutes) on every acfw-store c
 is killed anyway, say so in your result rather than reporting what the truncated output appeared to
 show.
 
-1. Read-only snapshot:  bash ${sq(STORE)} snapshot --digest --mode ${mode}  — its stdout is a single JSON object. Put that stdout VERBATIM (copy it exactly, add nothing) into snapshotJson.
-2. Integrity recheck (report-only):  bash ${sq(STORE)} doctor --quiet --active-only  — set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (verbatim FATAL| lines).
+1. Read-only snapshot:  bash ${sq(STORE)} snapshot --digest --mode ${mode}${ONLY_FLAGS} --full-to ${sq(FULL_SNAP)}  — its stdout is a single JSON object. Put that stdout VERBATIM (copy it exactly, add nothing) into snapshotJson. Do NOT summarize, abbreviate, re-indent or drop any entry: the object carries a "relay" header stating how many entries it contains, and the orchestrator refuses a payload that does not match it.
+2. Integrity recheck (report-only): the previous step wrote the FULL snapshot to ${sq(FULL_SNAP)}. If that file exists and is non-empty, run  bash ${sq(STORE)} doctor --quiet --active-only --snapshot ${sq(FULL_SNAP)}  so the battery reads the same store walk step 1 did; otherwise run  bash ${sq(STORE)} doctor --quiet --active-only  . Either way set doctorOk (SUMMARY ok=true), doctorSummary (verbatim SUMMARY line), doctorFatals (EVERY verbatim FATAL| line — the SUMMARY's fatal=N is cross-checked against how many you return).
 3. Heartbeat (best-effort, NOT committed): write a small JSON file at ${sq(RUN_LOCK)} (create its parent directory first if missing) containing {"iteration":${iter},"mode":"${mode}","ts":"<output of: date -u +%Y-%m-%dT%H:%M:%SZ>"}. If the write fails, ignore it.
 Return the ScanResult.`
   let scan = await safeAgent(scanPrompt, { label: `scan#${iter}`, phase: 'Iterate', schema: SCAN_RESULT, model: SHELL_MODEL }, () => null)
 
-  // mid-run FATAL introduced (e.g. a cycle from a retry, a half-applied transition) is a GENUINE stop
-  // (unrepairable integrity) -> abort before dispatch. A non-emit/garbled echo is NOT genuine and is
-  // handled below by parse-fallback + degrade (BUG-1), never by aborting the whole run.
+  // A doctor battery that could not RUN is still an immediate stop: the board is unverified rather
+  // than known-bad, and that verdict needs no index to reach. REPORTED findings are NOT decided here
+  // any more — they are classified below, once the snapshot gives us an index to attribute them to,
+  // so one malformed card holds itself out instead of stopping a run that never touches it.
+  const unavailableAbort = async (sc, whenNote) => {
+    const v = doctorVerdict(sc.doctorFatals)
+    if (v.reported) return null
+    stopReason = 'doctor-unavailable-midrun'
+    await unlock('Iterate')
+    return { aborted: true, stopReason, reason: `the mid-run integrity recheck could not RUN${whenNote} — the board is unverified, not known-bad. ${v.why}`, mode, iteration: iter, doctorUnavailable: true, doctorSummary: sc.doctorSummary, fatals: sc.doctorFatals }
+  }
   if (scan && !scan.doctorOk) {
-    const v = doctorVerdict(scan.doctorFatals)
-    stopReason = v.reported ? 'integrity-fatal-midrun' : 'doctor-unavailable-midrun'
-    return { aborted: true, reason: v.reported ? 'integrity FATAL detected mid-run; aborting before dispatch' : `the mid-run integrity recheck could not RUN — the board is unverified, not known-bad. ${v.why}`, mode, iteration: iter, doctorUnavailable: !v.reported, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
+    const ab = await unavailableAbort(scan, '')
+    if (ab) return ab
   }
 
-  let snap = null
-  if (scan) { try { snap = JSON.parse(scan.snapshotJson) } catch (e) { snap = null } }
+  // Parse + PROVE the relay. A shortened echo is valid JSON, so JSON.parse alone cannot tell a small
+  // board from a truncated one; relayCheck compares the payload against the header the producer wrote.
+  // A mismatch is routed into the SAME retry -> text-fallback ladder as an unparseable echo, because
+  // the remedy is identical (ask again) — only the terminal reason differs, and it has to: telling an
+  // operator the scan "degraded" when the board was silently halved sends them to the wrong place.
+  let snap = null, relayShort = null
+  const parseScan = (sc) => {
+    if (!sc) return null
+    let o = null
+    try { o = JSON.parse(sc.snapshotJson) } catch (e) { return null }
+    const rc = relayCheck(o)
+    if (!rc.ok) { relayShort = rc; log(`iter ${iter}: RELAY SHORT — ${rc.why}`); return null }
+    if (rc.unverifiable && iter === 1 && !relayWarned) { relayWarned = true; log('note: this store emits no relay header, so snapshot completeness cannot be verified (third-party adapter)') }
+    relayShort = null
+    return o
+  }
+  snap = parseScan(scan)
   if (scan && !snap) {
     // One schema re-scan on a garbled/truncated echo before falling back: the snapshot is relayed by an
     // agent echoing scan-backlog's stdout verbatim, so a single bad echo should not derail a long run.
-    log(`iter ${iter}: snapshot JSON unparseable — re-scanning once`)
+    log(`iter ${iter}: snapshot ${relayShort ? 'incomplete' : 'JSON unparseable'} — re-scanning once`)
     scan = await safeAgent(scanPrompt, { label: `scan#${iter}:retry`, phase: 'Iterate', schema: SCAN_RESULT, model: SHELL_MODEL }, () => null)
     if (scan && !scan.doctorOk) {
-      const v2 = doctorVerdict(scan.doctorFatals)
-      stopReason = v2.reported ? 'integrity-fatal-midrun' : 'doctor-unavailable-midrun'
-      return { aborted: true, reason: v2.reported ? 'integrity FATAL detected mid-run (on scan retry); aborting before dispatch' : `the mid-run integrity recheck could not RUN (on scan retry) — the board is unverified, not known-bad. ${v2.why}`, mode, iteration: iter, doctorUnavailable: !v2.reported, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
+      const ab2 = await unavailableAbort(scan, ' (on scan retry)')
+      if (ab2) return ab2
     }
-    if (scan) { try { snap = JSON.parse(scan.snapshotJson) } catch (e) { snap = null } }
+    snap = parseScan(scan)
   }
   if (!snap) {
     // Schema path exhausted (StructuredOutput non-emit, or unparseable twice). The model likely ran the
@@ -1516,7 +1774,22 @@ Return the ScanResult.`
     // printed (BUG-1 parse-fallback). The scan is read-only bookkeeping, not judgement.
     log(`iter ${iter}: scan schema path failed — trying schema-less text scan`)
     const fb = await textScanFallback(`scan#${iter}:text`)
-    if (fb) { snap = fb; log(`iter ${iter}: recovered snapshot via text fallback (doctor recheck skipped this iteration)`) }
+    if (fb) {
+      const rcf = relayCheck(fb)
+      if (rcf.ok) { snap = fb; relayShort = null; log(`iter ${iter}: recovered snapshot via text fallback (doctor recheck skipped this iteration)`) }
+      else { relayShort = rcf; log(`iter ${iter}: text fallback ALSO incomplete — ${rcf.why}`) }
+    }
+  }
+  if (!snap && relayShort) {
+    // Every relay attempt came back short. This is NOT "the scan degraded" — the command ran and the
+    // board was read; what failed is the hop between the script and this scheduler, and the cause is
+    // almost always a payload too large for one agent response. Say that, and name the two things that
+    // actually shrink it. Planning over a half-relayed board is the one thing we will not do: that is
+    // how a run reports tasks as nonexistent and stops, which is the failure this check exists for.
+    stopReason = 'relay-truncated'
+    log(`iter ${iter}: snapshot relay incomplete after retries (${relayShort.why}) — stopping loop, draining, then return`)
+    relayFailures.push({ iteration: iter, expected: relayShort.expected, got: relayShort.got, why: relayShort.why })
+    break
   }
   if (!snap) {
     // Even the text fallback failed. A read-only scan is bookkeeping, not judgement — do NOT abort the
@@ -1527,15 +1800,62 @@ Return the ScanResult.`
     log(`iter ${iter}: scan produced no snapshot after retries + text fallback — stopping loop, draining, then return (re-run /go to continue)`)
     break
   }
-  lastSnapshot = snap
+  // The doctor's findings ride the same hop as the snapshot. A dropped FATAL line silently
+  // UN-quarantines its task, so the run would dispatch against the exact state the gate exists to
+  // refuse — the one relay loss that is worse than losing a task record. Cross-check the count the
+  // battery itself reported against how many lines came back, and refuse rather than guess which.
+  if (scan && scan.doctorSummary) {
+    const drc = doctorRelayCheck(scan.doctorSummary, scan.doctorFatals)
+    if (!drc.ok) {
+      stopReason = 'doctor-relay-truncated'
+      await unlock('Iterate')
+      return { aborted: true, stopReason, reason: `the integrity report was relayed incompletely (${drc.why}) — we cannot tell WHICH finding was dropped, and a dropped FATAL would silently un-hold the task it names. Nothing was dispatched. Re-run /go; if it recurs, scope the run (/go <ids>) or raise shellModel.`, mode, iteration: iter, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
+    }
+  }
   if (snap.branchPrefix) branchPrefix = snap.branchPrefix
+
+  // ---- integrity findings: classify, then HOLD OUT the tasks they name (3.4.0) ----
+  // A FATAL used to stop the run, full stop. That conflates "this repository is unusable" with "one
+  // card is malformed", and on a shared board the second is overwhelmingly the common case: a single
+  // long-cancelled card with a hand-edited state blocked every run for a whole team, including runs
+  // scoped to tasks that never touched it. Repo-scoped findings still abort. Task-scoped ones hold
+  // that task out and the rest of the board proceeds. Findings naming nothing this board can act on
+  // are reported and otherwise ignored — aborting for them would reinstate the very gate being
+  // removed. Recomputed every iteration from that iteration's relay-verified lines: no sticky state,
+  // so a finding an operator fixes mid-run stops holding its task out on the next pass.
+  const preIdx = indexTasks((snap.tasks || []).concat(snap.inactive || []), snap.satisfiedDeps)
+  const cls = classifyFatals((scan && scan.doctorFatals) || [], preIdx)
+  if (cls.repo.length) {
+    stopReason = 'integrity-fatal-midrun'
+    await unlock('Iterate')
+    return { aborted: true, stopReason, reason: `repository-level integrity FATAL detected mid-run; aborting before dispatch (this class is not task-scoped — it affects the whole checkout): ${cls.repo.map((f) => f.code).join(', ')}`, mode, iteration: iter, doctorSummary: scan && scan.doctorSummary, fatals: cls.repo.map((f) => f.line), fatalsNotGating: cls.notGating.map((f) => f.line) }
+  }
+  const quarantined = new Set(cls.task.map((f) => f.stem))
+  for (const f of cls.task) noteHeld(f.stem, 'quarantined', f.code, f.detail)
+  const qkey = [...quarantined].sort().join(',')
+  if (qkey !== lastQuarantineKey) {
+    lastQuarantineKey = qkey
+    if (quarantined.size) {
+      const names = [...quarantined].slice(0, 3).join(', ')
+      log(`integrity: holding out ${quarantined.size} task(s) with a FATAL finding — ${names}${quarantined.size > 3 ? `, +${quarantined.size - 3} more` : ''}. The rest of the board runs. /whip-doctor explains each.`)
+    } else if (iter > 1) {
+      log('integrity: no tasks held out this iteration (previously held-out tasks are back in play)')
+    }
+  }
+  lastFatalsNotGating = cls.notGating.map((f) => f.line)
+  if (cls.notGating.length && iter === 1) {
+    log(`integrity: ${cls.notGating.length} FATAL finding(s) name nothing this run can dispatch, transition or integrate — reported, not gating.`)
+  }
+  snap = applyQuarantine(snap, quarantined)
+
+  lastSnapshot = snap
   const tasks = snap.tasks || []
-  // `inactive` (draft/archive) is UNION'd into the dependency index and nowhere else. The dispatcher's
-  // enricher splits it out of tasks[] so a scoped run's denominator and the per-task batteries see only
-  // work the scheduler can act on — but depsSatisfied treats an unresolvable token as dangling and
-  // refuses to dispatch, so dropping these from the index would turn "gated behind a draft" into
-  // "silently never dispatched". They can never be terminal (isTerminal is false for both states), so
-  // a dependent still waits; it just waits legibly.
+  // `inactive` (draft/archive, plus anything quarantined above) is UNION'd into the dependency index
+  // and nowhere else. The dispatcher's enricher splits it out of tasks[] so a scoped run's denominator
+  // and the per-task batteries see only work the scheduler can act on — but depsSatisfied treats an
+  // unresolvable token as dangling and refuses to dispatch, so dropping these from the index would
+  // turn "gated behind a draft" into "silently never dispatched". They can never be terminal
+  // (isTerminal is false for both states), so a dependent still waits; it just waits legibly.
   const idx = indexTasks(tasks.concat(snap.inactive || []), snap.satisfiedDeps)
   // Run scope (3.2.3). The INDEX stays whole — dependency resolution must still see out-of-scope
   // tasks, because depsSatisfied treats an unresolvable dep token as dangling and refuses to
@@ -1543,19 +1863,94 @@ Return the ScanResult.`
   // at every planning site below, and nowhere else.
   // tasks[] IS the scheduling view, so its stems are exactly what can be dispatched. Passing it makes
   // the guard below answer the real question instead of a two-value enumeration of it.
-  const scoped = ONLY ? expandScope(ONLY, idx, new Set(tasks.map((t) => t.stem))) : null
-  if (scoped && scoped.inactiveSeeds.length) {
-    stopReason = 'scope-not-actionable'
-    return { aborted: true, reason: `/go was scoped to tasks that are not actionable: ${scoped.inactiveSeeds.join(', ')}. A draft task is behind the human gate, an archived one is retired, and one in no recognised state is quarantined — none can be dispatched. Give it a schedulable state (pending) first (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+  // ---- resolve the run scope ----
+  // Seeds are resolved by the SCRIPT, in the store, over the whole board (`snapshot --only` returns
+  // snap.scope), and this scheduler consumes that resolution rather than re-deriving it. That split
+  // matters: idx.resolve settles a prefix by FIRST MATCH over map order, which on a large board
+  // silently selects whichever `feature-231-*` happened to be listed first, whereas the script
+  // refuses an ambiguous prefix outright. Re-resolving here would reintroduce the guess.
+  const scopeMeta = snap.scope && typeof snap.scope === 'object' ? snap.scope : null
+  let seedStems = ONLY
+  if (ONLY && scopeMeta) {
+    // Cross-check BEFORE trusting the resolution: every stem the script resolved must be exactly
+    // present in the relayed index, and every token we asked about must be accounted for in exactly
+    // one bucket. A payload that satisfies the relay header but is missing a task we were promised is
+    // a relay failure, NOT a nonexistent id — and calling it the latter is precisely the misdiagnosis
+    // this release exists to end ("check the ids" when the ids were fine).
+    const resolvedVals = Object.values(scopeMeta.resolved || {})
+    const accountedFor = new Set([
+      ...Object.keys(scopeMeta.resolved || {}),
+      ...(scopeMeta.unresolved || []),
+      ...(scopeMeta.ambiguous || []).map((a) => a && a.tok),
+      ...(scopeMeta.inactiveSeeds || []).map((e) => (e && e.stem) || e),
+    ])
+    const missingFromIndex = resolvedVals.filter((st) => !idx.byStem.has(st) && !idx.satByStem.has(st) && !heldOut.has(st))
+    const unaccounted = ONLY.filter((tok) => !accountedFor.has(tok))
+    if (missingFromIndex.length || unaccounted.length) {
+      stopReason = 'relay-truncated'
+      await unlock('Iterate')
+      return { aborted: true, stopReason, reason: `the store resolved ${resolvedVals.length} of the tasks you named, but the snapshot handed to the orchestrator does not contain ${missingFromIndex.concat(unaccounted).join(', ')} — the snapshot was relayed incompletely, so the ids are NOT missing from the backlog. Nothing was dispatched. Re-run /go; if it recurs, name fewer tasks or raise shellModel.`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+    }
+    seedStems = resolvedVals
+  }
+  const scoped = ONLY ? expandScope(seedStems, idx, new Set(tasks.map((t) => t.stem))) : null
+  // Unresolvable / ambiguous seeds are decided by the SCRIPT and only at iteration 1. Later
+  // iterations must not abort on them: on a shared board a card can legitimately move or be retired
+  // under a running orchestrator, and killing a healthy multi-hour run over someone else's edit is
+  // not a safety property. From iteration 2 the stem is held out and named in the report.
+  const scriptUnresolved = scopeMeta ? (scopeMeta.unresolved || []) : []
+  const scriptAmbiguous = scopeMeta ? (scopeMeta.ambiguous || []) : []
+  if (iter > 1 && scriptUnresolved.length) {
+    // Past iteration 1 the store itself can no longer resolve a seed it resolved before: someone else
+    // retired or renamed the card under a running orchestrator. That is a shared-board fact, not a
+    // reason to discard a healthy multi-hour run — hold the stem out and name it in the report.
+    for (const tok of scriptUnresolved) noteHeld(tok, 'vanished', '', 'the store could not resolve this id any more — it was retired or renamed mid-run')
+  }
+  if (iter === 1 && (scriptUnresolved.length || scriptAmbiguous.length)) {
+    stopReason = 'scope-unresolved'
+    await unlock('Iterate')
+    const ambText = scriptAmbiguous.map((a) => `${a.tok} (matches ${(a.candidates || []).join(', ')})`).join('; ')
+    return { aborted: true, stopReason, reason: [
+      scriptUnresolved.length ? `/go was scoped to tasks that do not exist in the backlog: ${scriptUnresolved.join(', ')} — check the ids` : '',
+      ambText ? `/go was scoped by an AMBIGUOUS prefix, which is never guessed: ${ambText} — name one` : '',
+    ].filter(Boolean).join('. ') + ' (nothing was dispatched)', scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
   }
   if (scoped && scoped.unresolved.length) {
-    stopReason = 'scope-unresolved'
-    return { aborted: true, reason: `/go was scoped to tasks that do not exist in the backlog: ${scoped.unresolved.join(', ')} — check the ids (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+    if (iter === 1) {
+      stopReason = 'scope-unresolved'
+      await unlock('Iterate')
+      return { aborted: true, stopReason, reason: `/go was scoped to tasks that do not exist in the backlog: ${scoped.unresolved.join(', ')} — check the ids (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+    }
+    for (const st of scoped.unresolved) noteHeld(st, 'vanished', '', 'was in scope at iteration 1 but is no longer on the board — someone else moved or retired it')
+  }
+  // An inactive member of an EXPLICIT scope is a refusal: you named a task that cannot run, and
+  // silently running fewer tasks than asked for is the behaviour this whole feature rejects. An
+  // inactive member of a FOCUS is different in kind — a focus is a standing list, and pausing one of
+  // its tasks (the supported way to park work) must not stop the others.
+  if (scoped && scoped.inactiveSeeds.length) {
+    if (SCOPE_SOURCE === 'focus') {
+      for (const e of scoped.inactiveSeeds) {
+        const stem = String(e).split(' ')[0]
+        noteHeld(stem, 'paused', '', String(e))
+      }
+      if (iter === 1) log(`scope: ${scoped.inactiveSeeds.length} focus task(s) are paused or retired and will be skipped — ${scoped.inactiveSeeds.join(', ')}`)
+    } else {
+      stopReason = 'scope-not-actionable'
+      await unlock('Iterate')
+      return { aborted: true, stopReason, reason: `/go was scoped to tasks that are not actionable: ${scoped.inactiveSeeds.join(', ')}. A draft task is behind the human gate, an archived one is retired, and one in no recognised state is quarantined — none can be dispatched. Give it a schedulable state (pending) first (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+    }
   }
   const sched = scoped ? tasks.filter((t) => scoped.scope.has(t.stem)) : tasks
-  if (scoped) runScope = scoped.scope
+  // runScope is the UNION across iterations, never just this one's. A scope member that collapses out
+  // of the working set once it is terminal-accepted would otherwise drop out of the drain filter, the
+  // needsOperator filter and scopeResolved — so the run would stop reporting on work it did.
+  if (scoped) {
+    if (!runScope) runScope = new Set()
+    for (const st of scoped.scope) runScope.add(st)
+  }
   if (scoped && iter === 1) {
     log(`scope: ${sched.length} task(s)${scoped.added.length ? ` (+${scoped.added.length} pulled in as unmet dependencies: ${scoped.added.join(', ')})` : ''}${SCOPE_FILTER ? ` — filter: ${SCOPE_FILTER}` : ''}`)
+    if (cls.notGating.length) log(`note: ${cls.notGating.length} integrity FATAL(s) sit outside this run's scope — not gating it`)
   }
 
   // Unblock/timeout plan is computed HERE (before the completion check) so completion can require that
@@ -1567,6 +1962,7 @@ Return the ScanResult.`
     maxReject: REJECT_CAP,
     maxBlock: BLOCK_CAP,
     parked: parkedThisRun,
+    quarantined,
     trunkRoot,
   })
 
@@ -1584,7 +1980,7 @@ Return the ScanResult.`
     // mis-measure it — warn instead of aborting, so a slightly stale adapter still permits scoping.
     if (!scoped) {
       stopReason = 'snapshot-version-skew'
-      return { aborted: true, reason: 'backlog snapshot is missing runtimeTerminal counts — snapshot engine / workflow version skew (or a store adapter emitting a pre-contract snapshot); reinstall acf-whip so both halves match', mode, iteration: iter }
+      return { aborted: true, stopReason, reason: 'backlog snapshot is missing runtimeTerminal counts — snapshot engine / workflow version skew (or a store adapter emitting a pre-contract snapshot); reinstall acf-whip so both halves match', mode, iteration: iter }
     }
     if (iter === 1) log('WARN snapshot is missing runtimeTerminal counts (snapshot/workflow version skew) — tolerated because this run is scoped, but reinstall acf-whip')
   }
@@ -1596,13 +1992,25 @@ Return the ScanResult.`
   const terminal = scoped
     ? sched.filter(isTerminal).length
     : (mode === 'override' ? snap.counts.runtimeTerminalOverride : snap.counts.runtimeTerminalDefault)
+  // Held-out tasks make "done" a DIFFERENT claim. A run that finished everything it was allowed to
+  // touch, while refusing to touch something in its scope, has not completed the backlog — and
+  // reporting `complete` there is the failure this guards: the operator reads "Backlog 100% terminal"
+  // and the task they asked for was never run. `partial` is a terminal state like `complete`; it just
+  // tells the truth, and `completed:false` keeps any automation reading that flag honest too.
+  const inScopeHeldOut = () => [...heldOut.keys()].filter((st) => !runScope || runScope.has(st))
   // Every scoped task already terminal (or all of them collapsed-accepted) => nothing to do. The
   // unscoped guard below is `total > 0`, which would spin here instead of stopping.
-  if (scoped && total === 0) { stopReason = 'complete'; break }
-  log(`iter ${iter}: ${terminal}/${total} ${scoped ? 'scoped' : 'active'} terminal (integrated=${snap.counts.integrated}, accepted=${snap.counts.accepted}, blocked=${snap.counts.blocked}, workingSet=${tasks.length}${scoped ? `, scope=${sched.length}` : ''})`)
+  if (scoped && total === 0) { stopReason = inScopeHeldOut().length ? 'partial' : 'complete'; break }
+  log(`iter ${iter}: ${terminal}/${total} ${scoped ? 'scoped' : 'active'} terminal (integrated=${snap.counts.integrated}, accepted=${snap.counts.accepted}, blocked=${snap.counts.blocked}, workingSet=${tasks.length}${scoped ? `, scope=${sched.length}` : ''}${heldOut.size ? `, heldOut=${heldOut.size}` : ''})`)
   // Complete only when 100% terminal AND nothing is queued to unblock — the extra unblock+dispatch
   // pass (retro I5A) keeps a last-iteration-integrated dependency from stranding its blocked dependent.
-  if (total > 0 && terminal === total && unblockActions.length === 0) { stopReason = 'complete'; break }
+  if (total > 0 && terminal === total && unblockActions.length === 0) {
+    stopReason = inScopeHeldOut().length ? 'partial' : 'complete'
+    break
+  }
+  // An UNSCOPED run whose entire remaining board is held out has nothing left to do either, and the
+  // `total > 0` guard above would spin it to the no-gain ceiling instead of stopping.
+  if (!scoped && total === 0 && heldOut.size) { stopReason = 'partial'; break }
 
   // ---- plan (pure JS): partition by slug, gate deps, build queues ----
   // PARALLELISM INVARIANT (default): every non-conflicting ready unit dispatches CONCURRENTLY.
@@ -1611,6 +2019,17 @@ Return the ScanResult.`
   // Nothing here may serialize work that a distinct slug + satisfied deps would let run in parallel.
   const codeSlug = (t) => t.slug && t.slug !== 'none'
   const seen = new Set()
+  // HOLD the slug of any quarantined task that was already in flight. Quarantine moves the task out
+  // of the scheduling view, which frees its worktree slug — and a same-slug sibling would then be
+  // dispatched into it. clean-checkout.sh opens with a silent `stash push -u`, so that sibling's
+  // first act would be to sweep the held-out task's uncommitted work into the shared stash, where the
+  // next clean-checkout pops it into a DIFFERENT task's tree. Holding the slug costs one iteration of
+  // parallelism on one slug; not holding it costs the work.
+  for (const t of (snap.inactive || [])) {
+    if (!t.quarantined) continue
+    if (t.folder !== 'in-progress' && t.folder !== 'completed' && t.folder !== 'in-review') continue
+    if (codeSlug(t)) seen.add(t.slug)
+  }
   // One agent per code slug per iteration. Reviewers claim first, then in-progress (re-dispatch
   // recovery), then pending — so a same-slug pending sibling is blocked by `seen` while the
   // in-progress task itself re-dispatches exactly once. (A task sitting in in-progress at plan time
@@ -1981,10 +2400,40 @@ Return the ScanResult.`
   // integration, or a dispatch that returned a REAL transition all count. A dispatch that returns
   // only 'none' (transient) does NOT — otherwise a task that re-dispatches and keeps failing would
   // hold idle at 0 forever and only the looser noGain guard (15) would catch it.
+  // Why is a pending task still sitting there? At a no-progress exit this is the whole question, and
+  // the report used to answer it by pointing at blocked/ and rejected/ — the two folders a gated
+  // PENDING task is not in. Recompute each iteration so the last one describes the state we stopped in.
+  lastGated = sched
+    .filter((t) => t.folder === 'pending' && !depsSatisfied(t, idx, quarantined))
+    .map((t) => {
+      const unmet = (t.deps || []).filter((d) => {
+        const dep = idx.resolve(d)
+        if (!dep) return true
+        return quarantined.has(dep.stem) || !depsSatisfied({ deps: [d], slug: t.slug }, idx, quarantined)
+      })
+      const first = unmet[0] || ''
+      const dep = first ? idx.resolve(first) : null
+      return {
+        stem: t.stem,
+        dep: first || '(unresolvable)',
+        why: !dep ? 'dependency names no task on this board'
+          : quarantined.has(dep.stem) ? `dependency ${dep.stem} is held out by an integrity finding`
+          : heldOut.has(dep.stem) ? `dependency ${dep.stem} is held out (${(heldOut.get(dep.stem) || {}).why})`
+          : `dependency ${dep.stem} is ${dep.folder}, not accepted`,
+      }
+    })
+
   const didWork = preActions.length > 0 || integratedThisIter > 0 || productiveDispatch
   idle = didWork ? 0 : idle + 1
-  noGain = terminal > prevTerminal ? 0 : noGain + 1
+  // Progress is not only "terminal went up". On a scoped run a task that becomes terminal-accepted
+  // COLLAPSES out of the next snapshot's working set, so `terminal` can stay flat while `total`
+  // shrinks by the same one — real progress that the old guard read as none. Seventeen same-slug or
+  // chain-dependent scoped tasks would exhaust NO_GAIN_LIMIT and exit 'no-progress' with the work
+  // still there. A member can only leave the scope by finishing, vanishing, or being held out, and
+  // all three are reported — so a shrinking denominator is always progress or always visible.
+  noGain = (terminal > prevTerminal || (prevTotal >= 0 && total < prevTotal)) ? 0 : noGain + 1
   prevTerminal = terminal
+  prevTotal = total
   // BREAK, never return: the run must fall through to Drain and the unlock, or a finished run holds its
   // own lock for LOCK_FRESH_MIN while its report tells the operator to re-run.
   if (capReached) { stopReason = 'agent-cap-reached'; break }
@@ -2001,18 +2450,34 @@ let finalSnap = lastSnapshot
 if (mode === 'default' && lastSnapshot) {
   const rescan = await safeAgent(
     `${ENV}
-Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}  and return its stdout VERBATIM in snapshotJson (set doctorOk true, doctorSummary "drain", doctorFatals []).`,
+Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}${ONLY_FLAGS}  and return its stdout VERBATIM in snapshotJson — copy it exactly, add nothing, drop nothing (set doctorOk true, doctorSummary "drain", doctorFatals []).`,
     { label: 'drain:scan', phase: 'Drain', schema: SCAN_RESULT, model: SHELL_MODEL },
     () => null,
   )
   let snap2 = null
   try { snap2 = rescan ? JSON.parse(rescan.snapshotJson) : null } catch (e) { snap2 = null }
+  // The drain relays the same way the loop does, so verify it the same way. A SHORT drain snapshot is
+  // worse than none: it would list fewer accepted tasks than exist and the run would report a clean
+  // finish having integrated only part of the work. Fall back to the last VERIFIED snapshot instead —
+  // it is stale, never truncated, and the integrator is idempotent against a stale entry.
+  if (snap2) {
+    const drc2 = relayCheck(snap2)
+    if (!drc2.ok) {
+      log(`drain: snapshot relay incomplete (${drc2.why}) — draining off the last verified snapshot instead`)
+      relayFailures.push({ iteration: 'drain', expected: drc2.expected, got: drc2.got, why: drc2.why })
+      snap2 = null
+    }
+  }
   // BUG-6a: if the drain scan itself can't emit (it routes through the same schema-forced agent as the
   // main scan), drain off the last good in-memory snapshot instead of skipping integration entirely. A
   // stale snapshot may list a just-integrated task as still-accepted, so exclude stems already integrated
   // this run; the LP-CAS integrator's O(1) already-integrated check makes a folded task a no-op (exit 0)
   // even if one slips through.
   if (!snap2) snap2 = lastSnapshot
+  // A held-out task is held out here too. The drain runs AFTER the loop, off a fresh snapshot that
+  // knows nothing about this run's quarantine — so without this, the one pass that exists to catch
+  // stragglers would cheerfully integrate the very task the integrity gate refused to touch.
+  if (snap2 && heldOut.size) snap2 = applyQuarantine(snap2, new Set(heldOut.keys()))
   finalSnap = snap2 || lastSnapshot
   if (snap2) {
     const idx2 = indexTasks((snap2.tasks || []).concat(snap2.inactive || []), snap2.satisfiedDeps)
@@ -2032,9 +2497,7 @@ Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}
 // mid-run abort paths return earlier and deliberately leave the lock to expire on its own: they end in
 // a state an operator should look at before relaunching. Best-effort by construction (the lock is a
 // guardrail): if this never runs, the freshness window releases it anyway.
-try {
-  await agentC(`Run exactly this command and report nothing else:  rm -f ${sq(RUN_LOCK)}`, { label: 'unlock', phase: 'Drain', model: SHELL_MODEL })
-} catch (e) { /* lock expires on its own */ }
+await unlock('Drain')
 
 // ============================ REPORT ============================
 // WS5 / retro #9: RECONCILE the run tallies against the freshest on-disk snapshot (finalSnap). The
@@ -2062,9 +2525,14 @@ const alreadyParked = new Set([...capParkedStems, ...parkedThisRun])
 const tokenParked = [...new Set(tokenStrandedStems)].filter((s) => !alreadyParked.has(s))
   .map((s) => ({ stem: s, blockCount: 0, rejectionCount: 0, needsTask: 'clean-checkout token never restored — verify the worktree branch, then re-run /go to re-dispatch' }))
 const needsOperator = [...capParked, ...depParked, ...tokenParked]
+// Tasks the run REFUSED to touch, and why. `completed` is true only when the run both reached
+// `complete` AND held nothing out inside its scope — a run that finished every task it was allowed to
+// touch, while refusing one it was asked to, has not completed the backlog, and saying so is the
+// point. Automation reading `completed` gets the same honest answer the note does.
+const heldOutList = [...heldOut.values()].filter((h) => !runScope || runScope.has(h.stem))
 return {
-  completed: stopReason === 'complete',
-  stopReason, // complete | no-progress | max-iterations | scan-degraded | agent-cap-reached | (aborts return earlier)
+  completed: stopReason === 'complete' && heldOutList.length === 0,
+  stopReason, // complete | partial | no-progress | max-iterations | scan-degraded | relay-truncated | agent-cap-reached | (aborts return earlier)
   mode,
   // Run scope (3.2.3). All three are null/empty on an unscoped run. scopeFilter is the operator's raw
   // words (a natural-language filter resolves to stems in the SKILL, so this is the only record of what
@@ -2072,6 +2540,16 @@ return {
   scopeFilter: SCOPE_FILTER || null,
   scopedTo: ONLY,
   scopeResolved: runScope ? [...runScope] : null,
+  scopeSource: SCOPE_SOURCE,
+  // 3.4.0. heldOut: what the run would not touch (quarantined by an integrity finding, paused, or
+  // vanished from the board mid-run). fatalsNotGating: findings that name nothing this run can act on
+  // — reported so they are never silent, acted on by nobody. gated: why a pending task never moved,
+  // answered from the scheduling view instead of by pointing at folders it is not in. relay: what the
+  // snapshot hop did, so a near-miss is visible BEFORE it becomes an abort on some later run.
+  heldOut: heldOutList,
+  fatalsNotGating: lastFatalsNotGating,
+  gated: lastGated,
+  relay: { failures: relayFailures, verified: relayFailures.length === 0 },
   iterations: iter,
   finalCounts,
   integrated,
@@ -2103,15 +2581,27 @@ return {
     stagesReplayed: esc.replayed,
     faults: esc.faults,
   },
+  // A SCOPED run never says "Backlog": it finished the tasks it was given, and claiming the board is
+  // done when 600 other cards were never looked at is the report reading an operator cannot trust.
   note: (stopReason === 'complete'
-    ? 'Backlog 100% terminal.'
-    : stopReason === 'no-progress'
-      ? 'No progress for 3 iterations — user intervention needed (check blocked/ and rejected/).'
-      : stopReason === 'agent-cap-reached'
-        ? `Stopped at the run's agent ceiling (${agentsUsed}/${AGENT_CAP}) with in-flight work finished and integrated. Nothing lost — every completed harness stage is on disk under the same attempt key, so re-running /go replays them for free and continues.`
-        : stopReason === 'scan-degraded'
-          ? 'Scan could not emit a snapshot after retries + schema-less text fallback; stopped the loop and drained integratable work. Nothing lost (git + .backlog/ are durable) — re-run /go to continue.'
-          : 'Hit the iteration cap.')
+    ? (runScope ? `Scope 100% terminal (${runScope.size} task(s)).` : 'Backlog 100% terminal.')
+    : stopReason === 'partial'
+      ? `Everything this run was allowed to touch is terminal, but ${heldOutList.length} task(s) were HELD OUT and never ran: ${heldOutList.map((h) => `${h.stem} (${h.why})`).join(', ')}. The backlog is NOT complete.`
+      : stopReason === 'no-progress'
+        ? `No progress for 3 iterations — user intervention needed.${lastGated.length ? ` ${lastGated.length} pending task(s) are gated: ${lastGated.slice(0, 3).map((g) => `${g.stem} (${g.why})`).join('; ')}${lastGated.length > 3 ? ', ...' : ''}.` : ''}${heldOutList.length ? ` ${heldOutList.length} task(s) held out: ${heldOutList.map((h) => h.stem).join(', ')}.` : ''} Also check blocked/ and rejected/.`
+        : stopReason === 'agent-cap-reached'
+          ? `Stopped at the run's agent ceiling (${agentsUsed}/${AGENT_CAP}) with in-flight work finished and integrated. Nothing lost — every completed harness stage is on disk under the same attempt key, so re-running /go replays them for free and continues.`
+          : stopReason === 'relay-truncated'
+            ? `The snapshot could not be relayed intact from the store to the orchestrator after retries${relayFailures.length ? ` (${relayFailures[relayFailures.length - 1].why})` : ''}. The board was read fine — the hop through the scan agent was short, which on a large store means the payload is too big for one response. Nothing was mis-scheduled and nothing is lost. Narrow the run (/go <ids>, or set a focus), or raise shellModel, then re-run.`
+            : stopReason === 'scan-degraded'
+              ? 'Scan could not emit a snapshot after retries + schema-less text fallback; stopped the loop and drained integratable work. Nothing lost (git + .backlog/ are durable) — re-run /go to continue.'
+              : 'Hit the iteration cap.')
+    + (heldOutList.length && stopReason !== 'partial' && stopReason !== 'no-progress'
+      ? ` ${heldOutList.length} task(s) were held out and never ran: ${heldOutList.map((h) => `${h.stem} (${h.why})`).join(', ')}.`
+      : '')
+    + (lastFatalsNotGating.length
+      ? ` ${lastFatalsNotGating.length} integrity FATAL(s) named tasks outside this run and did not gate it — run /whip-doctor to see them.`
+      : '')
     + (ESCALATE && esc.authored === 0 && esc.fellBack > 0
       ? ` ⚑ NO harness was authored this run (${esc.fellBack} fell back to single-agent dispatch) — check that acf-whip/skills/lib/bin/acfw-child-* are executable and that .claude/agents/ is populated.`
       : '')

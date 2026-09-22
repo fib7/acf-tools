@@ -363,6 +363,131 @@ else
   ok "jq absent (enricher split assertions skipped)"
 fi
 
+# ============================================================================================
+# 3.4.0: snapshot --only / --full-to / relay header (dispatcher post-stage)
+# ============================================================================================
+# The failure being prevented: a raw adapter emits EVERY card (accepted, archive, draft and all),
+# /go's shell-runner has to echo that through one schema string, and a shortened-but-valid echo is
+# indistinguishable from a real board — so a scoped run reports that its ids "do not exist".
+if command -v jq >/dev/null 2>&1; then
+  RAWCAPS='{"backend":"stub","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition"]}'
+  # A board shaped like the real hazard: a seed, a BLOCKED dep of that seed, a terminal-accepted dep
+  # of THAT, one unrelated card, one terminal-accepted card nothing depends on, and an archived card.
+  SCOPE_SNAP='{"raw":true,"generatedAt":"2026-09-22 00:00:00","counts":{"pending":2,"blocked":1,"accepted":2,"total":6},"tasks":[
+    {"stem":"ui-021-login","id":"ui-021-login","backendId":"MUL-4821","folder":"pending","slug":"ui","deps":["api-014-token"],"touchesGlobs":[]},
+    {"stem":"api-014-token","id":"api-014-token","backendId":"MUL-100","folder":"blocked","slug":"api","deps":["db-001-schema"],"touchesGlobs":[]},
+    {"stem":"db-001-schema","id":"db-001-schema","backendId":"MUL-101","folder":"accepted","slug":"none","deps":[],"touchesGlobs":[]},
+    {"stem":"unrelated-777","id":"unrelated-777","backendId":"MUL-777","folder":"pending","slug":"other","deps":[],"touchesGlobs":[]},
+    {"stem":"solo-500-acc","id":"solo-500-acc","backendId":"MUL-500","folder":"accepted","slug":"none","deps":[],"touchesGlobs":[]},
+    {"stem":"old-300-arch","id":"old-300-arch","backendId":"MUL-300","folder":"archive","slug":"none","deps":[],"touchesGlobs":[]}]}'
+
+  : > "$STUB_LOG"
+  S_ONLY=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot --only ui-021-login --mode default)
+
+  # --only must NEVER reach an adapter that does not declare snapshot-only: a raw adapter that
+  # narrowed its own walk would make both the closure and the store-wide counts wrong, silently.
+  check "--only is not forwarded to an adapter without snapshot-only" "! grep -q 'ARGS:snapshot.*--only' \"\$STUB_LOG\""
+  check "...and the adapter is still asked for the full walk" "grep -q 'ARGS:snapshot' \"\$STUB_LOG\""
+
+  check "--only narrows tasks[] to the closure" \
+    "[ \"\$(printf '%s' \"\$S_ONLY\" | jq -r '[.tasks[].stem]|sort|join(\",\")')\" = 'api-014-token,ui-021-login' ]"
+  # A BLOCKED dep is retryable, not done: leaving it outside the scope means it can never be
+  # unblocked, so the seed can never dispatch and the run exits no-progress with nothing done.
+  check "...pulling in a BLOCKED dependency" \
+    "printf '%s' \"\$S_ONLY\" | jq -e '.scope.added|index(\"api-014-token\")' >/dev/null"
+  check "...and stopping at a terminal-accepted one" \
+    "! printf '%s' \"\$S_ONLY\" | jq -e '[.tasks[].stem]|index(\"db-001-schema\")' >/dev/null"
+  check "...never touching an unrelated task" \
+    "! printf '%s' \"\$S_ONLY\" | jq -e '[.tasks[].stem]|index(\"unrelated-777\")' >/dev/null"
+  check "--only sets scopeApplied" "printf '%s' \"\$S_ONLY\" | jq -e '.scopeApplied == true' >/dev/null"
+  check "--only records what each seed resolved to" \
+    "[ \"\$(printf '%s' \"\$S_ONLY\" | jq -r '.scope.resolved[\"ui-021-login\"]')\" = 'ui-021-login' ]"
+  # The store-wide counts must survive narrowing: the doctor, the report and an unscoped completion
+  # test all read them, and a narrowed count would understate the board.
+  # 6 cards, one archived: the enricher's counts span the ACTIVE set, so 5 — and crucially NOT the 2
+  # the scoped view holds. Narrowing must never reach the number the report and the doctor read.
+  check "store-wide counts are NOT narrowed" "printf '%s' \"\$S_ONLY\" | jq -e '.counts.total == 5' >/dev/null"
+  check "...and a scoped count is reported alongside" "printf '%s' \"\$S_ONLY\" | jq -e '.scopeCounts.total == 2' >/dev/null"
+
+  # relay: the consumer must be able to PROVE it received everything the producer emitted.
+  check "relay header is emitted" "printf '%s' \"\$S_ONLY\" | jq -e '.relay.n == 2' >/dev/null"
+  check "relay is the FIRST key (a tail-elided echo still carries the expectation)" \
+    "printf '%s' \"\$S_ONLY\" | grep -q '^{\"relay\":'"
+  check "relay counts each array separately (a short payload names which one)" \
+    "printf '%s' \"\$S_ONLY\" | jq -e '.relay.tasks == 2 and .relay.inactive == 0 and .relay.sat == 0' >/dev/null"
+  check "relay.bytes is the stem byte sum" \
+    "[ \"\$(printf '%s' \"\$S_ONLY\" | jq -r '.relay.bytes')\" = \"\$(printf '%s' \"\$S_ONLY\" | jq -r '[.tasks[].stem|length]|add')\" ]"
+
+  # An unscoped snapshot carries the header too — the relay hop is the same on every path.
+  S_PLAIN=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot)
+  check "an unscoped snapshot still carries relay" "printf '%s' \"\$S_PLAIN\" | jq -e '.relay.n > 0' >/dev/null"
+  check "...and is not marked scopeApplied" "! printf '%s' \"\$S_PLAIN\" | jq -e '.scopeApplied == true' >/dev/null"
+
+  # Seed resolution: native id, unknown, ambiguous prefix, inactive.
+  S_BID=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot --only MUL-4821)
+  check "a native backend id resolves to its stem" \
+    "[ \"\$(printf '%s' \"\$S_BID\" | jq -r '.scope.resolved[\"MUL-4821\"]')\" = 'ui-021-login' ]"
+  # MUL-4 must NOT prefix-match MUL-4821: backend ids resolve EXACTLY, or `/go MUL-4` would silently
+  # run someone else's card.
+  S_BID2=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot --only MUL-4)
+  check "a partial backend id does NOT prefix-match" "printf '%s' \"\$S_BID2\" | jq -e '.scope.unresolved|index(\"MUL-4\")' >/dev/null"
+
+  S_NOPE=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot --only nope-404); RC=$?
+  check "an unresolvable seed is reported, not an error" "[ $RC -eq 0 ]"
+  check "...and named in scope.unresolved" "printf '%s' \"\$S_NOPE\" | jq -e '.scope.unresolved|index(\"nope-404\")' >/dev/null"
+  check "...leaving the view empty rather than falling back to the whole board" \
+    "printf '%s' \"\$S_NOPE\" | jq -e '(.tasks|length) == 0' >/dev/null"
+
+  AMB_SNAP=$(printf '%s' "$SCOPE_SNAP" | jq -c '.tasks += [{"stem":"ui-021-logout","id":"ui-021-logout","backendId":"MUL-999","folder":"pending","slug":"ui2","deps":[],"touchesGlobs":[]}]')
+  S_AMB=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$AMB_SNAP" bash "$STORE" snapshot --only ui-021)
+  check "an ambiguous prefix is reported, never guessed" \
+    "printf '%s' \"\$S_AMB\" | jq -e '.scope.ambiguous[0].tok == \"ui-021\"' >/dev/null"
+  check "...with the candidates named" \
+    "printf '%s' \"\$S_AMB\" | jq -e '(.scope.ambiguous[0].candidates|length) == 2' >/dev/null"
+  check "...and nothing dispatched on the guess" "printf '%s' \"\$S_AMB\" | jq -e '(.tasks|length) == 0' >/dev/null"
+
+  S_ARCH=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot --only old-300-arch)
+  check "an archived seed is reported as inactive, not unresolvable" \
+    "printf '%s' \"\$S_ARCH\" | jq -e '.scope.inactiveSeeds[0].stem == \"old-300-arch\"' >/dev/null"
+
+  # ---- real --digest for a raw adapter (it used to be a documented no-op) ----
+  S_DG=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot --digest --mode default)
+  check "--digest collapses a terminal-accepted DEP TARGET into satisfiedDeps" \
+    "printf '%s' \"\$S_DG\" | jq -e '[.satisfiedDeps[].stem]|index(\"db-001-schema\")' >/dev/null"
+  check "...carrying its backendId for display" \
+    "printf '%s' \"\$S_DG\" | jq -e '.satisfiedDeps[]|select(.stem==\"db-001-schema\")|.backendId == \"MUL-101\"' >/dev/null"
+  check "--digest DROPS a terminal-accepted task nothing depends on" \
+    "! printf '%s' \"\$S_DG\" | jq -e '[.tasks[].stem,.satisfiedDeps[].stem]|index(\"solo-500-acc\")' >/dev/null"
+  check "...but it survives in the store-wide counts" "printf '%s' \"\$S_DG\" | jq -e '.counts.total == 5' >/dev/null"
+  check "--digest marks itself" "printf '%s' \"\$S_DG\" | jq -e '.digest == true' >/dev/null"
+
+  # Mode sensitivity: an accepted code task with a live branch and no ledger marker still has to be
+  # INTEGRATED in default mode, so it must stay a full record there and collapse only under override.
+  BR_SNAP=$(printf '%s' "$SCOPE_SNAP" | jq -c '(.tasks[]|select(.stem=="solo-500-acc")|.slug) = "solo"')
+  mkdir -p "$REPO/.worktree" 2>/dev/null || true
+  S_DEF=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$BR_SNAP" bash "$STORE" snapshot --digest --mode default)
+  S_OVR=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$BR_SNAP" bash "$STORE" snapshot --digest --mode override)
+  check "override collapses an accepted code task that default would keep" \
+    "[ \"\$(printf '%s' \"\$S_OVR\" | jq -r '[.tasks[].stem]|index(\"solo-500-acc\")//\"gone\"')\" = 'gone' ]"
+
+  # ---- --full-to: one store walk feeds BOTH the scheduler and the doctor ----
+  FULLF="$WORK/full-snap.json"
+  STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot --digest --only ui-021-login --full-to "$FULLF" >/dev/null
+  check "--full-to writes a file" "[ -s \"\$FULLF\" ]"
+  check "...holding the FULL board, not the narrowed view" "[ \"\$(jq -r '.tasks|length' \"\$FULLF\")\" = '5' ]"
+  check "...unmarked by the narrowing that followed it" "! jq -e '.scopeApplied == true' \"\$FULLF\" >/dev/null"
+  # This is the point of the tee: doctor --snapshot refuses a narrowed/digest file by design, so the
+  # file must be the pre-collapse one or the dispatcher would have to walk the store a second time.
+  STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" doctor --snapshot "$FULLF" >/dev/null 2>&1; RC=$?
+  check "doctor --snapshot ACCEPTS the tee'd full file" "[ $RC -le 1 ]"
+  NARROWF="$WORK/narrow-snap.json"
+  STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot --only ui-021-login > "$NARROWF"
+  STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" doctor --snapshot "$NARROWF" >/dev/null 2>&1; RC=$?
+  check "...while the narrowed stdout snapshot is still refused (exit 2)" "[ $RC -eq 2 ]"
+else
+  ok "jq absent (3.4.0 scope/digest/relay assertions skipped)"
+fi
+
 echo
 echo "phase9-dispatcher: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
