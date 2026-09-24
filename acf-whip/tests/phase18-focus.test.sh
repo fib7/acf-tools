@@ -188,9 +188,10 @@ if command -v jq >/dev/null 2>&1; then
   check "...leaving the focus untouched" "[ \"\$(cat \"\$FOCUS_FILE\")\" = \"\$BEFORE_NJ\" ]"
   NJ set UI-21 >/dev/null 2>&1
   check "an ID resolves to its stem without jq" "grep -qx 'ui-021-login' \"\$FOCUS_FILE\""
-  # The guard that makes either parser trustworthy: N tokens in, N stems out, or refuse.
+  # The guard that makes either parser trustworthy: N distinct tokens in, N resolved ENTRIES out,
+  # or refuse. It counts entries and not stems on purpose — see the duplicate-token case below.
   check "the count guard is what backs the refusal, not the parser" \
-    "grep -q 'could only read back' \"\$FOCUS_BIN\""
+    "grep -q 'but it resolved' \"\$FOCUS_BIN\""
 else
   ok "jq unavailable — the jq-less path IS the path under test everywhere above"
 fi
@@ -223,6 +224,92 @@ check "...and leaves judge/author unset (they inherit the session model)" \
   "printf '%s' \"\$INFO\" | grep -q '\"judge\":\"\",\"author\":\"\"'"
 INFO5=$(ACFW_MODEL_SHELL=sonnet bash "$STORE_BIN" info)
 check "...overridable by env" "printf '%s' \"\$INFO5\" | grep -q '\"shell\":\"sonnet\"'"
+
+# ============================ 3.4.0 cleanup: five ways a focus lied ============================
+# Every case below was reproduced against the shipped 3.4.0 tree before the fix.
+
+# --- an EMPTY focus must not corrupt the one JSON object /go step 2 reads ----------------------
+# `write_focus` always writes header lines, so dropping every entry leaves a readable file with zero
+# stems. `grep -c` PRINTS 0 and EXITS 1 there, so `|| echo 0` appended a second zero and `info`
+# emitted "focusCount":00 — which jq accepts and JSON.parse rejects.
+F set api-014-token >/dev/null
+F drop api-014-token >/dev/null 2>&1
+check "an emptied focus leaves the file in place" "[ -r \"\$FOCUS_FILE\" ]"
+check "...with no stems" "[ \"\$(grep -cv '^#' \"\$FOCUS_FILE\")\" = '0' ]"
+EMPTY_INFO=$(bash "$STORE_BIN" info)
+check "...and info reports focusCount 0, not 00" "printf '%s' \"\$EMPTY_INFO\" | grep -q '\"focusCount\":0,'"
+if command -v node >/dev/null 2>&1; then
+  check "...and the whole info object is parseable JSON" \
+    "printf '%s' \"\$EMPTY_INFO\" | node -e 'let s=\"\";process.stdin.on(\"data\",d=>s+=d).on(\"end\",()=>{JSON.parse(s)})'"
+fi
+
+# --- two tokens naming one task is not a parse failure ----------------------------------------
+# The guard compared a de-duplicated stem list against raw argv, so `set <id> <stem>` of one task
+# refused with "install jq" told to a user who has jq. It counts resolved ENTRIES now.
+F set API-14 api-014-token >/dev/null 2>&1; RC=$?
+check "an id and its own stem resolve to one task without refusing" "[ $RC -eq 0 ]"
+check "...writing that task once" "[ \"\$(grep -cv '^#' \"\$FOCUS_FILE\")\" = '1' ]"
+F set api-014-token api-014-token >/dev/null 2>&1; RC=$?
+check "the same token twice is accepted, not treated as a short read" "[ $RC -eq 0 ]"
+
+# --- drop resolves ids, native ids and prefixes, as the docs promise ---------------------------
+# It used to be a literal whole-line compare, so `drop API-14` removed nothing and still printed
+# "focus now: N" — a success message for a no-op.
+F set api-014-token ui-021-login >/dev/null
+F drop API-14 >/dev/null 2>&1
+check "drop by ID removes the task" "! grep -qx 'api-014-token' \"\$FOCUS_FILE\""
+check "...and leaves the rest alone" "grep -qx 'ui-021-login' \"\$FOCUS_FILE\""
+F set api-014-token ui-021-login >/dev/null
+F drop api-014 >/dev/null 2>&1
+check "drop by unique prefix removes the task" "! grep -qx 'api-014-token' \"\$FOCUS_FILE\""
+DROPERR=$(F drop nothing-like-this 2>&1 >/dev/null)
+check "a token that matches nothing is REPORTED, not silently ignored" \
+  "printf '%s' \"\$DROPERR\" | grep -q 'matched nothing'"
+
+# --- a spent focus is replaced even by the --no-resolve writer ---------------------------------
+# /task's writers always pass --no-resolve, and the replace check was gated on it — so every /task
+# run appended and a bare /go kept re-scoping over work finished several runs ago. The check asks the
+# store about the tasks ALREADY in the focus, so it never needed the incoming tokens resolved.
+if command -v jq >/dev/null 2>&1; then
+  F set done-500 >/dev/null
+  OUT_REPL=$(F add --no-resolve --by task api-014-token 2>&1)
+  check "a focus whose every task is accepted is REPLACED by the /task writer" \
+    "printf '%s' \"\$OUT_REPL\" | grep -q 'focus replaced'"
+  check "...so the finished task is gone" "! grep -qx 'done-500' \"\$FOCUS_FILE\""
+  check "...and only the new one remains" "[ \"\$(grep -cv '^#' \"\$FOCUS_FILE\")\" = '1' ]"
+  F set api-014-token >/dev/null
+  OUT_APP=$(F add --no-resolve --by task ui-021-login 2>&1)
+  check "a focus with live work still APPENDS" "printf '%s' \"\$OUT_APP\" | grep -q 'focus now'"
+  check "...keeping both" "[ \"\$(grep -cv '^#' \"\$FOCUS_FILE\")\" = '2' ]"
+fi
+
+# --- a write refusal must be the SCRIPT's exit, not a subshell's ------------------------------
+# write_focus was the last stage of a pipeline, so every `exit` inside it (and inside the gitignore
+# hard gate it calls) terminated only that subshell: the FATAL printed, nothing was written, and the
+# next line reported success with status 0.
+check "write_focus takes its stems as an argument, never on stdin" \
+  "! grep -qE '\\| *write_focus' \"\$FOCUS_BIN\""
+RO="$WORK/ro"; git init -q -b trunk "$RO"; ( cd "$RO"; git config user.email t@t; git config user.name t; \
+  mkdir -p .backlog/pending; echo x > .gitignore; git add -A; git commit -qm s ) >/dev/null 2>&1
+chmod 444 "$RO/.gitignore"
+RO_OUT=$(ACFW_TRUNK_ROOT="$RO" bash "$FOCUS_BIN" set whatever 2>&1); RO_RC=$?
+chmod 644 "$RO/.gitignore"
+check "an unwritable .gitignore refuses with a nonzero status" "[ $RO_RC -ne 0 ]"
+check "...and never claims the focus was set" "! printf '%s' \"\$RO_OUT\" | grep -q 'focus set:'"
+check "...leaving no focus behind" "[ ! -e \"\$RO/.acfwhip/run/focus\" ]"
+
+# --- show --live says when it cannot answer ----------------------------------------------------
+# /go step 3 decides whether to launch from this output. Without jq the live path was skipped in
+# silence, so a focus of finished tasks looked exactly like a focus of runnable ones.
+F set api-014-token >/dev/null
+if [ -n "${NOJQ:-}" ]; then
+  LIVE_NOJQ=$(env PATH="$NOJQ" ACFW_TRUNK_ROOT="$REPO" "$NOJQ/bash" "$FOCUS_BIN" show --live 2>&1 || true)
+  check "show --live without jq says the live state is unavailable" \
+    "printf '%s' \"\$LIVE_NOJQ\" | grep -q 'live state unavailable'"
+  check "...and still lists the stored selection" "printf '%s' \"\$LIVE_NOJQ\" | grep -q 'api-014-token'"
+else
+  ok "jq unavailable — show --live already takes the no-jq path everywhere above"
+fi
 
 echo
 echo "phase18-focus: $PASS passed, $FAIL failed"

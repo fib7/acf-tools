@@ -111,9 +111,30 @@ ensure_ignored() {
 # every token resolved.
 RESOLVED=""
 UNRESOLVED=""
+NKEYS=0
+
+# Soft single-token resolution for `drop`, which must not refuse the whole operation the way
+# set/add do: dropping is subtractive and a token the store cannot answer about is simply reported.
+# Prints the stem, or nothing. Never exits.
+resolve_one() {
+  local out
+  out=$(bash "$STORE_BIN" snapshot --only "$1" 2>/dev/null) || return 0
+  [ -n "$out" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$out" | jq -r --arg t "$1" '(.scope.resolved // {})[$t] // empty' 2>/dev/null | head -1
+  else
+    # Same bounded parse as resolve_tokens: one token in, so `resolved` holds at most one pair.
+    printf '%s' "$out" \
+      | sed -n 's/.*"resolved":{\([^}]*\)}.*/\1/p' \
+      | tr ',' '\n' \
+      | sed -n 's/^[[:space:]]*"[^"]*"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      | grep -v '^$' | head -1
+  fi
+}
+
 resolve_tokens() {
   local out rc
-  RESOLVED=""; UNRESOLVED=""
+  RESOLVED=""; UNRESOLVED=""; NKEYS=0
   [ ${#TOKENS[@]} -gt 0 ] || return 0
   if [ "$NO_RESOLVE" = "1" ]; then
     local t
@@ -136,11 +157,13 @@ resolve_tokens() {
     # task's priority) and a loose match silently wrote them into the focus as if they were stems.
     #
     # `"resolved":{...}` is a flat string->string map, so the first `}` closes it.
-    RESOLVED=$(printf '%s' "$out" \
+    RESOLVED_PAIRS=$(printf '%s' "$out" \
       | sed -n 's/.*"resolved":{\([^}]*\)}.*/\1/p' \
       | tr ',' '\n' \
       | sed -n 's/^[[:space:]]*"[^"]*"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-      | grep -v '^$' | sort -u)
+      | grep -v '^$')
+    NKEYS=$(printf '%s\n' "$RESOLVED_PAIRS" | grep -c '[^[:space:]]' || true)
+    RESOLVED=$(printf '%s\n' "$RESOLVED_PAIRS" | grep -v '^$' | sort -u)
     # `"unresolved":[...]` is a flat string array, so the first `]` closes it.
     UNRESOLVED=$(printf '%s' "$out" | sed -n 's/.*"unresolved":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '"' | grep -v '^$' || true)
     # `ambiguous` holds nested arrays, which a bracket-delimited match cannot bound. `"tok"` appears
@@ -149,6 +172,7 @@ resolve_tokens() {
     [ -n "$AMB_TOKS" ] && UNRESOLVED=$(printf '%s\n%s\n' "$UNRESOLVED" "$AMB_TOKS" | grep -v '^$')
   else
     RESOLVED=$(printf '%s' "$out" | jq -r '(.scope.resolved // {}) | to_entries[] | .value' 2>/dev/null | grep -v '^$' | sort -u)
+    NKEYS=$(printf '%s' "$out" | jq -r '(.scope.resolved // {}) | length' 2>/dev/null || echo 0)
     UNRESOLVED=$(printf '%s' "$out" | jq -r '((.scope.unresolved // []) + ((.scope.ambiguous // []) | map(.tok + " (matches " + ((.candidates // []) | join(", ")) + ")"))) []' 2>/dev/null || true)
   fi
   if [ -n "$UNRESOLVED" ]; then
@@ -160,21 +184,30 @@ resolve_tokens() {
     echo "A focus holds exact stems only — a token that is ambiguous today would silently select a different task tomorrow." >&2
     exit 3
   fi
-  # ARITHMETIC GUARD, and the reason either parser above is trustworthy: we asked about N tokens, so
-  # the store resolved N stems. Anything else means the parse went wrong, not that the board is
-  # interesting — and a focus is only useful if it holds exactly what was asked for. Refuse rather
-  # than write what we think we read; a wrong focus is silently wrong on every later bare `/go`.
+  # ARITHMETIC GUARD, and the reason either parser above is trustworthy: we asked the store about N
+  # distinct TOKENS, so `scope.resolved` must carry N entries. Count the ENTRIES, not the stems they
+  # point at: two tokens legitimately name one task (`set <id> <stem>`, `set api-01 api-014`, or the
+  # same token twice), and comparing a de-duplicated stem list against raw argv failed those with a
+  # message blaming the parser. Anything else means the parse went wrong, not that the board is
+  # interesting — refuse rather than write what we think we read; a wrong focus is silently wrong on
+  # every later bare `/go`.
   local nwant nhave
-  nwant=${#TOKENS[@]}
-  nhave=$(printf '%s\n' "$RESOLVED" | grep -c '[^[:space:]]' || true); nhave=${nhave//[^0-9]/}
-  if [ "${nhave:-0}" -ne "$nwant" ]; then
-    echo "FATAL: asked the store about $nwant task(s) but could only read back ${nhave:-0} — the focus was NOT changed." >&2
+  nwant=$(printf '%s\n' "${TOKENS[@]}" | grep -v '^$' | sort -u | grep -c '[^[:space:]]' || true)
+  nwant=${nwant//[^0-9]/}; [ -n "$nwant" ] || nwant=0
+  nhave=${NKEYS//[^0-9]/}
+  if [ "${nhave:-0}" -ne "${nwant:-0}" ]; then
+    echo "FATAL: asked the store about $nwant task(s) but it resolved ${nhave:-0} — the focus was NOT changed." >&2
     echo "This is a parse failure, not a verdict about the tasks. Install jq for a reliable read, or pass --no-resolve if you are certain of the exact stems." >&2
     exit 3
   fi
 }
 
-write_focus() { # <stems on stdin>
+# Takes the stem list as an ARGUMENT, never on stdin. As the last stage of a pipeline this function
+# would run in a subshell, where its own `exit` — and ensure_ignored's hard refusal when .acfwhip/run/
+# cannot be gitignored — terminates only that subshell: the FATAL printed, nothing was written, and
+# the caller went on to report success with status 0. A focus that silently did not change is worse
+# than one that refused.
+write_focus() { # <stems as $1>
   local tmp ts
   ensure_ignored
   ts=$(date -u +"%Y-%m-%d %H:%M:%S")
@@ -184,7 +217,7 @@ write_focus() { # <stems on stdin>
     printf '# store=%s\n' "$STORE"
     printf '# setBy=%s\n' "$BY"
     printf '# ts=%s UTC\n' "$ts"
-    cat
+    printf '%s\n' "$1" | grep -v '^[[:space:]]*$' || true
   } > "$tmp" || { rm -f "$tmp"; echo "FATAL: could not write $tmp" >&2; exit 2; }
   mv -f "$tmp" "$FOCUS" || { rm -f "$tmp"; echo "FATAL: could not install $FOCUS" >&2; exit 2; }
 }
@@ -214,14 +247,15 @@ EOF
 $STEMS
 EOF
     else
-      printf '  %s\n' $STEMS
+      printf '%s\n' "$STEMS" | grep -v '^$' | sed 's/^/  /'
+      [ "$LIVE" = "1" ] && echo "  (live state unavailable: jq is not installed — these stems are the stored selection, not a report of what is still runnable)"
     fi
     ;;
 
   set)
     [ ${#TOKENS[@]} -gt 0 ] || { echo "FATAL: usage: acfw-focus set <task>..." >&2; exit 2; }
     resolve_tokens
-    printf '%s\n' "$RESOLVED" | grep -v '^$' | sort -u | write_focus
+    write_focus "$(printf '%s\n' "$RESOLVED" | grep -v '^$' | sort -u)"
     printf 'focus set: %s task(s)\n' "$(printf '%s\n' "$RESOLVED" | grep -c '[^[:space:]]')"
     ;;
 
@@ -234,8 +268,13 @@ EOF
     # work into the next run's scope forever. Replace it instead — that is what an operator starting
     # new work means. Only when the store can answer: with no jq, or an unreachable store, append
     # (adding is always safe; discarding a selection on a guess is not).
+    #
+    # This check deliberately does NOT depend on --no-resolve. It asks the store about the tasks
+    # ALREADY in the focus, so it needs nothing resolved about the incoming tokens — and gating it on
+    # --no-resolve exempted the one caller that matters, /task, whose writers always pass it. Every
+    # /task run then appended, so a bare /go kept re-scoping over work finished several runs ago.
     REPLACE=0
-    if [ -n "$EXISTING" ] && [ "$NO_RESOLVE" != "1" ] && command -v jq >/dev/null 2>&1; then
+    if [ -n "$EXISTING" ] && command -v jq >/dev/null 2>&1; then
       A=(snapshot); while IFS= read -r st; do [ -n "$st" ] && { A[${#A[@]}]="--only"; A[${#A[@]}]="$st"; }; done <<EOF
 $EXISTING
 EOF
@@ -252,10 +291,10 @@ EOF
       fi
     fi
     if [ "$REPLACE" = "1" ]; then
-      printf '%s\n' "$RESOLVED" | grep -v '^$' | sort -u | write_focus
+      write_focus "$(printf '%s\n' "$RESOLVED" | grep -v '^$' | sort -u)"
       printf 'focus replaced (every previous task was already done): %s task(s)\n' "$(printf '%s\n' "$RESOLVED" | grep -c '[^[:space:]]')"
     else
-      printf '%s\n%s\n' "$EXISTING" "$RESOLVED" | grep -v '^$' | sort -u | write_focus
+      write_focus "$(printf '%s\n%s\n' "$EXISTING" "$RESOLVED" | grep -v '^$' | sort -u)"
       printf 'focus now: %s task(s)\n' "$(read_stems | grep -c '[^[:space:]]')"
     fi
     ;;
@@ -265,11 +304,30 @@ EOF
     [ -r "$FOCUS" ] || { echo "no focus set"; exit 0; }
     assert_store_match
     KEEP=$(read_stems)
+    # A token may be a stem already in the focus (the common case), or the id, the native backend id
+    # or a unique prefix of one — all four are what the docs promise. A literal-only compare made
+    # `drop MUL-4821` remove nothing and still print "focus now: N", a success message for a no-op.
+    # Literal matches never touch the store, so a drop keeps working with the backend down.
+    MISSED=""
     for t in "${TOKENS[@]}"; do
-      KEEP=$(printf '%s\n' "$KEEP" | grep -vxF "$t" || true)
+      if printf '%s\n' "$KEEP" | grep -qxF "$t"; then
+        KEEP=$(printf '%s\n' "$KEEP" | grep -vxF "$t" || true)
+        continue
+      fi
+      TGT=$(resolve_one "$t")
+      if [ -n "$TGT" ] && printf '%s\n' "$KEEP" | grep -qxF "$TGT"; then
+        KEEP=$(printf '%s\n' "$KEEP" | grep -vxF "$TGT" || true)
+      else
+        MISSED="$MISSED$t
+"
+      fi
     done
-    printf '%s\n' "$KEEP" | grep -v '^$' | write_focus
+    write_focus "$(printf '%s\n' "$KEEP" | grep -v '^$')"
     printf 'focus now: %s task(s). NOTE: dropping is not pausing — a dropped task that something in the focus depends on is pulled back in. To pause: whip-move <task> draft\n' "$(read_stems | grep -c '[^[:space:]]')"
+    if [ -n "$MISSED" ]; then
+      echo "these matched nothing in the focus and were ignored:" >&2
+      printf '%s\n' "$MISSED" | grep -v '^$' | sed 's/^/  /' >&2
+    fi
     ;;
 
   clear)
