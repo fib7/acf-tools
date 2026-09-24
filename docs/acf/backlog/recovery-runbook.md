@@ -16,13 +16,30 @@ Operator reference for an acf-whip backlog that will not run, or a `/go` run tha
 /whip-doctor --fix    # apply the REPAIRABLE class, then re-scan
 ```
 
-Findings are `SEVERITY|CODE|TASK_ID|DETAIL`, then `BREAKDOWN|<SEV>|code=count,…`, then `SUMMARY|fatal=N|repairable=N|warn=N|ok=true|false`. `/go` refuses to dispatch while any FATAL remains.
+Findings are `SEVERITY|CODE|TASK_ID|DETAIL`, then `BREAKDOWN|<SEV>|code=count,…`, then `SUMMARY|fatal=N|repairable=N|warn=N|ok=true|false`.
 
-Severity is scoped to the dispatch path: a task in `accepted/` is terminal, so its structural defects are **advisory (WARN), never blocking**. FATAL is reserved for active tasks (`pending`, `in-progress`, `completed`, `in-review`).
+**A FATAL has two scopes, and `/go` routes on the difference (3.4.0).**
+
+- **Repo-scoped** — the checkout itself is unusable, so nothing can proceed: `detached-head`,
+  `worktree-wrong-branch`, `doctor-unavailable`, `snapshot-unavailable`, an unreadable store. These
+  abort the run, as every FATAL used to.
+- **Task-scoped** — one card is malformed. `/go` **holds out that task** — never dispatched, never
+  transitioned, never integrated, still gating its dependents, its worktree slug still reserved —
+  and runs the rest of the board. The run ends `partial` with `heldOut[]` naming what it refused to
+  touch, and `completed: false`. One long-cancelled card no longer blocks a whole team.
+
+A finding whose task field names nothing in the snapshot gates nothing at all: it is reported as
+`fatalsNotGating` and acted on by no one.
+
+**The exception**: the legacy markdown loop (no dynamic workflows) still refuses on ANY FATAL. It
+has no index to attribute a finding to a task and nowhere to record what was held out, and guessing
+by hand is the failure the classification exists to remove.
+
+Severity is also scoped to the dispatch path: a task in `accepted/` is terminal, so its structural defects are **advisory (WARN), never blocking**. FATAL is reserved for active tasks (`pending`, `in-progress`, `completed`, `in-review`).
 
 ---
 
-## FATAL — fix before `/go` will dispatch
+## FATAL — fix before the task it names can run
 
 | Code | Meaning | Recovery |
 |------|---------|----------|

@@ -464,7 +464,7 @@ The same doctor runs once per iteration (lite recheck, Step 0 below); a FATAL in
 
 The orchestrator (this skill, running as the parent agent at `$ACFW_TRUNK_ROOT` on the trunk branch) is the **only writer of `.backlog/` files**. Specialists and quality-reviewer **do not** move task files between state folders; they signal their decision via the `ACFW-RESULT` marker (defined below) on Task() return. The orchestrator parses the marker, performs the file move + `git mv` + commit on the trunk branch, then continues.
 
-**task-engineer transitions** (creation N/A→pending, retry rejected→pending, unblock blocked→pending, redesign rejected→blocked at >5 rejections) are likewise performed at root. task-engineer never invokes `clean-checkout-before-task` and never enters a worktree.
+**task-engineer transitions** (creation N/A→pending, retry rejected→pending, unblock blocked→pending, redesign rejected→blocked at the retry cap, `MAX_REJECT_RETRY`/`maxReject`, currently 3) are likewise performed at root. task-engineer never invokes `clean-checkout-before-task` and never enters a worktree.
 
 **Specialists** still do code work in their worktrees on `worktree/<slug>` (no change). Their commits on the worktree branch contain code only; no `.backlog/` deltas.
 

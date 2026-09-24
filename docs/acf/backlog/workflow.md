@@ -64,15 +64,15 @@ All `.backlog/` state moves happen at the **repo root** (`$ACFW_TRUNK_ROOT`) on 
 | completed | in-review | `/go` orchestrator (pre-move before dispatching quality-reviewer) |
 | in-review | accepted | `/go` orchestrator on reviewer's `transition: accepted` signal |
 | in-review | rejected | `/go` orchestrator on reviewer's `transition: rejected` signal (also increments Rejection Count) |
-| rejected | pending | task-engineer (retry, at root); max 5 attempts |
+| rejected | pending | `/go` orchestrator (workflow path) on retry, up to the orchestrator's cap (`MAX_REJECT_RETRY`, currently 3); task-engineer at root on the legacy markdown loop |
 | blocked | pending | `/go` orchestrator when deps resolve (gated on `Rejection Count` < cap and `Block-Count` < cap), or task-engineer (unblock, at root) |
-| rejected | blocked | task-engineer (redesign at >5 rejections, at root) |
+| rejected | blocked | `/go` orchestrator at the cap — the task is parked for task-engineer to redesign; task-engineer at root on the legacy loop |
 
 **task-engineer never enters a worktree.** It never invokes `clean-checkout-before-task`. All its operations are on `.backlog/` at the repo root, committed to the trunk branch.
 
 **Specialists** still do code work inside `.worktree/<slug>` on `worktree/<slug>` — that is unchanged. Their commits on the worktree branch contain code only; they do NOT move task files and do NOT commit `.backlog/` changes on the worktree branch.
 
-**Retry limit**: Rejected tasks can return to in-progress up to 5 times. After 5th rejection, task-engineer redesigns (rejected → blocked) at root.
+**Retry limit**: a rejected task returns to pending until it hits the orchestrator's retry cap (`MAX_REJECT_RETRY`, currently **3**, and settable per run with `maxReject`). At the cap it is moved to blocked for task-engineer to redesign, and the unblock pass will not lift it again — so the number here is not advisory, it is the point at which automation stops. A review that reports `faultClass: mechanism` (a broken environment, a lost clean-checkout token) does not charge it.
 
 **File move + Status rewrite + transition-log update = ATOMIC** (same commit on trunk). The single writer rewrites `- **Status**:` to the destination folder as it moves the file — **the folder is the source of truth and Status always follows it** — so a transition can never leave Status stale (a stale Status used to self-inflict a `status-folder-mismatch` FATAL that aborted `/go` at its first transition).
 **Timestamp command**: `date +"%Y-%m-%d %H:%M:%S"` (never placeholder).

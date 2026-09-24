@@ -85,7 +85,7 @@ conflict resolver stay on the session model. Pin it once per repo (`ACFW_MODEL_S
 When dynamic workflows are available (Claude Code ≥ 2.1.154), `/task` and `/go` run as **dynamic workflows** (`workflows/whip-task.workflow.js`, `workflows/whip-go.workflow.js`):
 
 - **Flat context**: the loop, slug partition, dependency gate, and topological integration order run inside a deterministic script — intermediate state lives in script variables, not Claude's context — so context stays flat no matter how many tasks/iterations. (This is the fix for the old "stop work to dump history" problem.)
-- **Schema-enforced worktree slugs**: `/task`'s planner cannot omit a slug; a JS validation gate (kebab-case, slug ≠ id, acyclic deps, unique ids) runs before any file is written; the doctor FATALs on a missing slug at dispatch.
+- **Schema-enforced worktree slugs**: `/task`'s planner cannot omit a slug; a JS validation gate (kebab-case, slug ≠ id, acyclic deps, unique ids) runs before any file is written; the doctor REPAIRS a missing slug on an active task by deriving one from the id, and FATALs only when two ids derive the same slug (`duplicate-derived-slug`) or there is no id to derive one from.
 - **Integrity-gated**: the doctor runs as a hard gate at startup and a recheck every iteration.
 - **Automatic fallback**: if dynamic workflows are off, both commands fall back to the legacy single-context loop (same behavior, byte-compatible).
 
@@ -662,7 +662,7 @@ commit stay atomic. Run `/whip-doctor` after.
 /whip-doctor --fix    # apply the REPAIRABLE class, then re-scan
 ```
 
-**Checks** (FATAL / REPAIRABLE / WARN): status-vs-folder mismatch, missing/empty worktree slug on a code task, unknown Assigned Agent, duplicate IDs, dangling/cyclic dependencies, cross-slug dependent dispatched before integration, worktree on the wrong branch, detached HEAD; stray `Integrated-At`, out-of-range Rejection Count, dup-folder, orphaned worktree; missing clean-checkout token, lingering in-review, stale in-progress, cross-slug glob overlap.
+**Checks** (FATAL / REPAIRABLE / WARN): status-vs-folder mismatch, missing/empty worktree slug on a code task, unknown Assigned Agent, duplicate IDs, dangling/cyclic dependencies, cross-slug dependent dispatched before integration, worktree on the wrong branch, detached HEAD; missing worktree slug derivable from the id, out-of-range Rejection Count, dup-folder, orphaned worktree; missing clean-checkout token, lingering in-review, stale in-progress, cross-slug glob overlap.
 
 **Output**: `SEVERITY|CODE|TASK_ID|DETAIL` lines + a `SUMMARY|fatal=N|repairable=N|warn=N|ok=…` line; exit 0 iff no FATAL. Runs automatically as a `/go` startup gate and per-iteration recheck.
 

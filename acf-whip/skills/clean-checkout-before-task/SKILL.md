@@ -73,6 +73,7 @@ Idempotent and safe to re-run: existing targets are skipped, and a missing manif
 | 2 | branch in use elsewhere (lock held) | Defer; try a different task |
 | 3 | worktree on the wrong branch | Stop; manual intervention |
 | 5 | trunk branch not resolvable (detached HEAD) | Operator must check out a branch at root |
+| 6 | the durable clean-checkout token could not be written to a non-`files` task store | Transient; orchestrator retries next iteration |
 | 99 | lock contention persisted past backoff (>7s) | Transient; orchestrator retries next iteration |
 
 ## Token format (for greppers and quality-reviewer)
