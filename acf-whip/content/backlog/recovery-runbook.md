@@ -109,7 +109,7 @@ Not `--fix`-able, for the same reason as `control-bytes`: restoring from `HEAD` 
 | Code | Meaning | Acknowledge by |
 |------|---------|----------------|
 | `orphaned-worktree-dirty` | The reaper **skipped** a dirty orphan worktree rather than destroying uncommitted work. | Inspect it, salvage anything you want, then `git worktree remove --force .worktree/<slug>`. |
-| `accepted-branchless-unverified` | An accepted code task has no worktree branch **and** no ledger marker. Its deliverable may or may not be on trunk. | Verify the deliverable exists on trunk. On `files`, ack it with `/whip-move <stem> accepted --integrated-at <sha>`. On every other backend there is nothing to stamp — no adapter maps `Integrated-At` and the ledger is the only oracle — so a change that is on trunk needs no ack, and one that is not needs re-running. |
+| `accepted-branchless-unverified` | An accepted code task has no worktree branch **and** no ledger marker. Its deliverable may or may not be on trunk. | Verify the deliverable exists on trunk, then clear it per backend — see below. It is WARN and gates nothing: the scheduler already treats a branchless accepted task as terminal. |
 | `dirty-trunk-root` | Tracked files are dirty at the shared root, outside `.backlog/` — a specialist may have escaped its worktree. | **Commit or stash them now.** The next integration resyncs the root with `git reset --hard` and the changes are gone. |
 | `trunk-unpushed` | Local trunk is ahead of its remote. LP-CAS lands on the **local** trunk and never pushes; this is the documented contract. | `git push` when ready. |
 | `duplicate-id` | One `ID` appears in two task files. Each runs on its own slug and ledger key, so there is no integration collision. | De-dup the id. |
@@ -216,5 +216,39 @@ acfw_is_integrated "$(git rev-parse --show-toplevel)" HEAD <task-stem> && echo i
 ```
 
 The marker (`.acfwhip/integrated/<shard>/<key>.json`) is written by the integrator only, co-committed in the same commit as the change. Because marker and change land together, a marker can never claim work that is absent.
+
+### Clearing `accepted-branchless-unverified`
+
+The finding means integration was never *recorded* — not that the work is missing. Check first:
+
+```
+git log --oneline <trunk> -- <a path the task touched>
+```
+
+**If the change is NOT on trunk**, the work was lost: move the task back (`/whip-move <stem> pending`)
+and let `/go` run it again. That is the case this WARN exists to catch.
+
+**If the change IS on trunk**, only a ledger marker clears it, because the marker is the oracle on
+every backend. On `files` you may instead ack with `/whip-move <stem> accepted --integrated-at <sha>`
+— the doctor's gate there accepts either. On every other backend there is no stamp: no adapter maps
+`Integrated-At`. Write the marker by hand, on trunk:
+
+```bash
+KEY=<stem>
+SHARD=$(printf '%s' "$KEY" | git hash-object --stdin | cut -c1-2)
+mkdir -p ".acfwhip/integrated/$SHARD"
+printf '{"key":"%s","patch":"","patch_parent":"","observed_trunk":"%s","slug":"%s"}\n' \
+  "$KEY" "$(git rev-parse HEAD)" "<the task's Worktree slug>" \
+  > ".acfwhip/integrated/$SHARD/$KEY.json"
+git add ".acfwhip/integrated/$SHARD/$KEY.json"
+git commit -m "chore: record out-of-band integration of $KEY"
+```
+
+Only do this for a change you have *seen* on trunk. The marker is what every later run believes, so
+a marker for work that never landed converts a visible warning into a silent hole — the dependents
+of that task will dispatch as if their prerequisite shipped.
+
+**Or leave it.** It is advisory, it gates nothing, and a standing WARN on a handful of historical
+tasks is a fair price for not writing ledger entries you are unsure of.
 
 **`Integrated-At:` is display and operator-ack metadata — never the oracle.** The integrator neither reads nor writes it. Setting it lands no code; clearing it un-integrates nothing. Its one functional use is the ack above: the doctor's cross-slug dep gate accepts either a ledger marker **or** an `Integrated-At:` stamp, so stamping a verified branchless task with `/whip-move --integrated-at <sha>` clears the gate for its dependents. Stamp only what you have verified is on trunk.

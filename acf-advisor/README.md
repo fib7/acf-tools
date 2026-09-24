@@ -166,6 +166,10 @@ There is **no Python orchestrator** — `board.py` was removed in v1.3.0, when t
 parallel Claude tool calls. Every advisor call, board or not, goes through the same CLI:
 
 ```bash
+# resolve the CLI once (the skills do this in pre-flight)
+ADVISOR_BIN="${ACF_ADVISOR_BIN:-./acf-advisor/scripts/advisor.py}"
+[ -x "$ADVISOR_BIN" ] || ADVISOR_BIN="$(ls -1t "$HOME"/.claude/plugins/cache/*/acf-advisor/*/scripts/advisor.py 2>/dev/null | head -1)"
+
 "$ADVISOR_BIN" --system-file <persona>.sys --model <model> < <prompt>.txt
 ```
 
