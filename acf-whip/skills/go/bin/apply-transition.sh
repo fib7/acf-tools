@@ -107,8 +107,12 @@ rescue_deliverables() {
     fi
   done
   [ "$dirty" = "1" ] || return 0
-  if ! git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME deliverables" --quiet; then
-    rc=$?
+  # Unnegated, then read $?. Inside `if ! cmd; then`, $? is the status of the NEGATION - 0 when the
+  # command failed - so `exit "$rc"` exited 0 and reported success for the exact failure it was
+  # added to surface. Same shape as the bug fixed in clean-checkout.sh, written into the fix for it.
+  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME deliverables" --quiet
+  rc=$?
+  if [ $rc -ne 0 ]; then
     echo "FATAL: commit failed (rc=$rc) while sweeping deliverables for $FNAME - they are STAGED but NOT committed." >&2
     echo "       Anything that can make \`git commit\` fail at the trunk root does it here: a signing key that is not" >&2
     echo "       usable (commit.gpgsign), a pre-commit hook from husky/lint-staged or core.hooksPath, an unset" >&2

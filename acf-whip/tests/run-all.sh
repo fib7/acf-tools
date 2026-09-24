@@ -208,6 +208,25 @@ done
 [ "$SH_FAIL" -eq 0 ] && printf '  %-34s ok    (bash 3.2 safe; no write-only arrays)\n' 'skill-shell-portability'
 [ "$SH_FAIL" -eq 0 ] || STATIC_FAIL=1
 
+# `if ! cmd; then rc=$?` captures the status of the NEGATION, which is always 0 inside the branch -
+# so the handler reports SUCCESS for the failure it exists to surface. This has now shipped twice in
+# this codebase: clean-checkout's exit 99 was unreachable for releases, and the very commit that
+# fixed it introduced the same shape into apply-transition.sh, where `exit "$rc"` exited 0 while a
+# commit had failed and deliverables sat staged. It is invisible in review and in testing (the happy
+# path is identical), so it gets a grep.
+NEG_FAIL=0
+for f in $(git ls-files '*.sh' 'skills/lib/bin/*' 'adapters/*/acfw-store-*' 2>/dev/null); do
+  [ -f "$f" ] || continue
+  HIT=$(awk 'prev ~ /^[[:space:]]*if[[:space:]]*!/ && $0 ~ /(rc|RC)=\$\?/ {print NR} {prev=$0}' "$f" 2>/dev/null)
+  if [ -n "$HIT" ]; then
+    printf '  %-34s FAIL  (%s:%s reads $? inside `if !` - always 0, so the failure reports success)\n' \
+      'shell-negated-status' "$f" "$(printf '%s' "$HIT" | tr '\n' ',' | sed 's/,$//')"
+    NEG_FAIL=1
+  fi
+done
+[ "$NEG_FAIL" -eq 0 ] && printf '  %-34s ok    (no handler reads $? inside an `if !` branch)\n' 'shell-negated-status'
+[ "$NEG_FAIL" -eq 0 ] || STATIC_FAIL=1
+
 # Workflow launch identity, checked in BOTH directions. A skill launching `acf-whip:<x>` that no
 # workflow `meta` declares fails exactly like the plugin-cache scriptPath it replaced — silently, at
 # the moment a user runs /go. The reciprocal check is the one with teeth: it fails when someone
