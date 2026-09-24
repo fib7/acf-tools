@@ -41,7 +41,7 @@ To force the LLM path again, configure `LITELLM_API_KEY` + `ADVISOR_MODEL` in yo
 3. **Composes personas** — one per confirmed dimension. Each gets a human first+last name with light humour paired with a decision-specific descriptor (e.g. `Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration`, not "security auditor"), plus explicit blind spots. Names mix cultures across the panel; cross-model clones share the descriptor but get distinct human names.
 4. **Picks `R`** by deliberative judgment (default 1; up to 5 when personas trade off, decision is irreversible, etc.). User can override.
 5. **Distributes models** from the pool: round-robin by default, or cross-model triangulation when one specific lens is critical AND the pool offers genuinely different reasoners.
-6. **Confirms the roster with you** (free, no advisor cost) → builds JSON manifest → `board.py` runs personas in parallel via `ThreadPoolExecutor`.
+6. **Confirms the roster with you** (free, no advisor cost) → writes one prompt file per persona → runs them as N parallel `Bash` calls to `advisor.py` in a single message.
 7. **Synthesizes** all takes into one recommendation, weighted by your priority dimension.
 8. Returns per-persona transcripts (header form `### Advisor (<model>) — <Human Name> (<descriptor>) says:`) plus the synthesis block.
 
@@ -87,12 +87,8 @@ All configuration is via environment variables. No config files.
 | Thinking budget (tokens) | `ADVISOR_THINKING_BUDGET` | default `8000` |
 | Override param-shape profile | `ADVISOR_PROFILE` | one of `claude_adaptive`, `claude_legacy_thinking`, `gemini_thinking_level`, `openai_reasoning_only`, `default`; unset = regex-routed by family name |
 | HTTP timeout (seconds) | `ADVISOR_TIMEOUT` | default `600` (was `180` pre-v1.2.0) |
-| Board: max parallel persona calls | `BOARD_PARALLELISM` | default `5` |
-| Board: total timeout for the whole panel | `BOARD_TOTAL_TIMEOUT_SECONDS` | default `1800` (was `900` pre-v1.2.0) |
-| Board: hard ceiling on `R` (round count) | `BOARD_MAX_ROUNDS` | default `5` |
 | Disable `.env` auto-load | `ADVISOR_NO_DOTENV=1` or `--no-dotenv` flag | auto-load on by default |
 | Override advisor.py path (dev) | `ACF_ADVISOR_BIN` | resolver falls back to plugin cache |
-| Override board.py path (dev) | `ACF_BOARD_BIN` | resolver falls back to plugin cache |
 
 ### `ADVISOR_MODEL` as a model pool (since v1.1.0)
 
@@ -164,15 +160,18 @@ echo "..." | ./acf-advisor/scripts/advisor.py --model gpt-5
 
 ---
 
-### Direct CLI use of the board
+### Driving the board by hand
 
-`scripts/board.py` reads a JSON manifest from stdin. The `board` skill normally builds it; but you can drive it directly for testing or scripting:
+There is **no Python orchestrator** — `board.py` was removed in v1.3.0, when the panel moved to
+parallel Claude tool calls. Every advisor call, board or not, goes through the same CLI:
 
 ```bash
-cat manifest.json | ./acf-advisor/scripts/board.py
+"$ADVISOR_BIN" --system-file <persona>.sys --model <model> < <prompt>.txt
 ```
 
-Manifest schema is documented in `acf-advisor/scripts/board.py`'s docstring. Exit codes: `0` synthesis succeeded (possibly degraded), `10` invalid manifest, `20` zero persona successes, `30` synthesis failed, `124` total timeout, `130` interrupted.
+The `board` skill writes those files into a private `mktemp -d` per run and issues N of these as
+parallel `Bash` calls in one message. To drive a panel yourself, write the files and run the calls;
+there is no manifest schema and no separate exit-code contract to satisfy.
 
 ---
 
@@ -185,10 +184,12 @@ Manifest schema is documented in `acf-advisor/scripts/board.py`'s docstring. Exi
                           (HTTP, auth, dotenv, retries — single source of truth)
                                   ↑                        ↑
                                   │                        │
-                  scripts/advisor.py                scripts/board.py
-                  (thin CLI wrapper)                 (panel orchestrator,
-                          ↑                          ThreadPoolExecutor)
-                          │                                ↑
+                  scripts/advisor.py ───────────────────┐
+                  (thin CLI wrapper)                     │
+                          ↑                              │
+                          │                     (N parallel Bash calls,
+                          │                      one per persona)
+                          │                              ↑
               skills/advisor/SKILL.md         skills/board/SKILL.md
               (Q/Context/Considered/Want      (dimension extraction →
               prompt format,                   roster confirm →
@@ -216,11 +217,9 @@ User → Claude → board skill →
   step 4: assign models from ADVISOR_MODEL pool
           (round-robin OR cross-model triangulation on priority lens)
   step 5: confirm roster + R with user
-  step 6: build manifest → board.py
-                          board.py: ThreadPoolExecutor over personas,
-                                    R rounds, transcript injection between
-                                    rounds, final synthesis call,
-                                    aggregate cost broken down by model
+  step 6: write one .sys per persona + one prompt file, into a private mktemp -d
+  step 6b: N parallel Bash calls to advisor.py in ONE message; repeat per round,
+           injecting the prior round's transcript; then one synthesis call
   step 7: render verbatim under per-persona "### Advisor (model) — name says:" headers
           (same idiom as advisor skill — multiplied)
   step 8: + Claude's brief take
@@ -232,7 +231,6 @@ User → Claude → board skill →
 |---|---|
 | `lib/advisor.py` | Core module: `run_advisor()`, HTTP client, dotenv loader, retry logic, redaction. Single source of truth — both scripts import from here. Stdlib-only. |
 | `scripts/advisor.py` | uv PEP 723 thin CLI wrapper around `lib.advisor.run_advisor()`. CLI flags: `--system`/`--system-file` (mutually exclusive), `--model`, `--timeout`, `--no-dotenv`, `--debug`. |
-| `scripts/board.py` | uv PEP 723 panel orchestrator. Reads JSON manifest from stdin, validates schema, runs personas in parallel via `ThreadPoolExecutor`, manages `R` rounds, calls synthesizer, prints structured markdown to stdout + aggregate cost to stderr. NO direct HTTP — all advisor calls go through `lib.advisor.run_advisor()`. |
 | `skills/advisor/SKILL.md` | Single second-opinion protocol. Canonical for the structured prompt format, observability conventions, upstream-error table. |
 | `skills/board/SKILL.md` | Panel workflow: dimension extraction → roster confirmation → manifest build. Cross-references the advisor skill — does NOT restate the prompt format, error handling, or observability. |
 | `persona-design/DESIGN.md` | The 7-step synthesis recipe + "shapes too generic — and the specific versions they should become" anti-pattern table. Durable artifact. |
@@ -336,6 +334,22 @@ Proprietary — Copyright 2025 Fibonacci Seven, LLC. See [LICENSE](LICENSE).
 Lean, env-var-driven, thinking-on-by-default. Two skills (`advisor` for single second opinions, `board` for hypertailored multi-persona panels), one shared core (`lib/advisor.py`), one POST per advisor call. When you want a considered take — solo or in concert — without leaving your session.
 
 ### Changelog
+
+- **v1.3.7** — Documentation caught up with the code, and two skill defects fixed.
+  - **`board.py` has not existed since v1.3.0**, when the panel moved to parallel Claude tool calls.
+    The README still documented a "Direct CLI use of the board" section with a manifest schema and an
+    exit-code contract, four env vars (`BOARD_PARALLELISM`, `BOARD_TOTAL_TIMEOUT_SECONDS`,
+    `BOARD_MAX_ROUNDS`, `ACF_BOARD_BIN`) that no shipped code reads, an architecture diagram and a
+    key-files row. Following any of it produced `no such file or directory`, or silently set nothing.
+  - **The board wrote to fixed `/tmp/board-*` paths.** Two sessions on one machine convening
+    overlapping boards share those names, so one session's prompt file could be overwritten between
+    the write and the parallel reads — its personas then answer the other session's question, and the
+    result is rendered and synthesised under the first roster's heading with nothing indicating the
+    swap. Each run now gets a private `mktemp -d`.
+  - **The advisor's heredoc used a fixed `PROMPT` delimiter.** Any assembled prompt containing a line
+    that is exactly `PROMPT` terminates it early: the advisor answers a truncated prompt (typically
+    missing "What I want from you"), and the remainder is handed to the shell as commands. The skill
+    now generates a per-invocation delimiter and checks it against the prompt before emitting.
 
 - **v1.3.3** — Routing-decision parity with the LLM-path call. Fixes a silent misroute to local-team mode when the plugin is installed in projects that configure `LITELLM_API_KEY` / `ADVISOR_MODEL` via a project `.env`:
   - **Root cause**: the `board` skill's pre-flight read `${ADVISOR_MODEL}` / `${LITELLM_API_KEY}` directly from bash — but Claude Code's Bash tool inherits the orchestrator process env, **not** the project `.env`. The skill therefore always saw missing env and chose local-team mode, even though the per-persona `advisor.py` invocation would have loaded the same `.env` and dispatched LLM calls. `--check-env` was designed for this exact routing decision in v1.2.0; the skill text in the same release contradictorily forbade its use ("no `--check-env`"). Both branches of v1.3.x inherited the bug.

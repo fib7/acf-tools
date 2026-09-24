@@ -113,10 +113,19 @@ Cap total assembled context at ~20KB. If load-bearing facts exceed 20KB, the que
 
 ## Invocation
 
-Pipe the assembled prompt to `"$ADVISOR_BIN"` via stdin. Heredoc with single-quoted delimiter so `$`, backticks, and backslashes are not expanded:
+Pipe the assembled prompt to `"$ADVISOR_BIN"` via stdin. Heredoc with a single-quoted delimiter so
+`$`, backticks and backslashes are not expanded.
+
+**Generate a fresh delimiter per invocation and check it does not collide.** A fixed word like
+`PROMPT` is terminated early by any line of the assembled prompt that equals it — a pasted shell
+heredoc, a zsh-prompt doc, a log line, or this very file. The prompt is then silently truncated at
+that line (usually losing "What I want from you", so the advisor answers a question with no ask),
+and everything after it is handed to the shell as commands. Use something like `PROMPT_<8 random
+hex>`, and before emitting the call verify that no line of the prompt is exactly that delimiter;
+regenerate if one is.
 
 ```bash
-cat <<'PROMPT' | "$ADVISOR_BIN"
+cat <<'PROMPT_a3f19c2e' | "$ADVISOR_BIN"
 ## Question
 …
 
@@ -131,7 +140,7 @@ cat <<'PROMPT' | "$ADVISOR_BIN"
 
 ## What I want from you
 …
-PROMPT
+PROMPT_a3f19c2e
 ```
 
 ## Response handling

@@ -60,7 +60,13 @@ If you find yourself about to write a context-building checklist, an upstream-er
 ADVISOR_BIN="${ACF_ADVISOR_BIN:-${CLAUDE_PLUGIN_ROOT:-}/scripts/advisor.py}"
 [ -x "$ADVISOR_BIN" ] || ADVISOR_BIN="$(ls -1t "$HOME"/.claude/plugins/cache/*/acf-advisor/*/scripts/advisor.py 2>/dev/null | head -1)"
 test -x "$ADVISOR_BIN" || { echo "advisor: not found; install via /plugin install acf-advisor@acf-tools" >&2; exit 1; }
+# One private directory per board run. Fixed /tmp/board-* names are shared by every session on the
+# machine, so two overlapping boards can read each other's prompt files.
+BOARD_TMP="$(mktemp -d "${TMPDIR:-/tmp}/board.XXXXXXXX")"
+echo "BOARD_TMP=$BOARD_TMP"
 ```
+
+Carry `$BOARD_TMP` through every later step; remove it when the board is done.
 
 Single oracle for routing AND pool enumeration. Use `bash -c` so array syntax works regardless of the orchestrator's interactive shell (Claude Code's Bash tool may run zsh):
 
@@ -179,7 +185,14 @@ Apply the **Context-building protocol** from `../advisor/SKILL.md` (mandatory ch
 <concrete, named ask — same for all personas; persona system prompts shape HOW each one answers>
 ```
 
-Write the assembled prompt to `/tmp/board-user-r1.txt`. Write each persona's system prompt to `/tmp/board-<persona-id>.sys`.
+Write the assembled prompt to `$BOARD_TMP/user-r1.txt`. Write each persona's system prompt to
+`$BOARD_TMP/<persona-id>.sys`.
+
+**Use the private directory from pre-flight, never a fixed `/tmp/board-*` path.** Two sessions on
+one machine convening overlapping boards share those names: session B's write can land after A
+wrote its prompt but before A's parallel `advisor.py` calls open it, so A's personas answer B's
+question and A renders and synthesises the result under its own roster heading, with nothing
+anywhere indicating the swap.
 
 ### 8. Run advisor.py — N parallel Bash calls in ONE message
 
@@ -188,7 +201,7 @@ Issue **a single orchestrator message containing N parallel `Bash` tool calls** 
 Each call runs:
 
 ```bash
-"$ADVISOR_BIN" --system-file /tmp/board-<persona-id>.sys --model <model> < /tmp/board-user-r1.txt
+"$ADVISOR_BIN" --system-file "$BOARD_TMP/<persona-id>.sys" --model <model> < "$BOARD_TMP/user-r1.txt"
 ```
 
 Substitute the literal `$ADVISOR_BIN` path resolved in pre-flight, the actual persona-id, and the assigned model. The calls run concurrently. `advisor.py` prints the advisor reply to **stdout** and `[advisor]` observability lines to **stderr** — keep the two separate when you render.
@@ -211,7 +224,7 @@ After collecting round-1 returns, build the round-2 user prompt by appending pri
 …
 ```
 
-Write to `/tmp/board-user-r2.txt`. Issue another N parallel `Bash` calls in ONE message, same pattern, pointing at the new prompt file. Each persona only sees prior-round (not mid-round) takes. Repeat for each round up to `R`.
+Write to `$BOARD_TMP/user-r2.txt`. Issue another N parallel `Bash` calls in ONE message, same pattern, pointing at the new prompt file. Each persona only sees prior-round (not mid-round) takes. Repeat for each round up to `R`.
 
 If a per-persona transcript is large, truncate to `~20000 / N` chars per persona to keep the round-2 prompt within size discipline.
 
