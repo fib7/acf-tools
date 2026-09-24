@@ -315,15 +315,41 @@ const FIVE = ['t1', 't2', 't3', 't4', 't5'].map((s, i) => ({ stem: s, slug: `s${
     r.report.iterations > 15)
 }
 
-// ============================ 10. a store with no relay header still works ==================
-// Third-party `snapshot-enriched` adapters predate this contract; the header is SHOULD, not MUST.
-// Refusing them would brick every such backend on upgrade — a worse failure than the one prevented.
+// ============================ 10. a missing header: tolerated only where it is optional =====
+// Third-party `snapshot-enriched` adapters predate this contract; the header is SHOULD, not MUST,
+// and refusing them would brick every such backend on upgrade. But every adapter acf-whip SHIPS
+// always emits one, so there a missing header is not an old adapter — it is the payload arriving
+// damaged. The threat is a model shortening what it echoes, and a model that drops entries is at
+// least as likely to drop a header it does not understand as to recompute one; tolerating that on a
+// shipped backend leaves the most probable relay loss passing silently.
+// The store-name decision is tested directly on the extracted pure function: driving it through
+// runGo would need a harness per backend (the transition surface differs), and the decision itself
+// is one branch with no I/O.
+{
+  const text = readFileSync(SRC, 'utf8')
+  const block = text.slice(text.indexOf('// <scheduler-pure>'), text.indexOf('// </scheduler-pure>'))
+  const { relayCheck } = new Function('mode', `${block}\nreturn { relayCheck }`)('default')
+  const headerless = { tasks: [{ stem: 'a' }], inactive: [], satisfiedDeps: [] }
+
+  const third = relayCheck(headerless, 'acme-tracker')
+  check('10a a third-party store with no relay header is accepted', third.ok === true)
+  check('10b ...and says so, rather than claiming it verified anything', third.unverifiable === true)
+  for (const store of ['files', 'beads', 'multica', 'linear']) {
+    const r = relayCheck(headerless, store)
+    check(`10c a MISSING header on the shipped '${store}' store is a relay failure`, r.ok === false)
+    check(`10d ...naming the store so the message is actionable`, /acf|always emits/.test(r.why || '') && r.why.includes(store))
+  }
+  // An intact header still verifies on every backend, shipped or not.
+  const good = { relay: { n: 1, bytes: 1, tasks: 1, inactive: 0, sat: 0 }, tasks: [{ stem: 'a' }], inactive: [], satisfiedDeps: [] }
+  check('10e an intact header passes on a shipped store', relayCheck(good, 'files').ok === true)
+  check('10f ...and on a third-party one', relayCheck(good, 'acme-tracker').ok === true)
+}
+// End to end on the default backend: a headerless snapshot must stop the run, not schedule against it.
 {
   const r = await runGo({ tasks: FIVE, onScan: (n, snap) => snap })
-  check('10a a snapshot with no relay header is accepted', r.report.stopReason === 'complete')
-  check('10b ...with the limitation stated once, not every iteration',
-    r.logs.filter((l) => /completeness cannot be verified/.test(l)).length <= 1)
-  check('10c every task ran', r.calls.legacy.length === 5)
+  check('10g a headerless snapshot on files ends the run as relay-truncated',
+    r.report.stopReason === 'relay-truncated')
+  check('10h ...dispatching nothing', r.calls.legacy.length === 0)
 }
 
 console.log(`\nphase19-relay: ${PASS} passed, ${FAIL} failed`)

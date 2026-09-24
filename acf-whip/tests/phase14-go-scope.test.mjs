@@ -496,5 +496,37 @@ const sorted = (set) => [...set].sort()
   check('expandScope does not close over args', !/function expandScope[\s\S]*?\n}/.exec(block)[0].includes('args'))
 }
 
+// ============================ structural: the two guarantees a call site can silently drop ====
+{
+  const src = text
+
+  // 1. THE QUARANTINE ARGUMENT. depsSatisfied's third parameter is optional by signature, so a call
+  // site that omits it does not fail — it silently disables the held-out-dependency gate and
+  // dispatches work behind a task an integrity FATAL held out. That is exactly what both dispatch
+  // queues did until 3.4.0's cleanup pass. Grep is the only thing that notices.
+  const bare = src.split('\n')
+    .map((l, i) => [i + 1, l])
+    .filter(([, l]) => /depsSatisfied\(/.test(l) && !/function depsSatisfied\(/.test(l))
+    .filter(([, l]) => !/depsSatisfied\([^)]*,\s*idx\s*,\s*quarantined\s*\)/.test(l))
+  check(`every depsSatisfied call site passes the quarantine set (bare: ${bare.map(([n]) => n).join(', ') || 'none'})`,
+    bare.length === 0)
+
+  // 2. THE RUN LOCK. Every abort that happens AFTER the scan agent refreshed the heartbeat must
+  // release it: nothing was dispatched, so there is nothing to protect, and holding it refuses the
+  // operator's corrected re-run for the full lock window. Bootstrap aborts run before any heartbeat
+  // and correctly do not unlock — they are identified by their literal stopReason.
+  const lines = src.split('\n')
+  const BOOTSTRAP_ABORTS = /stopReason: '(bootstrap-no-emit|run-lock-held|detached-head|doctor-unavailable|integrity-fatal-bootstrap)'/
+  const unlocked = []
+  lines.forEach((l, i) => {
+    if (!/return \{ aborted: true/.test(l)) return
+    if (BOOTSTRAP_ABORTS.test(l)) return
+    const window = lines.slice(Math.max(0, i - 4), i).join('\n')
+    if (!/await unlock\(/.test(window)) unlocked.push(i + 1)
+  })
+  check(`every post-bootstrap abort releases the run lock first (holding: ${unlocked.join(', ') || 'none'})`,
+    unlocked.length === 0)
+}
+
 console.log(`\nphase14-go-scope: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL ? 1 : 0)

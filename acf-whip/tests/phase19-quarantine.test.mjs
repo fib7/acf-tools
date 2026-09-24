@@ -216,6 +216,27 @@ for (const [code, key] of [['detached-head', '(repo)'], ['worktree-wrong-branch'
     (r.report.gated || []).some((g) => g.stem === 'ui' && /held out/.test(g.why || '')))
 }
 
+// ---------------------------------------------------------------------------------------------
+// 4bis. THE case the stem-keyed test exists for: a held-out dep that is accepted-TERMINAL.
+// Case 4 above is gated by the cross-slug integration clause (accepted + live branch + unintegrated)
+// and would pass even with the quarantine check disabled. Here the dep is integrated, so every other
+// clause in depsSatisfied says "satisfied" and ONLY `quarantined.has(dep.stem)` can hold the line.
+// This is the duplicate-key / dup-folder-unresolvable shape: two twins share one whip key, the index
+// keeps the accepted twin (byStem is last-write-wins), and a folder-only gate calls the task done.
+{
+  const r = await runGo({
+    tasks: [
+      { stem: 'dep', slug: 'sd', folder: 'accepted', hasIntegratedAt: true, hasWorktreeBranch: false },
+      { stem: 'ui', slug: 'su', deps: ['dep'] },
+    ],
+    fatalsPerScan: () => ['FATAL|duplicate-key|dep|two tasks share this whip key'],
+  })
+  check('4f an accepted-TERMINAL dep that is held out still gates its dependent', !touched(r, 'ui'))
+  check('4g ...and the run does not claim completion', r.report.completed === false)
+  check('4h ...and the report names the dependency, not a mystery', 
+    (r.report.gated || []).some((g) => g.stem === 'ui' && /dep/.test(g.dep || '')))
+}
+
 // ============================ 5. quarantine is not sticky ====================================
 // Recomputed from each iteration's findings: an operator who fixes the card mid-run gets it back.
 {
@@ -225,8 +246,38 @@ for (const [code, key] of [['detached-head', '(repo)'], ['worktree-wrong-branch'
   })
   check('5a a finding that disappears stops holding its task out', touched(r, 't2'))
   check('5b both tasks finish', touched(r, 't1') && touched(r, 't2'))
-  check('5c the run still records that it was held out at some point',
-    (r.report.heldOut || []).some((h) => h.stem === 't2'))
+  // The history and the verdict are different questions. heldOut drives what the run CLAIMS, so a
+  // task that ran must not be in it; heldOutEver is the audit trail, so a transient integrity
+  // failure is never invisible. Conflating them made a recovered run report `partial` — and, worse,
+  // made the drain skip the recovered task's accepted work, stranding it unintegrated.
+  check('5c heldOut does NOT claim a task that went on to run was held out',
+    !(r.report.heldOut || []).some((h) => h.stem === 't2'))
+  check('5d ...but the audit trail still records that it was held out at some point',
+    (r.report.heldOutEver || []).some((h) => h.stem === 't2' && h.lifted === true))
+  check('5e ...and a run that recovered reports complete, not partial', r.report.stopReason === 'complete')
+  check('5f ...with completed true', r.report.completed === true)
+}
+
+// --- 5bis. the DRAIN must respect the live set, not the history ------------------------------
+// The drain runs after the loop, off a fresh snapshot. It re-quarantined from every stem ever held
+// out, so a card whose FATAL an operator fixed mid-run — which then ran and was accepted — had its
+// finished work excluded from the one pass that exists to catch exactly that straggler.
+{
+  const r = await runGo({
+    tasks: [{ stem: 't1', slug: 's1' }, { stem: 'recovered', slug: 's2' }],
+    fatalsPerScan: (n) => (n === 1 ? ['FATAL|unknown-agent|recovered|agent file is gone'] : []),
+  })
+  check('5g a recovered task is not in the set the drain holds back',
+    !(r.report.heldOut || []).some((h) => h.stem === 'recovered'))
+  check('5h ...and the run integrates it rather than stranding it',
+    r.calls.integrate.includes('recovered') || touched(r, 'recovered'))
+}
+
+// Structural: the drain must build its hold set from the LIVE holds, never from the whole history.
+{
+  const src = readFileSync(SRC, 'utf8')
+  check('the drain quarantines from stillHeld(), not from every stem ever held out',
+    /const drainHold = new Set\(stillHeld\(\)/.test(src) && !/applyQuarantine\(snap2, new Set\(heldOut\.keys\(\)\)\)/.test(src))
 }
 
 // ============================ 6. a held-out in-flight task KEEPS its slug ====================

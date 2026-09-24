@@ -36,7 +36,7 @@ function load(mode) {
   // eslint-disable-next-line no-new-func
   // Every pure function must be named here. Omitting one does NOT fail the test — it silently stops
   // testing that function, which is the same false-green class this suite exists to prevent.
-  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, resultToState, reconcileIntegrationTallies, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H, reviewVerdict, attemptKeyOf, coerceAcfwResult, coerceResolveResult, reconcileChildProgress, escalationTier, chunkList, improved };`)
+  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, resultToState, reconcileIntegrationTallies, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H, reviewVerdict, attemptKeyOf, coerceAcfwResult, coerceResolveResult, reconcileChildProgress, escalationTier, chunkList, improved, stemBytes, relayCheck, doctorRelayCheck, classifyFatals, applyQuarantine, expandScope };`)
   return factory(mode)
 }
 const Sdef = load('default')
@@ -411,6 +411,19 @@ check('reconcile: a named-but-absent payload drops the stage', (() => {
   const r = RCP([{ name: 'x', status: 'ok', commit: false, result: { a: 1 }, payloadPath: 'payload/x.md', payloadMissing: true }], [], { worktreeExists: true })
   return r.names.length === 0
 })())
+
+// ============================ the extraction covers what 3.4.0 added =========================
+// The purity guarantee is "the block is extracted verbatim and run through new Function, so a
+// closure over run state breaks the tests loudly". That is only true for the names the extraction
+// actually pulls out. The five functions 3.4.0 added were not among them for a release, so a purity
+// violation in exactly the newest code would have been the one thing this file could not see.
+{
+  const S = Sdef
+  for (const name of ['stemBytes', 'relayCheck', 'doctorRelayCheck', 'classifyFatals', 'applyQuarantine', 'expandScope']) {
+    check(`${name} is extractable from <scheduler-pure> (so a closure over run state fails loudly)`,
+      typeof S[name] === 'function')
+  }
+}
 
 console.log(`\nphase2-scheduler: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL === 0 ? 0 : 1)

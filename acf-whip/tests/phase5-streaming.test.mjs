@@ -15,6 +15,27 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
+// Every adapter acf-whip ships stamps a `relay` header on its snapshot, and since 3.4.0 the
+// orchestrator refuses a payload from a shipped backend that has none — a model that shortens what
+// it echoes is at least as likely to drop the header as to recompute it. This mock is a shipped
+// backend, so it stamps one, exactly as scan-backlog.sh does.
+function withRelay(snap) {
+  const arrs = [['tasks', snap.tasks], ['inactive', snap.inactive], ['sat', snap.satisfiedDeps]]
+  let n = 0, bytes = 0
+  const per = {}
+  for (const [name, a] of arrs) {
+    const list = Array.isArray(a) ? a : []
+    per[name] = list.length
+    n += list.length
+    for (const e of list) for (const ch of String((e && e.stem) || '')) {
+      const c = ch.codePointAt(0)
+      bytes += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4
+    }
+  }
+  return Object.assign({ relay: { n, bytes, tasks: per.tasks, inactive: per.inactive, sat: per.sat } }, snap)
+}
+
+
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = join(HERE, '..', 'workflows', 'whip-go.workflow.js')
 
@@ -136,7 +157,7 @@ async function agent(prompt, opts) {
     return { ok: true, parser: 'node', errors: [], warnings: [], stageCount: 5, mutatingStages: 3 }
   }
   // scan / drain scan (verbatim digest echo)
-  if (/acfw-store' snapshot/.test(prompt)) return { snapshotJson: JSON.stringify(buildSnapshot()), doctorOk: true, doctorSummary: 'SUMMARY|ok=true', doctorFatals: [] }
+  if (/acfw-store' snapshot/.test(prompt)) return { snapshotJson: JSON.stringify(withRelay(buildSnapshot())), doctorOk: true, doctorSummary: 'SUMMARY|ok=true', doctorFatals: [] }
   // single writer
   if (/SINGLE backlog writer/.test(prompt)) {
     if (writerActive > 0) writerOverlap = true

@@ -74,8 +74,18 @@ const RUN_LOCK_BASE = RUN_LOCK.slice(RUN_LOCK.lastIndexOf('/') + 1)
 // back, so the scheduler and the integrity battery observe ONE store walk instead of two. On a shared
 // board two walks can straddle a colleague's transition, and the battery then reports findings about
 // a task the scheduler's own snapshot does not contain — which, under per-task quarantine, means
-// holding out a stem nobody can see. Lives beside the run lock, in the already-gitignored dir.
-const FULL_SNAP = `${RUN_LOCK_DIR}/snap-full.json`
+// holding out a stem nobody can see.
+//
+// APPLIES TO RAW ADAPTERS ONLY, and that is not a gap. The tee exists to feed the GENERIC battery,
+// which is the doctor for every adapter without `doctor-complete`. `files` declares it, so
+// `acfw-store doctor` execs doctor.sh, which walks `.backlog/` itself and never reads a snapshot —
+// there is no second walk to eliminate. The file is simply never written there, and the scan prompt
+// falls back to the two-command form when it is absent.
+//
+// Path: always under `.acfwhip/run/`, never beside the run lock. On files the lock lives in
+// `.backlog/`, which is the COMMITTED task store — dropping a scratch file in there would put an
+// untracked artefact in the tree every doctor pass reports on.
+const FULL_SNAP = `${trunkRoot}/.acfwhip/run/snap-full.json`
 
 // --only flags for every snapshot call, built once. A scoped run relays O(scope) records instead of
 // the whole board — which is the fix for the failure that started this: a store of several hundred cards whose full
@@ -133,13 +143,30 @@ let agentModels = {}
 // Which tier each agent this run spent belongs to. Without it, a run that quietly routed every
 // specialist to the session model is indistinguishable from one that honoured the project's
 // frontmatter — the same argument that put `escalation` in the report, applied to cost.
-const agentsByTier = { shell: 0, specialist: 0, review: 0, architect: 0, resolver: 0 }
+//
+// Counted where an agent is CHARGED, not where a call site is written. Incrementing in the option
+// helpers undercounted twice over: safeAgent charges up to three real agents per invocation on a
+// retry, and every agent a child harness spends was added to agentsUsed and to no tier at all — so
+// on an escalated run the tiers summed to a fraction of the total while the skill told the operator
+// this field said what each tier spent. `untiered` is deliberate: a dispatch that goes through
+// neither helper shows up as a number instead of vanishing.
+const agentsByTier = { shell: 0, specialist: 0, review: 0, architect: 0, resolver: 0, child: 0, untiered: 0 }
+// opts object -> tier. A WeakMap rather than a property on the options, because anything set there is
+// passed verbatim to agent() and an unknown key is the runtime's business, not ours.
+const tierOf = new WeakMap()
+// THE charge point: one agent spent, against the ledger and against its tier.
+function charge(opts, n) {
+  const k = Math.max(1, n || 1)
+  agentsUsed += k
+  const t = (opts && tierOf.get(opts)) || 'untiered'
+  agentsByTier[t] = (agentsByTier[t] || 0) + k
+}
 // THE single place a shell-tier call gets its model (and, when pinned, its effort). One helper, so a
 // new shell stage cannot silently inherit the session model by forgetting the option.
 function shellOpts(o) {
   const out = Object.assign({}, o, { model: SHELL_MODEL })
   if (EFFORTS.shell) out.effort = EFFORTS.shell
-  agentsByTier.shell++
+  tierOf.set(out, 'shell')
   return out
 }
 // Options for an agentType dispatch: the project's declared model for that agent, when it declares
@@ -147,8 +174,10 @@ function shellOpts(o) {
 function typedOpts(o, tier) {
   const out = Object.assign({}, o)
   const m = out.agentType && agentModels[out.agentType]
-  if (m) out.model = m
-  if (tier && agentsByTier[tier] != null) agentsByTier[tier]++
+  // Never clobber a model the caller already chose. No current caller does; the guard costs nothing
+  // and the child skeleton already gets this right (`&& !o.model && AGENT_MODELS[...]`).
+  if (m && !out.model) out.model = m
+  if (tier) tierOf.set(out, tier)
   return out
 }
 
@@ -182,7 +211,7 @@ const esc = { authored: 0, amended: 0, preflight: 0, fellBack: 0, refused: 0, sh
 let archMissingLogged = false // announce a missing workflow-architect ONCE, not once per unit
 // Every agent() in this script routes through agentC (or safeAgent, which charges its own retries) so
 // the ledger cannot drift low and let the CLOSE rung fire too late.
-async function agentC(p, o) { agentsUsed++; return agent(p, o) }
+async function agentC(p, o) { charge(o); return agent(p, o) }
 
 // <scheduler-pure> ===========================================================================
 // Everything between these markers is PURE (no agent/parallel/phase/log/clock, no closures except
@@ -665,13 +694,20 @@ function stemBytes(s) {
   }
   return n
 }
-function relayCheck(snap) {
+const RELAY_REQUIRED = ['files', 'beads', 'multica', 'linear']
+function relayCheck(snap, store) {
   if (!snap || typeof snap !== 'object') return { ok: false, why: 'no snapshot', expected: 0, got: 0 }
   const r = snap.relay
-  // A snapshot with NO header is not a failure: third-party `snapshot-enriched` adapters predate this
-  // contract and the field is SHOULD, not MUST. Say so once and proceed — refusing here would brick
-  // every such backend on upgrade, which is a worse failure than the one being prevented.
+  // A snapshot with NO header from a THIRD-PARTY adapter is not a failure: the field is SHOULD, not
+  // MUST, and refusing would brick every such backend on upgrade. But every adapter acf-whip ships
+  // always emits one, so on those a missing header IS the failure mode — the threat here is a model
+  // shortening the payload, and a model that drops entries is at least as likely to drop a 60-byte
+  // header it does not understand as to recompute it. Tolerating that on a shipped backend would
+  // leave the single most probable relay loss passing silently.
   if (!r || typeof r !== 'object' || typeof r.n !== 'number' || typeof r.bytes !== 'number') {
+    if (RELAY_REQUIRED.indexOf(String(store || '')) >= 0) {
+      return { ok: false, why: `the '${store}' store always emits a relay header and this snapshot has none — the payload was not relayed intact`, expected: null, got: null }
+    }
     return { ok: true, unverifiable: true, expected: null, got: null }
   }
   const arrs = [['tasks', snap.tasks], ['inactive', snap.inactive], ['sat', snap.satisfiedDeps]]
@@ -990,8 +1026,8 @@ async function safeAgent(prompt, opts, onGiveUp) {
   for (let k = 1; k <= tries; k++) {
     try {
       // Charged per ATTEMPT: a retry costs a real agent, and an undercounted ledger would let the
-      // CLOSE rung fire too late to matter.
-      agentsUsed++
+      // CLOSE rung fire too late to matter. Same for the tier — a retried shell call spends two.
+      charge(opts)
       return await agent(prompt, k === 1 ? opts : { ...opts, label: `${opts.label}:retry${k - 1}` })
     } catch (e) {
       log(`agent ${opts.label} non-emit/error (attempt ${k}/${tries}): ${String((e && e.message) || e).slice(0, 160)}`)
@@ -1531,7 +1567,8 @@ async function runAuthoredUnit(ctx) {
         archMissingLogged = true
         log('⚠ no workflow-architect agent installed — harnesses are being authored by the default agent (run /whip-init to install it: content/agent-patterns/universal/workflow-architect-pattern.md)')
       }
-      agentsByTier.architect++
+      // Tagged, not counted: safeAgent is the charge point, so a retried architect call spends two.
+      tierOf.set(aopts, 'architect')
       const a = await safeAgent(architectPrompt(ctx, budget, round, lastErr, prior), aopts, () => null)
       if (!a || a.wrote !== true) { esc.fellBack++; return { via: 'legacy', why: 'architect wrote no script', prior } }
       if (a.refuse === 'unrepairable') { esc.fellBack++; return { via: 'legacy', why: `architect declined: ${a.summary}`, prior } }
@@ -1557,12 +1594,15 @@ async function runAuthoredUnit(ctx) {
 
       // ---- 3. RUN. The ONE workflow() call site in acf-whip.
       //         Pre-charge the ENFORCED ceiling (runStage hard-guards used >= BUDGET), not a promise.
-      agentsUsed += budget
+      const CHILD_TIER = {}; tierOf.set(CHILD_TIER, 'child')
+      charge(CHILD_TIER, budget)
       let out = null, threw = null
       try { out = await workflow({ scriptPath: ctx.scriptPath }, childArgs(ctx, budget, prior, round)) }
       catch (e) { threw = e }
       const reported = (out && typeof out.agentsUsed === 'number') ? out.agentsUsed : budget
-      agentsUsed -= Math.max(0, budget - Math.min(budget, reported))   // true up DOWNWARD only
+      const refund = Math.max(0, budget - Math.min(budget, reported))
+      agentsUsed -= refund                       // true up DOWNWARD only
+      agentsByTier.child -= refund
       if (out && Array.isArray(out.stagesReplayed)) esc.replayed += out.stagesReplayed.length
 
       if (!threw && out && out.ok !== false) { esc.authored++; return { via: 'workflow', raw: out, prior } }
@@ -1617,8 +1657,9 @@ show.
 1. Run-lock check: run  find ${sq(RUN_LOCK_DIR)} -maxdepth 1 -name ${RUN_LOCK_BASE} -mmin -${LOCK_FRESH_MIN}  — if it prints a path, set lockFresh true and stop (do not run the doctor). Otherwise set lockFresh false (a "No such file or directory" error also means false).
 2. Detached HEAD check: run  git -C ${sq(trunkRoot)} symbolic-ref --quiet HEAD  — if it FAILS, set detached true and stop (do not run the doctor).
 3. If a branch is checked out: apply repairable integrity issues, then re-scan. The --fix pass is
-   deliberately FULL (it self-heals the accepted folder too, and doctor.sh forbids combining --fix
-   with --active-only); the re-scan that produces the gate verdict is --active-only, which by
+   deliberately FULL so it self-heals the accepted folder too — nothing in doctor.sh forbids
+   --fix with --active-only, it simply would not repair what the run needs repaired; the re-scan
+   that produces the gate verdict is --active-only, which by
    doctor.sh's own contract leaves the FATAL set and the ok flag UNCHANGED and only suppresses
    accepted-folder advisories — the per-file pass over a mostly-accepted board is the dominant cost:
      bash ${sq(STORE)} doctor --fix >/dev/null 2>&1 || true
@@ -1754,13 +1795,26 @@ const relayFailures = []    // {iteration, expected, got, why} for the report
 // FATAL), a paused one (inactive member of a focus), or a vanished one (in the scope at iteration 1,
 // gone from the board later — someone else moved it). This is what makes `partial` legible: a run
 // that finished everything it could still must not claim the backlog is done.
-const heldOut = new Map()   // stem -> {stem, why, code, detail, firstIter, lastIter}
+const heldOut = new Map()   // stem -> {stem, why, code, detail, firstIter, lastIter, lifted}
 const noteHeld = (stem, why, code, detail) => {
   const prev = heldOut.get(stem)
-  if (prev) { prev.lastIter = iter; return }
-  heldOut.set(stem, { stem, why, code: code || '', detail: detail || '', firstIter: iter, lastIter: iter })
+  if (prev) { prev.lastIter = iter; prev.lifted = false; return }
+  heldOut.set(stem, { stem, why, code: code || '', detail: detail || '', firstIter: iter, lastIter: iter, lifted: false })
 }
+// Quarantine is recomputed every iteration, so an operator who fixes a card mid-run gets it back.
+// heldOut, by contrast, is the run's HISTORY and never forgets — which is right for the report and
+// wrong for every decision. Left conflated, a task whose FATAL was fixed (and which then ran and was
+// accepted) still made the run report `partial`, and — worse — the drain re-quarantined it off the
+// same map, so the one pass that catches stragglers skipped its finished work. Mark, do not delete:
+// the entry stays visible, `lifted` says the hold ended.
+const liftHeld = (live) => {
+  for (const h of heldOut.values()) {
+    if (h.why === 'quarantined' && !live.has(h.stem)) h.lifted = true
+  }
+}
+const stillHeld = () => [...heldOut.values()].filter((h) => !h.lifted)
 let lastFatalsNotGating = []  // FATAL lines naming nothing this board can act on — reported, never acted on
+let lastQuarantined = new Set()  // the LIVE quarantine set from the last iteration — what the drain must respect
 let lastQuarantineKey = ''    // log the quarantine set on change, not every iteration
 let lastGated = []            // pending scope members whose deps are unsatisfied at the last iteration
 
@@ -1810,7 +1864,7 @@ Return the ScanResult.`
     if (!sc) return null
     let o = null
     try { o = JSON.parse(sc.snapshotJson) } catch (e) { return null }
-    const rc = relayCheck(o)
+    const rc = relayCheck(o, store)
     if (!rc.ok) { relayShort = rc; log(`iter ${iter}: RELAY SHORT — ${rc.why}`); return null }
     if (rc.unverifiable && iter === 1 && !relayWarned) { relayWarned = true; log('note: this store emits no relay header, so snapshot completeness cannot be verified (third-party adapter)') }
     relayShort = null
@@ -1835,7 +1889,7 @@ Return the ScanResult.`
     log(`iter ${iter}: scan schema path failed — trying schema-less text scan`)
     const fb = await textScanFallback(`scan#${iter}:text`)
     if (fb) {
-      const rcf = relayCheck(fb)
+      const rcf = relayCheck(fb, store)
       if (rcf.ok) { snap = fb; relayShort = null; log(`iter ${iter}: recovered snapshot via text fallback (doctor recheck skipped this iteration)`) }
       else { relayShort = rcf; log(`iter ${iter}: text fallback ALSO incomplete — ${rcf.why}`) }
     }
@@ -1892,6 +1946,8 @@ Return the ScanResult.`
   }
   const quarantined = new Set(cls.task.map((f) => f.stem))
   for (const f of cls.task) noteHeld(f.stem, 'quarantined', f.code, f.detail)
+  liftHeld(quarantined)
+  lastQuarantined = quarantined
   const qkey = [...quarantined].sort().join(',')
   if (qkey !== lastQuarantineKey) {
     lastQuarantineKey = qkey
@@ -2035,11 +2091,15 @@ Return the ScanResult.`
   // No silent fallback: a snapshot missing these counts means scan/workflow version skew; counting
   // isTerminal over the collapsed working set would UNDERcount and stall forever as 'no-progress'
   // instead of 'complete'. Abort loudly instead.
-  if (snap.counts.runtimeTerminalDefault == null || snap.counts.runtimeTerminalOverride == null) {
+  // `total` is checked with them: without it `total === undefined` makes every comparison below
+  // quietly false — terminal === total never fires, total < prevTotal is NaN-false — so the run
+  // spins the whole no-gain budget and exits `no-progress` with `undefined` in its own iteration log.
+  if (snap.counts.runtimeTerminalDefault == null || snap.counts.runtimeTerminalOverride == null || snap.counts.total == null) {
     // A scoped run counts isTerminal over its own tasks and never reads these, so skew here cannot
     // mis-measure it — warn instead of aborting, so a slightly stale adapter still permits scoping.
     if (!scoped) {
       stopReason = 'snapshot-version-skew'
+      await unlock('Iterate')
       return { aborted: true, stopReason, reason: 'backlog snapshot is missing runtimeTerminal counts — snapshot engine / workflow version skew (or a store adapter emitting a pre-contract snapshot); reinstall acf-whip so both halves match', mode, iteration: iter }
     }
     if (iter === 1) log('WARN snapshot is missing runtimeTerminal counts (snapshot/workflow version skew) — tolerated because this run is scoped, but reinstall acf-whip')
@@ -2057,7 +2117,7 @@ Return the ScanResult.`
   // reporting `complete` there is the failure this guards: the operator reads "Backlog 100% terminal"
   // and the task they asked for was never run. `partial` is a terminal state like `complete`; it just
   // tells the truth, and `completed:false` keeps any automation reading that flag honest too.
-  const inScopeHeldOut = () => [...heldOut.keys()].filter((st) => !runScope || runScope.has(st))
+  const inScopeHeldOut = () => stillHeld().map((h) => h.stem).filter((st) => !runScope || runScope.has(st))
   // Every scoped task already terminal (or all of them collapsed-accepted) => nothing to do. The
   // unscoped guard below is `total > 0`, which would spin here instead of stopping.
   if (scoped && total === 0) { stopReason = inScopeHeldOut().length ? 'partial' : 'complete'; break }
@@ -2070,7 +2130,7 @@ Return the ScanResult.`
   }
   // An UNSCOPED run whose entire remaining board is held out has nothing left to do either, and the
   // `total > 0` guard above would spin it to the no-gain ceiling instead of stopping.
-  if (!scoped && total === 0 && heldOut.size) { stopReason = 'partial'; break }
+  if (!scoped && total === 0 && inScopeHeldOut().length) { stopReason = 'partial'; break }
 
   // ---- plan (pure JS): partition by slug, gate deps, build queues ----
   // PARALLELISM INVARIANT (default): every non-conflicting ready unit dispatches CONCURRENTLY.
@@ -2116,13 +2176,13 @@ Return the ScanResult.`
   const pending = sched.filter((t) => t.folder === 'pending').sort(byPriorityThenStem)
   for (const t of [...freshInProgress.slice().sort(byPriorityThenStem), ...pending]) {
     if (t.slug === 'none') {
-      if (t.folder === 'pending' && !depsSatisfied(t, idx)) continue
+      if (t.folder === 'pending' && !depsSatisfied(t, idx, quarantined)) continue
       directQ.push({ t, premove: t.folder === 'pending' })
       continue
     }
     if (t.slug === '') { warnings.push(`${t.stem}: empty Worktree slug on a code task (FATAL integrity — left pending)`); continue }
     if (!claim(t.slug)) continue
-    if (t.folder === 'pending' && !depsSatisfied(t, idx)) { seen.delete(t.slug); continue } // free the slug for a ready sibling
+    if (t.folder === 'pending' && !depsSatisfied(t, idx, quarantined)) { seen.delete(t.slug); continue } // free the slug for a ready sibling
     specialistQ.push({ t, premove: t.folder === 'pending' })
   }
 
@@ -2528,7 +2588,7 @@ Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}
   // finish having integrated only part of the work. Fall back to the last VERIFIED snapshot instead —
   // it is stale, never truncated, and the integrator is idempotent against a stale entry.
   if (snap2) {
-    const drc2 = relayCheck(snap2)
+    const drc2 = relayCheck(snap2, store)
     if (!drc2.ok) {
       log(`drain: snapshot relay incomplete (${drc2.why}) — draining off the last verified snapshot instead`)
       relayFailures.push({ iteration: 'drain', expected: drc2.expected, got: drc2.got, why: drc2.why })
@@ -2544,7 +2604,11 @@ Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}
   // A held-out task is held out here too. The drain runs AFTER the loop, off a fresh snapshot that
   // knows nothing about this run's quarantine — so without this, the one pass that exists to catch
   // stragglers would cheerfully integrate the very task the integrity gate refused to touch.
-  if (snap2 && heldOut.size) snap2 = applyQuarantine(snap2, new Set(heldOut.keys()))
+  // The set is the LAST ITERATION'S LIVE one, not every stem ever held: a card whose FATAL an
+  // operator fixed mid-run went on to be accepted, and excluding it here stranded that work
+  // unintegrated with nothing in the report saying why.
+  const drainHold = new Set(stillHeld().map((h) => h.stem))
+  if (snap2 && drainHold.size) snap2 = applyQuarantine(snap2, drainHold)
   finalSnap = snap2 || lastSnapshot
   if (snap2) {
     const idx2 = indexTasks((snap2.tasks || []).concat(snap2.inactive || []), snap2.satisfiedDeps)
@@ -2596,7 +2660,10 @@ const needsOperator = [...capParked, ...depParked, ...tokenParked]
 // `complete` AND held nothing out inside its scope — a run that finished every task it was allowed to
 // touch, while refusing one it was asked to, has not completed the backlog, and saying so is the
 // point. Automation reading `completed` gets the same honest answer the note does.
-const heldOutList = [...heldOut.values()].filter((h) => !runScope || runScope.has(h.stem))
+const heldOutList = stillHeld().filter((h) => !runScope || runScope.has(h.stem))
+// Everything ever held out, including entries whose hold was lifted mid-run. `heldOut` drives what
+// the run CLAIMS; this is the audit trail, so a transient integrity failure is never invisible.
+const heldOutEver = [...heldOut.values()].filter((h) => !runScope || runScope.has(h.stem))
 return {
   completed: stopReason === 'complete' && heldOutList.length === 0,
   stopReason, // complete | partial | no-progress | max-iterations | scan-degraded | relay-truncated | agent-cap-reached | (aborts return earlier)
@@ -2614,6 +2681,7 @@ return {
   // answered from the scheduling view instead of by pointing at folders it is not in. relay: what the
   // snapshot hop did, so a near-miss is visible BEFORE it becomes an abort on some later run.
   heldOut: heldOutList,
+  heldOutEver,
   fatalsNotGating: lastFatalsNotGating,
   gated: lastGated,
   relay: { failures: relayFailures, verified: relayFailures.length === 0 },
