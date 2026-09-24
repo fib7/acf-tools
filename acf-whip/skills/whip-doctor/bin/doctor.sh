@@ -716,7 +716,7 @@ if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
     [ "$actual" != "$ACFW_BRANCH_PREFIX/$slug" ] && emit FATAL worktree-wrong-branch "$slug" "$ACFW_WORKTREE_DIR/$slug is on '$actual', expected '$ACFW_BRANCH_PREFIX/$slug'"
     if ! printf '%s\n' "$LIVE_SLUGS" | grep -qxF "$slug"; then
       if printf '%s\n' "$PARKED_SLUGS" | grep -qxF "$slug"; then
-        emit WARN parked-task-worktree "$slug" "$ACFW_WORKTREE_DIR/$slug belongs to a task that is parked (draft) or retired (archive) — NOT removed. Resume it with /whip-move $slug pending, or remove the worktree by hand once you are sure nothing in it is needed"
+        emit WARN parked-task-worktree "$slug" "$ACFW_WORKTREE_DIR/$slug belongs to a task that is parked (draft) or retired (archive) — NOT removed, because it is often the only copy of work that has not landed. Resume that task (/whip-move <task> pending) to put the slug back in use, or remove the worktree by hand: git worktree remove $ACFW_WORKTREE_DIR/$slug && git branch -D $ACFW_BRANCH_PREFIX/$slug"
         continue
       fi
       # NEVER --force a worktree that holds uncommitted work. This reaper is the one place acf-whip can

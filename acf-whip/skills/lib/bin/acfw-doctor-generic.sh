@@ -280,7 +280,7 @@ if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
     # here calls a live worktree orphaned. doctor.sh and scan-backlog.sh both already use -qxF.
     if ! printf '%s\n' "$LIVE_SLUGS" | grep -qxF "$slug"; then
       if printf '%s\n' "$PARKED_SLUGS" | grep -qxF "$slug"; then
-        emit WARN parked-task-worktree "$slug" "$ACFW_WORKTREE_DIR/$slug belongs to a task that is parked (draft) or retired (archive) — left alone. Resume it with /whip-move $slug pending, or remove the worktree by hand once you are sure nothing in it is needed"
+        emit WARN parked-task-worktree "$slug" "$ACFW_WORKTREE_DIR/$slug belongs to a task that is parked (draft) or retired (archive) — NOT removed, because it is often the only copy of work that has not landed. Resume that task (/whip-move <task> pending) to put the slug back in use, or remove the worktree by hand: git worktree remove $ACFW_WORKTREE_DIR/$slug && git branch -D $ACFW_BRANCH_PREFIX/$slug"
       elif [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
         emit WARN orphaned-worktree-dirty "$slug" "$ACFW_WORKTREE_DIR/$slug has no live task but holds UNCOMMITTED changes — inspect, salvage, remove by hand"
       else
