@@ -15,6 +15,8 @@ cd "$HERE/.." || exit 1
 # Optional suites: these skip themselves unless their backend is reachable, and a SKIP is not a
 # failure. phase9-adapter-multica is NOT here any more: it drives the adapter through an offline fake
 # of the multica CLI (injected at the ACFW_MULTICA_BIN seam), so it runs everywhere and must pass.
+# tests/perf-doctor.sh is deliberately absent from both lists: it is a timing harness, not a
+# pass/fail suite, so a slow machine would turn it into a flaky gate. Run it by hand.
 OPTIONAL="phase9-adapter-beads"
 
 SUITES_SH="
