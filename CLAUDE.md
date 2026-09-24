@@ -31,7 +31,7 @@
 | **acf-challenger-mode** | Cognitive | Logic validation enforcer | 6 |
 | **acf-arazor-mode** | Cognitive | Production verification enforcer | 6 |
 | **acf-nitro** | Cognitive | Parallel execution enforcer | 6 |
-| **acf-mission-control** | Functional | Two-line status line HUD (1M-aware fuel gauge, self-priced cost, rate limits, cache warmth); themeable glyphs (sleek/emoji/nerd/text); self-upgrading | 6 |
+| **acf-mission-control** | Functional | Two-line status line HUD (1M-aware fuel gauge, self-priced cost, rate limits, cache warmth); themeable glyphs (sleek/emoji/nerd/text); self-upgrading | 7 |
 | **acf-librarian** | Functional | Convention enforcement | 9 |
 | **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe; per-task authored child workflows; LP-CAS integration; pluggable task stores: files/beads/multica/linear; focus-driven bare /go; store-side snapshot narrowing with a verified relay; per-task integrity quarantine; tiered model routing; offline contract suite for every backend) | 117 |
 | **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 17 |
@@ -154,7 +154,7 @@ acf-tools/
 ├── acf-challenger-mode/             # Logic validation (6 files)
 ├── acf-arazor-mode/                 # Production verification (6 files)
 ├── acf-nitro/                       # Parallel enforcement (6 files)
-├── acf-mission-control/             # Status HUD (6 files)
+├── acf-mission-control/             # Status HUD (7 files)
 ├── acf-librarian/                   # Convention enforcement (9 files)
 ├── acf-whip/                        # Workflow automation, workflow-native (117 files; skills/ + workflows/ + adapters/ + tests/)
 └── acf-advisor/                     # Second-opinion LLM client (17 files)

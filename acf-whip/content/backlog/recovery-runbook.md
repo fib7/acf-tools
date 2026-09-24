@@ -172,6 +172,11 @@ Works on every backend, not just `files`. Both states are excluded from every sc
 completion denominator, while staying resolvable as dependencies — so a task that depends on a paused
 one is reported as *gated, and here is why*, not as a dangling reference.
 
+**The task's worktree and branch survive.** `/whip-doctor --fix` never reaps the worktree of a parked
+or retired task — it reports `WARN|parked-task-worktree` and leaves it, because that directory is
+frequently the only copy of work that has not landed. Remove it by hand when you are sure:
+`git worktree remove .worktree/<slug>` then `git branch -D worktree/<slug>`.
+
 Two things that look like they should park a task and do not:
 
 - **Dropping it from a run focus.** A scoped run pulls in the unmet dependencies of everything in its

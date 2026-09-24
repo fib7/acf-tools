@@ -554,15 +554,20 @@ Next step: Run /go
 
 **Usage**:
 ```bash
-/go                                          # every actionable task
+/go                                          # your FOCUS (see Run scope below)
+/go --all                                    # every actionable task, explicitly
 /go api-014-token-refresh ui-021-login-form  # exactly those, plus their unmet dependencies
+/go MUL-4821                                 # native backend ids resolve too
 /go frontend tasks only                      # a natural-language filter over the backlog
 /go bugfixes                                 # the fix/bug tasks
 ```
 
-**Run scope (3.2.3)**: with no arguments `/go` drains the whole backlog. With arguments it runs
-**only** what you name. Task ids/stems pass straight through; a natural-language filter is resolved
-**once, before launch** — matched against the fields the snapshot projects on every backend
+**Run scope (3.2.3, focus-driven since 3.4.0)**: with no arguments `/go` runs your **focus** — the
+per-checkout list `/task` sets to the tasks it just created, or that you set with `/whip-focus`. With
+no focus, `files` drains the whole backlog as before while every shared API-backed store refuses and
+names the three ways forward; `/go --all` is the explicit "yes, everything". With arguments it runs
+**only** what you name. Task ids, stems and native backend ids pass straight through; a
+natural-language filter is resolved **once, before launch** — matched against the fields the snapshot projects on every backend
 (`agent`, `slug`, `priority`, `stem`, `touchesGlobs`), shown to you, and confirmed — so the
 orchestrator always receives a concrete task list and stays deterministic. Unmet transitive
 dependencies are pulled in and named in the log; already-accepted ones are left alone. Nothing
@@ -592,6 +597,58 @@ less than you asked for. The run report echoes `scopeFilter`, `scopedTo` and `sc
 - `in-progress` → `blocked` (stale dispatch; default 8h, set `ACFW_INPROGRESS_TIMEOUT_HOURS` to change)
 
 **Output**: Continuous progress until completion
+
+---
+
+### /whip-focus - What a bare `/go` runs
+
+**Purpose**: manage the run focus — the small, per-checkout list of tasks a bare `/go` runs
+
+```bash
+/whip-focus                    # show it, with each task's live state and who set it when
+/whip-focus set <tasks...>     # replace it with exactly these
+/whip-focus add <tasks...>     # add these (replaces outright when every task in it is done)
+/whip-focus drop <tasks...>    # remove these
+/whip-focus clear              # remove it; a bare /go then follows the store's bareGo policy
+```
+
+Tasks may be named by stem, id, native backend id (`MUL-4821`) or a unique stem prefix. `set` and
+`add` resolve every token through the store first and **refuse the whole operation** if any is
+unknown or ambiguous — a focus holding raw arguments would inherit every ambiguity of the thing
+typed, and a selection that silently changes meaning is worse than no selection.
+
+It lives at `.acfwhip/run/focus`, which is gitignored, and that is not an implementation detail: a
+focus is one person's current selection, never a fact about the project. Two people on one board
+have two focuses, and neither one's `/go` becomes everyone's.
+
+**Dropping is not pausing.** A scoped run pulls in the unmet dependencies of everything in its
+scope, so a task you drop that something else needs comes straight back — correctly, since otherwise
+that dependent could never run. To actually park a task, use `/whip-move` below.
+
+---
+
+### /whip-move - Move ONE task between states
+
+**Purpose**: last-mile reconciliation without hand-editing the store
+
+```bash
+/whip-move <task> <state> [--reason "..."] [--integrated-at SHA] [--add-dep ID]
+```
+
+States: `pending in-progress completed in-review accepted rejected blocked draft archive`.
+
+**`draft` pauses and `archive` cancels**, on every backend (3.4.0). Both are inert to the scheduler
+and excluded from the completion denominator, while staying resolvable as dependencies — so a task
+that depends on a paused one is reported as *gated, and here is why*, not as a dangling reference.
+A parked task's worktree and branch are never reaped by `/whip-doctor --fix`; they are reported as
+`parked-task-worktree` and left for you.
+
+Setting a native `blocked`/`cancelled` status on an API-backed board does **not** pause a task —
+whip reads its own metadata, not the native status. The doctor reports that as `WARN|native-hold`
+and leaves the native status alone rather than repairing it.
+
+It runs the validated writer, so the folder move, the `Status:` sync, the transition-log row and the
+commit stay atomic. Run `/whip-doctor` after.
 
 ---
 

@@ -1,3 +1,4 @@
+<!-- acf-whip-artifact: content/backlog/workflow.md v3.4.0 -->
 # Task Workflow
 
 ## Pluggable task store (3.1.0)
@@ -12,7 +13,7 @@ primitive), `read`/`create`/`update-field`, `doctor`.
 | Backend | State lives in | Notes |
 |---|---|---|
 | `files` (default) | `.backlog/<state>/*.md` on trunk | reference backend; everything below describes it literally |
-| `beads` | `bd` issue tracker (`.beads/`, sqlite) | custom statuses mirror the whip states; deps native |
+| `beads` | `bd` issue tracker (`.beads/`, embedded Dolt) | custom statuses mirror the whip states; deps native |
 | `multica` | multica server (Postgres, via CLI) | `whip_state` metadata is canonical; comments are the audit trail |
 | `linear` | Linear workspace (GraphQL API) | `whip_*` state in per-issue attachment metadata; native status is a display projection; comments are the audit trail |
 
@@ -36,7 +37,15 @@ pending → in-progress → completed → in-review → [accepted|rejected]
 
 `/task` and `/go` run as **dynamic workflows** (`workflows/whip-task.workflow.js`, `workflows/whip-go.workflow.js`) when the host supports them. The loop, the slug partition, the dependency gate, the topological integration order, and the stall/terminal bookkeeping run inside a deterministic JavaScript script; **intermediate state lives in script variables, not Claude's context**, so context stays flat across iterations no matter how large the backlog. Every filesystem/git action is delegated to a narrow agent: a read-only scanner (`scan-backlog.sh`), a single sequential writer (`apply-transition.sh`), parallel specialists/reviewers isolated by worktree slug, and a sequential LP-CAS integrator (`integrate-lpcas.sh`) with conflict-resolver dispatch hoisted into the script.
 
-**Bounded working-set snapshot.** The workflow JS has no filesystem access, so each iteration a scanner agent runs `scan-backlog.sh` and hands its JSON back. To keep that payload small enough for the agent to relay reliably (the alternative — echoing a backlog-sized blob — stalls the agent on a large lived-in backlog), `scan-backlog.sh` emits a **working set**: full per-task objects only for tasks the scheduler can act on — every non-accepted active task, every accepted task still pending integration, and every accepted task that something **depends on** (so dependency resolution never sees a gap) — while **terminal/historical accepted tasks collapse into aggregate counts**. Completion is then measured over `counts.total` (active folders only) against `runtimeTerminalDefault`/`runtimeTerminalOverride`, which mirror the JS terminal rule exactly; a snapshot missing those counts aborts loudly (version skew) rather than silently stalling. The doctor's `--quiet` mode likewise bounds the integrity report to FATAL findings plus the grouped breakdown, so hundreds of historical advisories never flow through the gate agent.
+**Bounded working-set snapshot.** The workflow JS has no filesystem access, so each iteration a scanner agent runs the store walk and hands its JSON back. That hop is the constraint: the payload must fit what a model will echo reliably, and a short echo is valid JSON — indistinguishable from a smaller board — so the scheduler would plan over a backlog that does not exist. Three mechanisms bound it, and one proves it arrived.
+
+*Collapse.* `--digest` emits full per-task objects only for tasks the scheduler can act on — every non-accepted active task, every accepted task still pending integration, and every accepted task something **depends on** (so dependency resolution never sees a gap) — while terminal/historical accepted tasks collapse into aggregate counts. Since 3.4.0 this is real on **every** backend, not just `files`: the dispatcher applies the same three-way split to any adapter that does not implement it.
+
+*Narrowing.* A scoped run (`/go <ids>`, or a bare `/go` running your focus) passes `--only`, and the store emits just the closure of those tasks — the seeds plus every dependency that is not accepted-terminal. A five-task run relays five records whatever the board's size.
+
+*Proof.* Every snapshot leads with a `relay` header stating how many entries it contains and the byte sum of their stems. The consumer recomputes both and refuses a mismatch, retrying and then stopping as `relay-truncated` — never reporting the named ids as nonexistent, which is what a silently short echo used to look like. The doctor's findings ride the same hop, so the `SUMMARY`'s `fatal=N` is cross-checked against the lines relayed: a dropped FATAL would silently un-hold the task it names.
+
+Completion is measured over `counts.total` (active folders only) against `runtimeTerminalDefault`/`runtimeTerminalOverride`, which mirror the JS terminal rule exactly; a snapshot missing those counts aborts loudly (version skew) rather than silently stalling. The doctor's `--quiet` mode likewise bounds the integrity report to FATAL findings plus the grouped breakdown, so hundreds of historical advisories never flow through the gate agent.
 
 When dynamic workflows are unavailable (disabled, or older Claude Code), both commands fall back to the **legacy single-context loop** documented below — byte-compatible behavior over the same `.backlog/` state machine, but the loop lives in (and grows) Claude's context. The capability check is simply whether the `Workflow` tool is present; no plugin code special-cases it.
 
@@ -89,6 +98,18 @@ The lock is git itself: `git worktree add <repo>/.worktree/<slug> -b worktree/<s
 
 **Ownership scope.** acf-whip owns exactly one branch namespace — `worktree/<slug>` — and only ever creates, inspects, or removes worktrees on it. The doctor's orphan reaper and wrong-branch check are scoped to that namespace, so the `/go` bootstrap `--fix` never touches a worktree you keep in the same repo for your own research/benchmarking, even one parked under `.worktree/` — a foreign branch, a detached worktree (mid-rebase), or a plain directory there is left completely alone. The directory and branch prefix are configurable per project via `.backlog/.acfw-config` (`ACFW_WORKTREE_DIR`, default `.worktree`; `ACFW_BRANCH_PREFIX`, default `worktree`); change them only on a fresh backlog, since existing worktrees are pinned to the namespace they were created under.
 
+## Per-task child workflows (3.2.0)
+
+Each dispatched unit runs as its **own nested workflow**, not as a single agent. A **workflow-architect** agent authors a harness for that specific task by filling four marked regions of a locked, shipped skeleton (`skills/lib/child-skeleton.js.tmpl`); a validator byte-diffs every locked segment before `/go` will run the file. The skeleton owns the single `clean-checkout`, the stage primitives, the progress ledger, the budget guard, the commit verifier, the review-panel arithmetic and the sole return path — none of it can be authored away.
+
+**Seams.** Implementation and LP-CAS conflict resolution escalate by default. The multi-lens review panel is opt-in (`args.escalateReview`) because it is the only *subtractive* seam: it can reject work that would otherwise have shipped, against a hard 3-rejection terminal. Aggregation is strict majority with **no veto**, and a panel of any size can cost at most one rejection per round.
+
+**Durability.** Each stage's own agent appends its result to a ledger under `.acfwhip/run/child/<stem>/<attempt>/<kind>/` (gitignored), because a workflow script has no filesystem — which is exactly why the record survives the script throwing *and* the architect's repair edit. When a harness throws, a scout reconciles that ledger against git and the architect amends with the completed-stage set in hand; the amended run replays those stages in **zero agents**. A commit-bearing entry is trusted only when git confirms it with an `ACFW-Stage:` trailer; every disagreement resolves toward an **informed re-run**, never a skip.
+
+The attempt key is `a<RejectionCount>-b<BlockCount>`: stable across amends, re-dispatches and `/go` crashes (so progress survives them), and **new** on an external rejection — a retry harness that replayed everything as done would produce nothing.
+
+**Degradation.** The runtime caps total agents per run and children share the counter, so `/go` degrades FULL → LEAN → DIRECT → CLOSE as its budget depletes, falling back to verbatim 3.1.0 single-agent dispatch. Escalation is therefore a **policy, not a guarantee**: on a large backlog the tail of a run is 3.1.0, and the report says so (`escalation{}`, `agentsUsed`, `stopReason: agent-cap-reached`). Every exhaustion path — architect non-emit, pre-flight rejection, amend budget, `workflow()` unavailable — lands on the same fallback. `args.escalate: false` disables the whole feature.
+
 ### Step 0: clean-checkout-before-task
 
 Every implementer specialist and `quality-reviewer` invokes the `clean-checkout-before-task` skill as Step 0, before reading the task body. The skill:
@@ -99,7 +120,11 @@ Every implementer specialist and `quality-reviewer` invokes the `clean-checkout-
 4. Stashes unrelated working-tree changes.
 5. Logs `clean-checkout: ok` to the task transition log.
 
-Quality-reviewer rejects any task in `.backlog/in-review/` whose transition log lacks the `clean-checkout: ok` token.
+Quality-reviewer rejects any task in `.backlog/in-review/` whose transition log lacks the `clean-checkout: ok` token. As of 3.2.0 `/go` also checks this **deterministically** before dispatching a reviewer, and types the result: a missing token with the worktree branch **present** means the token was lost rather than the work (a mechanism fault — retried, no rejection charged), while no branch at all is a genuine quality rejection.
+
+**Exactly one clean-checkout per (task, attempt) — 3.2.0, WT-1.** The skill is *not* reentrant: its exit-2 mutual exclusion fires only when the worktree is **created**, so a second invocation against a live worktree passes the branch check and proceeds to step 4, whose `git stash push -u … || true` silently sweeps another stage's in-flight work into the **shared** `refs/stash`. Inside a child workflow the checkout therefore happens once, in the locked prologue, guarded by an **observation** (`git worktree list --porcelain` shows the branch) rather than by a ledger record — a lost ledger entry must never be able to trigger a second stash. No authored stage may invoke it, and the validator rejects a harness that names it.
+
+**One writer at a time.** Within a task, "write" includes editing files, `git add`/`git commit`, **and running the build or test suite** (which produces build output, caches, coverage and formatter rewrites). Read-only work — recon, call-site census, review lenses, adversarial judging — is the parallel lane. The stage runner forces mutating stages sequential, so this is structural rather than a request.
 
 All subsequent state moves, edits, and commits happen inside the worktree on `worktree/<slug>`. **No commits land on the trunk branch from a specialist.**
 
@@ -109,7 +134,14 @@ All subsequent state moves, edits, and commits happen inside the worktree on `wo
 
 **Streaming, not a wave barrier.** Each dispatched unit flows through its **own** lifecycle — specialist → review → integrate — as soon as it is ready, rather than waiting for the slowest task in the iteration. A documentation task done in minutes is reviewed, accepted, and (for code) integrated in minutes even while a multi-hour task dispatched in the same wave is still running. Two invariants are preserved by **explicit serialization**, not the iteration barrier: a single-writer promise-chain so `apply-transition.sh` calls never overlap, and an integrate lock so git folds onto trunk stay sequential. Cross-slug dependents are already gated at **dispatch** (a dependent is not dispatched until its dependency is accepted **and** integrated), so units accepted in the same wave are mutually dependency-independent and need only serialization; pre-existing accepted leftovers (which can be interdependent) integrate first in one topo-ordered, lock-held pass. The behavior is regression-tested in `tests/phase5-streaming` (a fast task integrates while a gated slow task in the same wave is still in flight — a construction that deadlocks under the old barrier).
 
-**Override**: if the project's `CLAUDE.md` (or any other persistent agent instructions) directs a different integration strategy — for example "open a PR per `PR Group:` via `gh pr create` instead of merging locally" — `/go` follows those instructions and skips auto-integration, per Claude's instruction-priority hierarchy. In that mode the operator is responsible for integration; no ledger marker is written and the loop's terminal check falls back to `accepted ∪ blocked`.
+**Override**: `/go` skips auto-integration entirely, the operator owns integration, no ledger marker is written, the terminal check falls back to `accepted ∪ blocked`, and each accepted task's `worktree/<slug>` branch and worktree are **kept alive** (in default mode they are reaped once the change is on trunk — in override mode that branch is the only copy of the deliverable). The doctor relaxes its `cross-slug-dep-not-integrated` gate in lockstep, because the scheduler and the doctor must agree on what "terminal" means or the run aborts on their disagreement.
+
+Select it in either of two ways:
+
+- **Pinned** (preferred when the answer must not vary per run): `ACFW_INTEGRATION_MODE=override` as an env var or a key in the committed config (`.acfwhip/config`, or the legacy `.backlog/.acfw-config` — whichever the project has; the first existing file wins). `acfw-store info` reports it as `integrationMode`. An unrecognized value is FATAL rather than a silent fallback, and a trailing `# comment` counts as part of the value.
+- **Unpinned**: `/go` decides per run by reading the project's `CLAUDE.md`/`AGENTS.md` — e.g. "open a PR per `PR Group:` via `gh pr create` instead of merging locally" — per Claude's instruction-priority hierarchy.
+
+Override mode does **not** push, run `gh pr create`, or read `PR Group` (which is stored but drives no behavior). It stops at accepted and gets out of the way. Note also that `.backlog/` state transitions are committed on the trunk branch in **both** modes; if trunk must stay free of bookkeeping commits, use a non-files task store, where task state lives outside git entirely.
 
 **Terminal in default mode**: an accepted task is terminal once nothing remains to fold into trunk — its **ledger marker is on trunk** (the integration oracle), **or** it is non-code (`Worktree: none`), **or** it has no `worktree/<slug>` branch (a historical/pre-3.0.0 task already merged the old way). Branchless historical accepted tasks are never enqueued for integration (no candidate ref; the integrator exits 4, "nothing to integrate"), so a lived-in backlog reaches 100% instead of looping on phantom branches. A `worktree/<slug>` branch that **exists but has no commits ahead of trunk** (a read-only/gate/verification task that got a slug but produced no code) also lands cleanly: the empty cherry-pick applies nothing and the integrator co-commits the marker alone, so the task becomes terminal instead of retrying forever.
 
@@ -136,7 +168,7 @@ Priority orders within a worktree partition. It does not authorize parallelism a
 5. **Dependency gating**: a task may dispatch only from a codebase that already contains all its dependencies.
    - **Same-slug dep** (dep's `Worktree:` equals this task's `Worktree:`): satisfied as soon as the dep is in `.backlog/accepted/`. The dep's commits already live on the shared `worktree/<slug>` branch.
    - **Cross-slug dep**: dep's commits must already be on the local trunk. It blocks only while genuinely pending integration — `accepted/`, a live `worktree/<slug>` branch, and **no ledger marker on trunk** yet. A dep whose marker is on trunk satisfies it; so does a **branchless historical/pre-3.0.0** accepted dep (no worktree branch = already on trunk the old way). A non-code (`none`) dep is satisfied on acceptance.
-   - In override (PR) mode, where no ledger marker is written, acceptance is sufficient for cross-slug deps; the operator is responsible for ordering.
+   - In override (PR) mode, where no ledger marker is written, acceptance is sufficient for cross-slug deps; the operator is responsible for ordering. The doctor's matching FATAL is relaxed there too — when it was not, the scheduler dispatched the dependent and the next integrity recheck aborted the run on that very dispatch.
 
 ## Evidence Requirements
 

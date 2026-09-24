@@ -103,8 +103,21 @@ never a fact about the project: two people on one board have two focuses.
 It holds script-resolved stems only. `set`/`add` resolve every token through the store and refuse the
 whole operation — writing nothing — if any is unknown or an ambiguous prefix; a focus holding raw
 arguments would inherit every ambiguity of the thing typed, and a selection that silently changes
-meaning is worse than no selection. Adding to a focus whose every task is done replaces it, or
-finished work would ride into the next run's scope forever.
+meaning is worse than no selection. Without `jq` — the `files` backend runs without it, so there
+that is the normal path and not a fallback — the resolution reads the snapshot with `sed`, and the
+first cut scanned the whole document for `"key":"value"` pairs: `acfw-focus set <two ids>` wrote
+thirteen entries including a commit SHA, a trunk path and the word `pending`, and exited 0 reporting
+success. Every field is bounded to its own delimited object now, and an arithmetic guard refuses the
+whole operation unless the store resolved exactly as many entries as there were distinct tokens.
+`show --live` also says when it cannot answer, instead of degrading to a bare stem list that looks
+identical to a list of runnable work.
+
+Adding to a focus whose every task is done replaces it, or finished work would ride into the next
+run's scope forever — and that check no longer depends on `--no-resolve`, which had exempted the one
+caller that matters, since both `/task` writers pass it. Every write refusal is the script's exit
+now: `write_focus` ran as the last stage of a pipeline, so its own `exit` — and the hard refusal when
+`.acfwhip/run/` cannot be gitignored — terminated only a subshell, and the next line printed
+"focus set: N task(s)" with status 0.
 
 With no focus, a bare `/go` follows a per-store policy: `files` drains the whole backlog exactly as
 before, while every shared API-backed store **refuses** and names the three ways forward. `/go --all`
@@ -114,10 +127,24 @@ one-off selection the standing default would mean the next bare `/go` ran someth
 **Pausing is now a state.** `/whip-move <task> draft` pauses and `archive` cancels, on every backend:
 inert to the scheduler, still resolvable as dependencies, so a dependent reads as gated rather than
 dangling. Dropping from a focus is documented as *not* pausing — a scoped run pulls in unmet
-dependencies, so a dropped task something else needs comes straight back. And on multica,
-`doctor --fix` no longer overwrites a human hold: a native `blocked`/`cancelled` against a runnable
-whip state was treated as drift and repaired, so every `/go` bootstrap silently un-parked every card
-the team had parked. It is `WARN|native-hold` now, with the remedy named, and left alone.
+dependencies, so a dropped task something else needs comes straight back — though `drop` now resolves
+ids, native ids and prefixes as the docs always claimed, instead of matching stored stems literally
+and printing "focus now: N" after removing nothing.
+
+A parked task's worktree and branch are never reaped either. The orphan reaper builds its liveness
+census from the ACTIVE folders, and draft/archive are not among them — so the supported way to pause
+work was also a way to have the next bootstrap `doctor --fix` force-remove the worktree and delete
+the branch of a committed-but-unintegrated deliverable, with `/go` discarding that pass's output.
+Parked slugs are `WARN|parked-task-worktree` now: reported, never reaped, because silent
+accumulation an operator can see beats silent deletion they cannot.
+
+And on **multica and Linear**, `doctor --fix` no longer overwrites a human hold: a native
+`blocked`/`cancelled` against a runnable whip state was treated as drift and repaired, so every `/go`
+bootstrap silently un-parked every card the team had parked. It is `WARN|native-hold` now, with the
+remedy named, and left alone. Linear keys on the workflow state TYPE (`canceled`, which only
+`archive` maps to), so a hold there is unambiguous; multica's `blocked` is a value whip projects onto
+itself, so a stale write and a human hold cannot be told apart — the finding says so and names the
+re-sync command instead of pretending to be certain.
 
 ### Agents are routed by what they do
 
@@ -165,13 +192,58 @@ tier stays cheap and the payload is bounded instead.
   left its own heartbeat fresh, so an operator who fixed a typo in ten seconds was refused for the
   next half hour with "another /go run appears active". Nothing was dispatched; there was nothing to
   protect. Aborts also carry their `stopReason` now, which `skills/go/SKILL.md` had documented for
-  two releases without it ever being emitted.
+  two releases without it ever being emitted. The one abort that still held it — a snapshot missing
+  its runtime-terminal counts — releases it too.
+- **A quarantined dependency did not actually gate its dependents.** Both dispatch queues called
+  `depsSatisfied(t, idx)` without the quarantine set. The parameter is optional by signature, so
+  nothing failed: the check simply became a no-op in the two places that dispatch, while the three
+  places that only report passed it. A task whose dependency an integrity FATAL held out ran anyway
+  whenever that dep was accepted-terminal — the duplicate-key shape the check exists for — and the
+  same iteration reported it as gated. The test that covered it passed for the wrong reason.
+- **A recovered task was reported as held out, and its work was stranded.** `heldOut` was both the
+  run's history and every decision's input, so a card whose FATAL an operator fixed mid-run made the
+  run report `partial` even though it ran, and the post-loop drain re-quarantined from the same map —
+  excluding the accepted work of exactly the task the operator had just repaired. The live set and
+  the audit trail are separate now (`heldOut` vs `heldOutEver`, with `lifted` on the recovered ones).
+- **A missing relay header passed.** The header is SHOULD for a third-party adapter, but every
+  adapter acf-whip ships always emits one — and the threat model is a model shortening what it
+  echoes, which is at least as likely to drop a header it does not understand as to recompute it. On
+  `files`, `beads`, `multica` and `linear` its absence is a relay failure now.
+- **A dep token that prefixed its own task was reported as a cycle.** The resolver's prefix fallback
+  never excluded the depending stem, so `feature-231-api-v2` declaring a dependency on a
+  `feature-231-api` that no longer exists prefix-matched itself, the self-loop branch fired, and
+  `/go` refused to dispatch against a cycle that is not there. Which stem won was awk hash order, so
+  it was not even reproducible across platforms. `dangling-dep` is the truthful finding and names the
+  thing to fix; a genuine self-dependency is still a cycle.
+- **A trailing `--mode` spun forever.** `shift 2` with one argument left is an error that shifts
+  nothing, so the parse loop never advanced — and in `acfw-store` it appended two array elements per
+  turn, so it grew without bound rather than merely hanging. Every flag added this release already
+  carried the guard; only `--mode` was missed, in three files, plus all four value flags in
+  `whip-move.sh`.
+- **`acfw-store info` could emit invalid JSON.** `grep -c` prints `0` *and* exits 1, so `|| echo 0`
+  appended a second zero and an emptied focus produced `"focusCount":00` — which jq tolerates and
+  `JSON.parse` rejects, in the single object `/go` step 2 reads to decide what to run.
+- **`agentsByTier` undercounted.** Tiers were incremented in the option helpers, but `safeAgent`
+  charges up to three real agents per invocation on a retry, and every agent a child harness spends
+  went into `agentsUsed` and into no tier at all. Counted where the agent is charged now, with a
+  `child` tier and an `untiered` bucket so a dispatch through neither helper shows up as a number
+  instead of vanishing. `/task`'s two recon agents were exactly such a dispatch.
+- **`efforts.shell` had no way in.** It was documented in the `/go` skill, read by both workflows and
+  echoed in both reports, but nothing produced it: no config key, no `info` field, no skill passing
+  it. `ACFW_EFFORT_SHELL` resolves env > `.acfwhip/config` now and refuses an unrecognised value,
+  because a rejected option would fail every agent call in the run.
+- **Linear's drift loop could mis-split its own input.** Tab is IFS *whitespace*, so a run of tabs
+  collapses: an issue with no `stateId` shifted every later field left, the state type came back
+  empty, and the `native-hold` guard silently never fired — repairing a cancellation a person made.
 
 ### Compatibility
 
 Contract stays v1 and every change is additive: new capability `snapshot-only`, new
 dispatcher-implemented `snapshot --only` / `--full-to`, new snapshot fields `relay{}`, `scope{}`,
-`scopeApplied`, `scopeCounts`, `inactive[]` on `files`, `backendId` in `satisfiedDeps`. A third-party
+`scopeApplied`, `scopeCounts`, `inactive[]` on `files`, `backendId` in `satisfiedDeps`, and two new
+`acfw-store info` fields (`efforts{}` beside `models{}`, `bareGo`/`focusFile`/`focusCount`). New
+report fields `heldOut`/`heldOutEver`/`fatalsNotGating`/`gated`/`relay`/`models`/`agentsByTier`, and
+one new WARN code, `parked-task-worktree`. A third-party
 adapter that emits no `relay` header is tolerated — the consumer logs once that completeness is
 unverifiable and proceeds, because refusing would brick every such backend on upgrade. `deps[]` are
 still stems: the `backendId` resolver serves SEEDS only, never dependency tokens, which both doctors

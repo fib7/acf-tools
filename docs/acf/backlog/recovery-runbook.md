@@ -1,3 +1,4 @@
+<!-- acf-whip-artifact: content/backlog/recovery-runbook.md v3.4.0 -->
 # Recovery Runbook
 
 Operator reference for an acf-whip backlog that will not run, or a `/go` run that stopped short.
@@ -162,7 +163,30 @@ active path any time with `bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" 
 
 ## Parking a task away from automation
 
-Move it to `.backlog/draft/`. That folder is excluded from every scan and from the completion denominator — it is the human gate. Move it back to `pending/` when it is ready.
+```
+/whip-move <task> draft      # paused — the human gate
+/whip-move <task> archive    # cancelled — retired for good
+/whip-move <task> pending    # bring it back
+```
+
+Works on every backend, not just `files`. Both states are excluded from every scan and from the
+completion denominator, while staying resolvable as dependencies — so a task that depends on a paused
+one is reported as *gated, and here is why*, not as a dangling reference.
+
+**The task's worktree and branch survive.** `/whip-doctor --fix` never reaps the worktree of a parked
+or retired task — it reports `WARN|parked-task-worktree` and leaves it, because that directory is
+frequently the only copy of work that has not landed. Remove it by hand when you are sure:
+`git worktree remove .worktree/<slug>` then `git branch -D worktree/<slug>`.
+
+Two things that look like they should park a task and do not:
+
+- **Dropping it from a run focus.** A scoped run pulls in the unmet dependencies of everything in its
+  scope, so a dropped task that something else in the focus needs comes straight back — correctly,
+  since otherwise that dependent could never run. A focus is a selection, not a state.
+- **Setting a native `blocked`/`cancelled` status** on an API-backed board. Whip reads its own
+  metadata, not the native status, so the card stays runnable. The doctor reports this as
+  `WARN|native-hold` and (since 3.4.0) leaves the native status alone rather than repairing it —
+  before that, every `/go` bootstrap silently un-parked every card parked this way.
 
 ---
 

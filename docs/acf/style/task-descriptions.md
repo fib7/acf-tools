@@ -1,3 +1,4 @@
+<!-- acf-whip-artifact: content/style/task-descriptions.md v3.4.0 -->
 # Task Description Style
 
 ## For: task-engineer when creating task files in .backlog/
@@ -124,6 +125,12 @@ database:
 - [ ] Comprehensively test the pipeline flow
 - [ ] Add proper logging throughout the codebase
 - [ ] Refactor the validation logic for better maintainability
+
+### Verifiability Boundary
+
+Every acceptance criterion MUST be verifiable inside the task's worktree and quality-gate environment. Criteria that need a **live deployed environment** (a staging URL, a real cluster, production telemetry) belong in a separate operator/deploy-gated task.
+
+A reviewer who cannot verify a criterion must reject the task — so an unverifiable criterion burns the 3-rejection budget without any defect existing.
 
 ### Technical Requirements Examples
 
