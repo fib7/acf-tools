@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/handlers/setup-statusline.py"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/handlers/setup-statusline.py\""
           }
         ]
       }
