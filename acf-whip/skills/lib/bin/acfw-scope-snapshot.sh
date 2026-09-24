@@ -33,7 +33,7 @@
 # --------
 # stdin   one enriched BacklogSnapshot JSON object
 # stdout  the same object, narrowed/collapsed, with these additive keys:
-#           relay        {n, tasks, inactive, sat, bytes}   FIRST key — see "relay" below
+#           relay        {n, tasks, inactive, sat, bytes}   leads the object — see "relay" below
 #           digest       true when --digest collapsed anything
 #           scopeApplied true when --only narrowed the view
 #           scope        {seeds, resolved{tok:stem}, unresolved[], ambiguous[], inactiveSeeds[], added[]}

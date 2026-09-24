@@ -10,9 +10,9 @@ allowed-tools:
   - TodoWrite
   - Task
   - Workflow
-  - mcp__perplexity__perplexity_search_web
+  - mcp__perplexity__perplexity_search
   - mcp__context7__resolve-library-id
-  - mcp__context7__get-library-docs
+  - mcp__context7__query-docs
   - mcp__figma-dev-mode-mcp-server__get_code
 ---
 
@@ -40,8 +40,9 @@ script, not in your context.
    echo "TRUNK_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)"
    bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info
    ```
-   The `acfw-store info` line reports the active task-store backend (`store`, default `files`) —
-   pass it through in step 2.
+   The `acfw-store info` line is one JSON object; step 2 consumes three fields from it: the active
+   task-store backend (`store`, default `files`), the per-tier model routing (`models`) and the
+   shell-tier effort pin (`efforts`). Pass all three through verbatim.
 2. Launch the workflow (runs in the background; intermediate state never enters your context):
    ```
    Workflow({
@@ -63,7 +64,7 @@ script, not in your context.
        // command and copy stdout into a schema — the registry ls, both writers, the doctor.
        // `models.judge` (planners, judge, critic) and `models.author` (task documents) ship unset,
        // which inherits the session model.
-       models: <info.models>
+       models: <info.models>, efforts: <info.efforts>
      }
    })
    ```
@@ -71,7 +72,8 @@ script, not in your context.
    commit sha, and the doctor verdict. Also say that a bare `/go` will now run exactly these tasks
    (the run returns `focus{}`): `/task` points this checkout's run focus at what it just created, so
    the operator never has to name ids for the work they just planned. `/go --all` remains the way to
-   run the whole backlog. `models`/`agentsByTier` report which tier ran how many agents.
+   run the whole backlog. `models`/`agentsByTier` report which tier ran how many agents — counted
+   where an agent is charged, so a retried call shows up as the two agents it actually cost.
    If it returns `aborted: true`, surface the `defects` list and
    **STOP** — do NOT hand-write task files to route around the validation gate. If it returns
    `error`, **or the `Workflow` call is refused outright**, fall back to the legacy path below — a
@@ -151,7 +153,7 @@ This guide defines ABSOLUTE requirements for task descriptions:
 Use Perplexity for best practices, patterns, pitfalls:
 
 ```markdown
-mcp__perplexity__perplexity_search_web:
+mcp__perplexity__perplexity_search:
 - "best practices for {feature-type} implementation {tech-stack}"
 - "common pitfalls when building {feature-type}"
 - "architecture patterns for {feature-type}"
@@ -190,7 +192,7 @@ For library capabilities:
 mcp__context7__resolve-library-id:
   libraryName: "{library-name}"
 
-mcp__context7__get-library-docs:
+mcp__context7__query-docs:
   context7CompatibleLibraryID: "/org/project"
   topic: "{feature-relevant-topic}"
 ```

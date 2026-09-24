@@ -46,13 +46,24 @@ Two truths anchor the design:
 | Run lock | files: `.backlog/.acfw-run.json` · non-files: `.acfwhip/run/acfw-run.json` (gitignored) |
 
 Every adapter invocation receives the env contract: `ACFW_TRUNK_ROOT`, `ACFW_TRUNK_BRANCH`,
-`ACFW_STORE_CONFIG`, `ACFW_CONTRACT_VERSION=1`, `ACFW_PLUGIN_LIB` (bash adapters may source
-`acfw-git.sh` from it). Backend-native env (`BD_*`, `MULTICA_*`, `LINEAR_API_KEY`, …) passes
-through untouched — credentials live in the operator's shell, never in the repo.
+`ACFW_STORE_CONFIG`, `ACFW_CONTRACT_VERSION=1`, `ACFW_INTEGRATION_MODE` (the resolved
+`default`/`override` pin), `ACFW_PLUGIN_LIB` (bash adapters may source `acfw-git.sh` from it).
+Backend-native env (`BD_*`, `MULTICA_*`, `LINEAR_API_KEY`, …) passes through untouched —
+credentials live in the operator's shell, never in the repo.
 
-`acfw-store info` prints the resolved picture (`{"store","configFile","adapter","runLock",
-"contractVersion"}`) — the workflows call it once at bootstrap; it is also the first thing to
-check when a backend misbehaves.
+`acfw-store info` prints the resolved picture — the workflows call it once at bootstrap, and both
+skills branch on it, so it is also the first thing to check when a backend misbehaves:
+
+```json
+{"store","configFile","adapter","runLock","integrationMode","bareGo","focusFile","focusCount",
+ "models":{"shell","judge","author"},"efforts":{"shell"},"contractVersion"}
+```
+
+`bareGo` is what a bare `/go` does when no focus is set (`all` on `files`, `refuse` on every shared
+API-backed store); `focusFile`/`focusCount` are the per-checkout run focus; `models` and `efforts`
+are the per-tier routing a project pins once in `.acfwhip/config`. An adapter supplies none of these
+— they are resolved in the dispatcher — but a third-party adapter author reads this list to know what
+callers already have without asking the backend.
 
 **Exit codes** (uniform across dispatcher and adapters): `0` ok/idempotent no-op · `2` usage ·
 `3` not found/ambiguous · `4` conflict (duplicate key) · `5` backend unavailable · `6` auth ·
@@ -103,8 +114,9 @@ and `comment`, verbatim, oldest-first). The audit trail is load-bearing — the 
 auto-reject greps the refreshed document for the `| clean-checkout | ok |` token that
 `clean-checkout-before-task` recorded via `log-event`. An adapter that drops stored events breaks
 review on its backend. Evidence and review notes flow back through `acfw-store comment`; `/task`
-authors new tasks into `.acfwhip/staging/` and the single writer ingests them via
-`acfw-store create`.
+authors new tasks into `.acfwhip/run/staging/` and the single writer ingests them via
+`acfw-store create`. (It was `.acfwhip/staging/` before 3.4.0, which `whip-init` gitignores nowhere —
+so every `/task` run on a non-files backend left untracked scratch in the consumer's tree.)
 
 ## Shipped backends compared
 
@@ -115,7 +127,7 @@ authors new tasks into `.acfwhip/staging/` and the single writer ingests them vi
 | Task document | the file itself | issue description | issue description | issue description |
 | Audit trail | Transition Log table in-file | `bd` comments | comments | comments |
 | Dependencies | `Dependencies:` field | `whip_deps` + native edges (cycle-checked) | `whip_deps` (no dependency API) | `whip_deps` + best-effort native `blocks` relations |
-| `commitsToGit` | true (`stage`, `doctor-complete`, `snapshot-enriched`) | false | false | false |
+| `commitsToGit` | true (`stage`, `doctor-complete`, `snapshot-enriched`, `snapshot-only`) | false | false | false |
 | Prerequisites | none | cgo-enabled `bd` on PATH (see [beads/README.md](./beads/README.md) — currently needs a build from beads `main`) | `multica` CLI + `MULTICA_SERVER_URL`/`MULTICA_TOKEN`/`MULTICA_WORKSPACE_ID` | `curl`+`jq` + `LINEAR_API_KEY`/`ACFW_LINEAR_TEAM` |
 
 Details per backend: [`files/`](./files/) · [`beads/README.md`](./beads/README.md) ·

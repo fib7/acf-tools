@@ -1,7 +1,7 @@
 ---
 name: whip-focus
 description: Manage the run focus — the small, per-checkout list of tasks a bare `/go` runs. Set it to what you are working on now, add to it, drop from it, or clear it. Never committed, never shared, so two people on one board have two focuses. Use when a bare `/go` should run YOUR tasks rather than the whole backlog, or to see what it would run.
-argument-hint: "[show | set <tasks...> | add <tasks...> | drop <tasks...> | clear]"
+argument-hint: "[show [--live] | set <tasks...> | add <tasks...> | drop <tasks...> | clear | path]"
 allowed-tools:
   - Bash
   - Read
@@ -26,8 +26,12 @@ have two focuses, and neither one's `/go` becomes everyone's.
 | `/whip-focus add <tasks...>` | Add these. Replaces outright when every task already in the focus is done |
 | `/whip-focus drop <tasks...>` | Remove these from the focus (see the warning below) |
 | `/whip-focus clear` | Remove the focus. A bare `/go` then follows the store's `bareGo` policy |
+| `/whip-focus path` | Print where the focus file lives. For scripts and for "where is this thing?" |
 
-Tasks may be named by stem, id, native backend id (`MUL-4821`), or a unique stem prefix.
+Tasks may be named by stem, id, native backend id (`MUL-4821`), or a unique stem prefix — for every
+subcommand that takes tasks, `drop` included. `set` and `add` refuse the whole operation if any token
+is unknown or ambiguous; `drop` is subtractive, so it resolves what it can and reports what matched
+nothing rather than refusing.
 
 ## How to run it
 
@@ -39,7 +43,8 @@ bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-focus" <subcommand> [tasks...]
 ```
 
 With no arguments, run `show --live` — the extra store read answers the question an operator actually
-has, which is whether any of it is still worth running.
+has, which is whether any of it is still worth running. Without `jq` the live read is impossible and
+the output says `live state unavailable`; pass that on rather than implying the stems are runnable.
 
 Report the output as-is. It is already written for a person.
 
@@ -48,7 +53,7 @@ Report the output as-is. It is already written for a person.
 | Code | Meaning | What to do |
 |---|---|---|
 | 0 | Done | Report the output |
-| 2 | Usage error, or the focus belongs to a different store backend | Report it; for the store mismatch the remedy is `/whip-focus clear` |
+| 2 | Usage error; the focus belongs to a different store backend; not inside a git repo; or `.acfwhip/run/` is not gitignored and the rule could not be added | Report it. For the store mismatch the remedy is `/whip-focus clear`; for the ignore refusal, add `.acfwhip/run/` to `.gitignore` by hand — a focus is one person's state and must never be committed |
 | 3 | A task did not resolve, or a prefix was ambiguous — **nothing was written** | Show the names it printed and ask for exact ids. Do NOT retry with a guess |
 | 5 | The task store could not be read | The backend is down or misconfigured; `acfw-store info` is the place to start |
 

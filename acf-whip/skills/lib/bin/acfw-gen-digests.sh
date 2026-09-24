@@ -16,7 +16,7 @@
 # Run from the plugin root, at RELEASE time, whenever a managed artifact changes:
 #   bash skills/lib/bin/acfw-gen-digests.sh
 #
-# tests/phase18-artifact-provenance.test.mjs fails if the CURRENT content of a managed artifact is
+# tests/phase18-artifact-provenance.test.sh fails if the CURRENT content of a managed artifact is
 # missing from the manifest, which is what forces this to be re-run.
 
 set -u

@@ -12,7 +12,7 @@
 # Usage:
 #   whip-move.sh <TASK> <TO_STATE> [--reason "..."] [--integrated-at SHA] [--add-dep ID] [--agent NAME]
 #     TASK            task stem, id, or a UNIQUE prefix; resolved across all .backlog/<state>/ folders
-#     TO_STATE        pending|in-progress|completed|in-review|accepted|rejected|blocked
+#     TO_STATE        pending|in-progress|completed|in-review|accepted|rejected|blocked|draft|archive
 #                     (use the task's CURRENT state to apply field edits without moving)
 #     --reason TEXT   transition-log note (default: "manual operator move")
 #     --integrated-at SHA   set "- **Integrated-At**: SHA" on the task (typical with TO_STATE=accepted)
@@ -68,6 +68,7 @@ TO_STATE="${POS[1]:-}"
 
 if [ -z "$TASK" ] || [ -z "$TO_STATE" ]; then
   echo "FATAL: usage: whip-move.sh <TASK> <TO_STATE> [--reason ..] [--integrated-at SHA] [--add-dep ID] [--agent NAME]" >&2
+  echo "       TO_STATE is one of: $VALID_STATES   (draft pauses, archive cancels)" >&2
   exit 2
 fi
 case " $VALID_STATES " in *" $TO_STATE "*) : ;; *) echo "FATAL: invalid TO_STATE '$TO_STATE' (one of: $VALID_STATES)" >&2; exit 2 ;; esac

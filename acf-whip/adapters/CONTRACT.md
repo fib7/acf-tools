@@ -32,8 +32,18 @@ acfw-store-<backend> <subcommand> [args...]
 
 `snapshot --only <key>` (repeatable) narrows the emitted view to the **closure** of the named tasks —
 the seeds plus every dependency that is not accepted-terminal — so a five-task run relays five records
-instead of the whole board. `snapshot --full-to FILE` tees the pre-narrowing snapshot to a file.
-Both are implemented once, in the dispatcher, over the final enriched JSON.
+instead of the whole board. `snapshot --full-to FILE` tees the pre-narrowing snapshot to a file, so
+the scheduler and the doctor can read ONE store walk instead of two (on a live shared board, two
+walks can straddle someone else's transition). Both are implemented once, in the dispatcher, over the
+final enriched JSON.
+
+`--full-to` is only meaningful for an adapter **without** `doctor-complete`, because the file exists
+to feed the generic battery. An adapter that owns its whole doctor never reads it: `files` declares
+both `doctor-complete` and `snapshot-enriched`, so `acfw-store doctor` execs the adapter, which walks
+the store itself and takes no snapshot. On a `snapshot-enriched` adapter the tee happens only when
+the call did not narrow — there is no pre-narrowing form left to write once the adapter has applied
+`--digest`/`--only` itself, and writing a narrowed file would silently hand the battery a partial
+graph. `doctor --snapshot FILE` refuses a narrowed or digest snapshot for the same reason.
 
 `--only` reaches an adapter **only** when it declares `snapshot-only`. A raw adapter must keep listing
 everything: the closure walk and the store-wide `counts` are computed from the full set, and narrowing
@@ -113,7 +123,8 @@ Adapters **without** `snapshot-enriched` emit `"raw":true` and omit git-derived 
 
 #### `relay{}` — proving the payload arrived whole
 
-Every snapshot the dispatcher emits carries a `relay` header as its **first** key:
+Every snapshot the dispatcher emits leads with a `relay` header — after the two keys the dispatcher
+injects (`store`, `tokenAllStates`), and always before `tasks[]`:
 
 ```json
 {"relay":{"n":12,"tasks":9,"inactive":1,"sat":2,"bytes":214}, ...}
@@ -126,8 +137,14 @@ This exists because the snapshot is produced by a script but **delivered by an a
 shell-runner reads the store walk's stdout and copies it into one schema string. That echo can come
 back short — valid JSON, fewer tasks — and a shortened board is indistinguishable from a small one.
 The consumer recomputes both numbers and refuses a mismatch. A count alone is forgeable by a model
-that tidies a header it can see; the byte sum is a second, content-derived number. First-key placement
-means a tail-elided echo still carries the expectation it fails.
+that tidies a header it can see; the byte sum is a second, content-derived number. Placing it ahead of
+`tasks[]` means a tail-elided echo still carries the expectation it fails.
+
+Every adapter acf-whip ships emits this header, so the orchestrator treats its **absence** on
+`files`, `beads`, `multica` or `linear` as a relay failure too: a model that drops entries is at
+least as likely to drop a header it does not understand as to recompute one. It stays SHOULD for a
+third-party `snapshot-enriched` adapter, where the consumer says once that completeness cannot be
+verified and proceeds — refusing there would brick every such backend on upgrade.
 
 It proves no entry was dropped, added, or replaced by one of a different stem length. It does **not**
 prove stem identity — an equal-length substitution passes — which is deliberate: a length sum is the
@@ -184,7 +201,7 @@ Output: `ok:`/`noop:`/`warn:` lines (echoed verbatim into run reports).
 | `update-body <key>` | Replace the task document/description from stdin. Refuse empty input. |
 | `log-event <key> --row "\| ... \|"` | Append one machine-greppable event row (the `clean-checkout \| ok` token). Must surface in later `snapshot.hasCleanCheckoutToken` — **in every task state, not only the review ones**. The field is a flat per-task boolean with no state qualifier: `false` means "this task has no token", and a consumer cannot tell a real absence from a state the adapter declined to scan. Two consumers depend on it: the review gate auto-rejects on `false`, and the generic doctor WARNs on an accepted task without one. Where an answer costs a request, bound the PAID set to the states where a wrong answer costs something now (`in-progress`, `completed`, `in-review`) rather than narrowing the field itself — never buy `accepted` coverage with an N+1 over a monotonically growing backlog. |
 | `comment <key> [--author A]` | Free-form evidence/review note from stdin. |
-| `doctor [--fix] [--quiet] [--active-only]` | Store-native integrity findings: `SEV\|code\|task\|detail` lines + `SUMMARY\|fatal=N\|repairable=N\|warn=N\|ok=bool`. Exit 0 iff no FATAL. **Field 3 is a routing decision, not a label** (3.4.0): a task-scoped finding MUST carry the exact whip key, and a store- or repo-scoped one MUST carry `-` or `(repo)`. `/go` classifies on it — a repo-scoped FATAL aborts the run, a task-scoped one holds out only that task, and a key matching nothing in the snapshot is reported but gates nothing. Matching is EXACT: a prefix or a slug in field 3 would attach the finding to the wrong task, which is the one way per-task quarantine is less safe than aborting. **Never repair a human hold**: if the native status expresses a deliberate pause or cancellation while the whip state is runnable, report it (`WARN\|native-hold\|<key>\|...`, naming `transition <key> draft`) and leave it — `/go` runs `--fix` at bootstrap, so repairing it un-parks every card the team parked, on every run. **`--quiet` suppresses the ADVISORY dump (WARN/REPAIRABLE), never the gate decision: every `FATAL\|` line MUST still be printed.** Without `doctor-complete` the dispatcher recomputes `ok=` from the lines it receives, so an adapter that swallows its FATALs under `--quiet` reports a clean board to `/go`'s startup gate while the verbose operator path shows the same FATAL — two tools disagreeing about one backlog. **Exit status is load-bearing**: `0` = ran, clean; `1` = ran, found FATALs (already emitted as lines); anything else = the battery COULD NOT RUN, and the dispatcher turns that into `FATAL\|doctor-unavailable` rather than silence, because absence of findings is not health. `doctor-complete` = covers the full battery (files); without it the dispatcher merges in the generic graph/git checks. |
+| `doctor [--fix] [--quiet] [--active-only]` | Store-native integrity findings: `SEV\|code\|task\|detail` lines + `SUMMARY\|fatal=N\|repairable=N\|warn=N\|ok=bool`. Exit 0 iff no FATAL. **Field 3 is a routing decision, not a label** (3.4.0): a task-scoped finding MUST carry the exact whip key, and a store- or repo-scoped one MUST carry `-` or `(repo)`. `/go` classifies on it — a repo-scoped FATAL aborts the run, a task-scoped one holds out only that task, and a key matching nothing in the snapshot is reported but gates nothing. Matching is EXACT: a prefix or a slug in field 3 would attach the finding to the wrong task, which is the one way per-task quarantine is less safe than aborting. **Never repair a human hold**: if the native status expresses a deliberate pause or cancellation while the whip state is runnable, report it (`WARN\|native-hold\|<key>\|...`, naming `transition <key> draft`) and leave it — `/go` runs `--fix` at bootstrap, so repairing it un-parks every card the team parked, on every run. Prefer a native field whip NEVER writes as the signal (Linear keys on the state TYPE `canceled`, which only `archive` maps to); where the native value is one whip projects onto itself — multica's `blocked` — a stale write and a human hold are indistinguishable, so say so in the detail and name the re-sync command rather than pretending the finding is certain. **`--quiet` suppresses the ADVISORY dump (WARN/REPAIRABLE), never the gate decision: every `FATAL\|` line MUST still be printed.** Without `doctor-complete` the dispatcher recomputes `ok=` from the lines it receives, so an adapter that swallows its FATALs under `--quiet` reports a clean board to `/go`'s startup gate while the verbose operator path shows the same FATAL — two tools disagreeing about one backlog. **Exit status is load-bearing**: `0` = ran, clean; `1` = ran, found FATALs (already emitted as lines); anything else = the battery COULD NOT RUN, and the dispatcher turns that into `FATAL\|doctor-unavailable` rather than silence, because absence of findings is not health. `doctor-complete` = covers the full battery (files); without it the dispatcher merges in the generic graph/git checks. |
 | `sync` | Durability flush (beads: `bd export` JSONL — bd's own `export.auto` defaults to false, so this is the only thing that refreshes the mirror). Best-effort; dispatcher never fails on it. |
 
 ## Conformance

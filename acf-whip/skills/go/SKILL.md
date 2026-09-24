@@ -85,8 +85,9 @@ Three properties worth knowing:
   and never integrated — including by the post-loop drain. This is what makes `/go` safe to run
   against a backlog shared with other people.
 - **Completion is measured over your scope**, not the whole backlog, so a scoped run ends when
-  *your* tasks are done. A stem that does not exist aborts the run instead of quietly running less
-  than you asked for.
+  *your* tasks are done. A stem the store cannot resolve at all aborts the run instead of quietly
+  running less than you asked for; one that vanishes mid-run (someone else retired it) is held out
+  and named, because by then the rest of the scope is already in flight.
 
 The `RunReport` echoes `scopeFilter` (your words), `scopedTo` (what you asked for) and
 `scopeResolved` (what actually ran, including pulled-in dependencies).
@@ -123,12 +124,7 @@ legacy loop has). Prefer it.
 
 **If the `Workflow` tool is available to you** (dynamic workflows enabled, Claude Code ≥ 2.1.154):
 
-1. Decide the integration mode. First check the machine pin: step 2's `acfw-store info` output
-   carries `integrationMode` — if it is non-empty, use it **verbatim** as `args.mode`, no further
-   reasoning. Only when it is empty, decide by reading the project's `CLAUDE.md`/`AGENTS.md`
-   (already in your context): `override` if they direct PR-per-group / non-local-merge
-   integration, otherwise `default` (auto-merge into local trunk).
-2. Resolve the environment with one bash call. **Refuse on detached HEAD** (empty branch):
+1. Resolve the environment with one bash call. **Refuse on detached HEAD** (empty branch):
    ```bash
    echo "PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT"
    echo "TRUNK_ROOT=$(git rev-parse --show-toplevel)"
@@ -136,15 +132,24 @@ legacy loop has). Prefer it.
    bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info
    ```
    If `TRUNK_BRANCH` is empty, STOP — `/go` requires a branch checked out at the repo root.
-   The `acfw-store info` line is one JSON object carrying everything the next two steps need:
-   the active **task-store backend** (`store`, default `files`), its adapter, the run-lock path
-   (`runLock`), the **integration pin** (`integrationMode`), the **run focus** (`focusFile`,
-   `focusCount`) and the bare-`/go` policy (`bareGo`) that step 3 branches on, and the per-tier
-   **model routing** (`models`) that step 4 passes through. Read it once here; do not re-run it.
+   The `acfw-store info` line is one JSON object carrying everything the rest of this procedure
+   needs: the active **task-store backend** (`store`, default `files`), its adapter, the run-lock path
+   (`runLock`), the **integration pin** (`integrationMode`) that step 2 reads, the **run focus**
+   (`focusFile`, `focusCount`) and the bare-`/go` policy (`bareGo`) that step 3 branches on, and the
+   per-tier **model routing** (`models`) and **effort pin** (`efforts`) that step 4 passes through.
+   Read it once here; do not re-run it.
+2. Decide the integration mode from the pin you just read: if `integrationMode` is non-empty, use it
+   **verbatim** as `args.mode`, no further reasoning. Only when it is empty, decide by reading the
+   project's `CLAUDE.md`/`AGENTS.md` (already in your context): `override` if they direct
+   PR-per-group / non-local-merge integration, otherwise `default` (auto-merge into local trunk).
 3. **Resolve the run scope** from whatever the user typed after `/go`. Four branches, in this order:
 
    **(0) `--all`** — omit `only` entirely. The whole backlog, explicitly. This always bypasses the
    focus and the `bareGo` policy; it is how you say "yes, everything" on a shared board.
+
+   `--all` takes no other arguments. `/go --all api-014-token` reads like a narrowing and would run
+   the entire board, which on a shared store is exactly what the `bareGo` policy exists to prevent —
+   so **stop and ask which they meant** (`/go --all`, or `/go api-014-token`) rather than picking one.
 
    **(a) No arguments** — the FOCUS branch. Step 2's `acfw-store info` already told you
    `focusCount`, `focusFile` and `bareGo`.
@@ -153,6 +158,14 @@ legacy loop has). Prefer it.
      ```bash
      bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-focus" show --live
      ```
+     Two answers are not a list of tasks, and both need handling before you read one:
+     - **exit 2 with a store mismatch** — the focus was written against a different backend.
+       `focusCount` is a raw line count and does not read that header, so this is reachable with
+       `focusCount > 0`. Report it and stop; the remedy it prints (`/whip-focus clear`) is the answer.
+     - **`live state unavailable (jq not installed)`** — the stems are the stored selection, not a
+       report of what is still runnable. You cannot answer the "is it still worth running" question
+       here, so say that plainly, show the list, and let the operator decide.
+
      If every task is already terminal, **do not launch**. Say so and give the three ways forward:
      `/whip-focus clear`, `/task <scope>` to create new work, or `/go --all`. Otherwise show the
      list with each task's live state and the `set by … at …` line, take **one confirmation**, and
@@ -169,9 +182,13 @@ legacy loop has). Prefer it.
      drains the whole thing is one person deciding for everyone, which is the failure this branch
      exists to prevent.
 
-   **(b) The arguments are task ids or stems** (they match the backlog's id/stem shape, e.g.
-   `api-014-token-refresh`, `add-login-form`) — pass them straight through as `only: ["api-014-token-refresh", ...]`.
-   No confirmation: the user named exact tasks.
+   **(b) The arguments name tasks** — a stem (`api-014-token-refresh`), an id (`API-14`), a **native
+   backend id** (`MUL-4821`, a Linear URL), or a unique stem prefix. Pass them straight through as
+   `only: ["api-014-token-refresh", ...]`. No confirmation: the user named exact tasks, and the store
+   resolves each token itself (exact id → exact stem → exact backend id → unique prefix), reporting an
+   ambiguous prefix with its candidates instead of guessing. Do **not** send a native id to branch (c)
+   because it does not look like a stem — there is no title or body in the snapshot to match it
+   against, so the filter branch would fail on a token the store resolves perfectly.
 
    **(c) Anything else is a filter predicate** — "frontend tasks only", "bugfixes",
    "high priority backend", "the auth work". Resolve it to a concrete list *here*, before launching:
@@ -216,8 +233,8 @@ legacy loop has). Prefer it.
              only: ["<stem-or-id>", ...], scopeFilter: "<the user's words, verbatim>",
              scopeSource: "focus" | "args",
              // step 2's `acfw-store info` resolved these from env > .acfwhip/config > defaults.
-             // Pass the object through verbatim; omit it only if `info` predates 3.4.0.
-             models: <info.models> }
+             // Pass both objects through verbatim; omit them only if `info` predates 3.4.0.
+             models: <info.models>, efforts: <info.efforts> }
    })
    ```
 
@@ -261,9 +278,17 @@ legacy loop has). Prefer it.
    | *(per agent)* | *(their frontmatter)* | Specialists and reviewers run on the `model:` declared in `.claude/agents/<name>.md`, when it declares one. |
    | *(fixed)* | *(session)* | The workflow architect and the conflict resolver. Not knobs. |
 
-   `efforts.shell` pins reasoning effort for the shell tier. It ships unset deliberately — Haiku is
-   absent from the documented effort-support table — and the run report echoes every tier, so you can
-   measure a change rather than assume it. The report's `agentsByTier` says what each tier spent.
+   `efforts.shell` pins reasoning effort for the shell tier (`ACFW_EFFORT_SHELL`, env >
+   `.acfwhip/config`, reported by `acfw-store info` as `efforts.shell`). It ships **unset**
+   deliberately — the shell tier's model is absent from the documented effort-support table, and the
+   effect of a low setting on verbatim-copy fidelity is undocumented — so it is an opt-in a team can
+   measure safely, now that a short relay is detected rather than believed. An unrecognised value is
+   refused (`acfw-store` exits 2) rather than passed through, because a rejected option would fail
+   every agent call in the run.
+
+   The report's `agentsByTier` counts agents where they are **charged**, so a retried call and every
+   agent a child harness spends are both in it (`child` is its own tier; `untiered` is a bucket that
+   exists so a dispatch through neither helper shows up as a number instead of vanishing).
 
    **Run-scope args (3.2.3).** Both come from step 3 and are omitted together on a full-backlog run:
 
@@ -272,13 +297,23 @@ legacy loop has). Prefer it.
    | `scopeSource` | `"args"` when `only` is set | `"focus"` marks a bare-`/go` run of the saved focus. It changes one decision: a paused or retired member of a FOCUS is skipped and reported, while one named EXPLICITLY aborts the run — you asked for a task that cannot run. |
    | `only` | *(none)* | Task stems/ids to run **instead of** the whole backlog. The orchestrator plans, transitions, integrates and counts completion over just these, plus any **unmet dependencies**, which it pulls in and names in the log. An id that does not exist aborts the run rather than silently running a smaller set. |
    | `scopeFilter` | `""` | The operator's raw words, recorded in the `RunReport` — for a natural-language filter this is the only record of what was actually asked for, since `only` holds the resolved stems. |
-   The per-iteration scan runs `acfw-store snapshot --digest` (a small scheduling snapshot — counts +
-   actionable tasks + a compact `satisfiedDeps` list, with terminal-accepted tasks collapsed) and
-   `whip-doctor --active-only` (full integrity over active folders; accepted fed as cheap stubs), so a
-   lived-in backlog scans in seconds instead of tens of seconds. The deterministic shell-runner agents
-   (scan, the single writer, integrate, bootstrap, drain) run on a fast model; pass an optional
-   `shellModel` arg to override it (e.g. pin to the session model for rollback). Specialists, reviewers,
-   and conflict-resolvers always run on the session model.
+   The per-iteration scan runs
+
+   ```
+   acfw-store snapshot --digest --mode <mode> [--only <stem>...] --full-to <run-dir>/snap-full.json
+   acfw-store doctor --quiet --active-only [--snapshot <that file>]
+   ```
+
+   — a small scheduling snapshot (counts + actionable tasks + a compact `satisfiedDeps` list, with
+   terminal-accepted tasks collapsed, narrowed to the scope when there is one) and full integrity over
+   the active folders, with accepted fed as cheap stubs. So a lived-in backlog scans in seconds
+   instead of tens of seconds. Both go through the dispatcher (`acfw-store`), never the battery by
+   path — that is what makes them work on every backend.
+
+   Which model runs what is the **Model routing** table above, not this paragraph: the shell tier
+   covers every agent that runs a fixed command and copies stdout into a schema, specialists and
+   reviewers take the `model:` their own agent file declares, and only the architect and the conflict
+   resolver are pinned to the session model.
 5. When it completes, report the returned `RunReport` (completed?, iterations, finalCounts,
    integrated[], stopReason). If it returns `aborted: true`, surface `reason` + `fatals` and STOP.
    On a scoped run also report `scopeResolved`, so the operator sees which tasks actually ran and
@@ -286,11 +321,15 @@ legacy loop has). Prefer it.
    store (`.backlog/` on the default files backend) are the only durable state.
 
    **Three fields change what you should say, and none of them is `completed` alone:**
-   - **`heldOut[]`** — tasks the run REFUSED to touch: `quarantined` (a task-level integrity FATAL),
-     `paused` (an inactive member of a focus), or `vanished` (someone retired it mid-run). Name them.
-     A run with anything held out inside its scope reports `stopReason: 'partial'` and
-     `completed: false` — it finished everything it was *allowed* to touch, which is not the same as
-     finishing the backlog, and the difference is exactly what an operator must not have to infer.
+   - **`heldOut[]`** — tasks the run REFUSED to touch, and still refuses at the end:
+     `quarantined` (a task-level integrity FATAL), `paused` (an inactive member of a focus), or
+     `vanished` (someone retired it mid-run). Name them. A run with anything held out inside its
+     scope reports `stopReason: 'partial'` and `completed: false` — it finished everything it was
+     *allowed* to touch, which is not the same as finishing the backlog, and the difference is
+     exactly what an operator must not have to infer.
+     **`heldOutEver[]`** is the same list plus the entries whose hold was LIFTED mid-run (`lifted:
+     true`) — an operator fixed the card and it went on to run. Those do not make a run `partial`
+     and are not in `heldOut`; mention them only if asked, but never claim a lifted task never ran.
    - **`fatalsNotGating[]`** — integrity findings that name nothing this run could act on. Mention
      the count and point at `/whip-doctor`; do **not** treat them as failures. A single malformed
      card no longer stops runs that never touch it.
@@ -298,6 +337,10 @@ legacy loop has). Prefer it.
      board was read correctly but the snapshot could not be relayed intact through the scan agent:
      nothing was mis-scheduled and nothing is lost. Tell the operator to narrow the run (`/go <ids>`,
      or set a focus) or raise `models.shell`. Never report it as missing task ids.
+     Every backend acf-whip ships stamps this header, so on `files`, `beads`, `multica` and `linear`
+     a snapshot arriving *without* one is also `relay-truncated` — a model that drops entries is at
+     least as likely to drop a header it does not understand. Only a third-party adapter is allowed
+     to omit it, and there the run says once that completeness could not be verified and proceeds.
 
    `stopReason: 'scope-unresolved'` still means an id in `only` matched no task — but only when the
    store itself could not resolve it. A resolved id absent from the relayed snapshot is reported as a
@@ -314,7 +357,7 @@ legacy loop has). Prefer it.
    - `escalation.authored === 0` with `escalation.fellBack > 0` means no harness was ever authored —
      check that `skills/lib/bin/acfw-child-*` are executable and `.claude/agents/` is populated.
    - `escalation.stagesReplayed` is work a re-run did **not** have to redo.
-5. Do **not** also run the legacy loop below — the workflow replaces it.
+6. Do **not** also run the legacy loop below — the workflow replaces it.
 
 **Only if the `Workflow` tool is NOT available** (dynamic workflows disabled, or older Claude Code):
 run the legacy single-context loop below. It enforces the same slug rules, but the loop lives in your

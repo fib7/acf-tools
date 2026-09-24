@@ -47,13 +47,15 @@ Exit 0 when `ok=true` (no FATAL), exit 1 otherwise.
     (`doctor-unavailable`, `snapshot-unavailable`), a backend that is unreadable. These abort
     a run exactly as they always did.
   - **Task-scoped** — one card is malformed: dangling or cyclic dependencies, an
-    `Assigned Agent` with no agent file, a code-mutating task with no `Worktree:` slug,
-    unparseable frontmatter, a task file collapsed to bare Transition Log rows by a concurrent
-    write, control bytes, a duplicate whip key, the same task in two folders with no readable
-    survivor. `/go` HOLDS OUT that task — never dispatched, never transitioned, never
-    integrated, and still gating its dependents — and runs the rest of the board. It reports
-    `partial`, not `complete`. Before 3.4.0 one long-cancelled card could block every run for
-    a whole team, including runs that never touched it.
+    `Assigned Agent` with no agent file, unparseable frontmatter, a task file collapsed to
+    bare Transition Log rows by a concurrent write, control bytes, two tasks deriving the same
+    worktree slug, a duplicate whip key, the same task in two folders with no readable
+    survivor, a code-mutating task with **no `Worktree:` slug and no id to derive one from**
+    (with an id it is REPAIRABLE — see below), plus the adapter FATALs `missing-metadata`
+    (linear) and `id-bijection` (beads). `/go` HOLDS OUT that task — never dispatched, never
+    transitioned, never integrated, and still gating its dependents — and runs the rest of the
+    board. It reports `partial`, not `complete`. Before 3.4.0 one long-cancelled card could
+    block every run for a whole team, including runs that never touched it.
 
   A finding whose task field names nothing in the snapshot gates nothing at all: it is
   reported (`fatalsNotGating`) and acted on by no one. Two FATALs are deliberately **not**
@@ -63,11 +65,20 @@ Exit 0 when `ok=true` (no FATAL), exit 1 otherwise.
   of the folders it is in, no copy can be chosen as the survivor, so `--fix` refuses and
   leaves every copy intact rather than guessing.
 - **REPAIRABLE** — safe to auto-fix with `--fix`, then re-scan to confirm: status-vs-folder
-  mismatch (synced), `Rejection Count` or `Block-Count` out of range (clamped), bracketed
-  dependency tokens (unwrapped), the same task present in two folders (kept the one matching
-  its `Status`), an orphaned `.worktree/<slug>` with no live task (removed — but an accepted
-  task whose change has NOT landed still counts as live, so its worktree survives; it is
-  often the only copy of the deliverable).
+  mismatch (synced), a missing `Worktree:` slug that can be **derived from the task id**
+  (written, with a collision check — this is the common case, so do not hand-edit a slug the
+  doctor would derive better), `Rejection Count` or `Block-Count` out of range (clamped),
+  bracketed dependency tokens (unwrapped), the same task present in two folders (kept the one
+  matching its `Status`), an orphaned `.worktree/<slug>` with no live task (removed — but an
+  accepted task whose change has NOT landed still counts as live, so its worktree survives; it
+  is often the only copy of the deliverable).
+
+  **This class is `files`-only.** On every other backend the graph and git half of the report
+  comes from the generic battery, which never mutates anything: out-of-range counters and
+  orphaned worktrees are reported as WARN there and are not repaired. What `--fix` does repair
+  on those backends is whatever the adapter itself repairs — `status-drift`, `bad-rejections`,
+  `bad-blocks`. Reaping stays with `files` deliberately: on an API-backed store the worktree is
+  frequently the only copy of an unintegrated deliverable.
 
 **Ownership scope (worktree checks).** The doctor manages **only** worktrees on the
 namespace it owns — `<ACFW_BRANCH_PREFIX>/<slug>` (default `worktree/<slug>`), configurable in
@@ -86,7 +97,18 @@ orphan reaper apply only to worktrees in acf-whip's branch namespace.
   its whip state still reads runnable. That last one is reported and never repaired —
   `/go` runs `--fix` at bootstrap, so repairing it would un-park every card the team parked,
   on every run. Park a task where the scheduler understands it instead:
-  `/whip-move <task> draft`.
+  `/whip-move <task> draft`. On multica that finding cannot tell a human hold from a stale
+  write — whip projects its own `blocked` state onto the native `blocked` status — so it names
+  the re-sync command for the stale case and repairs neither; Linear keys on the state *type*
+  and has no such ambiguity.
+
+  Also WARN, and worth knowing because they name something real: `parked-task-worktree` (the
+  worktree of a task you paused or retired — never reaped, so nothing you parked is destroyed,
+  and you remove it by hand when you are sure), `orphaned-worktree-dirty` (no live task but
+  uncommitted changes — never auto-removed), `duplicate-derived-slug` where one copy is
+  accepted, `dup-folder-untracked`, `dirty-trunk-root` (tracked files modified at the root
+  outside the task store — a specialist may have escaped its worktree), `trunk-unpushed`, and
+  `accepted-branchless-unverified`.
 
 ## How to respond
 
@@ -103,4 +125,4 @@ backlog-writer applies, preserving the single-writer invariant.
 
 ---
 
-**Last Updated**: 2026-05-28
+**Last Updated**: 2026-09-24

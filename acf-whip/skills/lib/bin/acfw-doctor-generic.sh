@@ -5,15 +5,20 @@
 #
 # For non-files backends the store-native invariants (status drift, metadata integrity)
 # live in the adapter's own `doctor`; everything a snapshot can prove lives HERE, with
-# the same finding codes and severities as doctor.sh so operators read one vocabulary:
+# the same finding CODES as doctor.sh so operators read one vocabulary. The severities
+# are NOT always identical, and the difference is deliberate: this script never mutates,
+# so anything doctor.sh calls REPAIRABLE because `--fix` repairs it is reported as WARN
+# here. `skills/whip-doctor/SKILL.md` states that split per backend.
 #   graph    : duplicate-id (WARN), dangling-dep, cyclic-deps,
 #              cross-slug-dep-not-integrated (FATAL), cross-slug-glob-overlap (WARN)
 #   per task : unknown-agent, rejection/block-count-out-of-range (WARN — report-only
 #              here; fixes are the adapter's), missing-clean-checkout-token,
 #              lingering-in-review, stale-in-progress, accepted-branchless-unverified
 #   git side : detached-head, dirty-trunk-root, trunk-unpushed,
-#              worktree-wrong-branch (FATAL), orphaned-worktree (report-only: this
-#              script NEVER mutates — reaping stays with doctor.sh/--fix on files)
+#              worktree-wrong-branch (FATAL), orphaned-worktree / orphaned-worktree-dirty
+#              / parked-task-worktree (report-only: this script NEVER mutates — reaping
+#              stays with doctor.sh/--fix on files, and a PARKED task's worktree is never
+#              reaped by either battery)
 # Emits SEV|code|task|detail lines + SUMMARY|; exit 0 iff no FATAL. The dispatcher
 # merges these lines with the adapter's own findings and recomputes the summary.
 #
