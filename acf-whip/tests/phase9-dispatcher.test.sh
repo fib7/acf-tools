@@ -198,7 +198,12 @@ check "healthy adapter doctor: ok=true, exit 0" "[ \$D_OK_RC -eq 0 ] && printf '
 
 # Contract exit 1 = 'ran, found FATALs'. Those are real findings, not a could-not-run.
 export STUB_DOCTOR='FATAL|some-real-defect|t1|a genuine finding'
-STUB_DOCTOR_RC=1 D_F=$(bash "$STORE" doctor 2>/dev/null) || true
+# The env var goes INSIDE the substitution. `STUB_DOCTOR_RC=1 D_F=$(...)` is two assignments in one
+# command, not a prefixed command: the stub never sees STUB_DOCTOR_RC, exits 0, and this asserted
+# "exit 0 with FATAL lines is not doctor-unavailable" - which was never the contract branch at issue.
+# The exit-1 arm went untested, so a regression merging the contract's 1 (ran, found FATALs) into the
+# could-not-run class would ship green and abort every /go on a board that has a real FATAL.
+D_F=$(STUB_DOCTOR_RC=1 bash "$STORE" doctor 2>/dev/null) || true
 check "adapter exit 1 (FATAL findings) is NOT reported as doctor-unavailable" "! printf '%s' \"\$D_F\" | grep -q 'doctor-unavailable'"
 
 # Contract exit 5 = backend unavailable. The battery did not run.

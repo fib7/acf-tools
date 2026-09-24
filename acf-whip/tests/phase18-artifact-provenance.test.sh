@@ -49,6 +49,18 @@ check "running again changes nothing" "[ \"\$(shasum -a 256 < \"$P1/$DEST_REL\")
 # Without a pristine-content manifest this branch is unreachable and the whole mechanism ships inert.
 P2="$WORK/legacy"; mkdir -p "$P2/$(dirname "$DEST_REL")"
 OLDC=$(git -C "$ACF_WHIP" log --format=%H -- content/backlog/workflow.md | sed -n '3p')
+# A shallow clone, a tarball, or any history with fewer than three commits touching this file leaves
+# OLDC empty - and `git show ":./path"` then prints the INDEX copy, so the fixture silently becomes
+# the current content and the two assertions below fail pointing at the SessionStart hook instead of
+# at the missing history. Say what is actually wrong.
+if [ -z "$OLDC" ]; then
+  echo "  SKIP: truncated history - no third commit touches content/backlog/workflow.md, so the"
+  echo "        retroactive fixture cannot be built. Run this suite from a full clone."
+  echo
+  echo "phase18-artifact-provenance: $PASS passed, $FAIL failed"
+  [ "$FAIL" -eq 0 ] || exit 1
+  exit 0
+fi
 git -C "$ACF_WHIP" show "$OLDC:./content/backlog/workflow.md" > "$P2/$DEST_REL"
 check "fixture is genuinely an older version (differs from current)" \
   "! diff -q \"$P2/$DEST_REL\" \"$SRC\" >/dev/null"
