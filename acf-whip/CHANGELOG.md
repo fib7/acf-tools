@@ -2,6 +2,78 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.4.1 — what an external review found in 3.4.0
+
+An automated reviewer read the whole 3.2.3→3.4.0 range on a downstream sync and raised 35 findings.
+Nineteen survived being checked against the code and then adversarially refuted; nine that looked
+real did not survive, which is why every one below is stated with its trigger rather than its claim.
+
+### A resolved conflict could silently drop trunk commits
+
+LP-CAS reads `OBSERVED` from the live trunk tip at the top of every invocation. In `--post-resolver`
+mode the integration worktree is still detached at the tip the FIRST process saw — `cherry-pick
+--no-commit` does not move `HEAD`, and neither does `--quit` — so the candidate was parented on the
+OLD tip while `land()` compare-and-swapped against the NEW one.
+
+Those are different refs and the CAS **succeeded anyway**: `update-ref`'s three-argument form checks
+only that trunk still equals the value handed to it, never that the new commit descends from it.
+Trunk was force-moved to a commit whose ancestry skips everything committed while the resolver agent
+worked — other tasks' integrations, their ledger markers, and on the `files` store every `.backlog`
+transition, since `apply-transition.sh` commits to trunk on a different serialization chain than
+integrate and both run inside one dispatch wave. `land()`'s own resync then deleted those files from
+the working tree as "changed paths". Recoverable only from the reflog, with nothing said about it.
+
+The resolver window is an LLM agent run, so trunk moving inside it is ordinary. The base is taken
+from the integration worktree now, so a moved trunk fails the CAS and exits `11 cas-lost`, which the
+caller already retries. Initial mode was never affected. Post-resolver had exactly one test before
+this and it never moved trunk.
+
+### A failed write reported success
+
+`apply-transition.sh` printed `ok:` unconditionally, so a failed `git add` or `git commit` at the
+trunk root was relayed to the orchestrator as an applied transition — and the task file had already
+been moved on disk, so `/go` read the move and believed the state change was durable. A whole run's
+board progress could exist only as uncommitted working-tree state, which the next clean-checkout or
+resync discards. Anything that makes `git commit` fail does this: `commit.gpgsign` with no usable
+key, a husky/lint-staged or `core.hooksPath` pre-commit hook, unset user identity, an `index.lock`
+held past the backoff. Both statuses propagate now, which finally makes the documented exit 99
+reachable rather than decorative.
+
+### Adjacent defects
+
+- **`clean-checkout.sh`'s exit 99 was unreachable.** `if ! cmd; then rc=$?` captures the status of
+  the negation, always 1, so every worktree-add failure was reported as "another agent owns this
+  branch" — a different diagnosis with a different remedy (defer and take another task, versus
+  retry this one next iteration).
+- **The hydrator wrote to clean-checkout's stdout**, which is contractually the absolute worktree
+  path and nothing else. On any project with a `.worktreeinclude`, the first checkout of every slug
+  emitted three lines where one was promised: `WT=$(clean-checkout.sh …)` broke outright, and the
+  agent paths asked the cheapest model in the system to guess which line was the path.
+- **`--integrated-at` was advertised on stores that cannot take it.** No adapter maps the field —
+  the in-tree ledger is the oracle on every backend — so multica and linear exited 2 and beads
+  stored nothing. It ran BEFORE the transition, so an operator following the doctor's own printed
+  ack lost the state change too: the task they believed closed out was still in review. Refused up
+  front now, and the three places that advertised it say `files` only.
+- **`price_map: False` still hit the network** (acf-mission-control 1.3.3): the setting suppressed
+  the pricing but not the detached rate-table fetch it exists to prevent.
+- **Two tests were false greens.** `STUB_DOCTOR_RC=1 D_F=$(…)` is two assignments, not a prefixed
+  command, so the stub never saw the variable and the contract's exit-1 arm went untested — a
+  regression folding "ran, found FATALs" into the could-not-run class would have shipped green and
+  aborted every `/go` on any board with a real FATAL. And the artifact-provenance fixture silently
+  became current content on a truncated history, failing while pointing at the wrong subsystem.
+- **The pre-push attribution gate had the wrong range and could skip silently.** It inspected
+  `<old tip>..<new tip>` on an existing branch, so merging any external history dragged in commits
+  already published on that same remote; and `for c in $(git rev-list …)` inspects nothing when
+  rev-list fails, letting a push through unchecked. Both fixed, with `.githooks/pre-push.test.sh`
+  pinning all five properties — the hook survives cherry-pick, rebase replay and `--no-verify`, and
+  had no tests at all.
+- **Documentation that was false about shipped code**: the recovery runbook still described the
+  board-wide FATAL gate 3.4.0 replaced with per-task quarantine; `workflow.md` gave the rejection
+  cap as 5 against a shipped 3 and credited task-engineer with moves the orchestrator performs; the
+  README claimed the doctor FATALs on a missing slug when it derives one; the doctor still listed a
+  stray-`Integrated-At` check that no longer exists; and `clean-checkout`'s exit table omitted the
+  code it returns on every non-`files` store.
+
 ## 3.4.0 — the snapshot stops going through an agent, and a bare `/go` stops meaning "everyone's board"
 
 Four things a team running a large shared board reported, and the defects underneath each.
