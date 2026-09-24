@@ -129,10 +129,15 @@ def main():
 
     action = None  # "installed" | (old, new) upgrade tuple | None
 
+    # Read the installed copy BEFORE the upgrade overwrites it: the user's `price_map` setting lives
+    # in their edited copy, and after shutil.copy2 below `local_script` is the plugin default with
+    # their choice surviving only in the .bak.
+    local_text = read_text(local_script) if local_script.exists() else ""
+
     if not local_script.exists():
         action = "installed"
     else:
-        local_version = parse_version(read_text(local_script))
+        local_version = parse_version(local_text)
         if src_version > local_version:
             action = (local_version, src_version)
 
@@ -148,7 +153,14 @@ def main():
             print("Mission Control upgrade failed: {}".format(exc), file=sys.stderr)
             sys.exit(0)
 
-    refresh_price_map(source_script)
+    # `price_map: False` means "do not price this session", and a user sets it to stop the HUD
+    # reaching the network at all. The refresh below is a detached fetch to a raw.githubusercontent
+    # rate table, so firing it regardless made the setting a lie: the traffic it exists to prevent
+    # still happened, up to once per TTL, at every session start. Honour the effective setting - the
+    # user's installed copy when there is one, the shipped default otherwise.
+    effective_text = local_text or source_text
+    if '"price_map": False' not in effective_text and "'price_map': False" not in effective_text:
+        refresh_price_map(source_script)
 
     # ---- settings.json: ensure statusLine + refreshInterval ----------------
     settings = {}
