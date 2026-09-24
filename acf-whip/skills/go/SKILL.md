@@ -136,8 +136,11 @@ legacy loop has). Prefer it.
    bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info
    ```
    If `TRUNK_BRANCH` is empty, STOP — `/go` requires a branch checked out at the repo root.
-   The `acfw-store info` line reports the active **task-store backend** (`store`, default `files`),
-   its adapter, and the run-lock path (`runLock`) — pass both through in step 4.
+   The `acfw-store info` line is one JSON object carrying everything the next two steps need:
+   the active **task-store backend** (`store`, default `files`), its adapter, the run-lock path
+   (`runLock`), the **integration pin** (`integrationMode`), the **run focus** (`focusFile`,
+   `focusCount`) and the bare-`/go` policy (`bareGo`) that step 3 branches on, and the per-tier
+   **model routing** (`models`) that step 4 passes through. Read it once here; do not re-run it.
 3. **Resolve the run scope** from whatever the user typed after `/go`. Four branches, in this order:
 
    **(0) `--all`** — omit `only` entirely. The whole backlog, explicitly. This always bypasses the
@@ -326,9 +329,11 @@ card is blocking this path, fix or retire it (`/whip-move <task> archive`) rathe
 the gate.
 
 **Run scope on the legacy path.** That loop is prose you execute, not a script taking args, so a scope
-cannot be threaded into it mechanically. Resolve it exactly as in step 3, then treat the resolved stem
-list — plus any unmet dependencies — as the *entire* backlog for this run: never select, transition or
-integrate a task outside it, and state the resolved list before you begin.
+cannot be threaded into it mechanically. Resolve it exactly as in step 3 — including the focus branch,
+so a bare `/go` here means the same thing it means on the workflow path — then treat the resolved stem
+list, plus any unmet dependencies, as the *entire* backlog for this run: never select, transition or
+integrate a task outside it, and state the resolved list before you begin. The `bareGo: refuse` policy
+applies here too; a shared board does not become drainable because the orchestrator is unavailable.
 
 ---
 
