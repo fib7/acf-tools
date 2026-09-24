@@ -858,14 +858,21 @@ cmd_doctor() {
     # Status drift, split by DIRECTION (3.4.0). Drift where the native status is an ordinary workflow
     # state is a bookkeeping slip and is repaired as before. Drift where a human has put the card on
     # HOLD — native blocked or cancelled, while whip_state still says it is runnable — is not drift at
-    # all: it is an instruction, and the old repair overwrote it. `/go` runs `doctor --fix` at
+    # all: it is an instruction, and the old repair overwrote it.
+    # WHAT THIS CANNOT DISTINGUISH, stated plainly: whip PROJECTS its own `blocked` state onto the
+    # native `blocked` status, so a card whose whip_state has since moved off blocked while the native
+    # field still reads blocked is indistinguishable from one a person parked. Both land here and
+    # neither is repaired. That asymmetry is deliberate — un-parking the whole board every bootstrap is
+    # a worse failure than leaving one native status stale — and the remedy line names the re-sync so
+    # the stale case is one command away. (`cancelled` has no such ambiguity: only `archive` maps to
+    # it, which is why Linear, keying on the state TYPE `canceled`, has no ambiguity at all.) `/go` runs `doctor --fix` at
     # bootstrap, so every run silently un-parked every card the team had parked, which is exactly the
     # behaviour that teaches people the tool cannot be trusted with their board. Report it, name the
     # supported way to park a task in the whip state vocabulary, and never write over it.
     # (No apostrophes in this block: it lives inside a single-quoted jq program.)
     (.[] | select((.metadata.whip_state // "") as $s | (nstat[$s] // "") as $w | (.status // "") as $ns
                   | ($w != "" and $ns != $w and ($ns == "blocked" or $ns == "cancelled")))
-       | "WARN|native-hold|\(.metadata.whip_key)|native status is \(.status) but whip_state=\(.metadata.whip_state) is runnable. Treating the hold as intentional and NOT repairing it. To park this task where the scheduler and the doctor both understand it: acfw-store transition \(.metadata.whip_key) draft   (or archive to retire it)"),
+       | "WARN|native-hold|\(.metadata.whip_key)|native status is \(.status) but whip_state=\(.metadata.whip_state) is runnable. Treating the hold as intentional and NOT repairing it, because overwriting a human hold is the worse error. If nobody parked this card, the native status is a stale write and re-running the transition re-syncs it: acfw-store transition \(.metadata.whip_key) \(.metadata.whip_state). To park it where the scheduler and the doctor both understand it: acfw-store transition \(.metadata.whip_key) draft   (or archive to retire it)"),
     (.[] | select((.metadata.whip_state // "") as $s | (nstat[$s] // "") as $w | (.status // "") as $ns
                   | ($w != "" and $ns != $w and $ns != "blocked" and $ns != "cancelled"))
        | "REPAIRABLE|status-drift|\(.metadata.whip_key)|native=\(.status) want=\(nstat[.metadata.whip_state])"),

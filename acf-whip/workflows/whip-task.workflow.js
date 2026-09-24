@@ -52,7 +52,11 @@ const ENV = `export ACFW_TRUNK_ROOT=${sq(trunkRoot)}; export ACFW_TRUNK_BRANCH=$
 const MODELS = (args && args.models && typeof args.models === 'object') ? args.models : {}
 const SHELL_MODEL = (args && args.shellModel) || MODELS.shell || 'haiku'
 const EFFORTS = (args && args.efforts && typeof args.efforts === 'object') ? args.efforts : {}
-const agentsByTier = { shell: 0, judge: 0, author: 0 }
+// `recon` ships UNSET like judge/author — the two recon agents genuinely explore a repository and
+// synthesise what they find, so they are not shell runners. They were, however, the only dispatches
+// in this file routed through neither helper, so they appeared in no tier at all while the /go skill
+// told operators this block says what each tier spent. Unset model, counted spend.
+const agentsByTier = { shell: 0, judge: 0, author: 0, recon: 0 }
 function shellOpts(o) {
   const out = Object.assign({}, o, { model: SHELL_MODEL })
   if (EFFORTS.shell) out.effort = EFFORTS.shell
@@ -213,7 +217,7 @@ const reg = await agent(
   `List this project's installed specialist agents. Run exactly:
   ls -1 ${sq(trunkRoot)}/.claude/agents/*.md 2>/dev/null | sed -E 's#.*/##; s#\\.md$##'
 Return the basenames (no .md extension, no directory path) as agents[]. If the directory is missing or empty, return an empty array.`,
-  shellOpts({ label: 'discover-agents', phase: 'Decompose', schema: REGISTRY }),
+  shellOpts({ label: 'discover-agents', phase: 'Recon', schema: REGISTRY }),
 )
 const registeredAgents = (reg && Array.isArray(reg.agents)) ? reg.agents : []
 // Empty registry: abort before writing any files. validatePlan can only check assignedAgent against
@@ -292,7 +296,7 @@ specific: "services/user-api/**" not "the backend". Also report where the tests 
 and how they are named. If the scope spans several independent surfaces, list them separately and most
 specific first — that separation is what lets the planner give each one its own worktree slug and run
 them in parallel.
-Return the ReconSurface.`, { label: 'recon:surface', phase: 'Recon', schema: RECON_SURFACE }),
+Return the ReconSurface.`, tierOpts({ label: 'recon:surface', phase: 'Recon', schema: RECON_SURFACE }, 'recon')),
 
   () => agent(`${ENV}
 Read-only reconnaissance of this project's CONVENTIONS. Change nothing.
@@ -303,7 +307,7 @@ Read-only reconnaissance of this project's CONVENTIONS. Change nothing.
    scripts, pyproject.toml, .pre-commit-config.yaml, go.mod — whichever exist.
 3. House style for task descriptions: docs/acf/style/task-descriptions.md and
    docs/acf/backlog/task-template.md if present, plus CLAUDE.md conventions.
-Return the ReconConventions.`, { label: 'recon:conventions', phase: 'Recon', schema: RECON_CONVENTIONS }),
+Return the ReconConventions.`, tierOpts({ label: 'recon:conventions', phase: 'Recon', schema: RECON_CONVENTIONS }, 'recon')),
 ])
 
 const reconBundle = `
@@ -614,10 +618,12 @@ Do EXACTLY this, nothing else:
 2. Verify each listed file exists under .backlog/pending/. If any are missing, report them in note and continue with the ones present.
 3. Stamp the VALIDATED dependency graph over each file's Dependencies line (the plan is authoritative; the authored line is not). Run these, skipping any whose file is missing:
 ${depStamps}
-4. Stage ONLY those files:  git add ${writtenFiles.map((f) => `.backlog/pending/${sq(f)}`).join(' ')}
-5. Commit once:  git commit -q -m "task: create ${writtenFiles.length} backlog task(s) [${[...new Set(writtenTasks.map((t) => t.worktreeSlug))].join(', ')}]"
-6. Capture the new HEAD sha:  git rev-parse HEAD
-7. Point this checkout's run focus at the tasks you just created, so a bare /go runs them and nothing else (best-effort — if it fails, say so in note and continue; the tasks are already committed):
+4. Make sure the run namespace is ignored, BEFORE staging — a project initialised before this directory existed has no rule for it, and the focus writer in step 7 would otherwise leave .gitignore modified in the trunk root after the commit, which the doctor reports as a dirty trunk and clean-checkout can sweep into the shared stash:
+   grep -qxF '.acfwhip/run/' .gitignore 2>/dev/null || printf '\n# ACF Whip /go run state (per-task harness scripts, stage ledgers, /task staging, the run focus)\n.acfwhip/run/\n' >> .gitignore
+5. Stage ONLY those files, plus .gitignore if step 4 changed it:  git add ${writtenFiles.map((f) => `.backlog/pending/${sq(f)}`).join(' ')} .gitignore
+6. Commit once:  git commit -q -m "task: create ${writtenFiles.length} backlog task(s) [${[...new Set(writtenTasks.map((t) => t.worktreeSlug))].join(', ')}]"
+7. Capture the new HEAD sha:  git rev-parse HEAD
+8. Point this checkout's run focus at the tasks you just created, so a bare /go runs them and nothing else (best-effort — if it fails, say so in note and continue; the tasks are already committed):
    bash ${sq(FOCUS)} add --no-resolve --by task ${writtenTasks.map((t) => sq(t.id)).join(' ')}
 
 Make NO other edit to the files. Do NOT touch any other path. Return the WriteResult.`,

@@ -47,7 +47,16 @@ const skelSrc = readFileSync(SKEL, 'utf8')
   check('whip-go declares the shellOpts helper', /function shellOpts\(o\) \{/.test(goSrc))
   check('...which is the single place the shell model is applied',
     (goSrc.match(/model: SHELL_MODEL/g) || []).length === 1)
-  check('...and it counts what it spends', /agentsByTier\.shell\+\+/.test(goSrc))
+  // Counting moved OUT of the option helpers in 3.4.0's cleanup: safeAgent charges up to three real
+  // agents per invocation on a retry, and every agent a child harness spent was in agentsUsed and in
+  // no tier at all — so the tiers summed to a fraction of the total while the skill told the operator
+  // this field said what each tier spent. Tag at the helper, charge where the agent is actually paid.
+  check('...and it TAGS the tier rather than counting at the call site', /tierOf\.set\(out, 'shell'\)/.test(goSrc))
+  check('...with a single charge point that moves both ledgers together',
+    /function charge\(opts, n\) \{[\s\S]{0,200}?agentsUsed \+= k[\s\S]{0,200}?agentsByTier\[t\]/.test(goSrc))
+  check('...used by safeAgent, so a RETRY is charged too', /charge\(opts\)/.test(goSrc))
+  check('...and by agentC', /async function agentC\(p, o\) \{ charge\(o\)/.test(goSrc))
+  check('...no raw agentsUsed++ survives outside the charge point', !/agentsUsed\+\+/.test(goSrc))
 
   const taskStrays = taskSrc.split('\n').filter((l) => /model: SHELL_MODEL/.test(l) && !/Object\.assign\(\{\}, o/.test(l))
   check('whip-task has no raw model: SHELL_MODEL at a call site either', taskStrays.length === 0)
@@ -77,6 +86,28 @@ const skelSrc = readFileSync(SKEL, 'utf8')
   check('whip-task: the task-document authors are author-tier', /tierOpts\(\{ label: `author:\$\{t\.id\}`[\s\S]{0,200}?'author'\)/.test(taskSrc))
   check('whip-task: judge and author ship UNSET (inherit the session model)',
     /MODELS\.judge \|\| null/.test(taskSrc) && !/MODELS\.judge \|\| '/.test(taskSrc))
+  // The recon pair explores and synthesises, so it belongs on the session model — but it was routed
+  // through NEITHER helper, which meant it appeared in no tier while the /go skill told operators
+  // agentsByTier says what each tier spent. Unset model, counted spend.
+  for (const label of ['recon:surface', 'recon:conventions']) {
+    check(`whip-task: ${label} is counted, on its own unset tier`,
+      new RegExp(`tierOpts\\(\\{ label: '${label}'[\\s\\S]{0,160}?'recon'\\)`).test(taskSrc))
+  }
+  check('whip-task: the recon tier exists in the ledger',
+    /agentsByTier = \{ shell: 0, judge: 0, author: 0, recon: 0 \}/.test(taskSrc))
+  // STRUCTURAL: every dispatch in the file goes through a tier helper. A new agent() that forgets
+  // silently inherits the session model AND vanishes from the cost report.
+  {
+    const unrouted = taskSrc.split('\n')
+      .map((l, i) => [i + 1, l])
+      .filter(([, l]) => /(await |\(\) => )agent\(/.test(l))
+      .filter(([n]) => {
+        const win = taskSrc.split('\n').slice(n - 1, n + 45).join('\n')
+        return !/(shellOpts|tierOpts)\(\{/.test(win)
+      })
+    check(`whip-task: every agent() dispatch is tiered (unrouted: ${unrouted.map(([n]) => n).join(', ') || 'none'})`,
+      unrouted.length === 0)
+  }
 }
 
 // ============================ agentType dispatches honour the project's frontmatter =========
@@ -89,10 +120,15 @@ const skelSrc = readFileSync(SKEL, 'utf8')
   check('specialist dispatches route through typedOpts', /const opts = typedOpts\(baseOpts, 'specialist'\)/.test(goSrc))
   check('reviewer dispatches route through typedOpts', (goSrc.match(/typedOpts\(\{ label: `review:/g) || []).length === 2)
   check('the conflict resolver is counted but never re-modelled', /typedOpts\(ropts, 'resolver'\)/.test(goSrc))
-  check('the architect is counted too', /agentsByTier\.architect\+\+/.test(goSrc))
+  check('the architect is tagged too', /tierOf\.set\(aopts, 'architect'\)/.test(goSrc))
+  check('child-harness agents are attributed to their own tier, not left off the tally',
+    /tierOf\.set\(CHILD_TIER, 'child'\)/.test(goSrc) && /charge\(CHILD_TIER, budget\)/.test(goSrc))
+  check('...and a downward true-up refunds the tier as well as the ledger',
+    /agentsByTier\.child -= refund/.test(goSrc))
   // An agent with no declared model must keep inheriting the session model — absence is not a value.
   check('typedOpts only sets a model when the agent declares one',
-    /const m = out\.agentType && agentModels\[out\.agentType\]\s*\n\s*if \(m\) out\.model = m/.test(goSrc))
+    /const m = out\.agentType && agentModels\[out\.agentType\]/.test(goSrc))
+  check('...and never clobbers a model the caller already chose', /if \(m && !out\.model\) out\.model = m/.test(goSrc))
 }
 
 // ============================ the child harness inherits the routing ========================
@@ -127,8 +163,10 @@ const skelSrc = readFileSync(SKEL, 'utf8')
   check('...including the per-agent map that was actually used', /agentModels,/.test(goSrc))
   check('...and the per-tier agent counts', /\n  agentsByTier,/.test(goSrc))
   check('the /task report carries the same block', /models: \{ shell: SHELL_MODEL, judge:/.test(taskSrc) && /\n  agentsByTier,/.test(taskSrc))
-  check('the tier counters cover every routed class',
-    /agentsByTier = \{ shell: 0, specialist: 0, review: 0, architect: 0, resolver: 0 \}/.test(goSrc))
+  check('the tier counters cover every routed class, including the child harness',
+    /agentsByTier = \{ shell: 0, specialist: 0, review: 0, architect: 0, resolver: 0, child: 0, untiered: 0 \}/.test(goSrc))
+  check('...with an untiered bucket, so a dispatch through neither helper shows up instead of vanishing',
+    /\|\| 'untiered'/.test(goSrc))
 }
 
 // ============================ config resolution, end to end ================================

@@ -108,6 +108,24 @@ acfw_resolve_models() { # <repo-root>
   printf '%s\t%s\t%s' "$shell" "$judge" "$author"
 }
 
+# acfw_resolve_efforts <repo-root> — print the reasoning effort pinned for the SHELL tier, or "".
+# Ships unset on purpose: the shell tier's model is absent from the documented effort-support table,
+# and the effect of a low setting on verbatim-copy fidelity is undocumented. It is offered as a knob
+# a team can now measure safely, because a short relay is DETECTED rather than believed — so it needs
+# a way in. It had none until 3.4.0's cleanup: both workflows read `args.efforts` and both echo it in
+# their report, but nothing produced it, so the documentation described a dial with no shaft.
+# Vocabulary is the runtime's ('low'|'medium'|'high'|'xhigh'|'max'); an unrecognised value is refused
+# rather than passed through, because a rejected option would fail every agent call in the run.
+acfw_resolve_efforts() { # <repo-root>
+  local root="${1:-}" e
+  e="${ACFW_EFFORT_SHELL:-}"; [ -n "$e" ] || e=$(acfw_config_get "$root" ACFW_EFFORT_SHELL)
+  case "$e" in
+    ''|low|medium|high|xhigh|max) : ;;
+    *) echo "FATAL: ACFW_EFFORT_SHELL='$e' is not a recognised effort (low|medium|high|xhigh|max). Unset it or fix the pin." >&2; return 2 ;;
+  esac
+  printf '%s' "$e"
+}
+
 # acfw_resolve_bare_go <repo-root> [store] — print 'all' or 'refuse': what a bare `/go` with no saved
 # focus does. On the files backend the backlog is this checkout's own, so draining it is what the
 # operator meant and the default stays 'all' (byte-identical to every release before 3.4.0). On a

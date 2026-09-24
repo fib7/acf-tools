@@ -53,10 +53,12 @@ AGENT="operator"
 POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --reason) REASON="${2:-}"; shift 2 ;;
-    --integrated-at) INTEGRATED_AT="${2:-}"; shift 2 ;;
-    --add-dep) ADD_DEP="${2:-}"; shift 2 ;;
-    --agent) AGENT="${2:-}"; shift 2 ;;
+    # `shift 2` with only one argument left FAILS and shifts nothing, so $1 stays the flag and this
+    # loop spins forever. Demand the value explicitly, the way doctor.sh does.
+    --reason) [ $# -ge 2 ] || { echo "FATAL: --reason requires a value" >&2; exit 2; }; REASON="$2"; shift 2 ;;
+    --integrated-at) [ $# -ge 2 ] || { echo "FATAL: --integrated-at requires a value" >&2; exit 2; }; INTEGRATED_AT="$2"; shift 2 ;;
+    --add-dep) [ $# -ge 2 ] || { echo "FATAL: --add-dep requires a value" >&2; exit 2; }; ADD_DEP="$2"; shift 2 ;;
+    --agent) [ $# -ge 2 ] || { echo "FATAL: --agent requires a value" >&2; exit 2; }; AGENT="$2"; shift 2 ;;
     --*) echo "FATAL: unknown flag: $1" >&2; exit 2 ;;
     *) POS+=("$1"); shift ;;
   esac

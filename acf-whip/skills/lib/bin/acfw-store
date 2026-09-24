@@ -53,18 +53,24 @@ if [ "$SUB" = "info" ]; then
   FOCUS_FILE=$(acfw_focus_path "$REPO_ROOT")
   FOCUS_COUNT=0
   if [ -r "$FOCUS_FILE" ]; then
-    FOCUS_COUNT=$(grep -cv '^[[:space:]]*\(#.*\)\?$' "$FOCUS_FILE" 2>/dev/null || echo 0)
+    # `grep -c` PRINTS 0 and EXITS 1 when nothing matches, so `|| echo 0` appends a SECOND zero and
+    # the count interpolates as `00` — which jq tolerates and JSON.parse rejects, breaking the one
+    # object /go step 2 reads. Reachable by emptying the focus with `acfw-focus drop`, which leaves
+    # the header lines behind. `|| true` keeps the single line grep already printed.
+    FOCUS_COUNT=$(grep -cv '^[[:space:]]*\(#.*\)\?$' "$FOCUS_FILE" 2>/dev/null || true)
     FOCUS_COUNT=${FOCUS_COUNT//[^0-9]/}
+    [ -n "$FOCUS_COUNT" ] || FOCUS_COUNT=0
   fi
   MODELS=$(acfw_resolve_models "$REPO_ROOT")
+  EFFORT_SHELL=$(acfw_resolve_efforts "$REPO_ROOT") || exit 2
   M_SHELL=${MODELS%%"$(printf '\t')"*}
   M_REST=${MODELS#*"$(printf '\t')"}
   M_JUDGE=${M_REST%%"$(printf '\t')"*}
   M_AUTHOR=${M_REST#*"$(printf '\t')"}
-  printf '{"store":"%s","configFile":"%s","adapter":"%s","runLock":"%s","integrationMode":"%s","bareGo":"%s","focusFile":"%s","focusCount":%s,"models":{"shell":"%s","judge":"%s","author":"%s"},"contractVersion":%s}\n' \
+  printf '{"store":"%s","configFile":"%s","adapter":"%s","runLock":"%s","integrationMode":"%s","bareGo":"%s","focusFile":"%s","focusCount":%s,"models":{"shell":"%s","judge":"%s","author":"%s"},"efforts":{"shell":"%s"},"contractVersion":%s}\n' \
     "$(jesc "$STORE")" "$(jesc "$CFG")" "$(jesc "$ADAPTER")" "$(jesc "$RUN_LOCK")" "$(jesc "$MODE")" \
     "$(jesc "$BARE_GO")" "$(jesc "$FOCUS_FILE")" "${FOCUS_COUNT:-0}" \
-    "$(jesc "$M_SHELL")" "$(jesc "$M_JUDGE")" "$(jesc "$M_AUTHOR")" "$ACFW_CONTRACT_VERSION"
+    "$(jesc "$M_SHELL")" "$(jesc "$M_JUDGE")" "$(jesc "$M_AUTHOR")" "$(jesc "$EFFORT_SHELL")" "$ACFW_CONTRACT_VERSION"
   exit 0
 fi
 
@@ -121,7 +127,8 @@ case "$SUB" in
         # --digest and --mode are forwarded AND remembered: the post-stage needs them to know which
         # collapse to apply and which definition of "terminal" to use.
         --digest)   SNAP_DIGEST=1; SNAP_ARGS[${#SNAP_ARGS[@]}]="$1"; shift ;;
-        --mode)     SNAP_MODE="${2:-default}"; SNAP_ARGS[${#SNAP_ARGS[@]}]="$1"; SNAP_ARGS[${#SNAP_ARGS[@]}]="${2:-default}"; shift 2 ;;
+        --mode)     [ $# -ge 2 ] || { echo "FATAL: --mode requires a value (override|default)" >&2; exit 2; }
+                    SNAP_MODE="$2"; SNAP_ARGS[${#SNAP_ARGS[@]}]="$1"; SNAP_ARGS[${#SNAP_ARGS[@]}]="$2"; shift 2 ;;
         --mode=*)   SNAP_MODE="${1#--mode=}"; SNAP_ARGS[${#SNAP_ARGS[@]}]="$1"; shift ;;
         *)          SNAP_ARGS[${#SNAP_ARGS[@]}]="$1"; shift ;;
       esac
@@ -143,7 +150,14 @@ case "$SUB" in
     if has_cap snapshot-enriched; then
       # The adapter owns the whole shape (files: scan-backlog.sh, which implements --digest and
       # --only itself and must run on a machine with no jq). Nothing to add.
+      #
+      # The tee only happens when the adapter did not narrow, because there is nothing PRE-narrowing
+      # left to write. That is not a gap: --full-to exists to feed the GENERIC battery, and an
+      # enriched adapter that also declares `doctor-complete` (files does) never uses it — its doctor
+      # walks the store itself. An enriched adapter WITHOUT doctor-complete gets the full file only on
+      # an unnarrowed call, which is the honest answer rather than a silently partial one.
       if [ -n "$FULL_TO" ] && [ ${#SNAP_ONLY[@]} -eq 0 ] && [ "$SNAP_DIGEST" -eq 0 ]; then
+        mkdir -p "$(dirname "$FULL_TO")" 2>/dev/null || true
         printf '%s\n' "$OUT" > "$FULL_TO" 2>/dev/null || true
       fi
       printf '%s\n' "$OUT"
@@ -156,6 +170,7 @@ case "$SUB" in
       # must be the pre-collapse one — that is what lets the scheduler and the doctor observe the SAME
       # store walk instead of two, which on a live shared board can straddle someone else's transition.
       if [ -n "$FULL_TO" ]; then
+        mkdir -p "$(dirname "$FULL_TO")" 2>/dev/null || true
         printf '%s\n' "$ENRICHED" > "$FULL_TO" 2>/dev/null || true
       fi
       if [ ${#SNAP_ONLY[@]} -gt 0 ] || [ "$SNAP_DIGEST" -eq 1 ]; then

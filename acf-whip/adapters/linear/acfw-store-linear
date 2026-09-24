@@ -846,7 +846,16 @@ cmd_doctor() {
   # same reason it matters: a tool that silently un-cancels a card is a tool a team stops trusting
   # with their board. Report it, name the way to park a task in whip's own vocabulary, leave it alone.
   local iid sid ws key want stype
+  # IFS=$'\t' alone is not enough: tab is IFS WHITESPACE, so a run of tabs collapses into one
+  # separator and an empty field shifts every later one left. An issue with no stateId (or no
+  # whip_key) then put the state TYPE where the key belongs, `stype` came back empty, and the
+  # native-hold guard below silently never fired — repairing a cancellation a person made, which is
+  # the exact behaviour this branch exists to prevent. The producer emits a literal "-" for an empty
+  # field and it is unwrapped here, so the column count is fixed whatever the payload.
   while IFS=$'\t' read -r iid sid ws key stype; do
+    [ "$sid" = "-" ] && sid=""
+    [ "$key" = "-" ] && key=""
+    [ "$stype" = "-" ] && stype=""
     [ -n "$ws" ] || continue
     want=$(state_id_for_whip "$ws") || continue
     [ "$want" = "$sid" ] && continue
@@ -856,7 +865,7 @@ cmd_doctor() {
     fi
     printf 'REPAIRABLE|status-drift|%s|native=%s want=%s\n' "$key" "$sid" "$want" >> "$sev_file"
     printf '%s\t%s\n' "$iid" "$want" >> "$drift_file"
-  done < <(jq -rs '.[] | select((.meta.whip_state // "") != "") | [.id, .stateId, .meta.whip_state, (.meta.whip_key // ""), (.stateType // "")] | @tsv' "$jsonl")
+  done < <(jq -rs '.[] | select((.meta.whip_state // "") != "") | [.id, ((.stateId // "") | if . == "" then "-" else . end), .meta.whip_state, ((.meta.whip_key // "") | if . == "" then "-" else . end), ((.stateType // "") | if . == "" then "-" else . end)] | @tsv' "$jsonl")
 
   local sev; sev=$(cat "$sev_file")
   local fatal repairable warn

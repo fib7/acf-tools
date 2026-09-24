@@ -53,7 +53,8 @@ while [ $# -gt 0 ]; do
   case "${1:-}" in
     --counts-only) COUNTS_ONLY=true; shift;;
     --digest) DIGEST=true; shift;;
-    --mode) MODE_ARG="${2:-default}"; shift 2;;
+    --mode) [ $# -ge 2 ] || { echo "FATAL: --mode requires a value (override|default)" >&2; exit 2; }
+            MODE_ARG="$2"; shift 2;;
     --mode=*) MODE_ARG="${1#--mode=}"; shift;;
     --only) [ $# -ge 2 ] || { echo "FATAL: --only requires a task key" >&2; exit 2; }
             ONLY_SEEDS="$ONLY_SEEDS$2
@@ -228,6 +229,7 @@ SCOPE_AMBIGUOUS=""     # lines: <token><TAB><candidate,candidate,...>
 SCOPE_INACTIVE=""      # lines: <stem><TAB><folder>
 SCOPE_SEED_STEMS=""    # lines: <stem>  (resolved, any folder)
 
+SCOPE_INDEX=""   # declared unconditionally: the digest branch's EXIT trap names it either way
 if [ -n "$ONLY_SEEDS" ]; then
   # One pass over the board: stem<TAB>id<TAB>folder for every card, in every folder.
   SCOPE_INDEX=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-scope.XXXXXX")
@@ -318,7 +320,10 @@ if [ "$DIGEST" = true ]; then
   ACC_LIST=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-acc.XXXXXX")
   WT_FILE=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-wt.XXXXXX")
   DT_FILE=$(mktemp "${TMPDIR:-/tmp}/acfw-scan-dt.XXXXXX")
-  trap 'rm -f "$ACC_LIST" "$WT_FILE" "$DT_FILE" "$IK_FILE"' EXIT
+  # $SCOPE_INDEX stays in the list: a `trap ... EXIT` REPLACES the previous handler, and dropping it
+  # here leaked one $TMPDIR/acfw-scan-scope.* per /go iteration, which is the hot path (--digest
+  # --only, every iteration, for the length of a run).
+  trap 'rm -f "$ACC_LIST" "$WT_FILE" "$DT_FILE" "$IK_FILE" "$SCOPE_INDEX"' EXIT
   find "$BL/accepted" -maxdepth 1 -type f -name '*.md' ! -name 'README.md' 2>/dev/null > "$ACC_LIST"
   printf '%s\n' "$EXISTING_WT_SLUGS" > "$WT_FILE"
   printf '%s\n' "$DEP_TOKENS" > "$DT_FILE"
@@ -585,7 +590,10 @@ if [ -n "$ONLY_SEEDS" ]; then
     # printf '%s\n' (not '%s'): without the trailing newline `read` hits EOF on the LAST candidate
     # and returns non-zero, so the loop body never runs for it and the ambiguity report silently
     # names one fewer candidate than it found — the opposite of the point.
-    printf '%s\n' "$cands" | tr ',' '\n' | while IFS= read -r c; do [ -n "$c" ] && printf '"%s",' "$(jesc "$c")"; done | sed 's/,$//'
+    # `tr -d` the trailing comma rather than `sed 's/,$//'`: this whole object must stay on ONE line
+    # (the file's contract, and acfw-store's `sed '1s/^{/...'` header injection depends on it), and
+    # BSD sed APPENDS a newline to input that has none — putting a literal newline mid-object.
+    printf '%s\n' "$cands" | tr ',' '\n' | while IFS= read -r c; do [ -n "$c" ] && printf '"%s",' "$(jesc "$c")"; done | tr -d '\n' | sed 's/,$//' | tr -d '\n'
     printf ']},'
   done)
   _inact=$(printf '%s' "$SCOPE_INACTIVE" | grep -v '^$' | while IFS="$ACFW_TAB" read -r st fo; do printf '{"stem":"%s","folder":"%s"},' "$(jesc "$st")" "$(jesc "$fo")"; done)

@@ -52,7 +52,8 @@ REPO_ROOT=""
 
 while [ $# -gt 0 ]; do
   case "${1:-}" in
-    --mode)    MODE="${2:-default}"; shift 2 ;;
+    --mode)    [ $# -ge 2 ] || { echo "FATAL: --mode requires a value (override|default)" >&2; exit 2; }
+               MODE="$2"; shift 2 ;;
     --mode=*)  MODE="${1#--mode=}"; shift ;;
     --digest)  DIGEST=1; shift ;;
     --only)    [ $# -ge 2 ] || { echo "FATAL: --only requires a value" >&2; exit 2; }
