@@ -21,6 +21,7 @@ Non-blocking: any failure exits 0 so a bad upgrade never breaks the session.
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -52,6 +53,23 @@ def parse_version(text):
                 out.append(0)
             return tuple(out)
     return (0, 0, 0)
+
+
+# An ACTIVE `price_map` entry: quoted key, any spacing around the colon, on a line that is not a
+# comment. A bare substring test both missed `"price_map" : False` and was satisfied by a
+# commented-out `# "price_map": False`, which would have suppressed the refresh while the real
+# setting was still enabled.
+PRICE_MAP_RE = re.compile(r'''^([ \t]*["']price_map["'])([ \t]*:[ \t]*)(True|False)''', re.M)
+
+
+def price_map_enabled(text):
+    """True when the effective config leaves price mapping on (the shipped default)."""
+    for m in PRICE_MAP_RE.finditer(text or ""):
+        line_start = (text or "").rfind("\n", 0, m.start()) + 1
+        if (text or "")[line_start:m.start()].lstrip().startswith("#"):
+            continue          # a commented-out entry is not the setting
+        return m.group(3) == "True"
+    return True               # no entry at all -> shipped default
 
 
 def read_text(path):
@@ -147,6 +165,22 @@ def main():
                 # Preserve the prior (possibly customized) copy before overwriting.
                 shutil.copy2(local_script, backup_script)
             shutil.copy2(source_script, local_script)
+            # CARRY THE OPT-OUT ACROSS THE UPGRADE. price_map lives in the very file the upgrade
+            # replaces, so without this the setting survived exactly one session: the next
+            # SessionStart read the fresh plugin copy, saw the shipped default, and resumed fetching
+            # the rate table. A self-upgrading script must not silently revert the one setting whose
+            # entire purpose is to stop it doing something.
+            if not price_map_enabled(local_text):
+                try:
+                    new_text = read_text(local_script)
+                    carried = PRICE_MAP_RE.sub(
+                        lambda m: "{}{}False".format(m.group(1), m.group(2)), new_text, count=1)
+                    if carried != new_text:
+                        local_script.write_text(carried)
+                        print("Mission Control: kept your price_map: False through the upgrade.",
+                              file=sys.stderr)
+                except Exception:  # noqa: BLE001 - never block the session on this
+                    pass
             mode = local_script.stat().st_mode
             local_script.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         except Exception as exc:  # noqa: BLE001 - non-blocking
@@ -159,7 +193,7 @@ def main():
     # still happened, up to once per TTL, at every session start. Honour the effective setting - the
     # user's installed copy when there is one, the shipped default otherwise.
     effective_text = local_text or source_text
-    if '"price_map": False' not in effective_text and "'price_map': False" not in effective_text:
+    if price_map_enabled(effective_text):
         refresh_price_map(source_script)
 
     # ---- settings.json: ensure statusLine + refreshInterval ----------------
