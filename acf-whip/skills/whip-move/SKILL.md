@@ -46,7 +46,7 @@ bash "${CLAUDE_PLUGIN_ROOT}/skills/whip-move/bin/whip-move.sh" <TASK> <TO_STATE>
 | Flag | Effect |
 |------|--------|
 | `--reason "..."` | Transition Log note (default: `manual operator move`). |
-| `--integrated-at SHA` | Set `- **Integrated-At**: SHA` (typical with `accepted`). |
+| `--integrated-at SHA` | Set `- **Integrated-At**: SHA` (typical with `accepted`). **`files` store only** — refused with exit 2 on every other backend, where no adapter maps the field and the in-tree LP-CAS ledger is the sole integration oracle. |
 | `--add-dep ID` | Append `ID` to the task's `- **Dependencies**:` list. |
 | `--agent NAME` | Transition Log actor (default: `operator`). |
 

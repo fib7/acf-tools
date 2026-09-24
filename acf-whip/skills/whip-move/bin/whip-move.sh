@@ -80,15 +80,27 @@ REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel)}"
 STORE_BACKEND=$(acfw_resolve_store "$REPO_ROOT")
 if [ "$STORE_BACKEND" != "files" ]; then
   STORE_BIN="$SCRIPT_DIR/../../lib/bin/acfw-store"
+  # --integrated-at is a FILES-ONLY affordance. CONTRACT.md is explicit that "integration state is NOT
+  # the adapter's business": the LP-CAS ledger in the git tree is the oracle on every backend, and
+  # `Integrated-At` is an inert display field even on files. So no adapter maps it - multica and linear
+  # exit 2 ("field is not mapped by the <backend> backend"), beads exits 0 having stored nothing - and
+  # because this ran BEFORE the transition, the operator following the doctor's own printed ack got a
+  # FATAL and silently lost the state change too: the task they believed they had closed out was still
+  # sitting in in-review. Refuse up front and name the oracle instead of half-applying the command.
+  if [ -n "$INTEGRATED_AT" ]; then
+    echo "FATAL: --integrated-at is not supported on the '$STORE_BACKEND' store." >&2
+    echo "       Integration is recorded by the in-tree LP-CAS ledger (.acfwhip/integrated/), which is the" >&2
+    echo "       sole oracle on every backend; Integrated-At is an inert display field that only the files" >&2
+    echo "       store carries. To close a task out here, move it without the flag:" >&2
+    echo "         whip-move.sh $TASK $TO_STATE${REASON:+ --reason \"$REASON\"}" >&2
+    echo "       and if its change really is on trunk, let /whip-doctor verify against the ledger." >&2
+    exit 2
+  fi
   RD=$(bash "$STORE_BIN" read "$TASK") || { echo "FATAL: no task matching '$TASK' in the '$STORE_BACKEND' store" >&2; exit 2; }
   STEM=$(printf '%s' "$RD" | sed -n 's/.*"stem":"\([^"]*\)".*/\1/p')
   FROM_STATE=$(printf '%s' "$RD" | sed -n 's/.*"folder":"\([^"]*\)".*/\1/p')
   FNAME="$STEM.md"
   EDITED=0
-  if [ -n "$INTEGRATED_AT" ]; then
-    bash "$STORE_BIN" update-field "$STEM" --set "Integrated-At=$INTEGRATED_AT" >/dev/null || exit 2
-    EDITED=1
-  fi
   if [ -n "$ADD_DEP" ]; then
     bash "$STORE_BIN" update-field "$STEM" --add-dep "$ADD_DEP" >/dev/null || exit 2
     EDITED=1

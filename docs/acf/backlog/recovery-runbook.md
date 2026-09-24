@@ -93,7 +93,7 @@ Not `--fix`-able, for the same reason as `control-bytes`: restoring from `HEAD` 
 | Code | Meaning | Acknowledge by |
 |------|---------|----------------|
 | `orphaned-worktree-dirty` | The reaper **skipped** a dirty orphan worktree rather than destroying uncommitted work. | Inspect it, salvage anything you want, then `git worktree remove --force .worktree/<slug>`. |
-| `accepted-branchless-unverified` | An accepted code task has no worktree branch **and** no ledger marker. Its deliverable may or may not be on trunk. | Verify the deliverable exists on trunk, then `/whip-move <stem> accepted --integrated-at <sha>`. |
+| `accepted-branchless-unverified` | An accepted code task has no worktree branch **and** no ledger marker. Its deliverable may or may not be on trunk. | Verify the deliverable exists on trunk. On `files`, ack it with `/whip-move <stem> accepted --integrated-at <sha>`. On every other backend there is nothing to stamp — no adapter maps `Integrated-At` and the ledger is the only oracle — so a change that is on trunk needs no ack, and one that is not needs re-running. |
 | `dirty-trunk-root` | Tracked files are dirty at the shared root, outside `.backlog/` — a specialist may have escaped its worktree. | **Commit or stash them now.** The next integration resyncs the root with `git reset --hard` and the changes are gone. |
 | `trunk-unpushed` | Local trunk is ahead of its remote. LP-CAS lands on the **local** trunk and never pushes; this is the documented contract. | `git push` when ready. |
 | `duplicate-id` | One `ID` appears in two task files. Each runs on its own slug and ledger key, so there is no integration collision. | De-dup the id. |
@@ -142,7 +142,7 @@ The timeout is **8h** by default; precedence is env `ACFW_INPROGRESS_TIMEOUT_HOU
 Only when a run stops for good and one or two tasks need closing by hand:
 
 ```bash
-/whip-move <stem> accepted --integrated-at <sha> --reason "verified by hand"
+/whip-move <stem> accepted --integrated-at <sha> --reason "verified by hand"   # files store only
 /whip-doctor
 ```
 

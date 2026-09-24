@@ -110,7 +110,7 @@ while IFS='|' read -r stem folder id status agent rc bc hasTok isCode hasBranch 
     emit WARN stale-in-progress "$stem" "in-progress for ${age}h (>= ${TIMEOUT_H}h timeout)"
   fi
   if [ "$folder" = "accepted" ] && [ "$isCode" = "true" ] && [ "$hasBranch" = "false" ] && [ "$hasInteg" = "false" ]; then
-    emit WARN accepted-branchless-unverified "$stem" "accepted, but no worktree branch and no ledger marker on trunk — verify the deliverable landed, then ack: whip-move $stem accepted --integrated-at <sha>"
+    emit WARN accepted-branchless-unverified "$stem" "accepted, but no worktree branch and no ledger marker on trunk — verify the deliverable actually landed (git log on trunk for its change). This battery runs on non-files stores, where Integrated-At is not mapped by any adapter and the in-tree ledger is the sole oracle, so there is no stamp to ack with: if the change is on trunk the marker is the record, and if it is not, the work needs re-running."
   fi
 # `slim: true` marks a DEPENDENCY-RESOLUTION STUB, not a task record: the files scanner emits terminal
 # accepted tasks that way, carrying only the fields depsSatisfied reads and dropping the rest to keep a
