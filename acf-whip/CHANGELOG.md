@@ -2,6 +2,35 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.4.2 — what the review found in 3.4.1
+
+The same reviewer read the 3.4.1 fixes. Seven comments, all on code written in that pass; six were
+real, and one of them was a defect introduced BY a 3.4.1 fix.
+
+- **The deliverables-commit handler reported success on failure.** `if ! cmd; then rc=$?` captures
+  the status of the NEGATION, always 0 inside the branch, so `exit "$rc"` exited 0 for precisely the
+  failure it had just been added to surface, leaving deliverables staged and uncommitted. This is
+  the same shape as clean-checkout's unreachable exit 99 — written into the commit that fixed it.
+  It is invisible in review and in testing, because the happy path is identical, so `run-all.sh`
+  now greps every shell file for it and fails the suite rather than relying on care.
+- **A stale remote-tracking ref could excuse a reintroduced attributed commit** in the pre-push
+  gate. `--remotes=<remote>` is a cached belief about the destination; if a branch there is deleted
+  or rewritten by someone else, the stale local ref hides the commit and rev-list still succeeds.
+  Fetching on every push is the wrong trade, so the check runs only when the exclusion is
+  load-bearing, then one `ls-remote` settles it. Detecting staleness needs both directions — the
+  case that actually excuses a commit is a tracking ref for a branch the remote no longer has at
+  all, which comparing only its reported refs cannot see.
+- **`price_map: False` survived exactly one session** (acf-mission-control 1.3.4). The opt-out lives
+  in the very file the self-upgrade replaces, so the next SessionStart read the fresh plugin copy
+  and resumed fetching. It is carried across the copy now. The detection was also a bare substring
+  test: it missed `"price_map" : False` and was satisfied by a commented-out one.
+- **`accepted-branchless-unverified` had no clearing path** on a non-`files` store after 3.4.1
+  removed the `--integrated-at` ack. The runbook now names all three endings, with a verified
+  hand-written-marker recipe and the warning that a marker for work that never landed turns a
+  visible warning into a silent hole.
+- The advisor README's manual board command referenced a variable nothing sets, and the pre-push
+  test scored its allowed-merge case on the absence of a word rather than the push's exit status.
+
 ## 3.4.1 — what an external review found in 3.4.0
 
 An automated reviewer read the whole 3.2.3→3.4.0 range on a downstream sync and raised 35 findings.
