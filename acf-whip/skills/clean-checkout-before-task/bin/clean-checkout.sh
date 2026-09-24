@@ -78,8 +78,14 @@ fi
 # ---- Step 3: Lazy-create the worktree ----
 WORKTREE_WAS_CREATED=0
 if [ ! -d "$WORKTREE_PATH" ]; then
-  if ! git_with_lock_backoff -C "$REPO_ROOT" worktree add "$WORKTREE_PATH" -b "$BRANCH" "$TRUNK_BRANCH" >&2; then
-    rc=$?
+  # Run it UNNEGATED and read $? directly. Inside `if ! cmd; then`, $? is the status of the NEGATION
+  # - always 1 - so `rc=$?` could never be 99 and the lock-contention exit below was unreachable
+  # code. A worktree add that lost the index.lock backoff was reported as "another agent owns this
+  # branch", which is a different diagnosis with a different remedy: the SKILL maps 2 to "defer, take
+  # another task" and 99 to "transient, the orchestrator retries this one next iteration".
+  git_with_lock_backoff -C "$REPO_ROOT" worktree add "$WORKTREE_PATH" -b "$BRANCH" "$TRUNK_BRANCH" >&2
+  rc=$?
+  if [ $rc -ne 0 ]; then
     [ $rc -eq 99 ] && exit 99
     echo "FATAL: cannot create worktree for $SLUG. Likely another agent owns branch $BRANCH." >&2
     exit 2
@@ -98,7 +104,12 @@ fi
 # files (e.g. .env, node_modules) into a freshly created worktree so it can run a full
 # dev sandbox. Idempotent; no-op when the manifest is absent. Placeholder for now.
 if [ "$WORKTREE_WAS_CREATED" = "1" ] && [ -f "$SCRIPT_DIR/hydrate-worktree.sh" ] && [ -f "$REPO_ROOT/.worktreeinclude" ]; then
-  bash "$SCRIPT_DIR/hydrate-worktree.sh" "$REPO_ROOT" "$WORKTREE_PATH" "$TASK_FILE" || \
+  # >&2 like every other subprocess here. This script's stdout is a CONTRACT - the absolute worktree
+  # path and nothing else (whip-go tells the specialist "its stdout is the absolute worktree path",
+  # and the child skeleton tells a cheap shell-tier model to report it "exactly as printed"). The
+  # hydrator prints progress lines, so on any project with a .worktreeinclude the first checkout of
+  # every slug emitted three lines where one was promised, and `WT=$(clean-checkout.sh ...)` broke.
+  bash "$SCRIPT_DIR/hydrate-worktree.sh" "$REPO_ROOT" "$WORKTREE_PATH" "$TASK_FILE" >&2 || \
     echo "WARN: worktree hydration reported a problem for $SLUG; continuing." >&2
 fi
 

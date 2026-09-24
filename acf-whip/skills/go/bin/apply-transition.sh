@@ -107,7 +107,14 @@ rescue_deliverables() {
     fi
   done
   [ "$dirty" = "1" ] || return 0
-  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME deliverables" --quiet
+  if ! git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME deliverables" --quiet; then
+    rc=$?
+    echo "FATAL: commit failed (rc=$rc) while sweeping deliverables for $FNAME - they are STAGED but NOT committed." >&2
+    echo "       Anything that can make \`git commit\` fail at the trunk root does it here: a signing key that is not" >&2
+    echo "       usable (commit.gpgsign), a pre-commit hook from husky/lint-staged or core.hooksPath, an unset" >&2
+    echo "       user.name/user.email, or an index.lock held past the backoff. Fix that, then re-run /go." >&2
+    exit "$rc"
+  fi
   echo "ok: committed uncommitted deliverables for $FNAME"
 }
 
@@ -219,11 +226,32 @@ if [ ${#STAGE_PATHS[@]} -gt 0 ]; then
   [ ${#STAGE_ADD[@]} -gt 0 ] && STAGE_MSG=" (+${#STAGE_ADD[@]} deliverable file(s))"
 fi
 
+# PROPAGATE BOTH STATUSES. `ok:` used to print unconditionally, so a failed add or commit was
+# reported to the orchestrator as an applied transition: the task file had already been MOVED on
+# disk by the mv above, /go read the move and believed the state change was durable, and the whole
+# run's board progress existed only as uncommitted working-tree state. The next clean-checkout or
+# resync could then discard it with nothing anywhere saying a write had failed. This is what the
+# header's documented exit 99 was always for; it was simply never reachable.
 if [ ${#STAGE_ADD[@]} -gt 0 ]; then
   git_with_lock_backoff -C "$REPO_ROOT" add -- ".backlog/$FROM_STATE/$FNAME" ".backlog/$TO_STATE/$FNAME" "${STAGE_ADD[@]}"
 else
   git_with_lock_backoff -C "$REPO_ROOT" add -- ".backlog/$FROM_STATE/$FNAME" ".backlog/$TO_STATE/$FNAME"
 fi
+rc=$?
+if [ $rc -ne 0 ]; then
+  echo "FATAL: git add failed (rc=$rc); $FNAME was moved to $TO_STATE on disk but is NOT staged." >&2
+  echo "       The move is real and the commit is not - reconcile with /whip-doctor before re-running /go." >&2
+  exit "$rc"
+fi
 git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME $FROM_STATE -> $TO_STATE$STAGE_MSG" --quiet
+rc=$?
+if [ $rc -ne 0 ]; then
+  echo "FATAL: commit failed (rc=$rc); $FNAME was moved to $TO_STATE on disk but is NOT committed." >&2
+  echo "       Anything that can make \`git commit\` fail at the trunk root does it here: a signing key that is not" >&2
+  echo "       usable (commit.gpgsign), a pre-commit hook from husky/lint-staged or core.hooksPath, an unset" >&2
+  echo "       user.name/user.email, or an index.lock held past the backoff. Fix that, then re-run /go -" >&2
+  echo "       the move is on disk and staged, so the re-run reconciles rather than repeating work." >&2
+  exit "$rc"
+fi
 echo "ok: $FNAME $FROM_STATE -> $TO_STATE$STAGE_MSG"
 exit 0

@@ -107,9 +107,18 @@ while IFS= read -r line || [ -n "$line" ]; do
   [ "$matched" = "0" ] && echo "WARN: hydrate pattern matched nothing: $pathspec" >&2
 done < "$MANIFEST"
 
+# Nothing in the tree reads a `worktree-hydrate` row - it is not a gate token, not a doctor input,
+# and not referenced by any skill. It was appended with a raw `>>`, which put a malformed 5-cell row
+# outside the Transition Log section at EOF of the LIVE task document and bypassed append_log_row's
+# blank-file refusal, the one guard between a transient empty read and a FATAL|collapsed-task-file
+# hold-out. Route it through the shared writer, with the 6th cell the row shape requires.
 if [ -n "$TASK_FILE" ] && [ -f "$TASK_FILE" ]; then
   TS=$(date -u +"%Y-%m-%d %H:%M:%S")
-  printf '| %s | worktree-hydrate | ok | hydrate-worktree | %s |\n' "$TS" "$(basename "$WORKTREE_PATH")" >> "$TASK_FILE"
+  # shellcheck source=../../lib/acfw-git.sh
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../lib" && pwd)/acfw-git.sh" 2>/dev/null || true
+  if command -v append_log_row >/dev/null 2>&1; then
+    append_log_row "$TASK_FILE" "| $TS | worktree-hydrate | ok | hydrate-worktree | $(basename "$WORKTREE_PATH") | |" || true
+  fi
 fi
 
 exit $RC
