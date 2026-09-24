@@ -236,6 +236,27 @@ build_gate_land() {
 # proceed to the SAME build/sanity/gate/land path as a clean apply.
 if [ "$MODE" = "post-resolver" ]; then
   [ -d "$INTEG_WT" ] || { emit "mechanism no-integration-worktree key=$KEY"; exit 9; }
+  # RE-PIN THE CAS BASE to the base this candidate was actually BUILT on.
+  #
+  # OBSERVED was read at the top of THIS process, from the live trunk tip. But INTEG_WT was detached
+  # at the tip the PREVIOUS process saw (the initial attempt, before the conflict), and nothing since
+  # has moved it: `cherry-pick --no-commit` does not move HEAD, and neither does `--quit`. So the
+  # commit build_gate_land is about to create is parented on the OLD tip, while land() would
+  # compare-and-swap against the NEW one.
+  #
+  # Those are different refs, and the CAS would SUCCEED — update-ref's 3-arg form checks only that
+  # trunk still equals the value handed to it, not that the new commit descends from it. Trunk would
+  # be force-moved to a commit whose ancestry skips every commit made while the resolver agent
+  # worked: other tasks' integrations, their ledger markers, and (on the files store, where
+  # apply-transition.sh commits to trunk on a different serialization chain than integrate) every
+  # .backlog state transition in that window. They leave trunk with nothing said about it, and
+  # land()'s own resync then deletes their files from the working tree as "changed paths".
+  #
+  # The resolver window is an LLM agent run, so trunk moving inside it is ordinary, not exotic.
+  # Taking the base from the worktree makes the CAS ask the right question: a moved trunk now fails
+  # it and exits 11 cas-lost, which the caller already treats as transient and retries.
+  OBSERVED=$(git -C "$INTEG_WT" rev-parse --verify HEAD 2>/dev/null) \
+    || { emit "mechanism integration-worktree-headless key=$KEY"; exit 9; }
   if [ -n "$(git -C "$INTEG_WT" diff --name-only --diff-filter=U 2>/dev/null)" ]; then
     cleanup_wt; emit "mechanism conflict-unresolved key=$KEY"; exit 9
   fi

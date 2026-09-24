@@ -137,6 +137,46 @@ check "#18 NOT a quality-fault"                 "! echo \"\$OUT\" | grep -q 'qua
 check "#18 marker NOT landed"                   "! acfw_is_integrated \"$REPO\" trunk k_o_b"
 check "#18 trunk unchanged"                     "[ \"\$(trunk_tip)\" = \"$BEFORE6\" ]"
 
+echo "== Test 6b: trunk that MOVES across the resolver window must lose the CAS, not overwrite it =="
+# THE defect this pins. In --post-resolver mode OBSERVED was re-read from the LIVE trunk tip, but the
+# integration worktree is still detached at the tip the FIRST process saw (cherry-pick --no-commit and
+# --quit both leave HEAD alone). So the candidate commit was parented on the OLD tip while land()
+# compare-and-swapped against the NEW one - and update-ref's 3-arg form only checks that trunk still
+# EQUALS the value handed to it, never that the new commit descends from it. The CAS therefore
+# SUCCEEDED and force-moved trunk to a commit whose ancestry skipped everything committed while the
+# resolver agent worked: other tasks' integrations, their ledger markers, and every .backlog
+# transition (apply-transition.sh commits to trunk on a different serialization chain than integrate).
+# land()'s own resync then deleted those files from the working tree as "changed paths". No warning.
+#
+# The resolver window is an LLM agent run, so trunk moving inside it is ordinary.
+BASEM=$(trunk_tip)
+mktask k_move; mkcand_path k_move "movefile.txt" $'shared\nv1\n'          "$BASEM"
+mktask k_conf; mkcand_path k_conf "movefile.txt" $'shared\nv2-conflict\n' "$BASEM"
+run_iw "$IW" "$(TF k_move)"; check "#6b the first candidate lands" "[ $RC -eq 0 ]"
+run_iw "$IW" "$(TF k_conf)"                          # same file, same base -> conflict, exit 7
+INTEG_MV="$REPO/$ACFW_WORKTREE_DIR/_integrate/k_conf"
+if [ "$RC" -eq 7 ] && [ -d "$INTEG_MV" ]; then
+  WT_BASE=$(git -C "$INTEG_MV" rev-parse HEAD)
+  # a CONCURRENT writer advances trunk while the "resolver" works - exactly what apply-transition.sh
+  # does on the files store, on its own chain, during the same dispatch wave
+  echo "concurrent" > "$REPO/concurrent-work.txt"
+  git -C "$REPO" add concurrent-work.txt
+  git -C "$REPO" commit -q -m "task: someone-else completed -> in-review"
+  MOVED=$(trunk_tip)
+  check "#6b trunk really moved under the resolver" "[ \"$MOVED\" != \"$WT_BASE\" ]"
+  # resolver resolves the conflict and stages it
+  printf 'v2-resolved\n' > "$INTEG_MV/movefile.txt"
+  git -C "$INTEG_MV" add movefile.txt
+  run_iw "$IW" --post-resolver "$(TF k_conf)"
+  check "#6b a moved trunk loses the CAS (exit 11 cas-lost), it does not silently win" "[ $RC -eq 11 ]"
+  check "#6b the concurrent commit is STILL trunk" "[ \"\$(trunk_tip)\" = \"$MOVED\" ]"
+  check "#6b the concurrent commit's file survives on trunk" "on_trunk concurrent-work.txt"
+  check "#6b ...and on disk (land's resync never ran)" "[ -f \"$REPO/concurrent-work.txt\" ]"
+  check "#6b k_conf did NOT land behind everyone's back" "! acfw_is_integrated \"$REPO\" trunk k_conf"
+else
+  echo "  SKIP: #6b needs the initial attempt to exit 7 with a worktree (got rc=$RC)"
+fi
+
 echo "== Test 7: #8 union gate failure blocks the land =="
 mktask k7; mkcand_path k7 "g7.txt" "g7"
 BEFORE7=$(trunk_tip)
