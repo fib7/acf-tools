@@ -837,16 +837,26 @@ cmd_doctor() {
   # FATAL: namespace key attachment present but whip metadata missing/empty.
   jq -rs '.[] | select(((.meta.whip_key // "") == "") or ((.meta.whip_state // "") == "")) | "FATAL|missing-metadata|\(.url)|namespace key attachment carries no whip metadata"' "$jsonl" >> "$sev_file"
 
-  # REPAIRABLE: native workflow-state drifted from the whip_state projection.
-  local iid sid ws key want
-  while IFS=$'\t' read -r iid sid ws key; do
+  # Native workflow-state drifted from the whip_state projection — split by DIRECTION.
+  #
+  # Ordinary drift is a bookkeeping slip and is repaired. Drift where a human has CANCELED the issue
+  # in Linear while whip_state still says it is runnable is not drift at all: it is an instruction,
+  # and repairing it writes the runnable state back over the cancellation. `/go` runs `doctor --fix`
+  # at bootstrap, so that happens on every run — the same defect the multica adapter had, and the
+  # same reason it matters: a tool that silently un-cancels a card is a tool a team stops trusting
+  # with their board. Report it, name the way to park a task in whip's own vocabulary, leave it alone.
+  local iid sid ws key want stype
+  while IFS=$'\t' read -r iid sid ws key stype; do
     [ -n "$ws" ] || continue
     want=$(state_id_for_whip "$ws") || continue
-    if [ "$want" != "$sid" ]; then
-      printf 'REPAIRABLE|status-drift|%s|native=%s want=%s\n' "$key" "$sid" "$want" >> "$sev_file"
-      printf '%s\t%s\n' "$iid" "$want" >> "$drift_file"
+    [ "$want" = "$sid" ] && continue
+    if [ "$stype" = "canceled" ] && [ "$ws" != "archive" ]; then
+      printf 'WARN|native-hold|%s|the issue is CANCELED in Linear but whip_state=%s is runnable. Treating the cancellation as intentional and NOT repairing it. To park this task where the scheduler and the doctor both understand it: acfw-store transition %s draft   (or archive to retire it)\n' "$key" "$ws" "$key" >> "$sev_file"
+      continue
     fi
-  done < <(jq -rs '.[] | select((.meta.whip_state // "") != "") | [.id, .stateId, .meta.whip_state, (.meta.whip_key // "")] | @tsv' "$jsonl")
+    printf 'REPAIRABLE|status-drift|%s|native=%s want=%s\n' "$key" "$sid" "$want" >> "$sev_file"
+    printf '%s\t%s\n' "$iid" "$want" >> "$drift_file"
+  done < <(jq -rs '.[] | select((.meta.whip_state // "") != "") | [.id, .stateId, .meta.whip_state, (.meta.whip_key // ""), (.stateType // "")] | @tsv' "$jsonl")
 
   local sev; sev=$(cat "$sev_file")
   local fatal repairable warn

@@ -130,19 +130,46 @@ resolve_tokens() {
     exit 5
   fi
   if ! command -v jq >/dev/null 2>&1; then
-    # No jq (the files backend runs without it). Parse the two fields we need with sed: the resolved
-    # map's values, and the unresolved list. Deliberately narrow — a parse miss must look like "did
-    # not resolve", never like "resolved to something".
-    RESOLVED=$(printf '%s' "$out" | tr ',' '\n' | sed -n 's/.*"resolved":{*"[^"]*":"\([^"]*\)".*/\1/p; s/^"\([^"]*\)":"\([^"]*\)"}*$/\2/p' | grep -v '^$' | sort -u)
+    # No jq — the `files` backend runs without it, so this path is not hypothetical. Parse ONLY the
+    # two fields we need, each from its own delimited object, never by scanning the whole document
+    # for "key":"value" pairs: the snapshot is full of those (trunkRoot, branchPrefix, a SHA, every
+    # task's priority) and a loose match silently wrote them into the focus as if they were stems.
+    #
+    # `"resolved":{...}` is a flat string->string map, so the first `}` closes it.
+    RESOLVED=$(printf '%s' "$out" \
+      | sed -n 's/.*"resolved":{\([^}]*\)}.*/\1/p' \
+      | tr ',' '\n' \
+      | sed -n 's/^[[:space:]]*"[^"]*"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      | grep -v '^$' | sort -u)
+    # `"unresolved":[...]` is a flat string array, so the first `]` closes it.
     UNRESOLVED=$(printf '%s' "$out" | sed -n 's/.*"unresolved":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '"' | grep -v '^$' || true)
+    # `ambiguous` holds nested arrays, which a bracket-delimited match cannot bound. `"tok"` appears
+    # nowhere else in a snapshot, so collect those directly.
+    AMB_TOKS=$(printf '%s' "$out" | grep -o '"tok":"[^"]*"' | sed 's/^"tok":"//; s/"$//' | grep -v '^$' || true)
+    [ -n "$AMB_TOKS" ] && UNRESOLVED=$(printf '%s\n%s\n' "$UNRESOLVED" "$AMB_TOKS" | grep -v '^$')
   else
     RESOLVED=$(printf '%s' "$out" | jq -r '(.scope.resolved // {}) | to_entries[] | .value' 2>/dev/null | grep -v '^$' | sort -u)
     UNRESOLVED=$(printf '%s' "$out" | jq -r '((.scope.unresolved // []) + ((.scope.ambiguous // []) | map(.tok + " (matches " + ((.candidates // []) | join(", ")) + ")"))) []' 2>/dev/null || true)
   fi
   if [ -n "$UNRESOLVED" ]; then
     echo "FATAL: these do not resolve to exactly one task, so the focus was NOT changed:" >&2
-    printf '  %s\n' $UNRESOLVED >&2
+    # A whole line per finding, never word-split: the jq path's text is "tok (matches a, b)", and
+    # splitting on spaces turned the one useful part — the candidates — into fragments on their own
+    # lines, which reads like several unrelated failures.
+    printf '%s\n' "$UNRESOLVED" | grep -v '^$' | sed 's/^/  /' >&2
     echo "A focus holds exact stems only — a token that is ambiguous today would silently select a different task tomorrow." >&2
+    exit 3
+  fi
+  # ARITHMETIC GUARD, and the reason either parser above is trustworthy: we asked about N tokens, so
+  # the store resolved N stems. Anything else means the parse went wrong, not that the board is
+  # interesting — and a focus is only useful if it holds exactly what was asked for. Refuse rather
+  # than write what we think we read; a wrong focus is silently wrong on every later bare `/go`.
+  local nwant nhave
+  nwant=${#TOKENS[@]}
+  nhave=$(printf '%s\n' "$RESOLVED" | grep -c '[^[:space:]]' || true); nhave=${nhave//[^0-9]/}
+  if [ "${nhave:-0}" -ne "$nwant" ]; then
+    echo "FATAL: asked the store about $nwant task(s) but could only read back ${nhave:-0} — the focus was NOT changed." >&2
+    echo "This is a parse failure, not a verdict about the tasks. Install jq for a reliable read, or pass --no-resolve if you are certain of the exact stems." >&2
     exit 3
   fi
 }

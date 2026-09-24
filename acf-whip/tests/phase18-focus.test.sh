@@ -152,6 +152,49 @@ F add --no-resolve --by task brand-new-001 >/dev/null
 check "--no-resolve writes without consulting the store" "grep -qx 'brand-new-001' \"\$FOCUS_FILE\""
 check "...and stamps who set it" "grep -q '^# setBy=task' \"\$FOCUS_FILE\""
 
+# ============================ the jq-less path must behave IDENTICALLY =========================
+# The `files` backend runs without jq — it is the one backend where this path is the normal path,
+# not a fallback. Parsing the snapshot by scanning for "key":"value" pairs matched trunkRoot,
+# branchPrefix, a commit SHA and every task's priority, and wrote all of them into the focus as if
+# they were stems, reporting success. A focus that is silently wrong is wrong on every later bare /go.
+if command -v jq >/dev/null 2>&1; then
+  NOJQ="$WORK/nojqbin"; mkdir -p "$NOJQ"
+  OLDIFS=$IFS; IFS=:
+  for d in $PATH; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*; do
+      b=$(basename "$f"); [ "$b" = "jq" ] && continue
+      [ -e "$NOJQ/$b" ] || ln -sf "$f" "$NOJQ/$b" 2>/dev/null
+    done
+  done
+  IFS=$OLDIFS
+  NJ(){ env PATH="$NOJQ" ACFW_TRUNK_ROOT="$REPO" "$NOJQ/bash" "$FOCUS_BIN" "$@"; }
+  check "the test harness really hid jq" "! env PATH=\"\$NOJQ\" \"\$NOJQ/bash\" -c 'command -v jq' >/dev/null 2>&1"
+
+  NJ clear >/dev/null 2>&1
+  NJ set api-014-token ui-021-login >/dev/null 2>&1
+  check "set resolves correctly without jq" \
+    "[ \"\$(grep -v '^#' \"\$FOCUS_FILE\" | sort | paste -sd, -)\" = 'api-014-token,ui-021-login' ]"
+  check "...writing ONLY stems — no trunk path, SHA, priority or branch prefix leaked in" \
+    "! grep -qE '^(/|\\.worktree|trunk|default|medium|pending|worktree|[0-9a-f]{40})\$' \"\$FOCUS_FILE\""
+  check "...and exactly as many entries as were asked for" "[ \"\$(grep -cv '^#' \"\$FOCUS_FILE\")\" = '2' ]"
+
+  BEFORE_NJ=$(cat "$FOCUS_FILE")
+  NJ add nope-404 >/dev/null 2>&1; RC=$?
+  check "an unknown task still refuses without jq" "[ $RC -eq 3 ]"
+  check "...leaving the focus untouched" "[ \"\$(cat \"\$FOCUS_FILE\")\" = \"\$BEFORE_NJ\" ]"
+  NJ set ui-021 >/dev/null 2>&1; RC=$?
+  check "an ambiguous prefix still refuses without jq" "[ $RC -eq 3 ]"
+  check "...leaving the focus untouched" "[ \"\$(cat \"\$FOCUS_FILE\")\" = \"\$BEFORE_NJ\" ]"
+  NJ set UI-21 >/dev/null 2>&1
+  check "an ID resolves to its stem without jq" "grep -qx 'ui-021-login' \"\$FOCUS_FILE\""
+  # The guard that makes either parser trustworthy: N tokens in, N stems out, or refuse.
+  check "the count guard is what backs the refusal, not the parser" \
+    "grep -q 'could only read back' \"\$FOCUS_BIN\""
+else
+  ok "jq unavailable — the jq-less path IS the path under test everywhere above"
+fi
+
 # ============================ acfw-store info exposes it =======================================
 F set api-014-token ui-021-login >/dev/null
 INFO=$(bash "$STORE_BIN" info)
