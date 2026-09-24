@@ -44,6 +44,66 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       fail=1
     fi
   done
+
+  # STALENESS CHECK, and only when it can matter.
+  #
+  # `--remotes=<remote>` reads LOCAL remote-tracking refs, which are a cached belief about the
+  # destination, not the destination. If a branch there was deleted or rewritten, a stale tracking
+  # ref can exclude an attributed commit that this push reintroduces — and rev-list still succeeds,
+  # so the refusal above never fires either.
+  #
+  # Fetching on every push to close that would be the wrong trade: slow, and broken offline, for a
+  # hook that runs constantly. So pay nothing in the common case and check only when the exclusion is
+  # actually load-bearing — when dropping it would have flagged something. Then one `ls-remote`
+  # settles whether the tracking refs backing that exclusion are still current.
+  strict="$local_sha"
+  [ "$remote_sha" = "$z" ] || strict="$local_sha --not $remote_sha"
+  hidden=""
+  if strict_revs=$(git rev-list $strict 2>/dev/null); then
+    for c in $strict_revs; do
+      case " $revs " in *" $c "*) continue ;; esac        # already inspected above
+      git log -1 --format=%B "$c" | grep -qiE "$pat" && hidden="$hidden $c"
+    done
+  fi
+  if [ -n "$hidden" ]; then
+    if ! ls_out=$(git ls-remote --heads "$remote_name" 2>/dev/null) || [ -z "$ls_out" ]; then
+      echo "pre-push: REFUSED — an attributed commit is excluded because a local remote-tracking ref" >&2
+      echo "          says it is already on '$remote_name', and that claim could not be verified" >&2
+      echo "          (ls-remote failed). Run:  git fetch --prune $remote_name   and push again." >&2
+      exit 1
+    fi
+    stale=0
+    # (a) a tracking ref whose sha no longer matches the remote's.
+    remote_names=""
+    while read -r rsha rref; do
+      [ -n "${rref:-}" ] || continue
+      short="${rref#refs/heads/}"
+      remote_names="$remote_names $short"
+      track="refs/remotes/$remote_name/$short"
+      lsha=$(git rev-parse --verify --quiet "$track" 2>/dev/null) || continue
+      [ "$lsha" = "$rsha" ] || stale=1
+    done <<EOF
+$ls_out
+EOF
+    # (b) a tracking ref for a branch the remote no longer has AT ALL. This is the case that
+    # actually excuses a reintroduced commit — the ref still points at it locally while nothing on
+    # the destination does — and comparing only the refs the remote still reports cannot see it.
+    # HEAD is a symref, not a branch; skip it.
+    for track in $(git for-each-ref --format='%(refname)' "refs/remotes/$remote_name/" 2>/dev/null); do
+      short="${track#refs/remotes/$remote_name/}"
+      [ "$short" = "HEAD" ] && continue
+      case " $remote_names " in *" $short "*) ;; *) stale=1 ;; esac
+    done
+    if [ "$stale" -ne 0 ]; then
+      echo "pre-push: REFUSED — this push reintroduces commit(s) carrying an AI attribution trailer:" >&2
+      for c in $hidden; do echo "            $(git log -1 --format='%h %s' "$c")" >&2; done
+      echo "          They were excluded as 'already on $remote_name', but your remote-tracking refs" >&2
+      echo "          for that remote are out of date, so that exclusion cannot be trusted. Run:" >&2
+      echo "            git fetch --prune $remote_name" >&2
+      echo "          and push again — if they really are still published there, this will pass." >&2
+      exit 1
+    fi
+  fi
 done
 
 if [ "$fail" -ne 0 ]; then
