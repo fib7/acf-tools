@@ -222,9 +222,14 @@ git config core.hooksPath .githooks
 ```
 
 - `.githooks/commit-msg` — rejects the commit outright.
-- `.githooks/pre-push` — re-checks the whole pushed range, because `commit-msg` does
-  not fire on `git cherry-pick` (how LP-CAS integrates), on rebase replay, or under
-  `--no-verify`.
+- `.githooks/pre-push` — re-checks what the push ADDS to that remote, because `commit-msg`
+  does not fire on `git cherry-pick` (how LP-CAS integrates), on rebase replay, or under
+  `--no-verify`. The range excludes commits already published on the remote being pushed
+  to: the policy is that this clone does not *introduce* attributed commits, and refusing
+  ones already sitting on that remote makes every fork sync permanently unpushable without
+  removing anything. An unpublished offender still cannot ride in through a merge.
+- `.githooks/pre-push.test.sh` — run it after touching either hook. It is the only thing
+  standing between "the gate works" and "the gate silently stopped rejecting".
 
 Never bypass with `--no-verify`. Full rules: `docs/acf/git/commit-conventions.md`,
 which the acf-librarian SessionStart hook injects into every session.

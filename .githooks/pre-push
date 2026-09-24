@@ -18,14 +18,26 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # Deleting a remote ref pushes a null local sha; nothing to inspect.
   [ "$local_sha" = "$z" ] && continue
 
-  if [ "$remote_sha" = "$z" ]; then
-    # New branch: inspect what this push adds beyond anything already on the remote.
-    range="$local_sha --not --remotes=$remote_name"
-  else
-    range="$remote_sha..$local_sha"
+  # What this push ADDS to this remote, in both cases. The exclusion is `--remotes=<remote>` and not
+  # just the old tip of this one branch: the policy is that THIS clone does not introduce AI-attributed
+  # commits, and a commit already published on the remote is not being introduced by us. Without it,
+  # merging any external branch that contains one — a fork sync, an upstream pull — is permanently
+  # unpushable, while the offending commit sits on that remote either way. The new-branch case has
+  # always had the correct scope; the existing-branch case did not, which is a range bug, not a
+  # stricter policy. Every genuinely new commit is still inspected on both paths.
+  range="$local_sha --not --remotes=$remote_name"
+  [ "$remote_sha" = "$z" ] || range="$range $remote_sha"
+
+  # `for c in $(git rev-list ...)` silently inspects NOTHING when rev-list fails (a bad ref, a shallow
+  # clone, an unreachable sha) — the loop body never runs and the push sails through unchecked. A gate
+  # that cannot compute its range has not passed; it has not run. Refuse instead.
+  if ! revs=$(git rev-list $range 2>/dev/null); then
+    echo "pre-push: REFUSED — could not compute the pushed range ($range)." >&2
+    echo "          The attribution gate did not run, so this push is not verified." >&2
+    exit 1
   fi
 
-  for c in $(git rev-list $range); do
+  for c in $revs; do
     if git log -1 --format=%B "$c" | grep -qiE "$pat"; then
       echo "pre-push: REJECTED $(git log -1 --format='%h %s' "$c")" >&2
       echo "          carries an AI attribution trailer." >&2
