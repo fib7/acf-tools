@@ -514,11 +514,19 @@ awk -F'\t' -v mode="$MODE" '
 # Memoised. A dep token is resolved once per DEPENDENT, so a token shared by many tasks rescanned the
 # whole stem table every time. The cache stores misses too ("" is a real answer), which is why the
 # presence test is on rcache and not on its value.
-function resolve(d,   s){
-  if(d in rcache) return rcache[d]
-  if(d in stems){ rcache[d]=d; return d }
-  for(s in stems){ if(index(s,d)==1){ rcache[d]=s; return s } }
-  rcache[d]=""; return ""
+function resolve(d, self,   s, k){
+  # Exact wins, and is O(1) — including a GENUINE self-dependency, which is a real cycle of one.
+  if(d in stems) return d
+  # Prefix fallback, excluding the DEPENDING task. Nothing excluded it before, so a token like
+  # feature-231-api that no longer exists prefix-matched its own task feature-231-api-v2, the
+  # self-loop branch fired, and the doctor reported a cycle that is not there — FATAL, ok=false,
+  # /go refuses to dispatch. Which stem won was awk hash order, so it was not even reproducible.
+  # A token that resolves only to its own task is a BAD TOKEN: fall through to dangling-dep, which
+  # names the thing to fix. Cached per (token, dependent) because the exclusion is per-dependent.
+  k = d SUBSEP self
+  if(k in rcache) return rcache[k]
+  for(s in stems){ if(s!=self && index(s,d)==1){ rcache[k]=s; return s } }
+  rcache[k]=""; return ""
 }
 
 # Tarjan strongly-connected components. The previous detector peeled nodes with no DEPENDENTS and
@@ -564,9 +572,9 @@ END{
     n=split(depsOf[s], da, ",");
     for(k=1;k<=n;k++){ d=da[k]; gsub(/[ \t]/,"",d);
       if(d=="" || d=="none") continue;
-      r=resolve(d);
+      r=resolve(d, s);
       if(r==""){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|dangling-dep|" s "|depends on " d " which has no task file"; continue }
-      adj[s]=adj[s]" "r; indeg[r]++;
+      adj[s]=adj[s]" "r;
       # Branch-aware: a cross-slug dep that is accepted-but-unintegrated only blocks when it still
       # has a live worktree branch (genuinely pending integration). A branchless historical accepted
       # dep is already on trunk -> satisfied (matches the workflow runtime-terminal model).
@@ -677,6 +685,20 @@ fi
 LIVE_SLUGS=$(awk -F'\t' -v mode="$MODE" '
   $2=="pending"||$2=="in-progress"||$2=="completed"||$2=="in-review" {print $5; next}
   $2=="accepted" && (mode=="override" || ($8=="" && $11=="1")) {print $5}' "$TSV" | sort -u)
+
+# PARKED slugs (3.4.0). draft/archive are not in $ACTIVE, so they never reach $TSV and a paused
+# task's slug looked exactly like an unowned one — the reaper force-removed the worktree and -D'd
+# the branch on the next bootstrap `doctor --fix`, whose stdout /go discards. Pausing is the
+# SUPPORTED way to park work on every backend, so it must not be the way to lose it. Reported, never
+# reaped: the judgement about a retired task's leftover branch is the operator's, and a WARN keeps it
+# visible instead of trading silent deletion for silent accumulation.
+PARKED_SLUGS=$(
+  for _st in draft archive; do
+    [ -d "$BL/$_st" ] || continue
+    grep -hE '^- \*\*Worktree\*\*:' "$BL/$_st/"*.md 2>/dev/null \
+      | sed -E 's/.*Worktree\*\*:[[:space:]]*//; s/[[:space:]]+$//; s/^[[:space:]]+//'
+  done | grep -vxE '(none)?' | sort -u
+)
 if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
   while IFS= read -r wt; do
     [ -z "$wt" ] && continue
@@ -692,7 +714,11 @@ if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
       *) continue ;;                # foreign / detached / plain dir — not ours
     esac
     [ "$actual" != "$ACFW_BRANCH_PREFIX/$slug" ] && emit FATAL worktree-wrong-branch "$slug" "$ACFW_WORKTREE_DIR/$slug is on '$actual', expected '$ACFW_BRANCH_PREFIX/$slug'"
-    if ! printf '%s\n' "$LIVE_SLUGS" | grep -qx "$slug"; then
+    if ! printf '%s\n' "$LIVE_SLUGS" | grep -qxF "$slug"; then
+      if printf '%s\n' "$PARKED_SLUGS" | grep -qxF "$slug"; then
+        emit WARN parked-task-worktree "$slug" "$ACFW_WORKTREE_DIR/$slug belongs to a task that is parked (draft) or retired (archive) — NOT removed. Resume it with /whip-move $slug pending, or remove the worktree by hand once you are sure nothing in it is needed"
+        continue
+      fi
       # NEVER --force a worktree that holds uncommitted work. This reaper is the one place acf-whip can
       # destroy one-of-a-kind deliverables (a `remove --force` discards modified AND untracked files:
       # thousands of cassettes, a findings doc, an .env). A dirty orphan is reported and left for a

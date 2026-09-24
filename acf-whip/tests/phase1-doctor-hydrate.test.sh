@@ -122,6 +122,34 @@ check "live worktree NOT flagged orphan" "! echo \"$OUT\" | grep -q 'orphaned-wo
 bash "$DOC" --fix "$REPO" >/dev/null
 check "orphan worktree removed after --fix" "[ ! -d '$REPO/.worktree/ghost' ]"
 
+echo "== a PARKED task keeps its worktree (3.4.0 pause is a real state) =="
+# The reaper's liveness census is built from the ACTIVE folders only, and draft/archive are not among
+# them — so the supported way to park work (`/whip-move <task> draft`) made the task's slug look
+# unowned, and the next bootstrap `doctor --fix` force-removed the worktree and -D'd the branch.
+# /go runs that --fix with stdout discarded, so the deliverable went with nothing saying so.
+mkdir -p "$REPO/.backlog/draft" "$REPO/.backlog/archive"
+mktask draft parked parked draft go-engineer none "" 0; git add -A; git commit -qm parked
+bash "$CC" "$REPO/.backlog/draft/parked.md" >/dev/null 2>&1 || \
+  git -C "$REPO" worktree add -q "$REPO/.worktree/parked" -b worktree/parked trunk 2>/dev/null
+OUT=$(bash "$DOC" "$REPO")
+check "a paused task's worktree is NOT called orphaned" "! echo \"$OUT\" | grep -q 'orphaned-worktree|parked'"
+check "...it is reported as parked instead, so it stays visible" "echo \"$OUT\" | grep -q '^WARN|parked-task-worktree|parked'"
+bash "$DOC" --fix "$REPO" >/dev/null
+check "...and it SURVIVES --fix (the whole point of pausing)" "[ -d '$REPO/.worktree/parked' ]"
+check "...branch intact too" "git -C '$REPO' rev-parse --verify -q refs/heads/worktree/parked >/dev/null"
+
+# Same protection for a retired task: archive is cancel, not 'destroy the only copy'.
+git -C "$REPO" mv .backlog/draft/parked.md .backlog/archive/parked.md 2>/dev/null || \
+  { mkdir -p "$REPO/.backlog/archive"; mv "$REPO/.backlog/draft/parked.md" "$REPO/.backlog/archive/parked.md"; }
+sed -i '' -E 's/^- \*\*Status\*\*: .*/- **Status**: archive/' "$REPO/.backlog/archive/parked.md" 2>/dev/null || \
+  sed -i -E 's/^- \*\*Status\*\*: .*/- **Status**: archive/' "$REPO/.backlog/archive/parked.md"
+git add -A; git commit -qm archived
+bash "$DOC" --fix "$REPO" >/dev/null
+check "an archived task's worktree also survives --fix" "[ -d '$REPO/.worktree/parked' ]"
+git -C "$REPO" worktree remove --force "$REPO/.worktree/parked" 2>/dev/null
+git -C "$REPO" branch -D worktree/parked >/dev/null 2>&1
+rm -f "$REPO/.backlog/archive/parked.md"; git add -A; git commit -qm cleanup-parked >/dev/null
+
 echo "== ownership scoping: foreign worktrees under .worktree/ are left alone =="
 # A user's own research/benchmark worktree parked under .worktree/, on a NON-namespace branch.
 # acf-whip owns only the <prefix>/<slug> branch namespace, so this must be invisible to the

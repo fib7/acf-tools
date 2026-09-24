@@ -139,11 +139,19 @@ BEGIN{ split("pending in-progress completed in-review blocked rejected accepted"
 # Memoised. A dep token is resolved once per DEPENDENT, so a token shared by many tasks rescanned the
 # whole stem table every time. The cache stores misses too ("" is a real answer), which is why the
 # presence test is on rcache and not on its value.
-function resolve(d,   s){
-  if(d in rcache) return rcache[d]
-  if(d in stems){ rcache[d]=d; return d }
-  for(s in stems){ if(index(s,d)==1){ rcache[d]=s; return s } }
-  rcache[d]=""; return ""
+function resolve(d, self,   s, k){
+  # Exact wins, and is O(1) — including a GENUINE self-dependency, which is a real cycle of one.
+  if(d in stems) return d
+  # Prefix fallback, excluding the DEPENDING task. Nothing excluded it before, so a token like
+  # feature-231-api that no longer exists prefix-matched its own task feature-231-api-v2, the
+  # self-loop branch fired, and the doctor reported a cycle that is not there — FATAL, ok=false,
+  # /go refuses to dispatch. Which stem won was awk hash order, so it was not even reproducible.
+  # A token that resolves only to its own task is a BAD TOKEN: fall through to dangling-dep, which
+  # names the thing to fix. Cached per (token, dependent) because the exclusion is per-dependent.
+  k = d SUBSEP self
+  if(k in rcache) return rcache[k]
+  for(s in stems){ if(s!=self && index(s,d)==1){ rcache[k]=s; return s } }
+  rcache[k]=""; return ""
 }
 
 # Tarjan strongly-connected components. The previous detector peeled nodes with no DEPENDENTS and
@@ -188,7 +196,7 @@ END{
     n=split(depsOf[s], da, ",");
     for(k=1;k<=n;k++){ d=da[k]; gsub(/[ \t]/,"",d);
       if(d=="" || d=="none") continue;
-      r=resolve(d);
+      r=resolve(d, s);
       # Same severity question the per-task battery asks: is the REFERRING task in the dispatch path?
       # accepted is terminal, draft is the human gate, archive is retired — a defect on any of them
       # cannot make a run wrong, so it must not gate one. This half was missed when the per-task tier
@@ -199,7 +207,7 @@ END{
       # dispatch (isTerminal is false for both), so this is not a gate FATAL — it is the reason a task
       # will sit in pending forever, which an operator otherwise has to work out from silence.
       if(r in inert && !(s in inert)){ print "WARN|dep-inactive|" s "|depends on " r ", which is in " state[r] " — it will never be dispatched until that task is moved to pending"; continue }
-      adj[s]=adj[s]" "r; indeg[r]++;
+      adj[s]=adj[s]" "r;
       # mode!="override": in override mode the operator integrates, so no marker is ever written and
       # accepted-but-unintegrated is the normal end state of every task. The scheduler already relaxes
       # this same gate there and dispatches the dependent, so firing here would abort the run on a
@@ -249,6 +257,10 @@ LIVE_SLUGS=$(printf '%s' "$SNAP" | jq -r --arg mode "$MODE" '.tasks[]? |
          or ($mode=="override" and .folder=="accepted")
          or (.folder=="accepted" and ((.hasIntegratedAt // false) | not) and ((.integratedAt // "") == "") and (.hasWorktreeBranch // false)))
   | .slug // ""' | sort -u)
+# PARKED slugs (3.4.0). A draft/archive task lives in `inactive[]`, never in `tasks[]`, so its slug
+# looked unowned here exactly as it did in doctor.sh — which reaps. The two batteries must agree
+# about the one thing that can destroy a deliverable.
+PARKED_SLUGS=$(printf '%s' "$SNAP" | jq -r '.inactive[]? | .slug // ""' 2>/dev/null | grep -v '^$' | grep -vx none | sort -u)
 if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
   while IFS= read -r wt; do
     [ -z "$wt" ] && continue
@@ -259,8 +271,12 @@ if [ -d "$REPO_ROOT/$ACFW_WORKTREE_DIR" ]; then
       *) continue ;;                # foreign / detached — not ours (ownership guard)
     esac
     [ "$actual" != "$ACFW_BRANCH_PREFIX/$slug" ] && emit FATAL worktree-wrong-branch "$slug" "$ACFW_WORKTREE_DIR/$slug is on '$actual', expected '$ACFW_BRANCH_PREFIX/$slug'"
-    if ! printf '%s\n' "$LIVE_SLUGS" | grep -qx "$slug"; then
-      if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    # -qxF, not -qx: a slug is a filename, not a regex. `api.v2` matched `apixv2` under -qx, which
+    # here calls a live worktree orphaned. doctor.sh and scan-backlog.sh both already use -qxF.
+    if ! printf '%s\n' "$LIVE_SLUGS" | grep -qxF "$slug"; then
+      if printf '%s\n' "$PARKED_SLUGS" | grep -qxF "$slug"; then
+        emit WARN parked-task-worktree "$slug" "$ACFW_WORKTREE_DIR/$slug belongs to a task that is parked (draft) or retired (archive) — left alone. Resume it with /whip-move $slug pending, or remove the worktree by hand once you are sure nothing in it is needed"
+      elif [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
         emit WARN orphaned-worktree-dirty "$slug" "$ACFW_WORKTREE_DIR/$slug has no live task but holds UNCOMMITTED changes — inspect, salvage, remove by hand"
       else
         emit WARN orphaned-worktree "$slug" "$ACFW_WORKTREE_DIR/$slug has no pending/in-progress/completed/in-review task (remove: git worktree remove $ACFW_WORKTREE_DIR/$slug)"

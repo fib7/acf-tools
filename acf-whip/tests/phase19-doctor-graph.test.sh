@@ -161,6 +161,38 @@ bash "$DOC" --fix "$REPO" >/dev/null 2>&1
 check "--fix refuses to guess a survivor: both copies survive" \
   "[ -f .backlog/pending/dup-001.md ] && [ -f .backlog/blocked/dup-001.md ]"
 
+# ============================ a dep token that prefixes its OWN task is not a cycle ============
+# The dep resolver falls back to a prefix scan over every stem, and nothing excluded the DEPENDING
+# stem from that scan. So `feature-231-api-v2` declaring a dependency on `feature-231-api` — a name
+# that no longer exists — prefix-matched itself, the self-loop branch fired, and the doctor reported
+# a cycle that is not there: FATAL, ok=false, /go refuses to dispatch. Which stem won was awk hash
+# order, so it was not even reproducible across platforms. A token that only resolves to its own task
+# is a BAD TOKEN; dangling-dep is the truthful finding and names the thing to fix.
+mkdir -p .backlog/pending
+mk pending feature-231-api-v2 f231 "feature-231-api"
+git add -A; git commit -qm prefixself
+check "a dep token that prefix-matches only its own task is NOT a cycle" \
+  "! bash \"\$DOC\" \"\$REPO\" 2>/dev/null | grep -q '^FATAL|cyclic-deps|feature-231-api-v2|'"
+check "...it is reported as a dangling dependency instead" \
+  "bash \"\$DOC\" \"\$REPO\" 2>/dev/null | grep -q '^FATAL|dangling-dep|feature-231-api-v2|'"
+check "...and the generic battery agrees" \
+  "! bash \"\$SCAN\" \"\$REPO\" 2>/dev/null | bash \"\$GEN\" \"\$REPO\" 2>/dev/null | grep -q '^FATAL|cyclic-deps|feature-231-api-v2|'"
+check "...reporting the same dangling token" \
+  "bash \"\$SCAN\" \"\$REPO\" 2>/dev/null | bash \"\$GEN\" \"\$REPO\" 2>/dev/null | grep -q '^FATAL|dangling-dep|feature-231-api-v2|'"
+# A genuine prefix reference to ANOTHER task still resolves, and a genuine self-dependency is still
+# a cycle — the fix must not blunt either.
+mk pending target-900-real tgt "none"
+mk pending refers-by-prefix rbp "target-900"
+mk pending honest-self hs "honest-self"
+git add -A; git commit -qm prefixstill
+check "a unique prefix of ANOTHER task still resolves" \
+  "! bash \"\$DOC\" \"\$REPO\" 2>/dev/null | grep -q '^FATAL|dangling-dep|refers-by-prefix|'"
+check "a genuine self-dependency is still a cycle" \
+  "bash \"\$DOC\" \"\$REPO\" 2>/dev/null | grep -q '^FATAL|cyclic-deps|honest-self|'"
+rm -f .backlog/pending/feature-231-api-v2.md .backlog/pending/target-900-real.md \
+      .backlog/pending/refers-by-prefix.md .backlog/pending/honest-self.md
+git add -A; git commit -qm rmprefixfixture
+
 echo
 echo "phase19-doctor-graph: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
