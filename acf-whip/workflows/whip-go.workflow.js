@@ -672,8 +672,8 @@ function reconcileIntegrationTallies(integratedStems, rejectedStems, attemptedIn
 // entries), and `relay.bytes` is the sum of the UTF-8 byte lengths of every stem across them. The
 // count alone is not enough — a model that truncates may also "tidy" a header it can see — so the
 // byte sum is a second, content-derived number it would have to recompute deliberately to keep
-// consistent. The header is emitted as the FIRST key, so a tail-elided echo still carries the
-// expectation it fails.
+// consistent. The header leads the object (after the dispatcher's own store/tokenAllStates keys, and
+// always before tasks[]), so a tail-elided echo still carries the expectation it fails.
 //
 // WHAT THIS PROVES, precisely: no entry was dropped, added, or replaced by one of a different stem
 // length. It does NOT prove stem identity — an equal-length substitution passes. That is deliberate:
