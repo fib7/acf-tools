@@ -98,6 +98,27 @@ CAPS=""
 load_caps() { [ -n "$CAPS" ] || CAPS=$("$ADAPTER" capabilities 2>/dev/null || true); }
 has_cap() { load_caps; printf '%s' "$CAPS" | grep -q "\"$1\""; }
 
+# norm_path <path>: the one spelling of a path that git gives many. COPIED VERBATIM from
+# skills/go/bin/apply-transition.sh: keep the two in step. The transition compensation below guards
+# the same paths that writer guards, and a guard that matches the spelling alone lets `docs//cycles`
+# or `docs/./cycles` through to `git add`. Only what git itself collapses is rewritten: repeated
+# slashes, `.` segments, a trailing slash. `..` is refused, never resolved. An empty result means the
+# root and comes back as `.`. Every rewrite shortens the string, so the loop ends.
+norm_path() {
+  local q="$1"
+  while :; do
+    case "$q" in
+      *//*)  q="${q%%//*}/${q#*//}" ;;
+      */./*) q="${q%%/./*}/${q#*/./}" ;;
+      ./*)   q="${q#./}" ;;
+      */.)   q="${q%/.}" ;;
+      ?*/)   q="${q%/}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s\n' "${q:-.}"
+}
+
 case "$SUB" in
 
   snapshot)
@@ -212,25 +233,45 @@ case "$SUB" in
     fi
     # Compensation: deliverables are repo-tree artifacts — commit them to trunk here,
     # with the same path refusals as apply-transition.sh, then transition stateside.
+    # Tasks never edit cycles, and this commits at the shared root, where a human may be half way
+    # through amending a plan.md or drafting a cycle: staging it would commit their draft with a task
+    # and void the approval at HEAD. The state and cycles guards read the NORMALIZED path, and that
+    # form is what gets staged, so `docs//cycles/<ID>/plan.md` cannot slip past on its spelling. An
+    # ancestor (`docs`, `.`) is staged with docs/cycles excluded. The exclude goes ONLY on that
+    # ancestor add: with an exclude pathspec present, git (seen on 2.51) can silently skip an exact
+    # untracked file whose parent directory is untracked and still exit 0.
     STEM="${REST[0]:-task}"
-    ADDED=0
+    ADDED=0          # 0 nothing staged · 1 exact paths only · 2 an ancestor too (needs the exclude)
+    ADDED_PATHS=()   # exactly what was staged here: the commit names these and nothing else
     for p in "${STAGE_PATHS[@]}"; do
       p="${p#./}"
       case "$p" in
-        "")                    echo "FATAL: --stage path is empty" >&2; exit 2 ;;
-        /*)                    echo "FATAL: --stage path must be repo-relative, got absolute: $p" >&2; exit 2 ;;
-        *..*)                  echo "FATAL: --stage path must not traverse '..': $p" >&2; exit 2 ;;
-        .backlog/*|.acfwhip/*) echo "FATAL: --stage refuses state paths (.backlog/, .acfwhip/): $p" >&2; exit 2 ;;
+        "")   echo "FATAL: --stage path is empty" >&2; exit 2 ;;
+        /*)   echo "FATAL: --stage path must be repo-relative, got absolute: $p" >&2; exit 2 ;;
+        *..*) echo "FATAL: --stage path must not traverse '..': $p" >&2; exit 2 ;;
       esac
-      if [ -e "$REPO_ROOT/$p" ]; then
-        git_with_lock_backoff -C "$REPO_ROOT" add -- "$p" || exit 99
-        ADDED=1
+      q=$(norm_path "$p")
+      case "$q" in
+        # The bare folders count: `git add -- .backlog` stages the whole task store.
+        .backlog|.backlog/*|.acfwhip|.acfwhip/*) echo "FATAL: --stage refuses state paths (.backlog/, .acfwhip/): $p" >&2; exit 2 ;;
+        docs/cycles|docs/cycles/*) echo "WARN: not staging '$p': tasks never edit cycles; change a plan with /whip" >&2; continue ;;
+      esac
+      if [ -e "$REPO_ROOT/$q" ]; then
+        case "$q" in
+          .|docs) git_with_lock_backoff -C "$REPO_ROOT" add -- "$q" ':(exclude)docs/cycles' || exit 99; ADDED=2 ;;
+          *)      git_with_lock_backoff -C "$REPO_ROOT" add -- "$q" || exit 99; [ "$ADDED" = 2 ] || ADDED=1 ;;
+        esac
+        ADDED_PATHS[${#ADDED_PATHS[@]}]="$q"
       else
-        echo "warn: --stage path not found, skipped: $p" >&2
+        echo "warn: --stage path not found, skipped: $q" >&2
       fi
     done
-    if [ "$ADDED" = "1" ] && ! git -C "$REPO_ROOT" diff --cached --quiet 2>/dev/null; then
-      git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $STEM deliverables" --quiet || exit 99
+    # The probe and the commit both name only those paths. A bare `git commit` took the whole root
+    # index, so a file a human had staged (a plan.md amendment while /go runs) was committed under a
+    # "task: ..." subject, and that staged file alone could make a deliverables commit look due.
+    [ "$ADDED" = 2 ] && ADDED_PATHS[${#ADDED_PATHS[@]}]=':(exclude)docs/cycles'
+    if [ "$ADDED" != 0 ] && ! git -C "$REPO_ROOT" diff --cached --quiet -- "${ADDED_PATHS[@]}" 2>/dev/null; then
+      git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $STEM deliverables" --quiet -- "${ADDED_PATHS[@]}" || exit 99
       echo "ok: committed deliverables for $STEM (store '$STORE' keeps state outside git)"
     fi
     exec "$ADAPTER" transition ${REST[@]+"${REST[@]}"}

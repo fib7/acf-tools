@@ -15,7 +15,9 @@
 #                   paths, so the next checkout/stash wiped them (permanent loss). The single writer
 #                   stages them by EXPLICIT path in the SAME commit as the folder move. State
 #                   namespaces are refused: .backlog/ is this writer's own business, .acfwhip/ is the
-#                   integrator's ledger. Non-existent paths are skipped with a note.
+#                   integrator's ledger. Non-existent paths are skipped with a note. docs/cycles/
+#                   is never staged (3.5.0: tasks never edit cycles): a path in it is skipped with a
+#                   WARN, and an ancestor (docs, docs/, .) is staged with docs/cycles excluded.
 #     TASK_FILE  absolute path to the task file in its CURRENT state folder
 #     TO_STATE   target folder under .backlog/ (pending|in-progress|completed|
 #                in-review|accepted|rejected|blocked)
@@ -41,8 +43,33 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/../../lib/acfw-git.sh"
 
+# norm_path <path>: the one spelling of a path that git gives many. git reads docs//cycles,
+# docs/./cycles, ././docs and docs/ as the same pathspec, so a guard that matches the spelling alone
+# lets the others through: `--stage docs//cycles/<ID>/plan.md` committed a human's unfinished plan
+# amendment with a task. Only what git itself collapses is rewritten: repeated slashes, `.`
+# segments, a trailing slash. `..` is refused, never resolved. `//` is collapsed before a leading
+# `./` is stripped, so `.//x` becomes `x` and only an absolute path can come out absolute.
+# An empty result means the root and comes back as `.`. Every rewrite shortens the string, so the
+# loop ends.
+norm_path() {
+  local q="$1"
+  while :; do
+    case "$q" in
+      *//*)  q="${q%%//*}/${q#*//}" ;;
+      */./*) q="${q%%/./*}/${q#*/./}" ;;
+      ./*)   q="${q#./}" ;;
+      */.)   q="${q%/.}" ;;
+      ?*/)   q="${q%/}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s\n' "${q:-.}"
+}
+
 # --stage PATH... — validated up-front (before any file mutation) so a bad path never leaves a
 # half-applied transition. Refusal is exit 2: a caller that hands us a state path has a bug.
+# The empty, absolute and `..` checks read the path as given. The state and cycles checks read its
+# normalized form, and that form is what gets staged, so the path tested is the path git receives.
 STAGE_PATHS=()
 while [ $# -gt 0 ]; do
   case "${1:-}" in
@@ -53,9 +80,19 @@ while [ $# -gt 0 ]; do
         "") echo "FATAL: --stage path is empty" >&2; exit 2 ;;
         /*) echo "FATAL: --stage path must be repo-relative, got absolute: $p" >&2; exit 2 ;;
         *..*) echo "FATAL: --stage path must not traverse '..': $p" >&2; exit 2 ;;
-        .backlog/*|.acfwhip/*) echo "FATAL: --stage refuses state paths (.backlog/, .acfwhip/): $p" >&2; exit 2 ;;
       esac
-      STAGE_PATHS[${#STAGE_PATHS[@]}]="$p"
+      q=$(norm_path "$p")
+      case "$q" in
+        # The bare folders count: `git add -- .backlog` stages the whole task store.
+        .backlog|.backlog/*|.acfwhip|.acfwhip/*) echo "FATAL: --stage refuses state paths (.backlog/, .acfwhip/): $p" >&2; exit 2 ;;
+        # Skipped, never refused (exit 2 would strand the state move over a bookkeeping slip). The
+        # bare folder counts: `git add -- docs/cycles` stages every cycle, a human's untracked draft
+        # included. CYCLES_EXCLUDE below covers the ancestors this case cannot see.
+        docs/cycles|docs/cycles/*)
+          echo "WARN: not staging '$p': tasks never edit cycles; change a plan with /whip" >&2
+          shift 2; continue ;;
+      esac
+      STAGE_PATHS[${#STAGE_PATHS[@]}]="$q"
       shift 2 ;;
     --) shift; break ;;
     -*) echo "FATAL: unknown option: $1" >&2; exit 2 ;;
@@ -93,24 +130,56 @@ FNAME=$(basename "$TASK_FILE")
 FROM_STATE=$(basename "$(dirname "$TASK_FILE")")
 DEST="$REPO_ROOT/.backlog/$TO_STATE/$FNAME"
 
+# Tasks never edit cycles, and this writer commits at the shared root, where a human may be half way
+# through amending a plan.md: a deliverable listed as `docs`, `docs/` or `.` would stage that draft
+# with the task's files, commit it, and void the approval at HEAD with no /whip card behind it. A
+# path IN docs/cycles is skipped at parse time above; an ANCESTOR of it gets this exclude, which
+# only git can apply. An exclude that filters out everything the ancestor matched is not an error
+# (rc 0), so a docs/ holding only cycles never strands the transition.
+#
+# The exclude goes ONLY on an ancestor's own `git add`, never on one that names exact files. With an
+# exclude pathspec present, git (seen on 2.51) can silently skip an exact untracked file whose parent
+# directory is untracked and still exit 0: `add -- docs/research/new.md ':(exclude)x'` stages
+# nothing. That is the shape of the rescue sweep's one-path add, and phase3's rescue case caught it.
+# The task-file add did not hit it in testing, but a path skipped there loses a task's move, so it
+# gets no exclude either. A directory ancestor is matched from above, not as the leading prefix of a
+# deeper path, and stages correctly at every depth (tracked, untracked, deleted).
+CYCLES_EXCLUDE=':(exclude)docs/cycles'
+cycles_ancestor() { # <repo-relative path>: 0 when docs/cycles lies under it
+  # STAGE_PATHS already holds normalized paths. Normalizing again costs nothing and keeps this
+  # right for any caller that passes a raw one: `././docs` is still `docs` to git.
+  case "$(norm_path "$1")" in .|docs) return 0 ;; esac
+  return 1
+}
+
 # On a no-op re-apply, the move already happened but a crash between `mv` and `commit` would have
 # left the deliverables uncommitted — the exact loss this flag exists to prevent. Commit whatever of
 # them is still uncommitted, then no-op. Nothing to commit -> git commit is skipped, so this is inert
 # on the common path.
 rescue_deliverables() {
   [ ${#STAGE_PATHS[@]} -gt 0 ] || return 0
-  local dirty=0 p
+  local dirty=0 p anc=0 swept=()
   for p in "${STAGE_PATHS[@]}"; do
     [ -e "$REPO_ROOT/$p" ] || continue
-    if [ -n "$(git -C "$REPO_ROOT" status --porcelain -- "$p" 2>/dev/null)" ]; then
+    if cycles_ancestor "$p"; then
+      # The probe excludes cycles too: a `docs` whose only change is under docs/cycles/ must read
+      # clean, or the add stages nothing and the commit below fails with "nothing to commit".
+      if [ -n "$(git -C "$REPO_ROOT" status --porcelain -- "$p" "$CYCLES_EXCLUDE" 2>/dev/null)" ]; then
+        git_with_lock_backoff -C "$REPO_ROOT" add -- "$p" "$CYCLES_EXCLUDE"; dirty=1
+        swept[${#swept[@]}]="$p"; anc=1
+      fi
+    elif [ -n "$(git -C "$REPO_ROOT" status --porcelain -- "$p" 2>/dev/null)" ]; then
       git_with_lock_backoff -C "$REPO_ROOT" add -- "$p"; dirty=1
+      swept[${#swept[@]}]="$p"
     fi
   done
   [ "$dirty" = "1" ] || return 0
+  [ "$anc" = 1 ] && swept[${#swept[@]}]="$CYCLES_EXCLUDE"
+  # Only the paths this sweep staged, never the whole index (see COMMIT_PATHS below for why).
   # Unnegated, then read $?. Inside `if ! cmd; then`, $? is the status of the NEGATION - 0 when the
   # command failed - so `exit "$rc"` exited 0 and reported success for the exact failure it was
   # added to surface. Same shape as the bug fixed in clean-checkout.sh, written into the fix for it.
-  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME deliverables" --quiet
+  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME deliverables" --quiet -- "${swept[@]}"
   rc=$?
   if [ $rc -ne 0 ]; then
     echo "FATAL: commit failed (rc=$rc) while sweeping deliverables for $FNAME - they are STAGED but NOT committed." >&2
@@ -217,17 +286,21 @@ mv "$TASK_FILE" "$DEST"
 # Deliverables ride the SAME commit as the state move: one atomic record of "this task produced
 # these files and reached this state". A listed path that does not exist is a specialist bookkeeping
 # slip, not a reason to strand the transition — skip it and say so.
-STAGE_ADD=()
+STAGE_ADD=()   # exact deliverable paths: staged with the task file, no pathspec magic
+STAGE_ANC=()   # ancestors of docs/cycles (., docs): staged on their own, with CYCLES_EXCLUDE
 STAGE_MSG=""
 if [ ${#STAGE_PATHS[@]} -gt 0 ]; then
   for p in "${STAGE_PATHS[@]}"; do
-    if [ -e "$REPO_ROOT/$p" ]; then
-      STAGE_ADD[${#STAGE_ADD[@]}]="$p"
-    else
+    if [ ! -e "$REPO_ROOT/$p" ]; then
       echo "warn: --stage path not found, skipped: $p" >&2
+    elif cycles_ancestor "$p"; then
+      STAGE_ANC[${#STAGE_ANC[@]}]="$p"
+    else
+      STAGE_ADD[${#STAGE_ADD[@]}]="$p"
     fi
   done
-  [ ${#STAGE_ADD[@]} -gt 0 ] && STAGE_MSG=" (+${#STAGE_ADD[@]} deliverable file(s))"
+  n=$(( ${#STAGE_ADD[@]} + ${#STAGE_ANC[@]} ))
+  [ $n -gt 0 ] && STAGE_MSG=" (+$n deliverable file(s))"
 fi
 
 # PROPAGATE BOTH STATUSES. `ok:` used to print unconditionally, so a failed add or commit was
@@ -247,7 +320,30 @@ if [ $rc -ne 0 ]; then
   echo "       The move is real and the commit is not - reconcile with /whip-doctor before re-running /go." >&2
   exit "$rc"
 fi
-git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME $FROM_STATE -> $TO_STATE$STAGE_MSG" --quiet
+# Ancestors of docs/cycles go in their own call (see CYCLES_EXCLUDE), and AFTER the exact add: `.`
+# stages the old task path's delete, and an exact `add -- .backlog/<from>/<task>.md` that runs later
+# no longer matches anything and fails with "pathspec did not match any files".
+if [ ${#STAGE_ANC[@]} -gt 0 ]; then
+  git_with_lock_backoff -C "$REPO_ROOT" add -- "${STAGE_ANC[@]}" "$CYCLES_EXCLUDE"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "FATAL: git add failed (rc=$rc) for deliverable path(s) ${STAGE_ANC[*]}; $FNAME was moved to $TO_STATE and staged, but NOT committed." >&2
+    echo "       Stage those paths by hand (git add -- <path> ':(exclude)docs/cycles'), commit, then run /whip-doctor." >&2
+    exit "$rc"
+  fi
+fi
+# Commit exactly the paths this call staged. A bare `git commit` takes the whole index, so anything a
+# human had already staged at the shared root rode along: a plan.md amendment `git add`ed while /go
+# runs in the background landed on trunk under a "task: ..." subject, unapproved, and the cycle's
+# approval stopped holding at HEAD (acfw-cycle check refuses 6 until someone re-approves). What the
+# human staged stays staged. The old path is named only when HEAD has it: a pathspec git knows
+# nothing about fails the whole commit ("did not match any file(s) known to git").
+COMMIT_PATHS=(".backlog/$TO_STATE/$FNAME")
+git -C "$REPO_ROOT" cat-file -e "HEAD:.backlog/$FROM_STATE/$FNAME" 2>/dev/null \
+  && COMMIT_PATHS[${#COMMIT_PATHS[@]}]=".backlog/$FROM_STATE/$FNAME"
+for p in ${STAGE_ADD[@]+"${STAGE_ADD[@]}"} ${STAGE_ANC[@]+"${STAGE_ANC[@]}"}; do COMMIT_PATHS[${#COMMIT_PATHS[@]}]="$p"; done
+[ ${#STAGE_ANC[@]} -gt 0 ] && COMMIT_PATHS[${#COMMIT_PATHS[@]}]="$CYCLES_EXCLUDE"
+git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME $FROM_STATE -> $TO_STATE$STAGE_MSG" --quiet -- "${COMMIT_PATHS[@]}"
 rc=$?
 if [ $rc -ne 0 ]; then
   echo "FATAL: commit failed (rc=$rc); $FNAME was moved to $TO_STATE on disk but is NOT committed." >&2

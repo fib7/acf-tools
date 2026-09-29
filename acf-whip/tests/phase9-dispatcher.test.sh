@@ -110,6 +110,46 @@ bash "$STORE" transition --stage /etc/passwd conf-x completed >/dev/null 2>&1; R
 check "--stage refuses absolute paths under compensation (exit 2)" "[ $RC -eq 2 ]"
 bash "$STORE" transition --stage ../escape conf-x completed >/dev/null 2>&1; RC=$?
 check "--stage refuses .. traversal under compensation (exit 2)" "[ $RC -eq 2 ]"
+# The bare folders: `git add -- .backlog` stages the whole task store.
+bash "$STORE" transition --stage .backlog conf-x completed >/dev/null 2>&1; RC=$?
+check "--stage refuses a bare .backlog under compensation (exit 2)" "[ $RC -eq 2 ]"
+bash "$STORE" transition --stage .//.acfwhip/ conf-x completed >/dev/null 2>&1; RC=$?
+check "--stage refuses .acfwhip in another spelling under compensation (exit 2)" "[ $RC -eq 2 ]"
+
+# ---- tasks never edit cycles, in any spelling git reads as docs/cycles ----
+# A human mid-amendment of an approved plan.md at this root: the compensation commit must never
+# carry it, or the approval at HEAD is voided with no /whip card behind it.
+CY=docs/cycles/20260101-x
+mkdir -p "$CY"; printf '# plan\n' > "$CY/plan.md"; git add "$CY/plan.md"; git commit -qm 'docs(plan): approve x'
+printf '# plan\nhalf-written amendment\n' > "$CY/plan.md"
+mkdir -p docs/cycles/20260102-draft; printf '# draft\n' > docs/cycles/20260102-draft/plan.md
+CYC_HEAD=$(git rev-parse HEAD)
+for sp in "docs//cycles/20260101-x/plan.md" "docs/./cycles" "././docs/cycles/" "docs/cycles"; do
+  ERR=$(bash "$STORE" transition --stage "$sp" conf-x completed 2>&1 >/dev/null); RC=$?
+  check "--stage '$sp' is skipped with a WARN, not refused (rc=$RC)" "[ $RC -eq 0 ] && printf '%s' \"\$ERR\" | grep -q 'WARN: not staging'"
+done
+check "no cycle spelling produced a commit" "[ \"\$(git rev-parse HEAD)\" = \"$CYC_HEAD\" ]"
+echo "notes" > docs/notes.md
+bash "$STORE" transition --stage docs conf-x completed >/dev/null 2>&1; RC=$?
+check "--stage docs (an ancestor of the cycles folder) commits (rc=$RC)" "[ $RC -eq 0 ] && git log -1 --name-only --format= | grep -qx 'docs/notes.md'"
+check "--stage docs leaves docs/cycles out of the commit" "! git log -1 --name-only --format= | grep -q '^docs/cycles/'"
+check "the amendment and the draft are still uncommitted" "[ -n \"\$(git status --porcelain -- \"$CY/plan.md\")\" ] && [ -n \"\$(git status --porcelain -- docs/cycles/20260102-draft)\" ]"
+check "nothing under docs/cycles was staged either" "[ -z \"\$(git diff --cached --name-only -- docs/cycles)\" ]"
+# An exact untracked file under an untracked directory gets no exclude pathspec: with one present,
+# git can skip that file silently and still exit 0.
+mkdir -p docs/research; echo "r" > docs/research/new.md
+bash "$STORE" transition --stage docs/research/new.md conf-x completed >/dev/null 2>&1; RC=$?
+check "an exact untracked deliverable under an untracked directory is committed (rc=$RC)" "[ $RC -eq 0 ] && git log -1 --name-only --format= | grep -qx 'docs/research/new.md'"
+# A STAGED amendment (git add) is the index, not the working tree: the compensation commit used to be a
+# bare `git commit`, which took it along. It must name only the deliverables it staged.
+git add -- "$CY/plan.md"; echo "more" > docs/research/new2.md
+bash "$STORE" transition --stage docs/research/new2.md conf-x completed >/dev/null 2>&1; RC=$?
+check "a staged plan amendment: the deliverable is committed (rc=$RC)" "[ $RC -eq 0 ] && git log -1 --name-only --format= | grep -qx 'docs/research/new2.md'"
+check "...and the staged amendment is not, and stays staged" "! git log -1 --name-only --format= | grep -q '^docs/cycles/' && [ -n \"\$(git diff --cached --name-only -- \"$CY/plan.md\")\" ]"
+H_STG=$(git rev-parse HEAD)
+bash "$STORE" transition --stage docs/research/new2.md conf-x completed >/dev/null 2>&1; RC=$?
+check "...a staged amendment alone never makes a deliverables commit look due (no new commit, rc=$RC)" "[ $RC -eq 0 ] && [ \"\$(git rev-parse HEAD)\" = '$H_STG' ]"
+git reset -q -- "$CY/plan.md"; git checkout -q -- "$CY/plan.md"; rm -rf docs/cycles/20260102-draft
 
 # ---- raw snapshot enrichment (adapter without snapshot-enriched) ----
 if command -v jq >/dev/null 2>&1; then

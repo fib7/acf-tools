@@ -27,7 +27,10 @@
 #
 # Outcomes are emitted as a machine-readable line on stdout: "ACFW-INTEGRATE: <verdict> ...".
 # This script mutates ONLY git (trunk ref + an integration worktree) — never the .backlog markdown;
-# deriving folder/views from git is the scanner/loop's job.
+# deriving folder/views from git is the scanner/loop's job. A candidate's .backlog/ and docs/cycles/
+# deltas are stripped before the fold (the latter with a WARN on stderr naming each path, and a second
+# WARN when nothing but the marker is left to land): task state and plan cycles are never a task's
+# deliverable.
 #
 # Exit codes:
 #   0   integrated (marker+change now reachable from trunk) OR already-integrated (idempotent skip)
@@ -109,15 +112,114 @@ strip_backlog_from_index() {
   fi
 }
 
+# Strip any docs/cycles/ delta the same way (3.5.0): TASKS NEVER EDIT CYCLES. A cycle folder is the
+# human's spec (plan.md) plus acfw-cycle's stamp and audit trail (record.md), and approval is bound to
+# the exact bytes of both at HEAD. A task that landed an edit there would re-arm an approval nobody
+# asked to re-arm, forge a `## Tasks` row coverage is computed from, or renumber a D-id — and because
+# land() resyncs every path a landing changed, it would also overwrite a human's uncommitted amendment
+# to plan.md at the trunk root. So the candidate's cycle edits are DROPPED, never landed.
+#
+# Unlike .backlog (which a specialist is forbidden to commit, so a delta there is a legacy phantom),
+# docs/cycles/ is reachable by an honest mistake ("tick the plan's checklist", "update the spec"), so
+# the drop is REPORTED: one WARN on stderr naming every stripped path, next to land()'s own WARN. The
+# content is not lost — refs/acfw/patch/<key> still holds it, and the WARN prints the diff to recover.
+#
+# The path list is taken against OBSERVED (worktree AND index AND untracked), not from the patch's own
+# diff: a branch that merged trunk carries trunk's newer cycle commits in diff(fork-base, tip), and
+# those are already on trunk — naming them would be a false alarm on every such task.
+# Untracked files are cleaned too: the `git add -A` in build_gate_land would otherwise sweep a stray
+# new file a resolver left under docs/cycles/ straight into the integration commit.
+CYCLES_DIR="docs/cycles"
+cycles_delta() { # paths under docs/cycles/ where INTEG_WT (worktree, index or untracked) differs from OBSERVED
+  { git -C "$INTEG_WT" diff --name-only "$OBSERVED" -- "$CYCLES_DIR"
+    git -C "$INTEG_WT" diff --cached --name-only "$OBSERVED" -- "$CYCLES_DIR"
+    git -C "$INTEG_WT" ls-files --others --exclude-standard -- "$CYCLES_DIR"
+  } 2>/dev/null | sort -u
+}
+strip_cycles_from_index() {
+  local _paths
+  _paths=$(cycles_delta)
+  [ -n "$_paths" ] || return 0
+  # First drop every UNMERGED cycle entry that OBSERVED does not have: the modify/delete conflict where
+  # the task edited docs/cycles/<ID>/plan.md and trunk git rm'd that cycle meanwhile. `checkout
+  # <tree> -- <path>` resolves an unmerged path only by writing the tree's version over it; with no
+  # version in the tree it refuses the WHOLE call ("path ... is unmerged"), so without this every
+  # attempt stalled with cycles-strip-failed (exit 12), /go retried it as transient forever, and the
+  # task's code never landed. Removing the entry from the index is the drop itself (trunk has no such
+  # file); the leftover worktree copy becomes untracked and the clean below deletes it. NUL-separated
+  # and literal: a quoted (non-ASCII) name or a glob character would otherwise miss the entry and
+  # bring the stall back for exactly that file.
+  git -C "$INTEG_WT" diff --name-only -z --diff-filter=U -- "$CYCLES_DIR" 2>/dev/null \
+    | while IFS= read -r -d '' _u; do
+        git -C "$INTEG_WT" cat-file -e "$OBSERVED:$_u" 2>/dev/null \
+          || git -C "$INTEG_WT" --literal-pathspecs rm -q --cached -f -- "$_u" >/dev/null 2>&1
+      done
+  # Restore tracked state to OBSERVED. --no-overlay for the same reason as the .backlog strip (an ADDED
+  # file must be removed, not kept), and it also resolves an unmerged cycle path OBSERVED has, in
+  # place. Guarded: with nothing under docs/cycles/ in OBSERVED or the index, the pathspec matches
+  # nothing and git refuses, which here only means there is no tracked delta to restore.
+  if git -C "$INTEG_WT" cat-file -e "$OBSERVED:$CYCLES_DIR" 2>/dev/null \
+     || [ -n "$(git -C "$INTEG_WT" ls-files -- "$CYCLES_DIR" 2>/dev/null | head -1)" ]; then
+    git -C "$INTEG_WT" checkout --no-overlay "$OBSERVED" -- "$CYCLES_DIR" >/dev/null 2>&1 || true
+  fi
+  git -C "$INTEG_WT" clean -fdq -- "$CYCLES_DIR" >/dev/null 2>&1 || true
+  # Verified, not assumed: a strip that silently failed would fold a plan edit into trunk. Refuse the
+  # candidate instead (mechanism fault, retried later), exactly like backlog-strip-failed.
+  if [ -n "$(cycles_delta)" ]; then
+    emit "stall cycles-strip-failed key=$KEY"
+    cleanup_wt
+    exit 12
+  fi
+  echo "WARN: $KEY: dropped this task's edits under $CYCLES_DIR/ (tasks never edit cycles; a plan changes only through /whip and acfw-cycle): $(printf '%s\n' "$_paths" | tr '\n' ' ')" >&2
+  echo "WARN: $KEY: the dropped change is still in $PATCH_REF. See it: git -C $ROOT diff ${PATCH_PARENT:-<parent>} ${PATCH:-$PATCH_REF} -- $CYCLES_DIR" >&2
+  # A candidate whose ONLY change was under docs/cycles/ now delivers nothing, yet still lands (the
+  # marker alone) and still counts as integrated, so its deliverable reads done. The script can tell,
+  # so it says so unconditionally instead of leaving the reader to infer it from the drop WARN.
+  # "Nothing left" is measured against OBSERVED across index, worktree AND untracked files: after a
+  # resolver the change can sit unstaged, and build_gate_land's `add -A` would still fold it in. In
+  # the conflict path unmerged code paths differ from OBSERVED, so a code conflict never trips this.
+  # The integration itself is not refused: exit 0 is what every caller already maps to "integrated",
+  # and a new verdict would be an interface change for a case the WARN makes visible.
+  if git -C "$INTEG_WT" diff --cached --quiet "$OBSERVED" 2>/dev/null \
+     && git -C "$INTEG_WT" diff --quiet "$OBSERVED" 2>/dev/null \
+     && [ -z "$(git -C "$INTEG_WT" ls-files --others --exclude-standard 2>/dev/null | head -1)" ]; then
+    echo "WARN: $KEY: after dropping $CYCLES_DIR/ this task delivers nothing: trunk gets its ledger marker and no content, so its deliverable reads done while nothing was built. If the plan itself needed the change, make it with /whip; if the work is still owed, create a task for it." >&2
+  fi
+}
+
 # ---- Observe the live trunk tip (never cached). ----
 OBSERVED=$(acfw_live_trunk "$ROOT" "$TRUNK") || { emit "stall trunk-unobservable"; exit 12; }
+
+# snapshot_overwritten <path>... — print a commit whose tree is OBSERVED with exactly these paths as they
+# sit on disk in ROOT right now (a path missing on disk is recorded as deleted). Built in a throwaway
+# index, so it touches neither ROOT's index, its working tree nor refs/stash, and cannot race a
+# sibling stage the way clean-checkout.sh's `stash push -u` would, or fail on a held index.lock the
+# way `stash create` (which rewrites the real index) does. It replaced `stash create` for the
+# recovery's sake: that snapshot was taken with HEAD already at NEW while the index still held
+# OBSERVED, so its only obvious use, `stash apply`, replayed NEW -> OBSERVED+edits and reverted, in
+# the root worktree, every OTHER path this landing changed (committing that tree un-lands the
+# integration). Here diff(OBSERVED, snapshot) is precisely the overwritten work and nothing else, so
+# the printed recovery is one pipe with no path list to quote. update-index (plumbing), not add:
+# literal paths with no pathspec magic, no .gitignore refusal, and a missing file becomes a removal.
+snapshot_overwritten() {
+  local _td _t _c=""
+  _td=$(mktemp -d "${TMPDIR:-/tmp}/acfw-preland.XXXXXX") || return 1
+  if GIT_INDEX_FILE="$_td/index" git -C "$ROOT" read-tree "$OBSERVED" >/dev/null 2>&1; then
+    printf '%s\0' "$@" | GIT_INDEX_FILE="$_td/index" git -C "$ROOT" update-index --add --remove -z --stdin >/dev/null 2>&1
+    _t=$(GIT_INDEX_FILE="$_td/index" git -C "$ROOT" write-tree 2>/dev/null) \
+      && _c=$(printf 'acf-whip pre-land snapshot: %s\n' "$KEY" | git -C "$ROOT" commit-tree "$_t" -p "$OBSERVED" 2>/dev/null)
+  fi
+  rm -rf "$_td"
+  [ -n "$_c" ] && echo "$_c"
+}
 
 # ---- CAS land: advance trunk from OBSERVED to NEW atomically, then resync ROOT's working tree. ----
 # update-ref's 3-arg form is the compare-and-swap: it succeeds ONLY if trunk is still exactly
 # OBSERVED, rejecting both a concurrent advance and an external rewind (the latter would otherwise
 # be masked by a fast-forward). On success ROOT (the trunk checkout) is resynced to the new tip.
 land() { # <new-oid>
-  local NEW="$1" _p _dirty _snap
+  local NEW="$1" _p _snap
+  local -a _dirty
   if git -C "$ROOT" update-ref "refs/heads/$TRUNK" "$NEW" "$OBSERVED" 2>/dev/null; then
     # Resync ROOT in TWO steps, and never with `reset --hard`. Two defects motivated the split:
     #
@@ -164,13 +266,31 @@ land() { # <new-oid>
     # shell test and not an `xargs -r` pipeline because BSD xargs has no -r and would run git anyway.
     if [ ${#CHANGED_PATHS[@]} -gt 0 ]; then
       # Snapshot uncommitted work on the paths about to be overwritten — the residual same-file case
-      # (c) cannot avoid. `stash create` writes a commit object and touches NEITHER the working tree
-      # NOR refs/stash, so unlike clean-checkout.sh's `stash push -u` it cannot sweep up, or race, a
-      # sibling stage's work. Reported, never auto-applied: the operator owns the merge.
-      _dirty=$(git -C "$ROOT" status --porcelain -- "${CHANGED_PATHS[@]}" 2>/dev/null)
-      if [ -n "$_dirty" ]; then
-        _snap=$(git -C "$ROOT" stash create "acf-whip pre-land $KEY" 2>/dev/null || true)
-        echo "WARN: landing $KEY overwrote uncommitted work in $ROOT on $(printf '%s\n' "$_dirty" | grep -c .) path(s) it also changed. Snapshot: ${_snap:-UNAVAILABLE}. Recover: git -C $ROOT stash apply ${_snap:-<none>}" >&2
+      # (c) cannot avoid — with snapshot_overwritten above. Reported, never auto-applied: the
+      # operator owns the merge.
+      # "Uncommitted" means different from what the root held BEFORE this landing, i.e. from OBSERVED.
+      # It was `git status --porcelain`, which compares against HEAD: the CAS above has already moved
+      # HEAD to NEW while the index still holds OBSERVED, so status listed EVERY path this landing
+      # changed as staged and the WARN fired on every integration, with a snapshot of work that never
+      # existed. Worktree-vs-OBSERVED sees staged and unstaged edits alike; an untracked file sitting
+      # on a path the landing adds is overwritten by the checkout below too, so it counts. The two
+      # lists are disjoint (tracked vs untracked), so no de-dup; NUL-separated so a non-ASCII name
+      # reaches the snapshot as itself rather than core.quotePath's quoted form.
+      _dirty=()
+      while IFS= read -r -d '' _p; do _dirty+=("$_p"); done < <(
+        { git -C "$ROOT" diff --name-only -z "$OBSERVED" -- "${CHANGED_PATHS[@]}"
+          git -C "$ROOT" ls-files -z --others --exclude-standard -- "${CHANGED_PATHS[@]}"
+        } 2>/dev/null)
+      if [ ${#_dirty[@]} -gt 0 ]; then
+        _snap=$(snapshot_overwritten "${_dirty[@]}" || true)
+        # The recovery re-applies ONLY the overwritten edits on top of the landed content, as a 3-way
+        # merge (a same-line clash leaves conflict markers, never a silent pick); -3 implies --index,
+        # so the recovered edits come back staged. Quoted with %q: ROOT can contain spaces.
+        if [ -n "$_snap" ]; then
+          echo "WARN: landing $KEY overwrote uncommitted work in $ROOT on ${#_dirty[@]} path(s) it also changed. Snapshot: $_snap; one path as it was: git show $_snap:<path>. The command below re-applies only your edits on top of the landed content, 3-way (a clash leaves conflict markers) and staged. Recover: git -C $(printf '%q' "$ROOT") diff --binary $OBSERVED $_snap | git -C $(printf '%q' "$ROOT") apply -3" >&2
+        else
+          echo "WARN: landing $KEY overwrote uncommitted work in $ROOT on ${#_dirty[@]} path(s) it also changed. Snapshot: UNAVAILABLE (the pre-land snapshot could not be written); that work is not recoverable from git." >&2
+        fi
       fi
       git_with_lock_backoff -C "$ROOT" checkout --no-overlay -q "$TRUNK" -- "${CHANGED_PATHS[@]}" >/dev/null 2>&1 \
         || echo "WARN: root worktree resync incomplete after landing $KEY (the index is still repaired below). Run: git -C $ROOT checkout --no-overlay -q $TRUNK -- \$(git -C $ROOT diff --name-only $OBSERVED $NEW -- . ':(exclude).backlog')" >&2
@@ -195,6 +315,7 @@ land() { # <new-oid>
 #      INTEG_WT holds the applied changeset staged/clean (no commit yet). ----
 build_gate_land() {
   strip_backlog_from_index
+  strip_cycles_from_index
   mkdir -p "$INTEG_WT/$(dirname "$MARKER")"
   printf '{"key":"%s","patch":"%s","patch_parent":"%s","observed_trunk":"%s","slug":"%s"}\n' \
     "$KEY" "$PATCH" "$PATCH_PARENT" "$OBSERVED" "$SLUG" > "$INTEG_WT/$MARKER"
@@ -306,6 +427,18 @@ else
   # event for the resolver — never a silent drop, never a quality reject. Leave the worktree
   # mid-cherry-pick so the caller can dispatch the assigned agent into it and re-invoke --post-resolver.
   CONFLICTED=$(git -C "$INTEG_WT" diff --name-only --diff-filter=U 2>/dev/null || true)
+  # A conflict inside docs/cycles/ is not worth an agent: build_gate_land drops every cycle path, so a
+  # resolver would be dispatched to merge text that is then thrown away (and handed a human's plan to
+  # edit). Strip first. If nothing else conflicts, this is a clean apply after all; otherwise the
+  # resolver only ever sees the code conflicts.
+  if printf '%s\n' "$CONFLICTED" | grep -q "^$CYCLES_DIR/"; then
+    strip_cycles_from_index
+    CONFLICTED=$(git -C "$INTEG_WT" diff --name-only --diff-filter=U 2>/dev/null || true)
+    if [ -z "$CONFLICTED" ]; then
+      git -C "$INTEG_WT" cherry-pick --quit >/dev/null 2>&1 || true   # clear sequencer, keep staged index
+      build_gate_land
+    fi
+  fi
   emit "resolver-needed key=$KEY"
   echo "worktree: $INTEG_WT"
   echo "assigned_agent: $ASSIGNED_AGENT"

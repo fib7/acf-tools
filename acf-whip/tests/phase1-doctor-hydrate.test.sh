@@ -606,6 +606,52 @@ printf 'state churn\n' >> "$RL/.backlog/marker.txt"
 RL_OUT=$(bash "$DOC" "$RL")
 check "dirty .backlog/ alone is NOT flagged (that is the writer's business)" "! echo \"\$RL_OUT\" | grep -q 'dirty-trunk-root'"
 git -C "$RL" checkout -- .backlog/marker.txt
+# docs/cycles/ (3.5.0): a cycle's plan.md is edited AT the root by design, and integrate-lpcas strips
+# docs/cycles/ from every candidate so no landing can overwrite it. A WARN there would stand on every
+# planned cycle in flight. Both batteries must agree, so each case runs through the generic one too.
+GEN="$ACF_WHIP/skills/lib/bin/acfw-doctor-generic.sh"
+gen_out() { printf '{"tasks":[]}' | bash "$GEN" "$RL" 2>&1; }
+HAVE_JQ=0; command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+CYD="docs/cycles/20260928-seat-notice"
+mkdir -p "$RL/$CYD"; printf '# Plan\n' > "$RL/$CYD/plan.md"; printf '# Record\n' > "$RL/$CYD/record.md"
+RL_OUT=$(bash "$DOC" "$RL")
+check "an UNTRACKED draft cycle folder is not flagged" "! echo \"\$RL_OUT\" | grep -q 'dirty-trunk-root'"
+git -C "$RL" add -- "$CYD" >/dev/null 2>&1; git -C "$RL" commit -qm "docs(plan): approve seat-notice" >/dev/null 2>&1
+printf 'amended by a human, not yet re-approved\n' >> "$RL/$CYD/plan.md"
+RL_OUT=$(bash "$DOC" "$RL")
+check "a TRACKED, amended docs/cycles/ plan.md is NOT flagged" "! echo \"\$RL_OUT\" | grep -q 'dirty-trunk-root'"
+if [ "$HAVE_JQ" = 1 ]; then
+  check "...and the generic battery agrees" "! gen_out | grep -q 'dirty-trunk-root'"
+else echo "  SKIP: generic battery parity (jq not installed)"; fi
+git -C "$RL" add -- "$CYD/plan.md" >/dev/null 2>&1
+RL_OUT=$(bash "$DOC" "$RL")
+check "a STAGED docs/cycles/ edit is NOT flagged either" "! echo \"\$RL_OUT\" | grep -q 'dirty-trunk-root'"
+# porcelain quotes an unusual path ("docs/cycles/..."), which dodged a plain prefix compare
+printf 'q\n' > "$RL/$CYD/a\"b.md"; git -C "$RL" add -- "$CYD/a\"b.md" >/dev/null 2>&1
+check "the path really is quoted by porcelain (else this case proves nothing)" \
+  "git -C '$RL' status --porcelain | grep -q '^A  \"docs/cycles/'"
+RL_OUT=$(bash "$DOC" "$RL")
+check "a QUOTED docs/cycles/ path is NOT flagged" "! echo \"\$RL_OUT\" | grep -q 'dirty-trunk-root'"
+if [ "$HAVE_JQ" = 1 ]; then
+  check "...and the generic battery agrees" "! gen_out | grep -q 'dirty-trunk-root'"
+fi
+# the exclusion is a PREFIX on docs/cycles/, not "anything under docs/": a sibling doc still counts,
+# and so does a lookalike folder name
+printf 'doc\n' > "$RL/docs/guide.md"; printf 'c\n' > "$RL/docs/cycles-notes.md"
+git -C "$RL" add -- docs/guide.md docs/cycles-notes.md >/dev/null 2>&1
+git -C "$RL" commit -qm docs -- docs/guide.md docs/cycles-notes.md >/dev/null 2>&1   # pathspec: the 2 cycle edits stay staged
+check "the two cycle edits are still dirty (else the count below proves nothing)" \
+  "[ \$(git -C '$RL' status --porcelain -- docs/cycles | grep -c .) -eq 2 ]"
+printf 'escaped\n' >> "$RL/docs/guide.md"; printf 'escaped\n' >> "$RL/docs/cycles-notes.md"
+RL_OUT=$(bash "$DOC" "$RL")
+check "dirty docs/ OUTSIDE docs/cycles/ is still flagged, counting only those (2), not the 2 cycle paths" \
+  "echo \"\$RL_OUT\" | grep -qE '^WARN\\|dirty-trunk-root\\|\\(repo\\)\\|2 tracked file'"
+if [ "$HAVE_JQ" = 1 ]; then
+  check "...and the generic battery reports the same count" \
+    "gen_out | grep -qE '^WARN\\|dirty-trunk-root\\|\\(repo\\)\\|2 tracked file'"
+fi
+git -C "$RL" reset -q >/dev/null 2>&1
+git -C "$RL" checkout -- docs >/dev/null 2>&1; rm -f "$RL/$CYD/a\"b.md"
 # simulate an origin that is 2 commits behind (no network, no remote needed)
 BEHIND=$(git -C "$RL" rev-parse HEAD)
 printf 'a\n' >> "$RL/src.txt"; git -C "$RL" commit -qam c1 >/dev/null 2>&1

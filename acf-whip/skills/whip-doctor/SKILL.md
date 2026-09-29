@@ -107,7 +107,8 @@ orphan reaper apply only to worktrees in acf-whip's branch namespace.
   and you remove it by hand when you are sure), `orphaned-worktree-dirty` (no live task but
   uncommitted changes — never auto-removed), `duplicate-derived-slug` where one copy is
   accepted, `dup-folder-untracked`, `dirty-trunk-root` (tracked files modified at the root
-  outside the task store — a specialist may have escaped its worktree), `trunk-unpushed`, and
+  outside the task store and docs/cycles/, so a specialist may have escaped its worktree; plans
+  are edited at the root by design and are never counted), `trunk-unpushed`, and
   `accepted-branchless-unverified`.
 
 ## How to respond

@@ -174,7 +174,7 @@ fi
 if [ "$FROM_STATE" = "$TO_STATE" ]; then
   if [ "$EDITED" = "1" ]; then
     git_with_lock_backoff -C "$REPO_ROOT" add ".backlog/$FROM_STATE/$FNAME"
-    git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME field edit (operator)" --quiet
+    git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $FNAME field edit (operator)" --quiet -- ".backlog/$FROM_STATE/$FNAME"
     echo "ok: $FNAME edited in place ($FROM_STATE)"
   else
     echo "noop: $FNAME already in $TO_STATE (no edits requested)"

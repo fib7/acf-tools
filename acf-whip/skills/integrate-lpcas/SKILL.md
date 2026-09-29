@@ -38,11 +38,18 @@ integration worktree under `<worktree-dir>/_integrate/<key>`) — never the `.ba
 4. `cherry-pick --no-commit` the candidate onto a fresh worktree at the observed tip — base is the
    candidate's own parent, **no rebase, no merge-base vs trunk, no replay** (#3). Conflict → surface
    `resolver-needed` (never a silent drop, #17).
+   A candidate's `.backlog/` and `docs/cycles/` changes are stripped before the fold: task state and
+   plan cycles are never a task's deliverable. A `docs/cycles/` strip prints a `WARN:` on stderr naming
+   each path and the diff that recovers it from `refs/acfw/patch/<key>`, plus a second `WARN:` when
+   nothing but the marker is left to land.
 5. Co-commit the change **+** the marker in one single-parent commit → "marker ⟺ change" (#5/#7/#11/#16).
 6. Parse-sanity (mechanism if broken, #18) then the union gate on the candidate tree (#8), via direct
    exec with `pipefail` so a gate exit can't be masked (#12). Fail → quality-fault.
 7. CAS-land: `update-ref refs/heads/<trunk> <new> <observed>` then resync ROOT. Rejection (external
-   move/rewind) → `cas-lost` (mechanism, transient) — never data loss.
+   move/rewind) → `cas-lost` (mechanism, transient) — never data loss. The resync checks out only the
+   paths this landing changed, so a `Worktree: none` task editing the root keeps its other files. When
+   the landing overwrites uncommitted work on one of those paths, it prints a `WARN:` on stderr with a
+   snapshot commit and a `Recover:` command that re-applies those edits 3-way.
 
 ## Outcomes (stdout `ACFW-INTEGRATE: <verdict>`) / exit codes
 | exit | verdict | meaning |
@@ -54,7 +61,7 @@ integration worktree under `<worktree-dir>/_integrate/<key>`) — never the `.ba
 | 7 | `resolver-needed` | cherry-pick conflict; worktree left mid-pick; caller dispatches resolver, re-invokes `--post-resolver` |
 | 9 | `mechanism …` | resolution-syntax-broken / conflict-unresolved / worktree error (NOT a quality reject) |
 | 11 | `cas-lost` | trunk moved/rewound under us → transient; caller re-observes (epoch check at loop) |
-| 12 | `stall trunk-unobservable` | trunk missing/detached |
+| 12 | `stall trunk-unobservable` · `stall backlog-strip-failed` · `stall cycles-strip-failed` · `stall root-index-desync` | trunk missing or detached; a candidate whose `.backlog/` or `docs/cycles/` edits could not be stripped (refused, never folded in); the root index could not be resynced after landing (the line carries the `git reset --mixed` to run) |
 
 Mechanism faults (7/9/11) and quality faults (6) route to **different** counters — a conflict never
 consumes the quality reject budget (#13).

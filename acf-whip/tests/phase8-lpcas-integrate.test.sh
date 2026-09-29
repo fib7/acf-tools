@@ -288,26 +288,300 @@ check "k_concurrent: root index is NOT desynced from trunk" \
 
 # ---- (13) The residual same-file case is reported and recoverable, never silent ---------------
 git -C "$REPO" checkout -q -- untouched.txt 2>/dev/null || true
-printf 'v2\n' > "$REPO/contended.txt"
+printf 'l1\nl2\nl3\nl4\nl5\n' > "$REPO/contended.txt"; printf 'a0\n' > "$REPO/landed-too.txt"
 git -C "$REPO" add -A >/dev/null 2>&1; git -C "$REPO" commit -qm "seed contended fixture" >/dev/null 2>&1
 mktask k_contended
 DWT="$WORK/cand-k_contended"; rm -rf "$DWT"
 git -C "$REPO" worktree add --detach -q "$DWT" trunk
-printf 'landed\n' > "$DWT/contended.txt"
+printf 'LANDED\nl2\nl3\nl4\nl5\n' > "$DWT/contended.txt"
+# more paths the landing changes and the operator never touched: the recovery must not revert them
+printf 'a1\n' > "$DWT/landed-too.txt"; printf 'new\n' > "$DWT/added-too.txt"
 git -C "$DWT" add -A; git -C "$DWT" commit -q -m "feat: k_contended"
 git -C "$REPO" update-ref "refs/acfw/patch/k_contended" "$(git -C "$DWT" rev-parse HEAD)"
 git -C "$REPO" worktree remove --force "$DWT"
-printf 'UNCOMMITTED ON THE CONTENDED PATH\n' > "$REPO/contended.txt"
+printf 'l1\nl2\nl3\nl4\nUNCOMMITTED ON THE CONTENDED PATH\n' > "$REPO/contended.txt"
 run_iw bash "$IW" "$(TF k_contended)"
 check "k_contended integrates"                       "[ $RC -eq 0 ]"
 check "k_contended: the overwrite is REPORTED, not silent" \
   "grep -q 'overwrote uncommitted work' '$WORK/iw.err'"
-check "k_contended: the WARN carries a recoverable stash snapshot oid" \
+check "k_contended: the WARN carries a recoverable snapshot oid" \
   "grep -qE 'Snapshot: [0-9a-f]{7,}' '$WORK/iw.err'"
 check "k_contended: the snapshot object really holds the overwritten content" \
   "git -C '$REPO' show \"\$(grep -oE 'Snapshot: [0-9a-f]{7,}' '$WORK/iw.err' | head -1 | cut -d' ' -f2):contended.txt\" 2>/dev/null | grep -q UNCOMMITTED"
-check "k_contended: stash create did NOT touch refs/stash (a sibling stage's stack is untouched)" \
+check "k_contended: the snapshot did NOT touch refs/stash (a sibling stage's stack is untouched)" \
   "! git -C '$REPO' rev-parse --verify -q refs/stash >/dev/null"
+# The printed recovery is what an operator will actually run, so run it. It used to be
+# `stash apply <snap>`: the snapshot was taken with HEAD already at NEW and the index still at
+# OBSERVED, so applying it replayed NEW -> OBSERVED+edits and reverted, in the root worktree, every
+# other path this landing changed. Committing that tree would un-land the integration.
+RECOVER=$(sed -n 's/.*Recover: //p' "$WORK/iw.err" | head -1)
+check "k_contended: the WARN prints a recovery command"  "[ -n \"\$RECOVER\" ]"
+( eval "$RECOVER" ) >"$WORK/recover.out" 2>&1; RRC=$?
+check "k_contended: the recovery merges cleanly (rc=$RRC; edits on different lines)" "[ $RRC -eq 0 ]"
+check "k_contended: the recovery restores the operator's uncommitted edit" \
+  "grep -qx 'UNCOMMITTED ON THE CONTENDED PATH' '$REPO/contended.txt'"
+check "k_contended: ...on top of the landed edit to the same file, not instead of it" \
+  "grep -qx LANDED '$REPO/contended.txt' && ! grep -q '^<<<<<<<' '$REPO/contended.txt'"
+check "k_contended: ...and does NOT revert a landed path the operator never touched" \
+  "[ \"\$(cat '$REPO/landed-too.txt')\" = a1 ]"
+check "k_contended: ...and does NOT delete a path the landing added" \
+  "[ \"\$(cat '$REPO/added-too.txt' 2>/dev/null)\" = new ]"
+check "k_contended: ...and does NOT remove the landed ledger marker from the root" \
+  "[ -f '$REPO/$(acfw_marker_path k_contended)' ]"
+check "k_contended: after recovery the ONLY difference from trunk is the operator's path" \
+  "[ \"\$(git -C '$REPO' diff --name-only trunk -- . ':(exclude).backlog')\" = contended.txt ]"
+git -C "$REPO" reset -q -- contended.txt 2>/dev/null; git -C "$REPO" checkout -q -- contended.txt 2>/dev/null
+
+# (13c) a SAME-LINE clash: the recovery must keep both sides as conflict markers, never pick one, and
+# still leave every other landed path alone.
+mktask k_clash
+KWT="$WORK/cand-k_clash"; rm -rf "$KWT"
+git -C "$REPO" worktree add --detach -q "$KWT" trunk
+printf 'LANDED\nl2\nLANDED-C\nl4\nl5\n' > "$KWT/contended.txt"; printf 'a2\n' > "$KWT/landed-too.txt"
+git -C "$KWT" add -A; git -C "$KWT" commit -q -m "feat: k_clash"
+git -C "$REPO" update-ref "refs/acfw/patch/k_clash" "$(git -C "$KWT" rev-parse HEAD)"
+git -C "$REPO" worktree remove --force "$KWT"
+printf 'LANDED\nl2\nOPERATOR-C\nl4\nl5\n' > "$REPO/contended.txt"
+run_iw bash "$IW" "$(TF k_clash)"
+check "13c: integrates"                                         "[ $RC -eq 0 ]"
+RECOVER=$(sed -n 's/.*Recover: //p' "$WORK/iw.err" | head -1)
+( eval "$RECOVER" ) >"$WORK/recover.out" 2>&1; RRC=$?
+check "13c: a same-line clash is NOT applied silently (rc=$RRC)" "[ $RRC -ne 0 ]"
+check "13c: ...it leaves conflict markers holding BOTH sides" \
+  "grep -q '^<<<<<<<' '$REPO/contended.txt' && grep -qx OPERATOR-C '$REPO/contended.txt' && grep -qx LANDED-C '$REPO/contended.txt'"
+check "13c: ...and the other landed path stays landed"          "[ \"\$(cat '$REPO/landed-too.txt')\" = a2 ]"
+git -C "$REPO" reset -q -- contended.txt 2>/dev/null; git -C "$REPO" checkout -q -- contended.txt 2>/dev/null
+
+# (13b) an UNTRACKED file sitting on a path the landing adds is overwritten too, and the WARN counts
+# it, so the snapshot must hold its content as well.
+mktask k_untracked
+UWT="$WORK/cand-k_untracked"; rm -rf "$UWT"
+git -C "$REPO" worktree add --detach -q "$UWT" trunk
+printf 'from the task\n' > "$UWT/fresh.txt"
+git -C "$UWT" add -A; git -C "$UWT" commit -q -m "feat: k_untracked"
+git -C "$REPO" update-ref "refs/acfw/patch/k_untracked" "$(git -C "$UWT" rev-parse HEAD)"
+git -C "$REPO" worktree remove --force "$UWT"
+printf 'OPERATOR SCRATCH, NEVER ADDED\n' > "$REPO/fresh.txt"
+run_iw bash "$IW" "$(TF k_untracked)"
+check "13b: integrates"                                         "[ $RC -eq 0 ]"
+check "13b: the overwrite of an untracked file is reported"     "grep -q 'overwrote uncommitted work in .* on 1 path(s)' '$WORK/iw.err'"
+check "13b: the snapshot holds the untracked file's content" \
+  "git -C '$REPO' show \"\$(grep -oE 'Snapshot: [0-9a-f]{7,}' '$WORK/iw.err' | head -1 | cut -d' ' -f2):fresh.txt\" 2>/dev/null | grep -q 'OPERATOR SCRATCH'"
+check "13b: the snapshot holds ONLY the overwritten path (diff from the pre-land trunk is fresh.txt)" \
+  "[ \"\$(git -C '$REPO' diff --name-only trunk~1 \"\$(grep -oE 'Snapshot: [0-9a-f]{7,}' '$WORK/iw.err' | head -1 | cut -d' ' -f2)\")\" = fresh.txt ]"
+git -C "$REPO" checkout -q -- fresh.txt 2>/dev/null
+
+# ---- (14) Tasks never edit cycles: docs/cycles/ is stripped from every candidate, with a WARN ------
+# A cycle folder is the human's plan.md plus acfw-cycle's record.md, and approval is bound to their
+# exact bytes at HEAD. A task that landed an edit there re-arms or forges an approval, and land()'s
+# resync would overwrite a human's uncommitted amendment at the root. So the edit is dropped, never
+# landed, and the drop is named on stderr (a specialist can reach docs/cycles/ by an honest mistake).
+echo "== Test 14: a candidate's docs/cycles/ edits never land, and are warned =="
+git -C "$REPO" checkout -q -- . 2>/dev/null || true
+CYC="docs/cycles/20260928-seat-notice"
+# (a) trunk has NO docs/cycles/ yet: an added cycle file is removed, the code still lands
+mktask k_cyc0
+C0="$WORK/cand-k_cyc0"; rm -rf "$C0"; git -C "$REPO" worktree add --detach -q "$C0" trunk
+mkdir -p "$C0/$CYC"; printf 'forged plan\n' > "$C0/$CYC/plan.md"; printf 'code0\n' > "$C0/cyc0.txt"
+git -C "$C0" add -A; git -C "$C0" commit -q -m "feat: k_cyc0"
+git -C "$REPO" update-ref refs/acfw/patch/k_cyc0 "$(git -C "$C0" rev-parse HEAD)"; git -C "$REPO" worktree remove --force "$C0"
+run_iw bash "$IW" "$(TF k_cyc0)"
+check "14a: integrates (exit 0)"                               "[ $RC -eq 0 ]"
+check "14a: the task's code landed"                            "[ \"\$(trunk_content cyc0.txt)\" = code0 ]"
+check "14a: the ADDED cycle file did not land (trunk had none)" "! on_trunk '$CYC/plan.md'"
+check "14a: the drop is WARNed, naming the path"               "grep -q '^WARN: k_cyc0: dropped.*$CYC/plan.md' '$WORK/iw.err'"
+check "14a: the WARN says how to see the dropped change"       "grep -q 'refs/acfw/patch/k_cyc0' '$WORK/iw.err'"
+check "14a: the integration commit touches nothing under docs/cycles/" \
+  "[ -z \"\$(git -C '$REPO' show --name-only --format= trunk -- docs/cycles)\" ]"
+check "14a: the marker still landed with the code"             "acfw_is_integrated \"$REPO\" trunk k_cyc0"
+check "14a: code landed too, so no 'delivers nothing' WARN"          "! grep -q 'delivers nothing' '$WORK/iw.err'"
+
+# seed a real, approved-looking cycle on trunk for the remaining cases
+mkdir -p "$REPO/$CYC"
+printf '# Plan\n\n## Deliverables\n\n### D1: seat notice\n' > "$REPO/$CYC/plan.md"
+printf '# Cycle Record\n\n## Tasks\n\n| Deliverable | Tasks |\n' > "$REPO/$CYC/record.md"
+git -C "$REPO" add -- "$CYC" >/dev/null; git -C "$REPO" commit -qm "docs(plan): approve seat-notice" >/dev/null
+PLAN_BLOB=$(git -C "$REPO" rev-parse "trunk:$CYC/plan.md")
+REC_BLOB=$(git -C "$REPO" rev-parse "trunk:$CYC/record.md")
+
+# (b) MODIFY + ADD under an existing cycle, while a human's uncommitted amendment sits at the root
+mktask k_cyc1
+C1="$WORK/cand-k_cyc1"; rm -rf "$C1"; git -C "$REPO" worktree add --detach -q "$C1" trunk
+printf '# Plan\n\n## Deliverables\n\n### D1: seat notice\n- [x] done\n' > "$C1/$CYC/plan.md"
+printf 'forged\n' > "$C1/$CYC/retro.md"; printf 'code1\n' > "$C1/cyc1.txt"
+git -C "$C1" add -A; git -C "$C1" commit -q -m "feat: k_cyc1"
+git -C "$REPO" update-ref refs/acfw/patch/k_cyc1 "$(git -C "$C1" rev-parse HEAD)"; git -C "$REPO" worktree remove --force "$C1"
+printf '# Plan\n\nHUMAN AMENDMENT IN PROGRESS\n' > "$REPO/$CYC/plan.md"
+run_iw bash "$IW" "$(TF k_cyc1)"
+check "14b: integrates (exit 0)"                                "[ $RC -eq 0 ]"
+check "14b: the task's code landed"                             "[ \"\$(trunk_content cyc1.txt)\" = code1 ]"
+check "14b: trunk plan.md is byte-identical (the edit was dropped)" \
+  "[ \"\$(git -C '$REPO' rev-parse 'trunk:$CYC/plan.md')\" = '$PLAN_BLOB' ]"
+check "14b: trunk record.md is byte-identical"                  "[ \"\$(git -C '$REPO' rev-parse 'trunk:$CYC/record.md')\" = '$REC_BLOB' ]"
+check "14b: the ADDED retro.md did not land"                    "! on_trunk '$CYC/retro.md'"
+check "14b: the WARN names the modified path"                   "grep -q '$CYC/plan.md' '$WORK/iw.err'"
+check "14b: the WARN names the added path"                      "grep -q '$CYC/retro.md' '$WORK/iw.err'"
+check "14b: the human's uncommitted amendment at the root SURVIVED the landing" \
+  "grep -q 'HUMAN AMENDMENT IN PROGRESS' '$REPO/$CYC/plan.md'"
+check "14b: ...and was not reported as overwritten (the landing never touched it)" \
+  "! grep -q 'overwrote uncommitted work' '$WORK/iw.err'"
+git -C "$REPO" checkout -q -- "$CYC/plan.md"
+
+# (c) no false alarm: a candidate that does not touch docs/cycles/ warns about nothing
+mktask k_cyc2; mkcand_path k_cyc2 "cyc2.txt" "code2"
+run_iw bash "$IW" "$(TF k_cyc2)"
+check "14c: a cycle-free candidate integrates"                  "[ $RC -eq 0 ]"
+check "14c: ...with no cycle WARN"                              "! grep -q 'docs/cycles' '$WORK/iw.err'"
+# land() used `git status --porcelain` to find uncommitted work on the paths it resyncs, but by then
+# the CAS has moved HEAD to NEW while the index still holds OBSERVED, so status called every landed
+# path "staged" and EVERY integration printed "overwrote uncommitted work" with a snapshot of nothing.
+check "14c: a landing over a clean root reports NO overwritten work (false-positive WARN)" \
+  "! grep -q 'overwrote uncommitted work' '$WORK/iw.err'"
+
+# (d) no false alarm either for a branch that CARRIES trunk's own newer cycle commit: its patch diff
+# includes the plan change, but that change is already on trunk, so nothing is dropped
+OLDBASE=$(trunk_tip)
+printf '# Plan\n\n## Deliverables\n\n### D1: seat notice, reworded\n' > "$REPO/$CYC/plan.md"
+git -C "$REPO" commit -qm "docs(plan): approve seat-notice (amended)" -- "$CYC/plan.md" >/dev/null
+mktask k_cyc3
+C3="$WORK/cand-k_cyc3"; rm -rf "$C3"; git -C "$REPO" worktree add --detach -q "$C3" "$OLDBASE"
+git -C "$REPO" show "trunk:$CYC/plan.md" > "$C3/$CYC/plan.md"; printf 'code3\n' > "$C3/cyc3.txt"
+git -C "$C3" add -A; git -C "$C3" commit -q -m "feat: k_cyc3 (merged trunk's plan)"
+git -C "$REPO" update-ref refs/acfw/patch/k_cyc3 "$(git -C "$C3" rev-parse HEAD)"; git -C "$REPO" worktree remove --force "$C3"
+run_iw bash "$IW" "$(TF k_cyc3)"
+check "14d: integrates"                                         "[ $RC -eq 0 ]"
+check "14d: no cycle WARN for a change trunk already has"       "! grep -q 'dropped this task' '$WORK/iw.err'"
+
+# (e) a conflict CONFINED to docs/cycles/ needs no resolver: stripped, then a clean apply
+BASEE=$(trunk_tip)
+PLAN_E=$(git -C "$REPO" show "trunk:$CYC/plan.md")
+mktask k_cyc4
+C4="$WORK/cand-k_cyc4"; rm -rf "$C4"; git -C "$REPO" worktree add --detach -q "$C4" "$BASEE"
+printf '%s\nTASK EDIT\n' "$PLAN_E" > "$C4/$CYC/plan.md"; printf 'code4\n' > "$C4/cyc4.txt"
+git -C "$C4" add -A; git -C "$C4" commit -q -m "feat: k_cyc4"
+git -C "$REPO" update-ref refs/acfw/patch/k_cyc4 "$(git -C "$C4" rev-parse HEAD)"; git -C "$REPO" worktree remove --force "$C4"
+printf '%s\nHUMAN EDIT COMMITTED\n' "$PLAN_E" > "$REPO/$CYC/plan.md"      # same region -> conflict
+git -C "$REPO" commit -qm "docs(plan): approve seat-notice (again)" -- "$CYC/plan.md" >/dev/null
+PLAN_E_BLOB=$(git -C "$REPO" rev-parse "trunk:$CYC/plan.md")
+run_iw bash "$IW" "$(TF k_cyc4)"
+check "14e: a cycle-only conflict is NOT resolver-needed (exit 0)"  "[ $RC -eq 0 ]"
+check "14e: ...no resolver block was printed"                     "! echo \"\$OUT\" | grep -q 'resolver-needed'"
+check "14e: the task's code landed"                               "[ \"\$(trunk_content cyc4.txt)\" = code4 ]"
+check "14e: the human's committed plan is untouched"              "[ \"\$(git -C '$REPO' rev-parse 'trunk:$CYC/plan.md')\" = '$PLAN_E_BLOB' ]"
+check "14e: the drop is WARNed"                                    "grep -q 'dropped this task.*$CYC/plan.md' '$WORK/iw.err'"
+check "14e: code landed too (conflict path), so no 'delivers nothing' WARN" "! grep -q 'delivers nothing' '$WORK/iw.err'"
+
+# (f) a conflict in code AND docs/cycles/: the resolver is handed the code conflict only
+BASEF=$(trunk_tip)
+printf 'line\n' > "$REPO/both.txt"; git -C "$REPO" add both.txt; git -C "$REPO" commit -qm "seed both" >/dev/null
+BASEF=$(trunk_tip); PLAN_F=$(git -C "$REPO" show "trunk:$CYC/plan.md")
+mktask k_cyc5
+C5="$WORK/cand-k_cyc5"; rm -rf "$C5"; git -C "$REPO" worktree add --detach -q "$C5" "$BASEF"
+printf 'task side\n' > "$C5/both.txt"; printf '%s\nTASK F\n' "$PLAN_F" > "$C5/$CYC/plan.md"
+git -C "$C5" add -A; git -C "$C5" commit -q -m "feat: k_cyc5"
+git -C "$REPO" update-ref refs/acfw/patch/k_cyc5 "$(git -C "$C5" rev-parse HEAD)"; git -C "$REPO" worktree remove --force "$C5"
+printf 'trunk side\n' > "$REPO/both.txt"; printf '%s\nHUMAN F\n' "$PLAN_F" > "$REPO/$CYC/plan.md"
+git -C "$REPO" commit -qm "trunk moves both" -- both.txt "$CYC/plan.md" >/dev/null
+PLAN_F_BLOB=$(git -C "$REPO" rev-parse "trunk:$CYC/plan.md")
+run_iw bash "$IW" "$(TF k_cyc5)"
+check "14f: a code conflict still needs the resolver (exit 7)"    "[ $RC -eq 7 ]"
+check "14f: conflicted_files names the code file"                  "echo \"\$OUT\" | grep -qx 'both.txt'"
+check "14f: ...and NOT the cycle file (the resolver never edits a plan)" "! echo \"\$OUT\" | grep -q 'docs/cycles'"
+INTEG_F="$REPO/$ACFW_WORKTREE_DIR/_integrate/k_cyc5"
+if [ "$RC" -eq 7 ] && [ -d "$INTEG_F" ]; then
+  # the resolver resolves the code AND leaves a stray untracked file under docs/cycles/
+  printf 'resolved\n' > "$INTEG_F/both.txt"; git -C "$INTEG_F" add both.txt
+  printf 'stray\n' > "$INTEG_F/$CYC/stray.md"
+  run_iw bash "$IW" --post-resolver "$(TF k_cyc5)"
+  check "14f: post-resolver integrates"                            "[ $RC -eq 0 ]"
+  check "14f: the resolved code landed"                            "[ \"\$(trunk_content both.txt)\" = resolved ]"
+  check "14f: the resolver's stray cycle file did NOT ride in via add -A" "! on_trunk '$CYC/stray.md'"
+  check "14f: ...and was WARNed"                                    "grep -q '$CYC/stray.md' '$WORK/iw.err'"
+  check "14f: the committed plan is untouched"                      "[ \"\$(git -C '$REPO' rev-parse 'trunk:$CYC/plan.md')\" = '$PLAN_F_BLOB' ]"
+  check "14f: resolved code is a real delivery: no 'delivers nothing' WARN" "! grep -q 'delivers nothing' '$WORK/iw.err'"
+else
+  bad "14f: needed exit 7 with an integration worktree (got rc=$RC)"
+fi
+
+# (g) a candidate whose ONLY change is under docs/cycles/ (the "tick D2 off in plan.md" task). After
+# the strip nothing is left but the marker. That still lands and still exits 0 (every caller maps 0 to
+# integrated), so the one honest signal is a distinct, UNCONDITIONAL WARN that it delivered nothing.
+PLAN_G_BLOB=$(git -C "$REPO" rev-parse "trunk:$CYC/plan.md")
+REC_G_BLOB=$(git -C "$REPO" rev-parse "trunk:$CYC/record.md")
+mktask k_cyc6
+C6="$WORK/cand-k_cyc6"; rm -rf "$C6"; git -C "$REPO" worktree add --detach -q "$C6" trunk
+printf '%s\n- [x] D1 done\n' "$(git -C "$REPO" show "trunk:$CYC/plan.md")" > "$C6/$CYC/plan.md"
+printf 'forged retro\n' > "$C6/$CYC/retro.md"
+git -C "$C6" add -A; git -C "$C6" commit -q -m "docs: tick D1 in the plan"
+git -C "$REPO" update-ref refs/acfw/patch/k_cyc6 "$(git -C "$C6" rev-parse HEAD)"; git -C "$REPO" worktree remove --force "$C6"
+run_iw bash "$IW" "$(TF k_cyc6)"
+check "14g: a cycles-only candidate still exits 0 (integrated)"   "[ $RC -eq 0 ] && echo \"\$OUT\" | grep -q 'integrated key=k_cyc6'"
+check "14g: the landed commit's ONLY path is the ledger marker" \
+  "[ \"\$(git -C '$REPO' show --name-only --format= trunk | sed '/^\$/d')\" = '$(acfw_marker_path k_cyc6)' ]"
+check "14g: trunk plan.md is byte-identical"                     "[ \"\$(git -C '$REPO' rev-parse 'trunk:$CYC/plan.md')\" = '$PLAN_G_BLOB' ]"
+check "14g: trunk record.md is byte-identical"                   "[ \"\$(git -C '$REPO' rev-parse 'trunk:$CYC/record.md')\" = '$REC_G_BLOB' ]"
+check "14g: the added retro.md did not land"                     "! on_trunk '$CYC/retro.md'"
+check "14g: the drop WARN names both paths" \
+  "grep -q '^WARN: k_cyc6: dropped.*$CYC/plan.md' '$WORK/iw.err' && grep -q '^WARN: k_cyc6: dropped.*$CYC/retro.md' '$WORK/iw.err'"
+check "14g: a distinct WARN says plainly that the task delivers nothing" \
+  "grep -q '^WARN: k_cyc6: after dropping docs/cycles/ this task delivers nothing' '$WORK/iw.err'"
+check "14g: ...exactly once"                                      "[ \$(grep -c 'delivers nothing' '$WORK/iw.err') -eq 1 ]"
+
+# mkcand_cyc <key> <base> <cmds> — a candidate built from <base> by running <cmds> (eval'd with CWD in
+# the candidate worktree), committed as one single-parent commit and published at refs/acfw/patch/<key>.
+mkcand_cyc() {
+  local wt="$WORK/cand-$1"; rm -rf "$wt"; git -C "$REPO" worktree add --detach -q "$wt" "$2"
+  ( cd "$wt" && eval "$3" ) >/dev/null 2>&1
+  git -C "$wt" add -A; git -C "$wt" commit -q -m "feat: $1"
+  git -C "$REPO" update-ref "refs/acfw/patch/$1" "$(git -C "$wt" rev-parse HEAD)"; git -C "$REPO" worktree remove --force "$wt"
+}
+
+# (h) MODIFY/DELETE: the task edited a cycle's plan.md, and trunk git rm'd that whole cycle meanwhile
+# (other cycles still on trunk). The cherry-pick leaves plan.md unmerged, and OBSERVED no longer has
+# it, so `checkout --no-overlay OBSERVED -- docs/cycles` refused ("path is unmerged") and the strip
+# stalled with exit 12. /go maps 12 to transient, so every run retried the same stall and the task's
+# code never landed.
+CYC_H="docs/cycles/20260928-doomed-cycle"
+mkdir -p "$REPO/$CYC_H"; printf '# Plan\n\n### D1: doomed\n' > "$REPO/$CYC_H/plan.md"
+git -C "$REPO" add -- "$CYC_H" >/dev/null; git -C "$REPO" commit -qm "docs(plan): approve doomed-cycle" >/dev/null
+mktask k_cyc7
+mkcand_cyc k_cyc7 trunk "printf '# Plan\n\n### D1: doomed, edited by the task\n' > '$CYC_H/plan.md'; printf 'code7\n' > cyc7.txt"
+git -C "$REPO" rm -rq -- "$CYC_H"; git -C "$REPO" commit -qm "docs(plan): drop doomed-cycle" >/dev/null
+run_iw bash "$IW" "$(TF k_cyc7)"
+check "14h: modify/delete on a cycle path integrates (exit 0, not a cycles-strip-failed stall)" \
+  "[ $RC -eq 0 ] && ! echo \"\$OUT\" | grep -q 'cycles-strip-failed'"
+check "14h: ...and is not handed to a resolver"                  "! echo \"\$OUT\" | grep -q 'resolver-needed'"
+check "14h: the task's code landed"                              "[ \"\$(trunk_content cyc7.txt)\" = code7 ]"
+check "14h: the deleted cycle stays deleted on trunk"            "! on_trunk '$CYC_H/plan.md'"
+check "14h: the other cycle is untouched on trunk"               "[ \"\$(git -C '$REPO' rev-parse 'trunk:$CYC/plan.md')\" = '$PLAN_G_BLOB' ]"
+check "14h: the drop is WARNed, naming the path"                 "grep -q '^WARN: k_cyc7: dropped.*$CYC_H/plan.md' '$WORK/iw.err'"
+check "14h: nothing is resurrected under the deleted cycle at the root" "[ ! -e '$REPO/$CYC_H' ]"
+check "14h: the integration worktree was removed"                "[ ! -d '$REPO/$ACFW_WORKTREE_DIR/_integrate/k_cyc7' ]"
+
+# (j) DELETE/MODIFY, the other direction: the task deleted a cycle file that trunk then amended. OBSERVED
+# has the path, so the strip restores trunk's version and the deletion is dropped.
+mktask k_cyc8
+mkcand_cyc k_cyc8 trunk "git rm -q -- '$CYC/record.md'; printf 'code8\n' > cyc8.txt"
+printf '%s\n| D1 | amended |\n' "$(git -C "$REPO" show "trunk:$CYC/record.md")" > "$REPO/$CYC/record.md"
+git -C "$REPO" commit -qm "docs(plan): record amended" -- "$CYC/record.md" >/dev/null
+REC_J_BLOB=$(git -C "$REPO" rev-parse "trunk:$CYC/record.md")
+run_iw bash "$IW" "$(TF k_cyc8)"
+check "14j: delete/modify on a cycle path integrates (exit 0)"   "[ $RC -eq 0 ]"
+check "14j: the task's code landed"                              "[ \"\$(trunk_content cyc8.txt)\" = code8 ]"
+check "14j: trunk's amended record.md survives the task's deletion" \
+  "[ \"\$(git -C '$REPO' rev-parse 'trunk:$CYC/record.md')\" = '$REC_J_BLOB' ]"
+check "14j: the drop is WARNed, naming the path"                 "grep -q '^WARN: k_cyc8: dropped.*$CYC/record.md' '$WORK/iw.err'"
+
+# (i) modify/delete again, with NO cycles left on trunk at all: OBSERVED has no docs/cycles/ tree, so
+# the strip's tracked-restore guard must still see (and drop) the unmerged entry.
+mktask k_cyc9
+mkcand_cyc k_cyc9 trunk "printf 'last task edit\n' >> '$CYC/plan.md'; printf 'code9\n' > cyc9.txt"
+git -C "$REPO" rm -rq -- docs/cycles; git -C "$REPO" commit -qm "docs(plan): drop every cycle" >/dev/null
+run_iw bash "$IW" "$(TF k_cyc9)"
+check "14i: modify/delete with no cycles on trunk integrates (exit 0)" "[ $RC -eq 0 ]"
+check "14i: the task's code landed"                              "[ \"\$(trunk_content cyc9.txt)\" = code9 ]"
+check "14i: trunk still has no docs/cycles/"                     "! on_trunk docs/cycles"
+check "14i: the drop is WARNed, naming the path"                 "grep -q '^WARN: k_cyc9: dropped.*$CYC/plan.md' '$WORK/iw.err'"
 echo ""
 echo "phase8-lpcas-integrate: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

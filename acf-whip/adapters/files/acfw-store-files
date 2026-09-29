@@ -231,7 +231,9 @@ cmd_create() {
   fi
   set_field "$dest" "Status" "$folder"
   git_with_lock_backoff -C "$REPO_ROOT" add -- ".backlog/$folder/$stem.md" || exit 99
-  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: create $stem in $folder" --quiet || exit 99
+  # Pathspec-limited, like every commit this adapter makes: a bare commit takes the whole root index,
+  # so a file a human staged (a plan.md amendment mid-review) landed under a "task: ..." subject.
+  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: create $stem in $folder" --quiet -- ".backlog/$folder/$stem.md" || exit 99
   printf '{"key":"%s","folder":"%s"}\n' "$(jesc "$stem")" "$(jesc "$folder")"
 }
 
@@ -307,7 +309,7 @@ cmd_update_field() {
   fi
   if [ "$edited" -eq 1 ]; then
     git_with_lock_backoff -C "$REPO_ROOT" add -- ".backlog/$folder/$fname" || exit 99
-    git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $fname field edit" --quiet || exit 99
+    git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $fname field edit" --quiet -- ".backlog/$folder/$fname" || exit 99
     printf '{"key":"%s","edited":true}\n' "$(jesc "$(basename "$f" .md)")"
   else
     printf '{"key":"%s","edited":false}\n' "$(jesc "$(basename "$f" .md)")"
@@ -325,7 +327,7 @@ cmd_update_body() {
   mv "$tmp" "$f"
   set_field "$f" "Status" "$folder"   # keep Status in sync with the folder (doctor invariant)
   git_with_lock_backoff -C "$REPO_ROOT" add -- ".backlog/$folder/$fname" || exit 99
-  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $fname body update" --quiet || exit 99
+  git_with_lock_backoff -C "$REPO_ROOT" commit -m "task: $fname body update" --quiet -- ".backlog/$folder/$fname" || exit 99
   printf '{"key":"%s","updated":true}\n' "$(jesc "$(basename "$f" .md)")"
 }
 

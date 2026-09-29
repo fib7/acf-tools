@@ -159,7 +159,9 @@ check_control_bytes() { # <file> <stem> <folder>
 
 commit_fix() { # <path-rel> <msg>
   git_with_lock_backoff -C "$REPO_ROOT" add "$1" >/dev/null 2>&1 || true
-  git_with_lock_backoff -C "$REPO_ROOT" commit -m "$2" --quiet >/dev/null 2>&1 || true
+  # Pathspec-limited: a bare commit takes the whole root index, so a file a human had staged (a
+  # plan.md amendment, say) landed under a "doctor: ..." subject.
+  git_with_lock_backoff -C "$REPO_ROOT" commit -m "$2" --quiet -- "$1" >/dev/null 2>&1 || true
 }
 
 # Existing worktree-branch slugs (ONE git call). Used to tell a live, integratable accepted
@@ -301,8 +303,14 @@ fi
 # A specialist is supposed to write only inside its own worktree. A relative path resolved against the
 # SHARED root instead leaves work here, where the integrator's post-land `reset --hard` will discard it.
 # Untracked files are excluded: operator scratch lives at the root legitimately.
-ndirty=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | awk 'substr($0,1,2)!="??" && substr($0,4,9)!=".backlog/"{n++} END{print n+0}')
-[ "${ndirty:-0}" -gt 0 ] && emit WARN dirty-trunk-root "(repo)" "$ndirty tracked file(s) modified/staged at the trunk root outside .backlog/ — a specialist may have escaped its worktree; commit or stash them before the next integration resyncs the root (git reset --hard)"
+# docs/cycles/ is excluded too (3.5.0): a cycle's plan.md is edited AT the root by design (a draft is
+# an untracked folder, and a human amending an approved plan leaves a tracked, dirty plan.md until the
+# re-approval commits it), and no landing can overwrite it, because integrate-lpcas strips docs/cycles/
+# from every candidate. Flagging it would put a standing false WARN on every planned cycle in flight.
+# A leading `"` is dropped first: porcelain quotes unusual paths, which would dodge both prefixes.
+# KEEP IN SYNC with acfw-doctor-generic.sh (the two batteries share the finding code and its meaning).
+ndirty=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | awk 'substr($0,1,2)!="??" { p=substr($0,4); sub(/^"/,"",p); if (substr(p,1,9)!=".backlog/" && substr(p,1,12)!="docs/cycles/") n++ } END{print n+0}')
+[ "${ndirty:-0}" -gt 0 ] && emit WARN dirty-trunk-root "(repo)" "$ndirty tracked file(s) modified/staged at the trunk root outside .backlog/ and docs/cycles/ — a specialist may have escaped its worktree; commit or stash them before the next integration resyncs the paths it lands"
 
 # ---- WARN: local trunk ahead of origin ----
 # The LP-CAS integrator lands on the LOCAL trunk by compare-and-swap and NEVER pushes — by design (a

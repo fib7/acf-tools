@@ -58,8 +58,11 @@ TIMEOUT_H=$(printf '%s' "$SNAP" | jq -r '.inProgressTimeoutHours // 8')
 if ! git -C "$REPO_ROOT" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
   emit FATAL detached-head "(repo)" "HEAD is detached at $REPO_ROOT; /go requires a branch checked out at the repo root"
 fi
-ndirty=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | awk 'substr($0,1,2)!="??" && substr($0,4,9)!=".backlog/"{n++} END{print n+0}')
-[ "${ndirty:-0}" -gt 0 ] && emit WARN dirty-trunk-root "(repo)" "$ndirty tracked file(s) modified/staged at the trunk root — a specialist may have escaped its worktree; commit or stash before the next integration resyncs the root"
+# dirty-trunk-root ignores untracked files, .backlog/ and docs/cycles/ (a cycle's plan.md is edited
+# at the root by design, and integrate-lpcas strips docs/cycles/ from every candidate, so no landing
+# can overwrite it). Same awk program as doctor.sh; KEEP IN SYNC.
+ndirty=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | awk 'substr($0,1,2)!="??" { p=substr($0,4); sub(/^"/,"",p); if (substr(p,1,9)!=".backlog/" && substr(p,1,12)!="docs/cycles/") n++ } END{print n+0}')
+[ "${ndirty:-0}" -gt 0 ] && emit WARN dirty-trunk-root "(repo)" "$ndirty tracked file(s) modified/staged at the trunk root outside .backlog/ and docs/cycles/ — a specialist may have escaped its worktree; commit or stash before the next integration resyncs the paths it lands"
 HEAD_BR=$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)
 if [ -n "$HEAD_BR" ] && git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/remotes/origin/$HEAD_BR" >/dev/null 2>&1; then
   nahead=$(git -C "$REPO_ROOT" rev-list --count "refs/remotes/origin/$HEAD_BR..HEAD" 2>/dev/null || echo 0)
