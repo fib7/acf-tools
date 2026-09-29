@@ -1,17 +1,17 @@
 # ACF Challenger Mode
 
-**Reasoning Validation Cognitive Mode for Agentic Continuous Flow**
+**A cognitive mode for Claude Code that finds the gaps and contradictions in a spec before agents build on it.**
 
-**ACF (Agentic Continuous Flow)** is software development where humans govern intelligent agent swarms rather than write code directly. Challenger mode ensures logical rigor before agents execute.
+**ACF (Agentic Continuous Flow)** is software development where humans govern intelligent agent swarms rather than write code directly. Hand an agent a vague spec and it fills the gaps with guesses, then builds on them.
 
 ## Purpose
 
-Challenger mode transforms Claude into a rigorous reasoning validator who systematically identifies every gap in logic, reasoning, and consistency. This isn't about being difficult—it's about ensuring specification completeness and logical soundness BEFORE agents waste cycles on flawed assumptions or incomplete requirements.
+Challenger mode turns Claude from a collaborator into a validator. It names every undefined term, unstated assumption, contradiction and unmeasurable criterion it finds, asks a specific question about each, and blocks execution until you answer. A gap caught in the spec costs one question. The same gap found after agents have built on it costs the work they did.
 
 ## ACF Use Cases
 
 ### 1. Requirements Clarification
-**Before agents implement**, use Challenger to expose vague specifications:
+Run a request through Challenger before agents implement it, so they don't invent the requirements you left out.
 
 ```
 User: "Make the dashboard more user-friendly"
@@ -26,10 +26,8 @@ Challenger: "Specification incomplete - cannot proceed.
             Execution blocked until requirements are quantified."
 ```
 
-**Value**: Prevents agent hallucination of requirements. Forces precision before execution.
-
 ### 2. Architecture Review
-**Before committing to design**, stress-test logical consistency:
+Before you commit to a design, check that its goals don't pull against each other.
 
 ```
 User: "We'll use microservices for scalability and monolith for simplicity"
@@ -49,10 +47,8 @@ Challenger: "Fundamental tradeoff conflict detected.
             Execution blocked until architecture is coherent."
 ```
 
-**Value**: Catches architectural incoherence before implementation.
-
 ### 3. Agent Output Validation
-**After agents generate solutions**, verify logical soundness:
+Check an agent's output for claims that cannot both be true.
 
 ```
 Agent output: "The algorithm is O(n log n) and runs in constant time"
@@ -71,10 +67,8 @@ Challenger: "Logical contradiction detected in complexity analysis.
             Cannot validate this output until contradiction is resolved."
 ```
 
-**Value**: Quality gate for agent-generated work. Prevents logical errors in production.
-
 ### 4. Risk Assessment
-**Before high-stakes decisions**, find hidden assumptions:
+Before a high-stakes decision, find out what optimistic wording like "basically done" is standing in for.
 
 ```
 User: "We can launch in 2 weeks since the MVP is basically done"
@@ -94,10 +88,8 @@ Challenger: "Specification incomplete - cannot validate launch readiness.
             and remaining work before I can assess 2-week timeline."
 ```
 
-**Value**: Exposes risk vectors hidden behind optimistic language.
-
 ### 5. Ontology Validation
-**During knowledge graph construction**, ensure logical consistency:
+When you build an ontology or knowledge graph, check that no two concepts contradict each other before anything is encoded on top of them.
 
 ```
 Ontology: "All tasks are autonomous" + "Tasks require human approval"
@@ -118,27 +110,27 @@ Challenger: "Logical contradiction in ontology definition.
             Cannot encode contradictory knowledge."
 ```
 
-**Value**: Prevents logical inconsistency in knowledge foundations.
-
 ## How It Works
 
-The plugin uses a SessionStart hook to inject rigorous logic validation instructions into Claude's context at the beginning of each session. This transforms Claude's behavior from collaborative implementer to systematic validator.
+A SessionStart hook injects `content/cognitive-mode.md` into Claude's context. From then on, Claude validates a request before it implements anything.
+
+The mode applies to every session while the plugin is enabled. Enabling or disabling it takes effect from the next session, not in the conversation you are in. Enable at most one of the three ACF cognitive modes (challenger, arazor, nitro) at a time.
 
 ### Core Behaviors
 
-1. **Systematic Validation** - Validate every statement with precision before execution
-2. **Logic Enforcement** - Identify fallacies by name, require evidence
-3. **Consistency Tracking** - Cross-reference all statements, identify contradictions
-4. **Coherence Verification** - Ensure specifications form coherent system
-5. **Execution Blocking** - Explicitly block on incomplete/inconsistent requirements
+1. **Validation first**: check every statement before executing anything
+2. **Logic enforcement**: name fallacies, require evidence
+3. **Consistency tracking**: cross-reference statements across the conversation and flag contradictions
+4. **Coherence check**: the requirements must fit together as one system
+5. **Execution blocking**: refuse to proceed on incomplete or inconsistent requirements, and say so explicitly
 
 ## When NOT to Use
 
-❌ **Collaborative implementation** - Normal Claude better for building together
-❌ **Brainstorming** - Validation mode blocks creative exploration
-❌ **Learning** - Too rigorous for educational/exploratory contexts
-❌ **Low-stakes work** - Overhead exceeds value for trivial decisions
-❌ **Well-defined specifications** - No value when requirements already complete
+- **Collaborative implementation.** Normal Claude is better for building together.
+- **Brainstorming.** Validation blocks open exploration.
+- **Learning.** Too rigorous for educational or exploratory work.
+- **Low-stakes work.** The overhead outweighs the value on trivial decisions.
+- **Well-defined specifications.** There is nothing to add when the requirements are already complete.
 
 ## ACF Workflow Integration
 
@@ -239,14 +231,14 @@ Challenger: "Specification validated. Requirements are:
 
 ## Variable-Aperture Governance
 
-In ACF, human attention is scarce. Allocate Challenger-level scrutiny surgically:
+Human attention is scarce in ACF, so spend Challenger's scrutiny where a wrong spec costs the most:
 
 | Task Risk | Use Challenger? | Reasoning |
 |-----------|----------------|-----------|
-| **Critical** (production deployment) | ✅ Yes | High stakes demand rigorous validation |
-| **High** (architecture decisions) | ✅ Yes | Errors compound over time |
-| **Medium** (feature specs) | ⚡ Selective | Use for complex/ambiguous specs |
-| **Low** (routine implementation) | ❌ No | Overhead exceeds value |
+| **Critical** (production deployment) | Yes | A wrong spec here is the most expensive |
+| **High** (architecture decisions) | Yes | Errors compound over time |
+| **Medium** (feature specs) | Selectively | For complex or ambiguous specs |
+| **Low** (routine implementation) | No | Overhead exceeds value |
 
 ## Contributing
 
@@ -256,7 +248,3 @@ See [Contributing Guide](../../CONTRIBUTING.md) for how to propose improvements 
 
 - Issues: [GitHub Issues](https://github.com/yourusername/acf-tools/issues)
 - Discussions: [GitHub Discussions](https://github.com/yourusername/acf-tools/discussions)
-
----
-
-**Remember**: In ACF, agents execute. Humans govern. Challenger mode is precision governance for reasoning validation.

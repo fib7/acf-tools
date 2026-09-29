@@ -1,6 +1,6 @@
 ---
 name: board
-description: Convene a board of advisors — multi-persona panel synthesized per call, hypertailored to the decision. Use when the user asks for a "panel", "board of advisors", "multi-perspective analysis", or when a non-trivial decision spans 2+ dimensions and is hard to reverse. Composes 1–5 decision-specific personas (using persona-design/DESIGN.md), confirms them with the user, then runs each persona — in LLM mode as a parallel advisor.py call against the configured LLM pool, in local-team mode as a parallel Claude Agent subagent. Synthesis is the orchestrator's own turn, weighted by the user-chosen priority dimension.
+description: Convene a board of advisors, a multi-persona panel composed per call and tailored to the decision. Use when the user asks for a "panel", "board of advisors", "multi-perspective analysis", or when a non-trivial decision spans 2+ dimensions and is hard to reverse. Composes 1–5 decision-specific personas (using persona-design/DESIGN.md), confirms them with the user, then runs every persona in parallel, in LLM mode as an advisor.py call against the configured LLM pool and in local-team mode as a Claude Agent subagent. Synthesis is the orchestrator's own turn, weighted by the priority dimension the user picked.
 allowed-tools:
   - Bash
   - Read
@@ -15,46 +15,46 @@ allowed-tools:
 ## When to use
 
 - The user asks for a "panel", "board", "multi-perspective", "second opinions plural", or "convene the board".
-- The user asks for a single second opinion (route to the `advisor` skill) but the question is genuinely multi-dimensional → escalate to a panel and tell the user.
-- A non-trivial decision spans **2+ distinct dimensions of correctness** AND is hard to reverse (architecture, security, irreversible migrations, irreversible product calls).
-- One specific dimension is decision-critical AND the user has multiple models in `ADVISOR_MODEL` → cross-model triangulation on that lens.
+- The user asks for a single second opinion (the `advisor` skill's job) but the question spans 2+ distinct dimensions → escalate to a panel and tell the user.
+- A non-trivial decision spans **2+ distinct dimensions of correctness** and is hard to reverse (architecture, security, irreversible migrations, irreversible product calls).
+- One dimension decides the outcome and the user has 2+ models in `ADVISOR_MODEL` → cross-model triangulation on that lens.
 
 ## When NOT to use
 
-- Trivial second opinions — route to the `advisor` skill.
-- Single-dimensional non-trivial questions — route to the `advisor` skill with ONE synthesized specialized persona via `--system-file`.
-- The user explicitly asked YOU to do the analysis — don't outsource it.
+- Trivial second opinions: route to the `advisor` skill.
+- Single-dimensional non-trivial questions: route to the `advisor` skill with one synthesized specialized persona via `--system-file`.
+- The user explicitly asked **you** to do the analysis. Do it; don't outsource it.
 
 ## Architecture (read this first)
 
-The board skill is a pure orchestrator. After the user approves the roster, the skill:
+The board skill only orchestrates. After the user approves the roster, you:
 
-1. Writes each persona's system prompt to a tempfile.
-2. Writes the shared user prompt (built per the context-building protocol below) to a tempfile.
-3. Runs each persona — **N parallel calls in ONE orchestrator message**, one per persona:
-   - **LLM mode**: N parallel `Bash` calls, each running `advisor.py` with that persona's system + assigned model. The orchestrator runs the commands itself and captures stdout/stderr directly — no subagent relay.
-   - **Local-team mode**: N parallel `Agent` subagents, each roleplaying a persona (no external API). This is the only path that uses subagents.
-4. Collects results; for multi-round panels, repeats with prior-round transcripts appended.
-5. Produces synthesis as the orchestrator's own next turn (no subagent).
+1. Write each persona's system prompt to a tempfile.
+2. Write the shared user prompt (built with the context-building protocol below) to a tempfile.
+3. Run every persona at once, **N parallel calls in one orchestrator message**, one per persona:
+   - **LLM mode**: N parallel `Bash` calls, each running `advisor.py` with that persona's system prompt and assigned model. You run the commands yourself and read stdout/stderr directly. No subagent relays them.
+   - **Local-team mode**: N parallel `Agent` subagents, each roleplaying one persona (no external API). This is the only path that uses subagents.
+4. Collect the results. For a multi-round panel, repeat with the prior round's transcripts appended.
+5. Write the synthesis as your own next turn (no subagent).
 
-There is **no Python orchestrator** (no `board.py`). All orchestration is markdown + Claude tool calls. Parallelism is visible and cancellable in the UI.
+There is **no Python orchestrator** (no `board.py`). All orchestration is this markdown plus Claude tool calls, so the user sees each parallel call in the UI and can cancel it.
 
-## Reused from the advisor skill (DO NOT restate)
+## Reused from the advisor skill (do not restate)
 
-Refer to `../advisor/SKILL.md`:
+These live in `../advisor/SKILL.md`:
 
-- **Context-building protocol — the load-bearing step.** Same checklist + bloat audit applies to the user prompt the board sends to every persona.
+- **Context-building protocol**, the step that decides answer quality. The same checklist and bloat audit apply to the user prompt the board sends to every persona.
 - The `### Advisor (<model>) — … says:` rendering header.
-- Stderr observability lines (`[advisor] sending: …`, `[advisor] model=…`, the zero-reasoning notice). Each `advisor.py` call's stderr carries these `[advisor]` lines; surface them aggregated.
+- Stderr observability lines (`[advisor] sending: …`, `[advisor] model=…`, the zero-reasoning notice). Every `advisor.py` call writes these `[advisor]` lines to stderr; show them aggregated.
 - The failure-mode table for upstream HTTP errors.
 
-The advisor skill's "do not probe env" rule applies to the **per-persona** invocation (each `advisor.py` call resolves its own env). The board skill's **routing decision** is different — it must call `advisor.py --check-env` first to see the project's `.env`. See "Pre-flight" below.
+The advisor skill's "do not probe env" rule covers the **per-persona** invocation, where each `advisor.py` call resolves its own env. The board's **routing decision** is different: you need the project's `.env` to make it, so call `advisor.py --check-env` first. See "Pre-flight" below.
 
-If you find yourself about to write a context-building checklist, an upstream-error table, or stderr observability conventions in this file — STOP. Cross-reference instead.
+Do not write a context-building checklist, an upstream-error table or stderr observability conventions into this file. Point to the advisor skill instead.
 
 ## Pre-flight: resolve advisor.py and route via `--check-env`
 
-`advisor.py` runs via `uv` (PEP 723 shebang) and auto-loads `.env` from CWD upward. **Do not read shell rc files or `~/.claude/` and do not `env | grep` for keys** — but DO use `advisor.py --check-env` for the routing decision: it runs the same dotenv chain as the real LLM-path call, so its answer matches what the per-persona invocation will see. Direct `${ADVISOR_MODEL}` / `${LITELLM_API_KEY}` reads from bash do **not** see the project `.env` (Claude Code's Bash tool inherits the orchestrator process env, not the project dotenv) and will silently misroute to local-team mode.
+`advisor.py` runs via `uv` (PEP 723 shebang) and loads `.env` from the CWD upward on its own. **Do not read shell rc files or `~/.claude/`, and do not `env | grep` for keys.** Do use `advisor.py --check-env` for the routing decision. It runs the same dotenv chain as the real LLM-path call, so its answer matches what each per-persona invocation will see. Reading `${ADVISOR_MODEL}` or `${LITELLM_API_KEY}` directly from bash does **not** see the project `.env`, because Claude Code's Bash tool inherits the orchestrator's process env and not the project dotenv. Those reads route to local-team mode by mistake, with no error.
 
 ```bash
 ADVISOR_BIN="${ACF_ADVISOR_BIN:-${CLAUDE_PLUGIN_ROOT:-}/scripts/advisor.py}"
@@ -66,9 +66,9 @@ BOARD_TMP="$(mktemp -d "${TMPDIR:-/tmp}/board.XXXXXXXX")"
 echo "BOARD_TMP=$BOARD_TMP"
 ```
 
-Carry `$BOARD_TMP` through every later step; remove it when the board is done.
+Carry `$BOARD_TMP` through every later step and remove it when the board is done.
 
-Single oracle for routing AND pool enumeration. Use `bash -c` so array syntax works regardless of the orchestrator's interactive shell (Claude Code's Bash tool may run zsh):
+One call decides the route and lists the model pool. Wrap it in `bash -c` so the array syntax works whatever the orchestrator's interactive shell is (Claude Code's Bash tool may run zsh):
 
 ```bash
 bash -c '
@@ -89,9 +89,9 @@ bash -c '
 '
 ```
 
-Capture `MODE=` and `POOL_CSV=` from stdout to drive the rest of the skill. `CHECK_RC=2` is the only condition for local-team fallback. Per-persona `advisor.py` invocations will load the same `.env` themselves — `--check-env` is the routing mirror, not a substitute.
+Read `MODE=` and `POOL_CSV=` from stdout; they drive the rest of the skill. `CHECK_RC=2` is the only condition for local-team fallback. Each per-persona `advisor.py` invocation loads the same `.env` itself. `--check-env` mirrors that load for routing and does not replace it.
 
-To iterate the pool portably (works in both bash and zsh — zsh does not word-split parameter expansions on `IFS` by default, so use `tr` + line-read):
+To iterate the pool in both bash and zsh, split with `tr` and read line by line (zsh does not word-split parameter expansions on `IFS` by default):
 
 ```bash
 echo "$POOL_CSV" | tr ',' '\n' | while IFS= read -r m; do
@@ -106,12 +106,12 @@ done
 | Path | When | Action |
 |---|---|---|
 | Default advisor | Trivial second opinion | Route to `../advisor/SKILL.md`. Stop here. |
-| Single specialized advisor | Non-trivial, ONE dimension | Synthesize ONE persona (per `persona-design/persona-template.md` — human name + descriptor); call `"$ADVISOR_BIN" --system-file <persona-file>`. Render with the existing advisor protocol, header form `### Advisor (<model>) — <Human Name> (<descriptor>) says:`. Stop here. |
+| Single specialized advisor | Non-trivial, one dimension | Synthesize one persona per `persona-design/persona-template.md` (human name plus descriptor), then call `"$ADVISOR_BIN" --system-file <persona-file>`. Render with the existing advisor protocol, header form `### Advisor (<model>) — <Human Name> (<descriptor>) says:`. Stop here. |
 | Panel | Non-trivial, ≥ 2 dimensions | Continue below. |
 
-### 2. Extract decision dimensions (FIRST, BEFORE any persona)
+### 2. Extract decision dimensions (first, before any persona)
 
-Read `persona-design/DESIGN.md` step 1. Extract dimensions of correctness — concrete, with named failure modes per dimension. Show the user a numbered list:
+Read step 1 of `persona-design/DESIGN.md`. Extract the dimensions of correctness: concrete ones, each with a named failure mode. Show the user a numbered list:
 
 ```
 I identify these dimensions in your decision:
@@ -122,7 +122,7 @@ I identify these dimensions in your decision:
 Which is most important to you? Synthesis will weight it.
 ```
 
-**Wait for the user's confirmation/edit AND priority pick.** This step is load-bearing — by the time the roster is composed, the decision is mostly made.
+**Wait until the user confirms or edits the list and picks a priority.** Do not hurry this step. By the time the roster is composed, most of the decision has been made.
 
 ### 3. Pick `R` (round count) using the criteria table
 
@@ -131,14 +131,14 @@ Which is most important to you? Synthesis will weight it.
 | Single dominant dimension; rest are minor | 1 |
 | Multiple independent dimensions; little overlap | 1 |
 | Two or more dimensions that *trade off against each other* (perf vs. correctness, latency vs. throughput, ergonomics vs. safety) | 2 |
-| Decision is genuinely irreversible AND personas may have non-obvious second-order effects | 3 |
-| Decision is high-stakes AND involves coupled subsystems needing iterative refinement (rare) | 4–5 |
+| Decision is irreversible and personas may have non-obvious second-order effects | 3 |
+| Decision is high-stakes and involves coupled subsystems needing iterative refinement (rare) | 4–5 |
 
-`R` is fixed at roster-confirmation time. **No autonomous mid-run extension.** Show the user the chosen `R` with a one-line justification at step 5.
+`R` is fixed when the user confirms the roster. **Never extend it yourself mid-run.** Show the user the chosen `R` with a one-line justification at step 6.
 
 ### 4. Compose personas (one per confirmed dimension)
 
-Follow `persona-design/DESIGN.md` step 4 + `persona-design/persona-template.md`. Cap at 5. **Apply the naming test**: if the descriptor could apply to a different decision without changing any words, rewrite. Each persona gets two halves joined by an em dash: a **human first + last name** with light humour AND a decision-specific descriptor (e.g. `Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration`). Mix cultures across the panel — Japanese, Indian, Persian, Slavic, Nordic, Latin, African, etc.; do not produce a roster of five Anglo names. Cross-model clones share the descriptor but get distinct human names. Each persona's system prompt MUST include all five template fields, especially **Blind spots (by design)** with at least 2 named.
+Follow step 4 of `persona-design/DESIGN.md` and `persona-design/persona-template.md`. Cap the panel at 5. **Apply the naming test**: if the descriptor would fit a different decision word for word, rewrite it. Each persona's name has two halves joined by an em dash: a **human first and last name** with light humour, then a decision-specific descriptor (e.g. `Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration`). Mix cultures across the panel (Japanese, Indian, Persian, Slavic, Nordic, Latin, African and others). Do not produce a roster of five Anglo names. Cross-model clones share the descriptor but get distinct human names. Each persona's system prompt MUST include all five template fields, especially **Blind spots (by design)** with at least two named.
 
 ### 5. Cross-model decision
 
@@ -146,8 +146,8 @@ Follow `persona-design/DESIGN.md` step 4 + `persona-design/persona-template.md`.
 |---|---|
 | 1 model | All personas share it. Skip cross-model triangulation. |
 | 2+ models, default | Round-robin assignment from the pool in roster order. |
-| 2+ models, explicit pin | If a specific lens benefits from a specific model's reasoning style, pin and state the reason at confirmation. |
-| 2+ models, **cross-model triangulation** | Clone the priority-dimension lens across 2–3 models (same `system` + `display_name`, distinct `id`s). Cross-model agreement-or-disagreement on that lens is itself the diagnostic. |
+| 2+ models, explicit pin | If a lens benefits from one model's reasoning style, pin that model and state the reason at confirmation. |
+| 2+ models, **cross-model triangulation** | Clone the priority-dimension lens across 2–3 models (same `system` + `display_name`, distinct `id`s). Whether the models agree on that lens is itself the diagnostic. |
 
 ### 6. Show the roster, get confirmation
 
@@ -157,15 +157,15 @@ For each persona, one line:
 <Human Name> — <descriptor> [<id>] (<model>). Covers: <dimension>. Reason for this slot: <one sentence>.
 ```
 
-Plus the chosen `R` with a one-line justification. If you used cross-model cloning, name it explicitly — and confirm each clone has a distinct human name.
+Add the chosen `R` with a one-line justification. If you cloned a lens across models, say so, and check that each clone has a distinct human name.
 
-**Output discipline for this turn.** Emit ONLY the per-persona lines above plus the chosen `R` justification. Do NOT add `Cultures: …`, `Model split: 2x foo, 1x bar`, persona-count tallies, dimension recaps, or any other derived/decorative summary. Model and descriptor are already inline in each persona line; culture mix is a composition heuristic for you, not content for the user.
+**Output discipline for this turn.** Emit only the per-persona lines above and the `R` justification. Do not add `Cultures: …`, `Model split: 2x foo, 1x bar`, persona-count tallies, dimension recaps or any other derived or decorative summary. Each persona line already carries its model and descriptor, and the culture mix is a composition heuristic for you, not content for the user.
 
-Wait for user approve/edit/veto. **This step is free of advisor cost.**
+Wait for the user to approve, edit or veto. **No advisor call has run yet, so this step has no advisor cost.**
 
 ### 7. Build the per-persona user prompt
 
-Apply the **Context-building protocol** from `../advisor/SKILL.md` (mandatory checklist + bloat audit + size discipline) to assemble ONE user prompt that all personas will see. Structure exactly as the advisor protocol specifies:
+Apply the **Context-building protocol** from `../advisor/SKILL.md` (mandatory checklist, bloat audit, size discipline) to assemble one user prompt that every persona sees. Use exactly the structure the advisor protocol specifies:
 
 ```
 ## Question
@@ -185,18 +185,18 @@ Apply the **Context-building protocol** from `../advisor/SKILL.md` (mandatory ch
 <concrete, named ask — same for all personas; persona system prompts shape HOW each one answers>
 ```
 
-Write the assembled prompt to `$BOARD_TMP/user-r1.txt`. Write each persona's system prompt to
+Write the assembled prompt to `$BOARD_TMP/user-r1.txt` and each persona's system prompt to
 `$BOARD_TMP/<persona-id>.sys`.
 
 **Use the private directory from pre-flight, never a fixed `/tmp/board-*` path.** Two sessions on
-one machine convening overlapping boards share those names: session B's write can land after A
-wrote its prompt but before A's parallel `advisor.py` calls open it, so A's personas answer B's
-question and A renders and synthesises the result under its own roster heading, with nothing
-anywhere indicating the swap.
+one machine convening overlapping boards share those names. Session B's write can land after A
+wrote its prompt but before A's parallel `advisor.py` calls open it. A's personas then answer B's
+question, and A renders and synthesises the result under its own roster heading, with nothing
+anywhere showing the swap.
 
-### 8. Run advisor.py — N parallel Bash calls in ONE message
+### 8. Run advisor.py: N parallel Bash calls in one message
 
-Issue **a single orchestrator message containing N parallel `Bash` tool calls** (one per persona). There is no subagent and no relay — you wrote the persona/prompt tempfiles in step 7, you run the commands, you render the results in step 11.
+Send **one orchestrator message containing N parallel `Bash` tool calls**, one per persona. No subagent or relay is involved: you wrote the persona and prompt tempfiles in step 7, you run the commands, and you render the results in step 11.
 
 Each call runs:
 
@@ -204,13 +204,13 @@ Each call runs:
 "$ADVISOR_BIN" --system-file "$BOARD_TMP/<persona-id>.sys" --model <model> < "$BOARD_TMP/user-r1.txt"
 ```
 
-Substitute the literal `$ADVISOR_BIN` path resolved in pre-flight, the actual persona-id, and the assigned model. The calls run concurrently. `advisor.py` prints the advisor reply to **stdout** and `[advisor]` observability lines to **stderr** — keep the two separate when you render.
+Substitute the literal `$ADVISOR_BIN` path resolved in pre-flight, the actual persona-id and the assigned model. The calls run concurrently. `advisor.py` prints the advisor reply to **stdout** and `[advisor]` observability lines to **stderr**. Keep the two apart when you render.
 
-If a call exits non-zero, note the exit code; its slot is rendered with `[FAILED rc=N]` and its stderr (see Failure handling).
+If a call exits non-zero, note the exit code. Its slot is rendered with `[FAILED rc=N]` and its stderr (see Failure handling).
 
 ### 9. Multi-round (R ≥ 2)
 
-After collecting round-1 returns, build the round-2 user prompt by appending prior-round transcripts:
+Once the round-1 replies are in, build the round-2 user prompt by appending the prior round's transcripts:
 
 ```
 <round-1 user prompt>
@@ -224,22 +224,22 @@ After collecting round-1 returns, build the round-2 user prompt by appending pri
 …
 ```
 
-Write to `$BOARD_TMP/user-r2.txt`. Issue another N parallel `Bash` calls in ONE message, same pattern, pointing at the new prompt file. Each persona only sees prior-round (not mid-round) takes. Repeat for each round up to `R`.
+Write it to `$BOARD_TMP/user-r2.txt`. Issue another N parallel `Bash` calls in one message, same pattern, pointing at the new prompt file. A persona sees replies from earlier rounds only, never one from the round in progress. Repeat for each round up to `R`.
 
-If a per-persona transcript is large, truncate to `~20000 / N` chars per persona to keep the round-2 prompt within size discipline.
+If a persona's transcript is large, truncate it to `~20000 / N` chars so the round-2 prompt stays within size discipline.
 
-### 10. Synthesis — orchestrator turn (no subagent)
+### 10. Synthesis: orchestrator turn (no subagent)
 
-After all rounds complete, **you (the orchestrator) produce the synthesis directly** as your own next turn. Use `persona-design/synthesizer.md` as your meta-prompt. Rules:
+After the last round, **you (the orchestrator) write the synthesis directly** as your next turn, with `persona-design/synthesizer.md` as your meta-prompt. Rules:
 
-- Weight by the user's priority dimension; the persona whose lens covers it gets the most weight on that dimension specifically.
-- Name disagreement explicitly — disagreement is signal, not a wording problem to paper over. Convergence across distinct lenses is the strongest signal; convergence within one lens (cross-model triangulation) is the next strongest.
-- Calibrate confidence to convergence. Speak plainly where personas agreed; name uncertainty where they didn't.
-- Before issuing the recommendation, name the strongest argument against it in one sentence (drawing from a dissenting persona where possible). If none of the personas surfaced one, say so explicitly — that itself is a flag.
-- Escalate, don't soften. If a persona named a fallacy or specification gap in the asker's framing, carry it into the synthesis verbatim. "Mostly working" stays "broken"; "just needs X" stays "incomplete".
-- End with a concrete recommendation, or — if the panel genuinely doesn't converge — a named tradeoff: the two paths and what each commits to. Do not split the difference into a vague middle.
+- Weight by the user's priority dimension. On that dimension, the persona whose lens covers it gets the most weight.
+- Name disagreement explicitly and do not smooth it over in the wording. Convergence across distinct lenses is the strongest signal; convergence within one lens (cross-model triangulation) is the next strongest.
+- Calibrate confidence to convergence. Speak plainly where personas agreed and name the uncertainty where they didn't.
+- Before giving the recommendation, state the strongest argument against it in one sentence, drawn from a dissenting persona where possible. If no persona raised one, say so. That absence is a warning sign in itself.
+- Escalate, don't soften. If a persona named a fallacy or a specification gap in the asker's framing, carry it into the synthesis verbatim. "Mostly working" stays "broken"; "just needs X" stays "incomplete".
+- End with a concrete recommendation or, if the panel does not converge, a named tradeoff: the two paths and what each commits to. Do not split the difference into a vague middle.
 
-The synthesizer is always Claude — not the advisor LLM. Diversity comes from the personas; integration comes from you.
+You write the synthesis; the advisor LLM never does. The personas supply the range of views and you integrate them.
 
 ### 11. Render output
 
@@ -264,13 +264,13 @@ The synthesizer is always Claude — not the advisor LLM. Diversity comes from t
 [board] mode=<llm|local-team> personas=N rounds=R
 ```
 
-**Strict template.** The output ends at the `[board]` line. No `Cultures:`, no `Model split:`, no persona-count tally, no parameter dump, no "Personas used:" recap. The `[board]` line is the only trailing metadata permitted. If you feel the urge to add a roster diagnostic, that's the urge to suppress.
+**Strict template.** The output ends at the `[board]` line. No `Cultures:`, no `Model split:`, no persona-count tally, no parameter dump, no "Personas used:" recap. The `[board]` line is the only trailing metadata allowed, so a roster diagnostic has no place in the output.
 
 ## Local-team mode
 
-Triggered when `advisor.py --check-env` exits non-zero (rc=2) — i.e. after walking the project's `.env` chain plus the orchestrator's shell env, either no api key (`LITELLM_API_KEY` / `OPENAI_API_KEY`) or no model (`ADVISOR_MODEL` / `OPENAI_MODEL`) could be resolved. Same workflow as steps 1–7 above (dimension extraction, roster confirmation, prompt building) — only step 8 differs.
+Runs when `advisor.py --check-env` exits non-zero (rc=2): after walking the project's `.env` chain and the orchestrator's shell env, it resolved no API key (`LITELLM_API_KEY` / `OPENAI_API_KEY`) or no model (`ADVISOR_MODEL` / `OPENAI_MODEL`). Steps 1–7 above (dimension extraction, roster confirmation, prompt building) stay the same. Only step 8 differs.
 
-**Tell the user explicitly** what's happening, in one short paragraph:
+**Tell the user explicitly** what is happening, in one short paragraph:
 
 ```
 No external advisor endpoint configured (no LITELLM_API_KEY/OPENAI_API_KEY or no ADVISOR_MODEL
@@ -280,34 +280,34 @@ No external API calls.
 
 ### Step 8 (local-team)
 
-Local-team mode is the **only** path that uses `Agent` subagents — there is no external endpoint, so each persona must be a Claude instance roleplaying. Dispatch N parallel `Agent` calls. Each subagent's prompt is the persona's full system text (Dimension / Lens / Bias / Blind spots / Output discipline) + this marker line + the user prompt:
+Local-team mode is the **only** path that uses `Agent` subagents. There is no external endpoint, so each persona has to be a Claude instance roleplaying it. Dispatch N parallel `Agent` calls. Each subagent's prompt is the persona's full system text (Dimension / Lens / Bias / Blind spots / Output discipline), then this marker line, then the user prompt:
 
 > You are roleplaying as the advisor described above. Respond ONLY in that voice. Output discipline applies. Do not ask follow-up questions; if information is missing, name what's missing and proceed with stated assumptions.
 
-Render with `(local)` instead of `(<model>)` in the headers. Cross-model triangulation is N/A — all "models" are Claude.
+Render with `(local)` instead of `(<model>)` in the headers. Cross-model triangulation does not apply, since every persona runs on Claude.
 
-## Bloat guards (verbatim — do not soften)
+## Bloat guards (do not soften)
 
 - **Cap at 5 personas total.** Each cross-model clone counts as a separate slot.
-- **Distinct dimensions per persona.** If two personas have ≥ 70% lens overlap AND share a model, merge or drop one. Cross-model clones of the same lens are exempt — that's intentional triangulation.
-- **Cross-model cloning is an explicit choice with a stated reason.** Default to single-model per lens.
-- **`R` is fixed at roster-confirmation time.** No autonomous mid-run extension. Disagreement after `R` rounds IS the signal.
-- **Default `R = 1`** unless a specific signal in the criteria table warrants more. Justify the choice in one line.
-- **If your synthesized roster maps 1:1 to a worked example in `persona-design/examples/`, you skipped dimension extraction.** Redo from step 2.
-- **No roster meta-summary in user-facing output.** Culture mix and model-pool composition are *inputs to your composition decision*, not outputs. Never emit `Cultures: …`, `Model split: …`, persona-count tallies, or similar decorative summaries. The trailing `[board]` line is the only summary metadata permitted.
+- **Distinct dimensions per persona.** If two personas have ≥ 70% lens overlap and share a model, merge them or drop one. Cross-model clones of one lens are exempt, because that overlap is the triangulation.
+- **Cross-model cloning is an explicit choice with a stated reason.** Default to one model per lens.
+- **`R` is fixed when the user confirms the roster.** Never extend it yourself mid-run. If the personas still disagree after `R` rounds, that disagreement is the finding.
+- **Default `R = 1`** unless a specific signal in the criteria table calls for more. Justify the choice in one line.
+- **If your roster maps 1:1 onto a worked example in `persona-design/examples/`, you skipped dimension extraction.** Redo from step 2.
+- **No roster meta-summary in user-facing output.** Culture mix and model-pool composition feed *your composition decision*. They are not output. Never emit `Cultures: …`, `Model split: …`, persona-count tallies or similar summaries. The trailing `[board]` line is the only summary metadata allowed.
 
 ## Failure handling
 
-Per-persona failures are isolated by design: if one `advisor.py` call fails, that persona's slot is rendered with `[FAILED rc=N]` and stderr; synthesis runs over the remaining N-1 takes. Don't retry the whole board for a single failure. If ALL personas fail, surface the common error and stop — likely an env or endpoint issue.
+One persona's failure does not touch the others. If one `advisor.py` call fails, render that persona's slot with `[FAILED rc=N]` and its stderr, and run the synthesis over the remaining N-1 replies. Don't retry the whole board for one failure. If every persona fails, show the common error and stop: the env or the endpoint is the likely cause.
 
-For specific upstream errors (HTTP 401, 404, rate limits, etc.), see the failure-modes table in `../advisor/SKILL.md`.
+For specific upstream errors (HTTP 401, 404, rate limits and so on), see the failure-modes table in `../advisor/SKILL.md`.
 
 ## Critical rules
 
-- **Do not probe env outside the project.** No reading `~/.zshrc`, `~/.claude/`, `~/.config/`. The skill asks `advisor.py --check-env` (which runs the same dotenv chain as the LLM-path call) for the routing decision and the pool enumeration. Do not read `${ADVISOR_MODEL}` / `${LITELLM_API_KEY}` directly from bash — Claude Code's Bash tool does not auto-source project `.env`, so those reads silently misroute to local-team mode.
-- **Cross-reference, don't restate** — the context-building protocol, observability conventions, and upstream-error handling all live in `../advisor/SKILL.md`.
-- **Synthesize personas per call** — never reuse a roster from a worked example. Examples teach the *reasoning chain*, not the output.
-- **Surface dimensions to the user BEFORE composing personas.** The roster confirmation later is a backup, not the main lever.
-- **Cap at 5 personas. Default `R = 1`.** Both bumps require an explicit justification visible to the user.
-- **N parallel calls in ONE orchestrator message** — `Bash` calls in LLM mode, `Agent` subagents in local-team mode. Sequential dispatch defeats the architecture.
-- **Synthesis is YOUR turn, not a subagent call.** Avoids the synthesizer adopting a persona of its own.
+- **Do not probe env outside the project.** No reading `~/.zshrc`, `~/.claude/` or `~/.config/`. Ask `advisor.py --check-env` (it runs the same dotenv chain as the LLM-path call) for the routing decision and the model pool. Do not read `${ADVISOR_MODEL}` / `${LITELLM_API_KEY}` directly from bash. Claude Code's Bash tool does not source the project `.env`, so those reads route to local-team mode by mistake, with no error.
+- **Cross-reference, don't restate.** The context-building protocol, observability conventions and upstream-error handling all live in `../advisor/SKILL.md`.
+- **Synthesize personas per call.** Never reuse a roster from a worked example: the examples teach the *reasoning chain*, not the output.
+- **Show the user the dimensions before composing personas.** The roster confirmation later is a backup, not the main check.
+- **Cap at 5 personas. Default `R = 1`.** Raising either needs an explicit justification the user can see.
+- **N parallel calls in one orchestrator message**: `Bash` calls in LLM mode, `Agent` subagents in local-team mode. Dispatching them one at a time throws away the parallelism the design is built on.
+- **The synthesis is your turn, not a subagent call,** so the synthesizer never adopts a persona of its own.

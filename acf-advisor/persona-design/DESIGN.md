@@ -1,29 +1,29 @@
 # Persona synthesis recipe
 
-This file is the durable artifact. It defines a *process* for composing a panel hypertailored to a specific decision — not a catalog of pre-made personas. Personas are synthesized per call, named for the decision's specific nouns, and each cover exactly one dimension of correctness.
+How to compose a board panel for one specific decision. This is a *process*, not a catalog of ready-made personas: you write the personas per call, name them after the decision's own nouns, and give each one exactly one dimension of correctness.
 
-If you find yourself reaching for "the usual five" (pragmatist, skeptic, security, perf, architect), you have skipped the recipe. Start over from step 1.
+If you catch yourself reaching for "the usual five" (pragmatist, skeptic, security, perf, architect), you have skipped the recipe. Start over from step 1.
 
 ---
 
-## Step 1 — Extract decision dimensions (visible to user, BEFORE personas)
+## Step 1: Extract decision dimensions (show the user, BEFORE any persona)
 
-Read the question + context. List the dimensions of correctness this specific decision has. A dimension is a way the decision can fail. Concrete, decision-specific, with the failure mode named:
+Read the question and its context, then list the dimensions of correctness this decision has. A dimension is a way the decision can fail. Make each one concrete and specific to the decision, with the failure mode named:
 
-> NOT: "security"
-> YES: "token expiry race during cutover when both old and new auth flows are live"
+> Too vague: "security"
+> Specific: "token expiry race during cutover when both old and new auth flows are live"
 
-> NOT: "performance"
-> YES: "GC pressure if the per-request allocation count rises >2x at p99"
+> Too vague: "performance"
+> Specific: "GC pressure if the per-request allocation count rises >2x at p99"
 
-> NOT: "operability"
-> YES: "rollback safety if the migration discovers a corrupted row partway through"
+> Too vague: "operability"
+> Specific: "rollback safety if the migration discovers a corrupted row partway through"
 
-Output the dimension list to the user as a numbered markdown list, with the failure mode named per dimension. **Wait for confirmation.** Ask: *"Which of these dimensions is most important to you? Synthesis will weight it."* The answer becomes `priority_dimension` in the manifest.
+Show the user the dimensions as a numbered markdown list, with the failure mode named for each. **Wait for confirmation**, and ask: *"Which of these dimensions is most important to you? Synthesis will weight it."* The answer is the priority dimension.
 
-This step is the load-bearing one. The roster confirmation later is too late — by then the personas are composed and the user is rubber-stamping. The dimension list is where the real decision happens; surface it.
+Everything later rests on this step. Roster confirmation comes too late to shape the panel: by then the personas exist and the user is rubber-stamping them. The real decision happens on the dimension list, so put it in front of the user.
 
-## Step 2 — Decide the path (single advisor vs panel)
+## Step 2: Decide the path (single advisor or panel)
 
 | Dimensions identified | Path |
 |---|---|
@@ -31,17 +31,17 @@ This step is the load-bearing one. The roster confirmation later is too late —
 | ≥ 2 distinct dimensions | Panel |
 | Trivial / lookup-style question | Default advisor (existing skill, no persona synthesis needed) |
 
-Single advisor is the cheapest non-trivial path — same cost as default but with a sharp lens.
+A single specialized advisor is the cheapest non-trivial path: it costs the same as the default advisor and brings a sharper lens.
 
-## Step 3 — Decide the round count `R`
+## Step 3: Decide the round count `R`
 
-For the panel path, pick `R` from the criteria table in `skills/board/SKILL.md`. Default `R = 1`. Increase only when a specific signal in the decision context warrants it (personas trade off against each other, irreversible decision with second-order effects, coupled subsystems). Show the user the chosen `R` with a one-line justification at the roster confirmation step.
+For a panel, pick `R` from the criteria table in `skills/board/SKILL.md`. The default is `R = 1`. Go higher only when something specific in the decision calls for it: personas that trade off against each other, an irreversible decision with second-order effects, coupled subsystems. Show the user the chosen `R` with a one-line justification when you confirm the roster.
 
-`R` is fixed at manifest-build time — no autonomous mid-run extension. If panelists disagree after `R` rounds, that disagreement IS the signal; surface it via synthesis.
+`R` is fixed at roster confirmation, and the run never extends it on its own. If panelists still disagree after `R` rounds, the disagreement IS the signal; report it in the synthesis.
 
-## Step 4 — Compose one persona per confirmed dimension (use the template)
+## Step 4: Compose one persona per confirmed dimension (use the template)
 
-For each dimension on the confirmed list, write one persona using `persona-template.md`. Mandatory structured fields:
+For each confirmed dimension, write one persona using `persona-template.md`. The structured fields are mandatory:
 
 ```
 ## Persona: {name — must reference a specific noun from the decision}
@@ -52,57 +52,57 @@ For each dimension on the confirmed list, write one persona using `persona-templ
 - **Output discipline**: state the position you'd defend; calibrate confidence symmetrically; name the strongest counter to your own recommendation; name fallacies in the asker's reasoning (false dichotomy, strawman, circular, appeal to authority, etc.); no padding, recap, hedges, or smoothing labels
 ```
 
-**Naming test**: if the persona descriptor could apply to a different decision without changing any words, it is too generic. Rewrite. ("security skeptic" fails the test; "token-lifecycle skeptic for OAuth-A→B migration" passes.)
+**Naming test**: if the persona's descriptor could apply to a different decision without changing a word, it is too generic, so rewrite it. "Security skeptic" fails; "token-lifecycle skeptic for OAuth-A→B migration" passes.
 
-Each persona also gets a **human first + last name** with light humour, paired with the descriptor by an em dash: `Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration`. Mix cultures across the panel (Japanese, Indian, Persian, Slavic, Nordic, Latin, African, etc.) — a board of five Anglo names reads like a stock photo. The descriptor stays load-bearing for specificity; the human name is the memorable handle the user sees in roster confirmation, transcripts, and synthesis. Cross-model clones share the descriptor but get distinct human names. See `persona-template.md` "Persona name" section for the full rules.
+Each persona also gets a **human first + last name** with light humour, joined to the descriptor by an em dash: `Tomoe Tokunaga — token-lifecycle skeptic for OAuth-A→B migration`. Mix cultures across the panel (Japanese, Indian, Persian, Slavic, Nordic, Latin, African, etc.); a board of five Anglo names reads like a stock photo. The descriptor carries the specificity. The name is the handle the user remembers across roster confirmation, transcripts and synthesis. Cross-model clones share the descriptor but get distinct names. The "Persona name" section of `persona-template.md` has the full rules.
 
-**Blind-spots field is non-negotiable.** A persona that opines on everything has no useful bias; it's just a generalist. Each persona must explicitly refuse to weigh in on dimensions outside its lens — that's what makes synthesis cleanly weight the takes later.
+**The blind-spots field is required.** A persona that opines on everything has no useful bias; it is a generalist. Each persona must explicitly refuse to weigh in on dimensions outside its lens, because that refusal is what lets synthesis weight the takes cleanly later.
 
-Cap at 5 personas. Merge or drop until ≤5.
+Cap the panel at 5 personas. Merge or drop until you have 5 or fewer.
 
-## Step 5 — Decide model assignment
+## Step 5: Decide model assignment
 
-Read `available_models` (parsed from `ADVISOR_MODEL`).
+Read the model pool (parsed from `ADVISOR_MODEL`).
 
-- **Single model in pool** → all personas share it. Skip to step 6.
-- **Multiple models in pool, default behavior** → leave each persona's `model: null`; board.py round-robins them across the pool in manifest order.
-- **Pin a specific model to a specific lens** when there's a real reason (e.g. "this lens benefits from gpt-5.5's deep reasoning on long causal chains"). State the reason in the roster confirmation line.
-- **Cross-model triangulation** (clone one lens across N models) when one specific dimension is decision-critical AND the pool has genuinely different reasoners. Two manifest entries with identical `system` + `display_name`, distinct `id`s, different `model`s. Cross-model agreement-or-disagreement on that lens is itself the diagnostic. Costs N roster slots — use deliberately.
+- **One model in the pool**: every persona uses it. Skip to step 6.
+- **Several models, default behavior**: leave each persona's model unpinned; the board assigns them round-robin from the pool in roster order.
+- **Pin a specific model to a specific lens** only for a real reason (e.g. "this lens benefits from gpt-5.5's deep reasoning on long causal chains"), and state the reason on the roster confirmation line.
+- **Cross-model triangulation** (one lens cloned across N models): use it when one dimension is decision-critical AND the pool has models that reason differently. The clones are roster entries with the same `system` and `display_name`, distinct `id`s and different models. Whether the models agree on that lens is itself the diagnostic. It costs N roster slots, so use it deliberately.
 
-## Step 6 — Show the roster, get confirmation
+## Step 6: Show the roster and get confirmation
 
-For each persona, one line:
+Show one line per persona, in the format from `skills/board/SKILL.md` step 6:
 
-> `<name>` [`<id>`] (`<model>`) — covers: `<dimension>`. Reason for this slot: `<one sentence>`.
+> `<Human Name> — <descriptor> [<id>] (<model>). Covers: <dimension>. Reason for this slot: <one sentence>.`
 
-If `R > 1`: a one-line justification for the chosen round count.
+If `R > 1`, add a one-line justification for the round count.
 
-Wait for the user to approve, edit, or veto. **This step is fast and free of advisor cost.** Treat user feedback as load-bearing.
+Wait for the user to approve, edit or veto. **This step is quick and costs no advisor calls.** Take the user's feedback seriously; it overrides your draft.
 
-## Step 7 — Build the manifest, run the panel
+## Step 7: Run the panel
 
-Construct the JSON manifest matching `scripts/board.py`'s schema. Pipe to `board.py`. Render the output verbatim under headers (preserving the per-persona "Advisor (`<model>`) — `<name>` says:" pattern from the existing advisor skill — same idiom, multiplied). End with the synthesis block. Surface the `[board] aggregate:` cost line.
+Write each persona's system prompt to its own `.sys` file and the shared user prompt to one file, both in the run's private `mktemp -d` directory. Then run one `advisor.py` call per persona, as parallel `Bash` calls in a single message (steps 7–11 of `skills/board/SKILL.md` have the exact commands). Render each reply verbatim under the advisor skill's header, one per persona: `### Advisor (<model>) — <Human Name> (<descriptor>) says:`. Write the synthesis yourself, and end with the `[board]` line.
 
 ---
 
-## Persona shapes that are too generic — and the specific versions they should become
+## Generic persona shapes and their specific versions
 
-These are warning signs. If your synthesized persona maps 1:1 to one of the left-hand items, you have not done the work yet. The right-hand column shows what specificity looks like for a real decision.
+Treat these as warning signs. If a persona you wrote maps 1:1 to an item in the left-hand column, you haven't done the work yet. The right-hand column shows what specificity looks like for a real decision.
 
 | Generic shape | What's wrong | Decision-specific version (example) |
 |---|---|---|
-| `pragmatist` | "Get it shipped" applies to every decision; carries no decision-specific signal | `YAGNI advocate for OAuth flow swap — argue against the rewrite if the existing flow's only bug is the cookie-domain edge case` |
-| `skeptic` | Devil's-advocate-as-job-title — too vague to disagree usefully | `migration-rollback skeptic — assume the data backfill will find a corrupt row at row 1.2M; what's the recovery path?` |
+| `pragmatist` | "Get it shipped" applies to every decision and carries no decision-specific signal | `YAGNI advocate for OAuth flow swap — argue against the rewrite if the existing flow's only bug is the cookie-domain edge case` |
+| `skeptic` | Devil's advocate as a job title: too vague to disagree usefully | `migration-rollback skeptic — assume the data backfill will find a corrupt row at row 1.2M; what's the recovery path?` |
 | `security auditor` | Threat-models in the abstract; misses *which* threat model applies | `token-lifecycle skeptic — focus on token expiry races during cutover when old + new auth flows coexist` |
-| `performance engineer` | "Make it fast" — no insight into which constant matters here | `cache-coherence specialist — if the new design adds an L2 cache layer between auth and the session store, model the staleness window and its consequences` |
-| `systems architect` | Boundaries-and-coupling without a reason this decision needs them named | `inter-service contract auditor — does this change require a coordinated rollout across the auth, session, and gateway services? If yes, name the order` |
-| `ops engineer` | "What about ops?" — no specific operational concern | `migration-on-call ergonomics — if this fails at 3am, what's the runbook? Is the rollback one command or a multi-step dance?` |
-| `domain expert` | Tautological — what domain? | `oauth2-rfc-skeptic — read the migration plan against RFC 6749 §10 and name the assumptions it violates` |
-| `contrarian` | Disagreement-as-a-job is performative, not informative | `single-tenant-fan in a multi-tenant proposal — argue the simpler architecture if tenant isolation isn't actually a requirement yet` |
+| `performance engineer` | "Make it fast", with no insight into which constant matters here | `cache-coherence specialist — if the new design adds an L2 cache layer between auth and the session store, model the staleness window and its consequences` |
+| `systems architect` | Boundaries and coupling, with no reason this decision needs them named | `inter-service contract auditor — does this change require a coordinated rollout across the auth, session, and gateway services? If yes, name the order` |
+| `ops engineer` | "What about ops?", with no specific operational concern | `migration-on-call ergonomics — if this fails at 3am, what's the runbook? Is the rollback one command or a multi-step dance?` |
+| `domain expert` | Tautological: which domain? | `oauth2-rfc-skeptic — read the migration plan against RFC 6749 §10 and name the assumptions it violates` |
+| `contrarian` | Disagreement as a job is performance, not information | `single-tenant-fan in a multi-tenant proposal — argue the simpler architecture if tenant isolation isn't actually a requirement yet` |
 
-The transformation pattern: generic role → **lens × decision-specific noun × failure mode**.
+The pattern: generic role → **lens × decision-specific noun × failure mode**.
 
-With human names attached, those right-hand entries become memorable handles:
+With human names attached, the right-hand entries become handles people remember:
 
 - `pragmatist` → `Yui Yagni — YAGNI advocate for OAuth flow swap`
 - `skeptic` → `Reza Rezervi — migration-rollback skeptic for the user_credentials backfill`
@@ -111,17 +111,17 @@ With human names attached, those right-hand entries become memorable handles:
 
 ---
 
-## What this recipe enforces
+## What the recipe enforces
 
-- **Decision-specificity by construction**: the dimension extraction step demands concrete failure modes, not abstract categories. The naming test on personas catches anything that slips through.
-- **No "default 5"**: archetypes are absent from the artifact set on purpose. The list above is a warning, not a menu.
-- **The user has visible levers at three points**: dimension confirmation (most important), roster confirmation, and post-synthesis recommendation review. Each lever is cheap to operate.
-- **The synthesis call has a clean job**: integrate weighted by `priority_dimension`. It is not synthesizing personas; it is synthesizing *takes*. Two different problems.
+- **Specificity by construction.** Dimension extraction demands concrete failure modes, not categories, and the naming test catches any persona that slips through anyway.
+- **No "default 5".** The artifact set has no archetypes, on purpose. The table above is a warning, not a menu.
+- **Three points where the user can steer**: dimension confirmation (the one that matters most), roster confirmation, and review of the recommendation after synthesis. Each costs the user a moment.
+- **Synthesis has one job**: combine what the personas said, weighted by the priority dimension. Composing the personas was step 4's problem, not the synthesizer's.
 
 ---
 
-## When in doubt: walk through a worked example
+## When in doubt, read a worked example
 
-`examples/auth-redesign.md`, `examples/perf-regression.md`, `examples/data-migration.md`, and `examples/product-prioritization.md` show end-to-end synthesis: original decision prompt → extracted dimensions with reasoning → personas considered AND rejected with rationale → final structured roster → tier-of-path choice. Read these for the *reasoning chain*, not as templates to copy. Pattern-matching the output produces generic panels; pattern-matching the reasoning produces hypertailored ones.
+`examples/auth-redesign.md`, `examples/perf-regression.md`, `examples/data-migration.md` and `examples/product-prioritization.md` each run end to end: the original decision prompt, the extracted dimensions with reasoning, the personas considered and rejected with rationale, the final roster, and the choice of path and round count. Read them for the *reasoning chain*, not as templates. Copy their output and you get generic panels; copy their reasoning and you get panels built for your decision.
 
-If a new decision shape arrives that doesn't resemble any of the four examples, run the recipe from step 1 anyway. The examples cover infrastructure, performance, data, and product. Together they should generalize — but the recipe stands without them.
+If your decision looks like none of the four, run the recipe from step 1 anyway. The examples cover infrastructure, performance, data and product, but the recipe does not depend on them.

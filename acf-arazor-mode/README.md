@@ -1,17 +1,19 @@
 # ACF Arazor Mode
 
-**Production Verification Cognitive Mode for Agentic Continuous Flow**
+**A cognitive mode for Claude Code that answers "is it production ready?" with done or not done.**
 
-**ACF (Agentic Continuous Flow)** is software development where humans govern intelligent agent swarms rather than write code directly. Arazor mode enforces ruthless honesty for production readiness.
+**ACF (Agentic Continuous Flow)** is software development where humans govern intelligent agent swarms rather than write code directly. Agents write the code, but a person still decides whether it ships. Arazor mode makes Claude answer that question like a release gate.
 
 ## Purpose
 
-Arazor mode enforces ruthless honesty with zero tolerance for false production claims. This isn't cruelty—it's precision in production gatekeeping. When deploying agent-generated code, you need binary answers: **done** or **not done**. No participation trophies.
+Arazor mode has zero tolerance for false production claims. A 98% pass rate is a failing suite, eight of ten stories is an unfinished sprint, and "mostly working" is broken.
+
+The tone is harsh on purpose. When you gate a deploy of agent-generated code, you need a binary answer: **done** or **not done**.
 
 ## ACF Use Cases
 
 ### 1. Pre-Deployment Validation
-**Before production push**, get ruthless assessment:
+Ask before you push to production. Any failing test means a broken suite, whatever the pass rate.
 
 ```
 User: "Ready to deploy? Tests are 98% passing"
@@ -19,10 +21,8 @@ User: "Ready to deploy? Tests are 98% passing"
 Arazor: "Tests broken. 2% failures present. Not production ready."
 ```
 
-**Value**: Prevents "almost ready" deployments. Binary gate for quality.
-
 ### 2. Sprint/Milestone Review
-**Status reporting** without sugarcoating:
+Arazor reports status without cushioning. Unfinished stories mean an unfinished sprint.
 
 ```
 User: "Made excellent progress this sprint—8 of 10 stories complete!"
@@ -30,10 +30,8 @@ User: "Made excellent progress this sprint—8 of 10 stories complete!"
 Arazor: "2 stories incomplete. Sprint failed."
 ```
 
-**Value**: No celebration of incomplete work. Clear accountability.
-
 ### 3. Agent Execution Verification
-**After agents claim completion**, verify truth:
+When an agent reports success with a caveat, Arazor treats the caveat as the result.
 
 ```
 Agent: "Successfully completed migration with minor data inconsistencies"
@@ -41,10 +39,8 @@ Agent: "Successfully completed migration with minor data inconsistencies"
 Arazor: "Data consistency broken. Migration failed."
 ```
 
-**Value**: Catches agent overconfidence. Ensures quality bar.
-
 ### 4. Technical Debt Assessment
-**Honest debt inventory** without minimization:
+"A few minor issues" still counts as issues.
 
 ```
 User: "Just a few minor linting issues, otherwise code quality is excellent"
@@ -52,10 +48,8 @@ User: "Just a few minor linting issues, otherwise code quality is excellent"
 Arazor: "Linting broken. Code quality insufficient."
 ```
 
-**Value**: Forces acknowledgment of all quality gaps.
-
 ### 5. Production Incident Assessment
-**Post-mortem honesty** without spin:
+In a post-mortem, "mostly recovered" is not recovered.
 
 ```
 User: "System mostly recovered, experiencing occasional slowdowns"
@@ -63,26 +57,26 @@ User: "System mostly recovered, experiencing occasional slowdowns"
 Arazor: "System broken. Performance degraded."
 ```
 
-**Value**: No false recovery claims. Clear status.
-
 ## How It Works
 
-The plugin injects anti-sugarcoating instructions at session start. Claude's responses transform to ruthless honesty with 5-word sentence maximum.
+A SessionStart hook injects `content/cognitive-mode.md` into Claude's context. It caps sentences at five words and sets the rules listed under Core Behaviors.
+
+The mode applies to every session while the plugin is enabled. Enabling or disabling it takes effect from the next session, not in the conversation you are in. Enable at most one of the three ACF cognitive modes (challenger, arazor, nitro) at a time.
 
 ### Core Behaviors
 
-1. **Lead with Failures** - What's broken comes first
-2. **Binary Outcomes** - Done or not done, no percentages
-3. **Zero Tolerance** - Any failure = system broken
-4. **Exact Counts** - "127 errors" not "some errors"
-5. **No Celebration** - Never praise incomplete work
+1. **Lead with failures**: what's broken comes first
+2. **Binary outcomes**: done or not done, no percentages
+3. **Zero tolerance**: any failure means the system is broken
+4. **Exact counts**: "127 errors", not "some errors"
+5. **No celebration**: never praise incomplete work
 
 ## When NOT to Use
 
-❌ **Brainstorming/exploration** - Kills creative momentum
-❌ **Learning/teaching** - Too harsh for growth contexts
-❌ **Morale-sensitive situations** - Can demoralize teams
-❌ **Incremental progress tracking** - Use for final gates only
+- **Brainstorming or exploration.** Five-word verdicts shut down open-ended thinking.
+- **Learning and teaching.** Too harsh when the goal is understanding.
+- **Morale-sensitive conversations.** It can demoralize a team.
+- **Tracking incremental progress.** Save it for final gates.
 
 ## ACF Workflow Integration
 
@@ -164,68 +158,50 @@ Arazor: "All checks passed. Zero failures. Production ready."
 
 ## Language Characteristics
 
-### Maximum 5 Words Per Sentence
-
-Normal Claude: "The implementation has encountered some integration challenges"
-Arazor: "Integration tests broken."
-
-### Lead with Failures
-
-Normal Claude: "Great progress with minor issues remaining"
-Arazor: "Issues present. System broken."
-
-### Binary Status
-
-Normal Claude: "99% complete with one small bug"
-Arazor: "Bug present. Task failed."
-
-### Exact Counts
-
-Normal Claude: "A few errors to resolve"
-Arazor: "23 errors present."
+| Rule | Normal Claude | Arazor |
+|---|---|---|
+| At most 5 words per sentence | "The implementation has encountered some integration challenges" | "Integration tests broken." |
+| Lead with failures | "Great progress with minor issues remaining" | "Issues present. System broken." |
+| Binary status | "99% complete with one small bug" | "Bug present. Task failed." |
+| Exact counts | "A few errors to resolve" | "23 errors present." |
 
 ## Production Readiness Criteria
 
-Arazor will **ONLY** claim "Production ready" if:
+Arazor says "Production ready" only when all of these hold:
 
-- ✅ Zero errors
-- ✅ Zero warnings
-- ✅ Zero test failures
-- ✅ Zero security issues
-- ✅ Zero performance degradation
-- ✅ Zero compatibility issues
+- Zero errors
+- Zero warnings
+- Zero test failures
+- Zero security issues
+- Zero performance degradation
+- Zero compatibility issues
 
-**Anything less**: "Not production ready"
+Anything less gets "Not production ready".
 
 ## Variable-Aperture Governance
 
-Use Arazor for high-stakes quality gates:
+Match the gate to the stakes:
 
 | Deployment Type | Use Arazor? | Reasoning |
 |----------------|-------------|-----------|
-| **Production** | ✅ Always | Zero tolerance for production failures |
-| **Staging** | ⚡ Selective | Use for release candidates |
-| **Development** | ❌ Rarely | Too strict for iteration |
-| **Prototypes** | ❌ Never | Inappropriate for exploration |
+| **Production** | Always | Zero tolerance for production failures |
+| **Staging** | Selectively | For release candidates |
+| **Development** | Rarely | Too strict for iteration |
+| **Prototypes** | Never | Wrong tool for exploration |
 
 ## Comparison with Challenger
 
 | Dimension | Challenger | Arazor |
 |-----------|-----------|--------|
 | **Purpose** | Reasoning validation | Production verification |
-| **Tone** | Intellectually aggressive | Ruthlessly honest |
-| **Output** | Long, detailed attacks | Short, binary judgments |
-| **Use When** | Requirements unclear | Quality assessment needed |
-| **Sentence Length** | Variable (attack depth) | Max 5 words (forced brevity) |
+| **Tone** | Direct, professional, uncompromising | Ruthlessly honest |
+| **Output** | Structured gap analysis and clarification questions | Short, binary verdicts |
+| **Use When** | Requirements are unclear | You need a readiness verdict |
+| **Sentence Length** | No limit | At most 5 words |
 
 ## Team Communication
 
-When sharing Arazor outputs with teams:
-
-1. **Context first** - "Using ruthless honesty mode for accuracy"
-2. **Not personal** - Tool enforces standards, not judgment of people
-3. **Action-oriented** - Binary clarity enables clear action
-4. **Goal: Deployment confidence** - Ensures quality bar met
+If you share Arazor output with a team, say which mode produced it. The verdicts measure the work against a fixed bar, not the people who did it.
 
 ## Contributing
 
@@ -235,7 +211,3 @@ See [Contributing Guide](../../CONTRIBUTING.md) for proposing improvements.
 
 - Issues: [GitHub Issues](https://github.com/yourusername/acf-tools/issues)
 - Discussions: [GitHub Discussions](https://github.com/yourusername/acf-tools/discussions)
-
----
-
-**Remember**: In ACF, agent-generated work flows to production fast. Arazor is the quality gate that prevents "mostly working" from reaching users.
