@@ -273,8 +273,14 @@ session tells you it is behind and leaves the merge to you.
 work is cherry-picked onto your local trunk, nothing is pushed and no PR is opened. If merges must go
 through review, pin the mode so it never depends on a per-run judgement:
 
+Set it in the config file your repo already has, and change the existing line if there is one
+(`/whip-init` pins `default` in new projects): `.backlog/.acfw-config` on the files store,
+`.acfwhip/config` on the others. acf-whip reads only the first of the two it finds, so never create
+`.acfwhip/config` next to an existing `.backlog/.acfw-config`: it would hide every key in the old
+file.
+
 ```bash
-echo 'ACFW_INTEGRATION_MODE=override' >> .acfwhip/config    # committed; travels with the repo
+ACFW_INTEGRATION_MODE=override    # committed; travels with the repo
 ```
 
 `/go` then stops at `accepted`, writes no ledger marker, and keeps each `worktree/<slug>` branch alive
