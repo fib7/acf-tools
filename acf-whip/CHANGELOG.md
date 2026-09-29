@@ -165,6 +165,27 @@ history. The small-work route, `/task "<scope>"` then `/go`, is unchanged.
 - **`dirty-trunk-root` counted a quoted `.backlog/` path as dirty.** `git status --porcelain` quotes
   a path with unusual characters, and the leading quote dodged the exclusion. Both doctor batteries
   strip it first.
+- **Skill text lost its `$0`, `$1` and `$2`.** Claude Code replaces `$<digit>` in a skill with the
+  skill's arguments whenever any are passed, so an awk `$0` became your goal text: whip-init's Next
+  Steps update silently did nothing, and the same code sat in `/whip` and `/retro`. Every skill now
+  writes awk fields as `$(N)` and shell positionals as `${N}`, and `run-all.sh` fails on a bare
+  `$<digit>` in any SKILL.md. Every skill also writes the plugin root braced, `${CLAUDE_PLUGIN_ROOT}`,
+  the only form the loader substitutes.
+- **A dead `/go` held you for half an hour.** A run that died with its session (a closed terminal, a
+  crash, `claude -p` reaching its background-wait limit) left a fresh run lock, and `/whip` said only
+  "wait: /go is running". The lock now gets a NEED YOU card with its age and the one command that
+  clears it. The next `/go` redispatches the interrupted task.
+- **`/whip-init` on a plain Node project installed gates that failed every commit.** A `package.json`
+  without Express, Fastify or NestJS was not detected as Node at all, and the Node pre-commit config
+  ran `npm run build`, `npm run lint` and a TypeScript ESLint setup the project did not have. Plain
+  Node is detected; npm hooks run only when their script exists and a commit stages JS or TS;
+  formatters no longer touch `.backlog/`, `.acfwhip/`, `docs/acf/` or `docs/cycles/` (a formatted
+  managed doc can never refresh again, and a reflowed ledger marker failed the integration commit);
+  a frontend next to a Go or Python backend gets its own gates doc; the ruff pin moves to v0.16.9.
+- **The templates disagreed about who moves task files.** `README.sample.md` and several agent and
+  manifest templates told specialists and the reviewer to move task files; `workflow.md` gives every
+  move to `/go`. They now agree. The research-agent template no longer relies on
+  `CLAUDE_PLUGIN_ROOT`, which is empty inside a project agent.
 
 ### Upgrading
 

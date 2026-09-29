@@ -125,7 +125,7 @@ Quality-reviewer rejects any task in `.backlog/in-review/` whose transition log 
 
 **One writer at a time.** Within a task, "write" includes editing files, `git add`/`git commit`, **and running the build or test suite** (which produces build output, caches, coverage and formatter rewrites). Read-only work — recon, call-site census, review lenses, adversarial judging — is the parallel lane. The stage runner forces mutating stages sequential, so this is structural rather than a request.
 
-All subsequent state moves, edits, and commits happen inside the worktree on `worktree/<slug>`. **No commits land on the trunk branch from a specialist.**
+All subsequent code edits and commits happen inside the worktree on `worktree/<slug>`; task state stays with the orchestrator, which moves task files at the root. **No commits land on the trunk branch from a specialist.**
 
 ### Integration
 
