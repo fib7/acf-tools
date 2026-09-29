@@ -202,13 +202,20 @@ across iterations**. The legacy loop grows your context every iteration. Prefer 
      drains everything is one person deciding for the whole team. This branch exists to stop that.
 
    **(b) The arguments name tasks**: a stem (`api-014-token-refresh`), an id (`API-14`), a **native
-   backend id** (`MUL-4821`, a Linear URL), or a unique stem prefix. Pass them straight through as
-   `only: ["api-014-token-refresh", ...]`. Do not ask for confirmation: the user named exact tasks,
-   and the store resolves each token itself (exact id → exact stem → exact backend id → unique
-   prefix). An ambiguous prefix comes back with its candidates instead of a guess. A native id may
-   not look like a stem, but do **not** send it to branch (c) for that reason. The snapshot has no
-   title or body to match it against, so the filter branch would fail on a token the store resolves
-   without trouble.
+   backend id** (`MUL-4821` on multica, `ENG-102` on Linear), or a unique stem prefix. Pass them
+   straight through as `only: ["api-014-token-refresh", ...]`. Do not ask for confirmation: the user
+   named exact tasks, and the store resolves each token itself (exact id → exact stem → exact backend
+   id → unique prefix). An ambiguous prefix comes back with its candidates instead of a guess. A
+   native id may not look like a stem, but do **not** send it to branch (c) for that reason. The
+   snapshot has no title or body to match it against, so the filter branch would fail on a token the
+   store resolves without trouble.
+
+   A backend id resolves only for an issue that **is a whip task**, one that `/task` created (on
+   Linear it carries the `acf-whip` label and this repo's attachment). A bare number (`512`), an
+   issue URL, and a parent issue a person created by hand (say `ENG-101`, the feature the tasks came
+   from) do **not** resolve, and the run stops with `scope-unresolved`. Given a URL, pass on only its
+   identifier (`ENG-102`), and only when that issue is one of the tasks. For a whole feature, run the
+   focus `/task` set (a bare `/go`), or name its tasks.
 
    **(c) Anything else is a filter predicate**, such as "frontend tasks only", "bugfixes",
    "high priority backend" or "the auth work". Resolve it to a concrete list *here*, before launching:
