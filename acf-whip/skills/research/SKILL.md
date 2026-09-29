@@ -75,7 +75,7 @@ Single-phase research workflow:
 # /skills/lib/acfw-store.sh. That refused the files store, which this block used to pass with no plugin
 # dependency at all.
 trunk_root=${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}
-store_name=$(bash -c '. "$1/skills/lib/acfw-store.sh" 2>/dev/null && acfw_resolve_store "$2"' _ "${CLAUDE_PLUGIN_ROOT}" "$trunk_root")
+store_name=$(bash -c '. "${1}/skills/lib/acfw-store.sh" 2>/dev/null && acfw_resolve_store "${2}"' _ "${CLAUDE_PLUGIN_ROOT}" "$trunk_root")
 
 if [ -z "$store_name" ]; then
   # Empty only when the lib did not load (acfw_resolve_store never prints empty): a broken install, or

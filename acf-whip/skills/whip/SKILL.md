@@ -221,7 +221,7 @@ there can bill a paid tool or dispatch a subagent for nothing.
    `.acfwhip/spec-tools/`, in the working tree or at HEAD):
    ```bash
    R=$(git rev-parse --show-toplevel) || exit 1
-   if { find "$R/.acfwhip/spec-tools" -maxdepth 1 -type f 2>/dev/null; git -C "$R" ls-tree --name-only HEAD .acfwhip/spec-tools/ 2>/dev/null; } | sed 's#.*/##' | awk 'index($0, ".") == 0 && NF { f = 1 } END { exit !f }'; then echo SPEC_TOOLS=yes; else echo SPEC_TOOLS=no; fi
+   if { find "$R/.acfwhip/spec-tools" -maxdepth 1 -type f 2>/dev/null; git -C "$R" ls-tree --name-only HEAD .acfwhip/spec-tools/ 2>/dev/null; } | sed 's#.*/##' | awk 'index($(0), ".") == 0 && NF { f = 1 } END { exit !f }'; then echo SPEC_TOOLS=yes; else echo SPEC_TOOLS=no; fi
    ```
    (`awk`, not `grep -v`: some shells wrap `grep`, and a wrapped `grep -qv` on empty input says
    yes.)

@@ -548,7 +548,7 @@ After every Task() return, parse the marker and perform the move at root:
 # Parses the ACFW-RESULT marker, then delegates the move + transition-log + commit to the
 # shared apply-transition.sh primitive (idempotent; single source of truth; safe on resume).
 acfw_apply_result() {
-  local task_file="$1" from_state="$2" result="$3"
+  local task_file="${1}" from_state="${2}" result="${3}"
   local transition reject_inc notes new_state inc=0 dfile dseen dkey
   transition=$(echo "$result" | sed -nE 's/^[[:space:]]*transition:[[:space:]]*([a-z]+).*/\1/p')
   reject_inc=$(echo "$result" | sed -nE 's/^[[:space:]]*rejection_increment:[[:space:]]*([0-9]+).*/\1/p')
@@ -1118,7 +1118,7 @@ if [ ${#INTEGRATE_QUEUE[@]} -gt 0 ]; then
       printf '%s\t%s\t%s\n' "$(basename "$f" .md)" "$f" \
         "$(grep -E '^- \*\*Dependencies\*\*:' "$f" | head -1 | sed -E 's/.*Dependencies\*\*:[[:space:]]*//')"
     done | awk -F'\t' '
-      { stem[NR]=$1; file[NR]=$2; deps[NR]=$3; n=NR; idx[$1]=NR }
+      { stem[NR]=$(1); file[NR]=$(2); deps[NR]=$(3); n=NR; idx[$(1)]=NR }
       END {
         for (i=1;i<=n;i++) {
           m=split(deps[i], d, ",")

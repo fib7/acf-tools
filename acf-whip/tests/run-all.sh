@@ -175,6 +175,18 @@ else
   printf '  %-34s FAIL  (unbraced $CLAUDE_PLUGIN_ROOT; Claude Code expands only the braced form)\n' 'skill-plugin-root'
   printf '%s\n' "$UNBRACED" | sed 's/^/      /'; STATIC_FAIL=1
 fi
+# Claude Code substitutes `$<digit>` in skill text with the skill's positional arguments whenever any
+# are passed (loader regex /\$(\d+)(?!\w)/). An awk `$0` or a shell function's `$1` in a SKILL.md
+# therefore becomes the user's goal text the moment someone types `/whip "<goal>"`: found by the
+# 3.5.0 canary, where whip-init's Next Steps replacement silently did nothing. Write awk fields as
+# `$(0)`/`$(1)` and shell positionals as `${1}`; neither matches the loader's pattern.
+POSITIONAL=$(grep -nE '\$[0-9]' skills/*/SKILL.md 2>/dev/null || true)
+if [ -z "$POSITIONAL" ]; then
+  printf '  %-34s ok    (no $<digit> for the skill loader to substitute)\n' 'skill-positional-args'
+else
+  printf '  %-34s FAIL  ($<digit> in a SKILL.md is replaced by a skill argument; use $(N) in awk, ${N} in shell)\n' 'skill-positional-args'
+  printf '%s\n' "$POSITIONAL" | sed 's/^/      /'; STATIC_FAIL=1
+fi
 # Adapters were outside every static gate: a syntax error in one is invisible until a run
 # hits that backend, and three of the four have no offline suite at all.
 for a in adapters/*/acfw-store-*; do

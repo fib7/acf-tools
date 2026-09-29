@@ -209,11 +209,11 @@ if [ "$MODE" = planless ]; then
     done
   else
     F=$(bash "$B/acfw-focus" path 2>/dev/null </dev/null) && [ -r "$F" ] && grep -Ev '^[[:space:]]*(#.*)?$' "$F"
-  fi | awk '!seen[$0]++' > "$IN/tokens.txt"
+  fi | awk '!seen[$(0)]++' > "$IN/tokens.txt"
 else
   # rework and stuck name tasks. A gap names a deliverable: its blocked tasks are already stuck
   # lines, and a phantom one is not in the store to read.
-  awk -F'|' '$1 == "TRIGGER" && ($2 == "rework" || $2 == "stuck") { print $3 }' "$IN/triggers.txt" | sort -u > "$IN/tokens.txt"
+  awk -F'|' '$(1) == "TRIGGER" && ($(2) == "rework" || $(2) == "stuck") { print $(3) }' "$IN/triggers.txt" | sort -u > "$IN/tokens.txt"
   if [ "$FORCE" = 1 ]; then
     grep -q '^TRIGGER|manual|' "$IN/triggers.txt" || echo "TRIGGER|manual|--force" >> "$IN/triggers.txt"
     # Nothing named a task, so a forced retro is about the whole cycle: every stem its record maps,
@@ -458,7 +458,7 @@ if [ -n "$AID" ]; then
         if (hit != "") print "VERIFY|" h ": a [guide] item may not target " hit " (acf-whip refreshes that doc, and an edit stops the refresh)"
         d = 0
       }
-      { line = $0; sub(/\r$/, "", line) }
+      { line = $(0); sub(/\r$/, "", line) }
       # A fenced line is inert for headings, but a [guide] item that shows its edit in a code block
       # still targets that file.
       fence_step(line) { if (d && guide) managed(line); next }

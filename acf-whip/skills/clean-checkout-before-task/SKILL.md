@@ -83,7 +83,7 @@ Idempotent and safe to re-run: existing targets are skipped, and a missing manif
 ```
 
 The agent field is the literal `clean-checkout-before-task` (the script hard-codes it —
-it is **not** derived from `$0`, which would drift to `clean-checkout.sh`). Quality-reviewer
+it is **not** derived from the script's own path, which would drift to `clean-checkout.sh`). Quality-reviewer
 rejects any task in `.backlog/in-review/` whose transition log lacks at least one
 `clean-checkout | ok` line.
 
