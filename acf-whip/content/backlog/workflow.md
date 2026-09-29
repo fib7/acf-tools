@@ -416,6 +416,16 @@ naming the missing work. The fix is always to create the missing task as a depen
 `/go` does not help. Parked tasks appear under `needsOperator` in the run report, with their
 `needsTask` hint.
 
+**Missing clean-checkout token (3.5.1).** A task that reaches review without its clean-checkout token
+while its worktree branch exists has a mechanism fault, not a defect, so nothing is charged. It is
+re-reviewed once, then parked in `blocked/`, and its re-dispatch re-records the token before its
+harness runs; when no worktree holds the branch any more, clean-checkout re-attaches it. If the task
+reaches review without the token again, `/go` holds it in `blocked/` for the rest of the run instead of
+re-queueing it. It appears under `needsOperator` with the restore's cause and the command that clears
+it, and the next `/go` tries again. A worktree the restore found dirty gets one more cycle first,
+because its harness commits the work. A token the store could not read (a failed request on Linear)
+is reported as unknown, never as missing, so it parks nothing.
+
 ## Manual close-out (`/whip-move`)
 
 When a run stops short (a `scan-degraded` stop, say, or a deliberate partial run), `/whip-move`

@@ -36,7 +36,7 @@ function load(mode) {
   // eslint-disable-next-line no-new-func
   // Every pure function must be named here. Omitting one does NOT fail the test — it silently stops
   // testing that function, which is the same false-green class this suite exists to prevent.
-  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, resultToState, reconcileIntegrationTallies, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H, reviewVerdict, attemptKeyOf, coerceAcfwResult, coerceResolveResult, reconcileChildProgress, escalationTier, chunkList, improved, stemBytes, relayCheck, doctorRelayCheck, classifyFatals, applyQuarantine, expandScope };`)
+  const factory = new Function('mode', `${block}\nreturn { indexTasks, isTerminal, depsSatisfied, topoIntegrationOrder, planUnblockAndTimeout, resultToState, reconcileIntegrationTallies, byPriorityThenStem, MAX_REJECT_RETRY, MAX_BLOCK_RETRY, DEFAULT_TIMEOUT_H, reviewVerdict, attemptKeyOf, coerceAcfwResult, coerceResolveResult, reconcileChildProgress, escalationTier, chunkList, improved, stemBytes, relayCheck, doctorRelayCheck, classifyFatals, applyQuarantine, expandScope, requeueable, progressStep, tokenHold, tokenHoldRemedy, TOKEN_PARK_LIMIT };`)
   return factory(mode)
 }
 const Sdef = load('default')
@@ -423,6 +423,65 @@ check('reconcile: a named-but-absent payload drops the stage', (() => {
     check(`${name} is extractable from <scheduler-pure> (so a closure over run state fails loudly)`,
       typeof S[name] === 'function')
   }
+}
+
+// ============================ 3.5.1: the livelock guards =========================
+// The ENG-101 run: a task whose clean-checkout token no restore could write was parked (blocked,
+// inc 0), re-queued by the unblock pass, replayed and parked again, and the no-progress guard reset on
+// every park because `blocked` is terminal. These pin the three pure pieces that end that cycle.
+{
+  const { requeueable, progressStep, tokenHold, tokenHoldRemedy, TOKEN_PARK_LIMIT, planUnblockAndTimeout, indexTasks } = Sdef
+  const caps = { maxReject: 3, maxBlock: 3 }
+
+  // -- requeueable: the unblock pass's own predicate, minus dependencies --
+  check('requeueable: blocked under both caps, not parked -> true',
+    requeueable(T({ stem: 'b', folder: 'blocked' }), caps) === true)
+  check('requeueable: parked (Set) -> false', requeueable(T({ stem: 'b', folder: 'blocked' }), { ...caps, parked: new Set(['b']) }) === false)
+  check('requeueable: quarantined -> false', requeueable(T({ stem: 'b', folder: 'blocked' }), { ...caps, quarantined: ['b'] }) === false)
+  check('requeueable: at the rejection cap -> false', requeueable(T({ stem: 'b', folder: 'blocked', rejectionCount: 3 }), caps) === false)
+  check('requeueable: at the re-block cap -> false', requeueable(T({ stem: 'b', folder: 'blocked', blockCount: 3 }), caps) === false)
+  check('requeueable: not blocked -> false', requeueable(T({ stem: 'b', folder: 'pending' }), caps) === false)
+  {
+    // The unblock pass still waits for dependencies: requeueable says "may come back", not "comes back now".
+    const A = T({ stem: 'a', folder: 'accepted', slug: 'sa', hasWorktreeBranch: true, hasIntegratedAt: false })
+    const B = T({ stem: 'b', folder: 'blocked', slug: 'sb', deps: ['a'] })
+    const r = planUnblockAndTimeout([A, B], indexTasks([A, B]), { trunkRoot: '/r' })
+    check('requeueable + unsatisfied dep -> the unblock pass still leaves it blocked', requeueable(B, caps) === true && r.unblockActions.length === 0)
+  }
+
+  // -- progressStep: high/low-water marks, never the previous iteration --
+  const seed = { noGain: 0, settledHigh: -1, totalLow: -1 }
+  const run = (obs) => obs.reduce((p, o) => progressStep(p, o), seed)
+  check('progressStep: the first observation is progress (seeds are -1)', progressStep(seed, { settled: 0, total: 5 }).noGain === 0)
+  {
+    // settled oscillates 0,1,0,1,... (park / unblock), total flat: the old guard reset on every 1.
+    const obs = []
+    for (let i = 0; i < 30; i++) obs.push({ settled: i % 2, total: 5 })
+    const end = run(obs)
+    check('progressStep: a park/unblock oscillation cannot reset the guard (noGain climbs past NO_GAIN_LIMIT)', end.noGain >= 15)
+  }
+  check('progressStep: settled beating its best resets', run([{ settled: 1, total: 5 }, { settled: 1, total: 5 }, { settled: 2, total: 5 }]).noGain === 0)
+  check('progressStep: settled equal to its best does not reset', run([{ settled: 2, total: 5 }, { settled: 1, total: 5 }, { settled: 2, total: 5 }]).noGain === 2)
+  check('progressStep: total falling below its lowest resets (a scoped task collapsing out of the working set)',
+    run([{ settled: 0, total: 5 }, { settled: 0, total: 5 }, { settled: 0, total: 4 }]).noGain === 0)
+  check('progressStep: total rising and falling back does not reset',
+    run([{ settled: 0, total: 5 }, { settled: 0, total: 6 }, { settled: 0, total: 5 }]).noGain === 2)
+
+  // -- tokenHold: one re-dispatch per run, one more for a dirty tree --
+  check('TOKEN_PARK_LIMIT extracted from source (=2)', TOKEN_PARK_LIMIT === 2)
+  check('tokenHold: the first park always re-queues', tokenHold(1, undefined) === false && tokenHold(1, { outcome: 'failed', exitCode: 2 }) === false)
+  check('tokenHold: the second park holds after a failed restore', tokenHold(2, { outcome: 'failed', exitCode: 2 }) === true)
+  check('tokenHold: the second park holds when no restore ran', tokenHold(2, undefined) === true)
+  check('tokenHold: a dirty tree gets one more cycle (its verify commits the work)', tokenHold(2, { outcome: 'dirty', exitCode: 0 }) === false)
+  check('tokenHold: ...but not a third', tokenHold(3, { outcome: 'dirty', exitCode: 0 }) === true)
+
+  // -- tokenHoldRemedy: the operator gets the cause, not "verify the branch" --
+  const br = 'worktree/api'
+  check('tokenHoldRemedy: exit 2 points at the worktree registry', /git worktree list/.test(tokenHoldRemedy({ outcome: 'failed', exitCode: 2 }, br)))
+  check('tokenHoldRemedy: exit 3 names the namespace settings', /ACFW_WORKTREE_DIR/.test(tokenHoldRemedy({ outcome: 'failed', exitCode: 3 }, br)))
+  check('tokenHoldRemedy: exit 6 points at the store', /acfw-store info/.test(tokenHoldRemedy({ outcome: 'failed', exitCode: 6 }, br)))
+  check('tokenHoldRemedy: a dirty tree says commit or discard', /commit or discard/.test(tokenHoldRemedy({ outcome: 'dirty', exitCode: 0 }, br)))
+  check('tokenHoldRemedy: no restore still names the branch', tokenHoldRemedy(undefined, br).includes(br))
 }
 
 console.log(`\nphase2-scheduler: ${PASS} passed, ${FAIL} failed`)

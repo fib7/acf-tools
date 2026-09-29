@@ -517,8 +517,13 @@ async function runGo(cfg) {
   const p = (r.calls.restore[0] || {}).prompt || ''
   check('14a a dispatch onto an existing worktree with no token re-records it exactly once', r.calls.restore.length === 1)
   check('14b ...with the SAME clean-checkout command the locked checkout stage runs (same script, same task path)', p.includes(CC))
-  check('14c ...and only on a CLEAN attached tree (a dirty one is where a second stash destroys work)',
-    /elif \[ -n "\$S" \]; then echo 'OUTCOME dirty'/.test(p) && p.indexOf('OUTCOME dirty') < p.indexOf(CC))
+  // Two clean-checkout calls since 3.5.1: the re-attach arm (no worktree holds the branch, so there is no
+  // tree to be dirty) and the attached arm, which must still sit behind the dirty and unreadable checks.
+  check('14c ...and on an ATTACHED tree only when it is clean (a dirty one is where a second stash destroys work)',
+    /elif \[ -n "\$S" \]; then echo 'OUTCOME dirty'/.test(p) && p.indexOf('OUTCOME dirty') < p.lastIndexOf(CC))
+  check('14c3 ...the only clean-checkout ahead of the status probe is the no-worktree re-attach arm',
+    p.indexOf(CC) > p.indexOf('if [ -z "$WT" ]') && p.indexOf(CC) < p.indexOf('OUTCOME unreadable')
+    && p.indexOf(CC) !== p.lastIndexOf(CC))
   check('14c2 ...where an UNREADABLE tree is never read as clean (the status call\'s own exit is tested first)',
     /elif ! S=\$\(git -C "\$WT" status --porcelain\); then echo 'OUTCOME unreadable'/.test(p)
     && p.indexOf('OUTCOME unreadable') < p.indexOf('OUTCOME dirty'))
@@ -571,15 +576,33 @@ async function runGo(cfg) {
         /OUTCOME restored/.test(clean.out) && clean.ran)
 
       // `git -C` cannot enter the tree: status prints its fatal to stderr and NOTHING to stdout. The
-      // 3.4.3 original read that empty stdout as a clean tree and ran clean-checkout.
+      // 3.4.3 original read that empty stdout as a clean tree and ran clean-checkout. The directory is
+      // THERE (its .git pointer is broken), so the 3.5.1 prune must leave it alone and the probe must
+      // still fail closed.
+      const gitPtr = readFileSync(join(wt, '.git'), 'utf8')
+      writeFileSync(join(wt, '.git'), 'gitdir: /nonexistent/acfw-p11\n')
+      const broken = run()
+      check('14y a tree git cannot read (status exits non-zero) -> OUTCOME unreadable, clean-checkout never runs (fails CLOSED)',
+        /OUTCOME unreadable/.test(broken.out) && !broken.ran)
+      check('14y1 ...and the prune spared its registration (the directory exists)',
+        git('-C', repo, 'worktree', 'list', '--porcelain').stdout.includes(`branch refs/heads/${branch}`))
+      writeFileSync(join(wt, '.git'), gitPtr)
+
+      // 3.5.1: the directory deleted by hand WITHOUT a prune — how a reaped worktree usually looks. The
+      // branch stays registered at a dead path, which used to read as 'unreadable' forever. Now the dead
+      // registration is pruned and clean-checkout re-attaches the branch.
       rmSync(wt, { recursive: true, force: true })
       const gone = run()
-      check('14y a tree git cannot read (status exits non-zero) -> OUTCOME unreadable, clean-checkout never runs (fails CLOSED)',
-        /OUTCOME unreadable/.test(gone.out) && !gone.ran)
+      check('14y2 a worktree directory deleted without a prune -> pruned and re-attached (OUTCOME reattached)',
+        /OUTCOME reattached/.test(gone.out) && gone.ran
+        && !git('-C', repo, 'worktree', 'list', '--porcelain').stdout.includes(`branch refs/heads/${branch}`))
 
+      // 3.5.1: a branch no worktree holds is RE-ATTACHED by clean-checkout (it attaches a fresh tree, so
+      // there is nothing to stash). Leaving it to "the locked stage" never worked: a harness replaying
+      // its ledger replays checkout in zero agents, and the ENG-101 run's 3.2.3 branches stayed detached.
       git('-C', repo, 'worktree', 'prune')
       const none = run()
-      check('14z no worktree on the branch -> OUTCOME no-worktree, clean-checkout never runs', /OUTCOME no-worktree/.test(none.out) && !none.ran)
+      check('14z no worktree on the branch -> clean-checkout runs once to re-attach it (OUTCOME reattached)', /OUTCOME reattached/.test(none.out) && none.ran)
     } finally { rmSync(base, { recursive: true, force: true }) }
   }
   check('14e ...and on files it proves the row landed (clean-checkout only WARNs and exits 0 when append_log_row refuses)',
@@ -613,6 +636,20 @@ async function runGo(cfg) {
     dirty.calls.restore.length === 2 && dirty.report.completed === true)
   const failed = await runGo({ tasks: [{ stem: 't1', slug: 's1', hasCleanCheckoutToken: false }], onRestore: () => ({ outcome: 'failed', exitCode: 2 }) })
   check('14p a failed re-record still runs the harness (exit 2 on a path mismatch would recur forever)', failed.calls.workflow.length >= 1 && failed.logs.some((l) => /could not re-record/.test(l) && /exit 2/.test(l)))
+  // 3.5.1, the ENG-101 livelock: a restore that can NEVER succeed. Before, the task was parked (inc 0),
+  // re-queued, replayed and parked again until MAX_ITER, and the no-progress guard reset on every park.
+  const parksOf = (r) => r.calls.writer.filter((w) => w.stem === 't1' && w.toState === 'blocked').length
+  check('14p2 ...and it ends: parked twice (one re-dispatch), then held — not re-queued until MAX_ITER',
+    parksOf(failed) === 2 && failed.calls.restore.length === 2)
+  check('14p3 ...the held task is reported with the restore\'s cause and the command that clears it',
+    (failed.report.needsOperator || []).some((n) => n.stem === 't1' && /exit 2/.test(n.needsTask) && /git worktree list/.test(n.needsTask)))
+  check('14p4 ...and the run stops on its own terms, not max-iterations or the agent cap',
+    failed.report.stopReason !== 'max-iterations' && failed.report.stopReason !== 'agent-cap-reached')
+  // A tree that stays dirty gets exactly one extra cycle (its verify is what cleans it), then is held.
+  const stuck = await runGo({ tasks: [{ stem: 't1', slug: 's1', hasCleanCheckoutToken: false }], onRestore: () => ({ outcome: 'dirty', exitCode: 0 }) })
+  check('14p5 a worktree that never comes clean: three parks, then held with "commit or discard"',
+    parksOf(stuck) === 3 && (stuck.report.needsOperator || []).some((n) => n.stem === 't1' && /commit or discard/.test(n.needsTask)))
+  check('14p6 ...and it stops without spinning to max-iterations', stuck.report.stopReason !== 'max-iterations')
 
   // ---- once per dispatch, never per amend round (round 0 may have dirtied the tree)
   let n14 = 0
@@ -633,6 +670,29 @@ async function runGo(cfg) {
   check('14t ...so the cycle ENDS: accepted and integrated, run complete', cyc.model.get('t1').folder === 'accepted' && cyc.model.get('t1').hasIntegratedAt === true && cyc.report.completed === true)
   check('14u ...parked exactly once (the replay no longer re-parks it)', cyc.calls.writer.filter((w) => w.toState === 'blocked').length === 1)
   check('14u2 ...and the report does not list it as needing an operator (the park was lifted and it was accepted)', !(cyc.report.needsOperator || []).some((n) => n.stem === 't1'))
+
+  // 3.5.1: a token the store could not READ is null (a failed Linear comments request), not false. The
+  // typed gate fires only on false, so an unknown token parks nothing and charges nothing: the task goes
+  // to its reviewer, which reads the task document itself. The model holds the token; the scan reports
+  // it unknown, which is exactly the rate-limited-read case that used to start the park cycle.
+  const unknownTok = (scan) => {
+    const o = JSON.parse(scan.snapshotJson)
+    for (const t of o.tasks || []) if (t.stem === 't1') t.hasCleanCheckoutToken = null
+    return { ...scan, snapshotJson: JSON.stringify(o) }
+  }
+  const unk = await runGo({ tasks: [{ stem: 't1', slug: 's1', folder: 'in-review' }], onScan: unknownTok })
+  check('14u3 an UNKNOWN token (null) in review is not parked and not auto-rejected',
+    !unk.calls.writer.some((w) => w.stem === 't1' && (w.toState === 'blocked' || w.toState === 'rejected')))
+  check('14u4 ...its reviewer runs and the task is accepted', unk.calls.review.length >= 1 && unk.model.get('t1').folder === 'accepted')
+  // Control: the same scan rewrite with FALSE must park, or 14u3 proves nothing about the scan's value.
+  const absentTok = (scan) => {
+    const o = JSON.parse(scan.snapshotJson)
+    for (const t of o.tasks || []) if (t.stem === 't1' && t.folder === 'in-review') t.hasCleanCheckoutToken = false
+    return { ...scan, snapshotJson: JSON.stringify(o) }
+  }
+  const abs = await runGo({ tasks: [{ stem: 't1', slug: 's1', folder: 'in-review' }], onScan: absentTok })
+  check('14u5 control: the same rewrite with false (definitely absent) parks it, inc 0',
+    abs.calls.writer.some((w) => w.stem === 't1' && w.toState === 'blocked' && w.inc === '0'))
 }
 
 // ---------------------------------------------------------------------------------------------

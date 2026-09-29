@@ -487,9 +487,9 @@ function planUnblockAndTimeout(tasks, idx, opts) {
   // specialist has re-blocked it 3x (its real blocker is unmodeled — retro I2) STOPS being re-queued
   // so it can no longer livelock the run. It stays blocked (terminal) and surfaces as needsOperator.
   const unblockActions = tasks
-    .filter((t) => t.folder === 'blocked')
+    .filter((t) => requeueable(t, { maxReject, maxBlock, parked, quarantined }))
     .sort(byPriorityThenStem)
-    .filter((t) => (t.rejectionCount || 0) < maxReject && (t.blockCount || 0) < maxBlock && !parked.has(t.stem) && !quarantined.has(t.stem) && depsSatisfied(t, idx, quarantined))
+    .filter((t) => depsSatisfied(t, idx, quarantined))
     .map((t) => mk(t, 'blocked', 'pending', 'dependencies resolved — unblocked'))
 
   // in-progress -> blocked: stale past the operator timeout (ageHours is computed by scan-backlog;
@@ -503,6 +503,67 @@ function planUnblockAndTimeout(tasks, idx, opts) {
   const freshInProgress = tasks.filter((t) => t.folder === 'in-progress' && !staleStems.has(t.stem))
 
   return { unblockActions, timeoutActions, freshInProgress }
+}
+
+// Is this blocked task one the unblock pass may still send back to pending? ONE definition, shared by
+// planUnblockAndTimeout and the progress guard (3.5.1). Dependencies are deliberately NOT part of it: a
+// task waiting on a dependency will be re-queued the moment that dependency lands, so it has not
+// settled — it is only waiting.
+function requeueable(t, o) {
+  const parked = (o.parked instanceof Set) ? o.parked : new Set(o.parked || [])
+  const quarantined = (o.quarantined instanceof Set) ? o.quarantined : new Set(o.quarantined || [])
+  return t.folder === 'blocked' && (t.rejectionCount || 0) < o.maxReject && (t.blockCount || 0) < o.maxBlock &&
+    !parked.has(t.stem) && !quarantined.has(t.stem)
+}
+
+// The no-progress guard's step (3.5.1). PURE; the loop feeds it one observation per iteration.
+//   It used to reset whenever `terminal` beat the PREVIOUS iteration's value. `blocked` is terminal, so a
+// task the unblock pass keeps re-queueing moves terminal up (parked), down (unblocked), up again — and
+// every up reset the guard. The missing-clean-checkout-token arm is exactly that: it parks with inc 0 and
+// binc 0, so the task never reaches a cap, and a token nothing can restore cycled until MAX_ITER or the
+// agent cap. That is the ENG-101 run: hours of active run time, most tasks implemented, none accepted.
+//   So progress is measured against high/low-water marks, never against the last iteration:
+//   - `settled` (terminal minus the blocked tasks the unblock pass may still re-queue) must beat its best
+//     value so far. A park/unblock cycle returns to the same count and can never beat it;
+//   - `total` must fall below its lowest value so far. That keeps 3.4.0's rule that a scoped task
+//     collapsing out of the working set once it is accepted is progress, without letting a count that
+//     rises and falls back reset the guard.
+// Seeds are -1, so the first observation always counts as progress, as prevTerminal = -1 did before.
+function progressStep(prev, cur) {
+  const gained = cur.settled > prev.settledHigh || (prev.totalLow >= 0 && cur.total < prev.totalLow)
+  return {
+    noGain: gained ? 0 : prev.noGain + 1,
+    settledHigh: Math.max(prev.settledHigh, cur.settled),
+    totalLow: prev.totalLow < 0 ? cur.total : Math.min(prev.totalLow, cur.total),
+  }
+}
+
+// The missing-token park may re-queue a task, because a re-dispatch runs restoreCheckoutToken, the one
+// deterministic writer of that token. It may not do so forever (3.5.1): if the task comes back without
+// a token after that, nothing this run can do will produce one. `parks` counts this run's parks of the
+// task, including the one being decided; `restore` is the outcome of the latest restoreCheckoutToken
+// ({outcome, exitCode}), or undefined when none ran. A 'dirty' tree gets exactly one more cycle: the
+// restore leaves it alone on purpose, and the harness's verify commits the work, so the NEXT re-dispatch
+// finds it clean. Anything else is held at the second park.
+const TOKEN_PARK_LIMIT = 2
+function tokenHold(parks, restore) {
+  if (parks >= TOKEN_PARK_LIMIT + 1) return true
+  return parks >= TOKEN_PARK_LIMIT && !(restore && restore.outcome === 'dirty')
+}
+// What the operator must do about a held task, from what the last restore saw. The exit codes are
+// clean-checkout.sh's (its SKILL.md table); 2 is the one the ENG-101 run hit: a 3.2.3-era branch whose
+// worktree directory was gone, which clean-checkout could not attach before 3.5.1.
+function tokenHoldRemedy(restore, branch) {
+  const o = restore && restore.outcome
+  const rc = restore && restore.exitCode
+  if (o === 'dirty') return `${branch}'s worktree still has uncommitted work: commit or discard it, then re-run /go`
+  if (o === 'unreadable') return `git cannot read ${branch}'s worktree (moved or deleted by hand?): \`git worktree prune\`, then re-run /go`
+  if (o === 'unrecorded') return `clean-checkout ran but wrote no token row: check the task file's Transition Log, then re-run /go`
+  if (o === 'failed' && rc === 2) return `${branch} is checked out in another worktree, or could not be attached: \`git worktree list\`, free that worktree, then re-run /go`
+  if (o === 'failed' && rc === 3) return `the worktree at ${branch}'s path is on a different branch: move it aside or fix ACFW_WORKTREE_DIR / ACFW_BRANCH_PREFIX, then re-run /go`
+  if (o === 'failed' && rc === 6) return `the task store refused the token write: check \`acfw-store info\` (credentials, connectivity), then re-run /go`
+  if (o === 'failed') return `clean-checkout exited ${rc} (see its SKILL.md exit table), then re-run /go`
+  return `verify ${branch} and its worktree, then re-run /go to re-dispatch`
 }
 
 // Map a dispatched unit's CURRENT folder + the specialist/reviewer's reported transition to the next
@@ -1650,8 +1711,14 @@ Report the final porcelain output. Change nothing else. Never run clean-checkout
 // the SAME command the locked stage would, and only on a CLEAN attached tree. There clean-checkout skips
 // creation, has nothing to stash, re-validates the branch and records the token. A dirty tree is left
 // alone (the one case where a second stash destroys work; the harness's verify commits it, so the next
-// re-dispatch finds it clean), and so is a missing worktree (the locked stage creates it and records
-// the token itself). It never DEFERS the harness: clean-checkout can fail for reasons no retry fixes —
+// re-dispatch finds it clean).
+//   A branch that NO worktree holds is re-attached here too (3.5.1). Before, that case was left to "the
+// locked stage", which never ran: a harness replaying its ledger replays checkout in zero agents, so the
+// directory stayed gone, and clean-checkout could not have attached it anyway (it only knew
+// `worktree add -b`, which fails on an existing branch). That was the ENG-101 run, whose 3.2.3-era
+// branches outlived their directories. It is safe for the same reason the clean case is: clean-checkout
+// attaches a FRESH tree (nothing to stash) or, when something else sits at its path, fails the branch
+// check before its stash step. It never DEFERS the harness: clean-checkout can fail for reasons no retry fixes —
 // it tests the CONSTRUCTED path, so a worktree whose real path differs exits 2 every time — and a task
 // that never starts is worse than one the review gate parks. Escalation-off and budget-rung dispatches
 // never get here: their 3.1.0 specialist runs its own STEP 0.
@@ -1665,7 +1732,7 @@ function needsTokenRestore(t) {
 const TOKENRESTORE = {
   type: 'object', additionalProperties: false, required: ['outcome', 'exitCode'],
   properties: {
-    outcome: { type: 'string', enum: ['restored', 'unrecorded', 'dirty', 'unreadable', 'no-worktree', 'failed'] },
+    outcome: { type: 'string', enum: ['restored', 'reattached', 'unrecorded', 'dirty', 'unreadable', 'failed'] },
     exitCode: { type: 'integer' },
   },
 }
@@ -1684,10 +1751,20 @@ async function restoreCheckoutToken(ctx) {
   // NOTHING to stdout, the empty string reads as CLEAN, and clean-checkout — which finds the real tree
   // from the constructed path — stashes the live work into refs/stash and reports success. So the
   // status call's own exit is tested first, and an unreadable tree is never treated as a clean one.
+  // A registration whose directory is GONE (rm -rf without `git worktree prune`, the usual way a
+  // worktree gets reaped) used to read as 'unreadable' and never heal: the branch stays "checked out"
+  // at a dead path, so clean-checkout could not attach it either. Pruning first is still fail-closed:
+  // prune drops only registrations whose directory is missing (never a locked one, and git locks a
+  // worktree while `worktree add` builds it), so a tree that exists survives it, is found again by the
+  // re-query, and goes through the same unreadable/dirty probes as before.
   const r = await safeAgent(`${ENV}
 Re-record this task's clean-checkout token before its harness runs. Run EXACTLY this, ONCE:
   WT=$(git -C ${sq(trunkRoot)} worktree list --porcelain | ${WT_BY_BRANCH_AWK(ctx.branch)})
-  if [ -z "$WT" ]; then echo 'OUTCOME no-worktree'
+  if [ -n "$WT" ] && [ ! -e "$WT" ]; then git -C ${sq(trunkRoot)} worktree prune >/dev/null 2>&1
+    WT=$(git -C ${sq(trunkRoot)} worktree list --porcelain | ${WT_BY_BRANCH_AWK(ctx.branch)}); fi
+  if [ -z "$WT" ]; then ${mat}bash ${sq(CLEAN_CHECKOUT)} ${sq(ctx.taskPath)} >/dev/null; rc=$?
+    if [ "$rc" -ne 0 ]; then echo "OUTCOME failed $rc"${verify}
+    else echo 'OUTCOME reattached'; fi
   elif ! S=$(git -C "$WT" status --porcelain); then echo 'OUTCOME unreadable'
   elif [ -n "$S" ]; then echo 'OUTCOME dirty'
   else ${mat}bash ${sq(CLEAN_CHECKOUT)} ${sq(ctx.taskPath)} >/dev/null; rc=$?
@@ -1695,14 +1772,18 @@ Re-record this task's clean-checkout token before its harness runs. Run EXACTLY 
     else echo 'OUTCOME restored'; fi
   fi
 Report outcome (the word after OUTCOME) and exitCode (the number after "failed", else 0). Change nothing
-else: never run clean-checkout a second time or any other way, never stash, reset, commit or edit a file.`,
+else: never run clean-checkout a second time or any other way, never stash, reset, commit or edit a
+file, and never prune except where the snippet does.`,
     shellOpts({ label: `token:${ctx.key}`, phase: ctx.phase, schema: TOKENRESTORE }), () => null)
   const o = r && r.outcome
   if (o === 'restored') log(`  ${ctx.stem}: clean-checkout token re-recorded on the existing ${ctx.branch} worktree before its harness`)
+  else if (o === 'reattached') log(`  ${ctx.stem}: no worktree held ${ctx.branch} — re-attached it and re-recorded the clean-checkout token before its harness`)
   else if (o === 'dirty') log(`⚠ ${ctx.stem}: no clean-checkout token, and ${ctx.branch}'s worktree has uncommitted work — NOT re-running clean-checkout (it would stash that work into the shared refs/stash); the harness runs, and the review gate treats the missing token as a mechanism fault`)
   else if (o === 'unreadable') log(`⚠ ${ctx.stem}: no clean-checkout token, and git could not read ${ctx.branch}'s worktree status — NOT re-running clean-checkout (an unread tree is never assumed clean: that is the one command that can stash its work); the harness runs, and the review gate treats the missing token as a mechanism fault`)
-  else if (o !== 'no-worktree') log(`⚠ ${ctx.stem}: could not re-record the clean-checkout token on ${ctx.branch} (${o ? `${o}${r.exitCode ? ` exit ${r.exitCode}` : ''}` : 'no emit'}) — the harness runs anyway; the review gate treats the missing token as a mechanism fault`)
-  return o || 'no-emit'
+  else log(`⚠ ${ctx.stem}: could not re-record the clean-checkout token on ${ctx.branch} (${o ? `${o}${r.exitCode ? ` exit ${r.exitCode}` : ''}` : 'no emit'}) — the harness runs anyway; the review gate treats the missing token as a mechanism fault`)
+  // The outcome and the exit code, not just the word: the missing-token park reads them to decide
+  // whether another cycle can help, and the operator report names the exit (tokenHoldRemedy).
+  return { outcome: o || 'no-emit', exitCode: (r && Number.isInteger(r.exitCode)) ? r.exitCode : 0 }
 }
 
 // Before an INLINE review panel only: is the clean-checkout token actually there? (3.4.3)
@@ -1759,7 +1840,7 @@ async function runAuthoredUnit(ctx) {
     let prior = await scout(ctx)   // before round 0 too: a re-dispatch may already have progress
     // Once per dispatch, never per amend round: after round 0 the harness itself may have dirtied the
     // tree, and the whole point of the guard is that no second checkout ever runs against live work.
-    if (ctx.kind === 'impl' && needsTokenRestore(ctx.t)) await restoreCheckoutToken(ctx)
+    if (ctx.kind === 'impl' && needsTokenRestore(ctx.t)) tokenRestoreLast.set(ctx.stem, await restoreCheckoutToken(ctx))
     let lastErr = '', round = 0
 
     while (round <= MAX_AMEND) {
@@ -1977,8 +2058,9 @@ let capReached = false
 phase('Iterate')
 let iter = 0
 let idle = 0 // consecutive iterations doing NO work (genuinely stuck: unsatisfiable deps) — break at 3
-let noGain = 0 // consecutive iterations with no terminal gain (perpetual futile retry) — break at NO_GAIN_LIMIT
-let prevTerminal = -1
+let noGain = 0 // consecutive iterations with no settled progress (perpetual futile retry) — break at NO_GAIN_LIMIT
+let settledHigh = -1 // progressStep()'s marks (3.5.1): the best `settled` so far and the lowest `total` so far
+let totalLow = -1
 const integratedStems = []
 const rejectedStems = []
 const autoRejectedStems = [] // review-time clean-checkout auto-rejects; rejectedStems only ever held integrateOne's
@@ -1990,6 +2072,18 @@ const tokenStrandedStems = []      // stems parked because the token never came 
 // never restored" on a run that ended complete: the 3.5.0 canary's own summary had to explain the
 // report away. Only a stem whose last event is still 'parked' needs an operator.
 const tokenLastEvent = new Map()
+// 3.5.1. The missing-token park's bound. tokenParks counts this run's parks per stem; tokenRestoreLast
+// holds the latest restoreCheckoutToken outcome ({outcome, exitCode}) per stem; tokenHeld maps a stem
+// the park may no longer re-queue to the remedy the operator report prints. See tokenHold().
+const tokenParks = new Map()
+const tokenRestoreLast = new Map()
+const tokenHeld = new Map()
+// Everything the unblock pass must leave blocked this run: BUG-2's dependency-missing parks plus the
+// held token strands. A union, not a merge into parkedThisRun, because the report files the two apart
+// (depParked vs tokenParked) and a held strand is not missing a dependency.
+function parkedFor() {
+  return tokenHeld.size ? new Set([...parkedThisRun, ...tokenHeld.keys()]) : parkedThisRun
+}
 const attemptedIntegrate = new Set() // every stem handed to integrateOne — used to reconcile the report
                                      // against disk (WS5 / retro #9): an attempted stem now in rejected/
                                      // was rejected at integration even if the agent failed to emit it.
@@ -2029,7 +2123,6 @@ let lastSnapshot = null
 let runScope = null
 let stopReason = 'max-iterations'
 // ---- 3.4.0 run-level bookkeeping ----
-let prevTotal = -1          // last iteration's scope denominator; see the noGain guard for why
 let relayWarned = false     // "this store emits no relay header" — say it once, not every iteration
 const relayFailures = []    // {iteration, expected, got, why} for the report
 // heldOut: every task the run REFUSED to touch, and why. A quarantined task (task-level integrity
@@ -2318,7 +2411,7 @@ Return the ScanResult.`
     timeoutH: (snap.inProgressTimeoutHours != null ? snap.inProgressTimeoutHours : DEFAULT_TIMEOUT_H),
     maxReject: REJECT_CAP,
     maxBlock: BLOCK_CAP,
-    parked: parkedThisRun,
+    parked: parkedFor(),
     quarantined,
     trunkRoot,
   })
@@ -2333,7 +2426,7 @@ Return the ScanResult.`
   // isTerminal over the collapsed working set would UNDERcount and stall forever as 'no-progress'
   // instead of 'complete'. Abort loudly instead.
   // `total` is checked with them: without it `total === undefined` makes every comparison below
-  // quietly false — terminal === total never fires, total < prevTotal is NaN-false — so the run
+  // quietly false — terminal === total never fires, total < totalLow is NaN-false — so the run
   // spins the whole no-gain budget and exits `no-progress` with `undefined` in its own iteration log.
   if (snap.counts.runtimeTerminalDefault == null || snap.counts.runtimeTerminalOverride == null || snap.counts.total == null) {
     // A scoped run counts isTerminal over its own tasks and never reads these, so skew here cannot
@@ -2597,18 +2690,33 @@ Return the ScanResult.`
         // pass re-queues it, and the re-dispatch's restoreCheckoutToken re-records the token on its
         // (by then committed, clean) worktree before the harness replays. Until 3.4.3 wired the stage
         // preamble that replay could never write one — which is why the note's remedy must stay true.
+        //   And it may re-queue only while that can still help (3.5.1). A task that comes back without
+        // its token after a re-dispatch has shown that restoreCheckoutToken cannot write one this run —
+        // an exit 2 on a branch no worktree could attach, an exit 6 from a store that refuses the write
+        // — and inc/binc 0 kept it under both caps, so it cycled park -> unblock -> replay until MAX_ITER.
+        // tokenHold() decides; a held task joins the unblock pass's `parked` set and stays blocked.
         const seen = (tokenStrandSeen.get(t.stem) || 0) + 1
         tokenStrandSeen.set(t.stem, seen)
         if (seen < 2) {
           log(`↷ ${t.stem}: clean-checkout token missing but ${branchPrefix}/${t.slug} exists — mechanism, left in-review/ for re-review`)
           return
         }
-        log(`⚠ ${t.stem}: clean-checkout token still missing after ${seen} reviews — parking in blocked/ for an operator instead of re-reviewing forever`)
+        const parks = (tokenParks.get(t.stem) || 0) + 1
+        tokenParks.set(t.stem, parks)
+        const restore = tokenRestoreLast.get(t.stem)
+        const hold = tokenHold(parks, restore)
+        const remedy = tokenHoldRemedy(restore, `${branchPrefix}/${t.slug}`)
+        if (hold) tokenHeld.set(t.stem, `clean-checkout token never restored${restore ? ` (last restore: ${restore.outcome}${restore.exitCode ? ` exit ${restore.exitCode}` : ''})` : ''} — ${remedy}`)
+        log(hold
+          ? `⚠ ${t.stem}: clean-checkout token still missing after a re-dispatch (park ${parks}) — held in blocked/ for an operator for the rest of this run: ${remedy}`
+          : `⚠ ${t.stem}: clean-checkout token still missing after ${seen} reviews — parking in blocked/; the re-dispatch re-records it before the harness`)
         tokenStrandedStems.push(t.stem)
         tokenLastEvent.set(t.stem, 'parked')
         // inc: 0 — this is mechanical. Charging a life for a token the orchestrator itself could not
         // write would spend the task's three rejections on a fault it never caused.
-        await streamWrite([{ stem: t.stem, toState: 'blocked', agent: 'orchestrator', notes: `clean-checkout token absent on ${seen} consecutive reviews while ${branchPrefix}/${t.slug} exists. The token's only writer runs at dispatch, so no further review can restore it; a re-dispatch re-records it once that worktree is clean — verify the branch, then re-run /go to re-dispatch.`, inc: 0 }], `review#${iter}:${t.stem}`)
+        await streamWrite([{ stem: t.stem, toState: 'blocked', agent: 'orchestrator', notes: hold
+          ? `clean-checkout token still absent after a re-dispatch while ${branchPrefix}/${t.slug} exists; held for an operator. ${remedy}.`
+          : `clean-checkout token absent on ${seen} consecutive reviews while ${branchPrefix}/${t.slug} exists. The token's only writer runs at dispatch, so no further review can restore it; a re-dispatch re-records it once that worktree is clean — verify the branch, then re-run /go to re-dispatch.`, inc: 0 }], `review#${iter}:${t.stem}`)
         productiveDispatch = true
         return
       }
@@ -2820,9 +2928,15 @@ Return the ScanResult.`
   // chain-dependent scoped tasks would exhaust NO_GAIN_LIMIT and exit 'no-progress' with the work
   // still there. A member can only leave the scope by finishing, vanishing, or being held out, and
   // all three are reported — so a shrinking denominator is always progress or always visible.
-  noGain = (terminal > prevTerminal || (prevTotal >= 0 && total < prevTotal)) ? 0 : noGain + 1
-  prevTerminal = terminal
-  prevTotal = total
+  //   And "terminal went up" is measured as SETTLED against a high-water mark (3.5.1, progressStep):
+  // terminal counts blocked tasks, so a task the unblock pass keeps re-queueing raised it on every park
+  // and reset this guard every lap. The predicate is the unblock pass's own (requeueable), so the two
+  // can never disagree about which blocked tasks are merely waiting.
+  const settled = terminal - sched.filter((t) => requeueable(t, { maxReject: REJECT_CAP, maxBlock: BLOCK_CAP, parked: parkedFor(), quarantined })).length
+  const step = progressStep({ noGain, settledHigh, totalLow }, { settled, total })
+  noGain = step.noGain
+  settledHigh = step.settledHigh
+  totalLow = step.totalLow
   // BREAK, never return: the run must fall through to Drain and the unlock, or a finished run holds its
   // own lock for LOCK_FRESH_MIN while its report tells the operator to re-run.
   if (capReached) { stopReason = 'agent-cap-reached'; break }
@@ -2839,7 +2953,8 @@ let finalSnap = lastSnapshot
 if (mode === 'default' && lastSnapshot) {
   const rescan = await safeAgent(
     `${ENV}
-Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}${ONLY_FLAGS}  and return its stdout VERBATIM in snapshotJson — copy it exactly, add nothing, drop nothing (set doctorOk true, doctorSummary "drain", doctorFatals []).`,
+Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}${ONLY_FLAGS}  and return its stdout VERBATIM in snapshotJson — copy it exactly, add nothing, drop nothing (set doctorOk true, doctorSummary "drain", doctorFatals []).
+SHELL TIMEOUT: the store walk is O(backlog) and can run for minutes on an API-backed store (every Linear answer is a network request). Pass an explicit timeout of at least 300000 ms (5 minutes) on that command: your Bash tool's default is short enough to kill it mid-walk, and a killed walk prints a truncated object.`,
     shellOpts({ label: 'drain:scan', phase: 'Drain', schema: SCAN_RESULT }),
     () => null,
   )
@@ -2917,7 +3032,7 @@ const depParked = [...parkedThisRun].filter((s) => !capParkedStems.has(s)).map((
 // cannot fix from the task file alone would be the one class the report omits.
 const alreadyParked = new Set([...capParkedStems, ...parkedThisRun])
 const tokenParked = [...new Set(tokenStrandedStems)].filter((s) => !alreadyParked.has(s) && tokenLastEvent.get(s) === 'parked')
-  .map((s) => ({ stem: s, blockCount: 0, rejectionCount: 0, needsTask: 'clean-checkout token never restored — verify the worktree branch, then re-run /go to re-dispatch' }))
+  .map((s) => ({ stem: s, blockCount: 0, rejectionCount: 0, needsTask: tokenHeld.get(s) || 'clean-checkout token never restored — verify the worktree branch, then re-run /go to re-dispatch' }))
 const needsOperator = [...capParked, ...depParked, ...tokenParked]
 // Tasks the run REFUSED to touch, and why. `completed` is true only when the run both reached
 // `complete` AND held nothing out inside its scope — a run that finished every task it was allowed to
@@ -3014,7 +3129,7 @@ return {
     + (ESCALATE && esc.authored === 0 && esc.fellBack > 0
       ? ` ⚑ NO harness was authored this run (${esc.fellBack} fell back to single-agent dispatch) — check that acf-whip/skills/lib/bin/acfw-child-* are executable and that .claude/agents/ is populated.`
       : '')
-    + (needsOperator.length ? ` ${needsOperator.length} task(s) parked for an operator (re-block/rejection cap reached): ${needsOperator.map((n) => n.stem).join(', ')}.` : '')
+    + (needsOperator.length ? ` ${needsOperator.length} task(s) parked for an operator (a retry cap, a missing dependency or a clean-checkout token that never came back; needsOperator says which): ${needsOperator.map((n) => n.stem).join(', ')}.` : '')
     + (integrationWarnings.size
       ? ` ${integrationWarnings.size} integration WARN(s)${integrationWarnings.size > INTEGRATION_WARN_CAP ? ` (the first ${INTEGRATION_WARN_CAP} are in integrationWarnings; the workflow log has every one)` : ' in integrationWarnings'}: relay them verbatim, since one may hold the only Recover: command for overwritten work.`
       : '')
