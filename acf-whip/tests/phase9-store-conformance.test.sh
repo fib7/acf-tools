@@ -128,6 +128,13 @@ if printf '%s' "$CAPS" | grep -q '"log-event"'; then
     "[ \"\$(jget \"\$SNAP_C\" 'j.tasks.find(t=>t.stem===\"conf-a\").hasCleanCheckoutToken')\" = 'true' ]"
   check "a task that never logged one still reports false (not blanket true)" \
     "[ \"\$(jget \"\$SNAP_C\" 'j.tasks.find(t=>t.stem===\"conf-b\").hasCleanCheckoutToken')\" = 'false' ]"
+  # Three legal values: true, false, and null — "the adapter could not read the token this pass" (a
+  # failed or rate-limited request). null is not absent: the review gate parks a task on false, so an
+  # adapter that folds a failed read into false turns one transient into a park/re-dispatch loop.
+  # Anything else (a string "false", a number) is none of the three and misreads under `=== false`.
+  # A missing key stays legal here; the dispatcher defaults it to false for a raw adapter.
+  check "hasCleanCheckoutToken, where present, is a boolean or null on every listed task" \
+    "[ \"\$(jget \"\$SNAP_C\" 'j.tasks.filter(t=>!t.slim && (\"hasCleanCheckoutToken\" in t)).every(t=>typeof t.hasCleanCheckoutToken===\"boolean\"||t.hasCleanCheckoutToken===null)')\" = 'true' ]"
 else
   ok "log-event capability absent (token assertions skipped)"
 fi
@@ -161,13 +168,15 @@ if printf '%s' "$CAPS" | grep -q '"log-event"'; then
   # Present-in-full-and-false is legal ONLY for an adapter that does not declare `token-all-states` —
   # where each answer costs a request, bounding the paid set to the review states is the right trade,
   # and the declaration is what stops a consumer reading that `false` as "no token".
+  # null (could not read) is legal in both branches: it claims nothing, so it can never be the wrong
+  # definite answer this check exists to catch.
   A_TOK=$(jget "$SNAP_A" 'j.tasks.some(t=>t.stem==="conf-a") ? (j.tasks.find(t=>t.stem==="conf-a").slim ? "slim" : String(j.tasks.find(t=>t.stem==="conf-a").hasCleanCheckoutToken)) : "absent"')
   if printf '%s' "$CAPS" | grep -q '"token-all-states"'; then
     check "accepted task reports its token (adapter declares token-all-states; got: $A_TOK)" \
-      "[ \"\$A_TOK\" = 'absent' ] || [ \"\$A_TOK\" = 'slim' ] || [ \"\$A_TOK\" = 'true' ]"
+      "[ \"\$A_TOK\" = 'absent' ] || [ \"\$A_TOK\" = 'slim' ] || [ \"\$A_TOK\" = 'true' ] || [ \"\$A_TOK\" = 'null' ]"
   else
     check "accepted task is collapsed, slim, or reports a token the adapter admits it did not scan (got: $A_TOK)" \
-      "[ \"\$A_TOK\" = 'absent' ] || [ \"\$A_TOK\" = 'slim' ] || [ \"\$A_TOK\" = 'true' ] || [ \"\$A_TOK\" = 'false' ]"
+      "[ \"\$A_TOK\" = 'absent' ] || [ \"\$A_TOK\" = 'slim' ] || [ \"\$A_TOK\" = 'true' ] || [ \"\$A_TOK\" = 'false' ] || [ \"\$A_TOK\" = 'null' ]"
   fi
 fi
 RD=$("$ADAPTER" read conf-a)

@@ -85,6 +85,12 @@ Moving the log out of comments made three things simpler:
 `clean-checkout` token in a comment, keeps resolving and is not auto-rejected. Once a task has been
 through the new write path, the fallback costs nothing.
 
+**A failed read is `null`, not `false`.** The token can live in two places, so `false` needs both
+read: the description (from `issue list`, or `issue get` when the list omitted it) and the comments.
+If either read fails, the task reports `hasCleanCheckoutToken: null` (unknown) and stderr says how
+many. The review gate parks a task on `false`, so a transient reported as `false` would park work
+that has its token.
+
 **Failure handling is asymmetric on purpose.** `transition` writes its row last and best-effort.
 The `whip_state` write before it is the commit point, and a lost row must not make a completed move
 look failed, so a failed row write does not fail the call. It prints a WARN on stderr instead of

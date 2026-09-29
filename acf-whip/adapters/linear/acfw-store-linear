@@ -339,8 +339,8 @@ add_comment() {
 # write_key_attachment, add_comment, collect_issues), so a single 429 after the issue list had already
 # succeeded read as "this specialist never ran clean-checkout" — which costs the task either a skipped
 # review or one of its three lives at the deterministic auto-reject. Same class as the multica
-# transients 3.3.0 made tri-state; the contract still types the FIELD as a boolean, so the three-way
-# answer stops here at the call site rather than reaching the snapshot.
+# transients 3.3.0 made tri-state. The three-way answer now reaches the snapshot too: rc 2 projects
+# as `hasCleanCheckoutToken: null` (see cmd_snapshot), because stopping it here meant emitting false.
 issue_has_token() {
   local rc
   gql "$Q_ISSUE_COMMENTS" "$(jq -cn --arg id "$1" '{id:$id}')"; rc=$?
@@ -763,22 +763,25 @@ cmd_snapshot() {
   local toks="" unknown_toks="" id tok_rc
   for id in $(jq -rs 'map(select((.meta.whip_state // "") as $s | ($s == "in-progress" or $s == "completed" or $s == "in-review")) | .id) | .[]' "$jsonl"); do
     issue_has_token "$id"; tok_rc=$?
-    # rc 2 is "could not ask", NOT "absent". The field is a flat boolean by contract, so the snapshot
-    # still carries false — but the count is reported rather than folded silently into the same value
-    # a genuinely missing token produces, which is what made a transient look like a skipped worktree.
+    # rc 2 is "could not ask", NOT "absent", and it is projected as null rather than false. false is
+    # the one value the review gate acts on: token missing + branch present parks the task in blocked,
+    # the unblock pass re-dispatches it, and the next rate-limited read parks it again — a livelock
+    # driven by nothing but a 429. null tells every consumer "no answer this pass" (CONTRACT.md).
     [ "$tok_rc" -eq 2 ] && unknown_toks="$unknown_toks$id"$'\n'
     if [ "$tok_rc" -eq 0 ]; then toks="$toks$id"$'\n'; fi
   done
-  local tok_json; tok_json=$(printf '%s' "$toks" | jq -Rn '[inputs | select(length > 0)]')
+  local tok_json unk_json
+  tok_json=$(printf '%s' "$toks" | jq -Rn '[inputs | select(length > 0)]')
+  unk_json=$(printf '%s' "$unknown_toks" | jq -Rn '[inputs | select(length > 0)]')
   # `grep -c .` on empty input prints 0 AND exits 1, so the count is taken from stdout and the status
   # is discarded deliberately — the `|| echo 0` form this release already had to fix elsewhere emits
   # "0\n0" and aborts the arithmetic that reads it.
   local n_unknown; n_unknown=$(printf '%s' "$unknown_toks" | grep -c . || true)
   if [ "${n_unknown:-0}" -gt 0 ]; then
-    echo "WARN: clean-checkout token could not be read for $n_unknown issue(s) after a retry; they are reported as having no token. Re-run the snapshot before trusting a review decision on them." >&2
+    echo "WARN: clean-checkout token could not be read for $n_unknown issue(s) after a retry; they are reported as unknown (hasCleanCheckoutToken: null), not as absent. A later snapshot answers them." >&2
   fi
 
-  jq -rs --argjson tok "$tok_json" --arg gen "$(date -u +"%Y-%m-%d %H:%M:%S")" '
+  jq -rs --argjson tok "$tok_json" --argjson unk "$unk_json" --arg gen "$(date -u +"%Y-%m-%d %H:%M:%S")" '
     def splitlist: (. // "") | split(",") | map(gsub("^\\s+";"") | gsub("\\s+$";"")) | map(select(. != "" and . != "none"));
     ( map(select((.meta.whip_key // "") != ""))
       | map({
@@ -795,7 +798,10 @@ cmd_snapshot() {
           rejectionCount: (((.meta.whip_rejections // 0) | tonumber?) // 0),
           blockCount: (((.meta.whip_blocks // 0) | tonumber?) // 0),
           lastTransitionTs: (.meta.whip_last_transition_ts // ""),
-          hasCleanCheckoutToken: (.id as $iid | ($tok | index($iid)) != null)
+          hasCleanCheckoutToken: (.id as $iid
+            | if ($tok | index($iid)) != null then true
+              elif ($unk | index($iid)) != null then null
+              else false end)
         }) ) as $tasks
     | ($tasks | map(.folder)) as $f
     | {

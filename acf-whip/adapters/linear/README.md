@@ -84,7 +84,10 @@ The original whip priority is kept verbatim in `whip_priority`.
 Linear accepts only string and number metadata values. Transition audit rows
 (`whip-transition | ts | from | to | agent | notes`) and the `clean-checkout` token go into issue
 comments. `snapshot.hasCleanCheckoutToken` is a substring scan over the comments of `in-progress`,
-`completed` and `in-review` issues. Issues in other states are not scanned.
+`completed` and `in-review` issues. Issues in other states are not scanned. Each scan is one request.
+If it still fails after one retry (a rate limit, a 5xx, a dropped connection), that issue reports
+`null`, meaning unknown, never `false`, and stderr says how many. The review gate parks a task on
+`false`, so a rate-limited read reported as `false` would park work that has its token.
 
 For each dependency whose issue already exists, the adapter also tries to add a native
 `issueRelationCreate type:blocks` edge. That step is best-effort: a failure is swallowed and never

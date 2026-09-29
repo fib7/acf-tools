@@ -747,23 +747,32 @@ cmd_snapshot() {
   #   (a) `issue get` when list omitted the description entirely;
   #   (b) the legacy comment scan — a task that entered review BEFORE the log moved into the document
   #       has its token in a comment, and dropping that would auto-reject it on upgrade.
-  for id in $(jq -rs --arg tok "$CLEAN_CHECKOUT_TOKEN" '
+  local ent listed_empty desc_known
+  for ent in $(jq -rs --arg tok "$CLEAN_CHECKOUT_TOKEN" '
         map(select((.metadata.whip_state // "") as $s
                    | ($s == "in-progress" or $s == "completed" or $s == "in-review")
                      and (((.description // "") | contains($tok)) | not))
             | {id: .id, empty: (((.description // "") | length) == 0)})
-        | .[] | .id' "$jsonl"); do
+        | .[] | "\(.id)|\(.empty)"' "$jsonl"); do
+    id="${ent%|*}"; listed_empty="${ent##*|}"
     # A FAILED read is not an absent token. Both fallbacks folded a backend error into the same
     # value a genuine miss produces, so one timeout here reads downstream as "this specialist never
     # ran clean-checkout" — which costs the task a skipped review or one of its three lives at the
     # deterministic auto-reject. The metadata helpers were made tri-state in 3.3.0 for exactly this;
     # these two reads were missed because they answer through $toks rather than through a helper.
-    desc=""; tok_unknown=0
+    #
+    # The token has TWO homes, so "absent" needs BOTH read: the description (every row written since
+    # 3.2.0) and the comments (legacy). The description counts as read when `issue list` carried it
+    # (the free pass above already found no token there) or when `issue get` succeeded. A list that
+    # omitted it plus a failed get means the place a current token lives was never seen, and a clean
+    # comment scan cannot stand in for it: that used to report a definite false for exactly the task
+    # most likely to carry a token.
+    desc=""; tok_unknown=0; desc_known=1
+    [ "$listed_empty" = "true" ] && desc_known=0
     multica_call issue get "$id" --output json
     if [ "$MC_RC" -eq 0 ]; then
       desc=$(printf '%s' "$MC_OUT" | jq -r '.description // ""' 2>/dev/null)
-    else
-      tok_unknown=1
+      desc_known=1
     fi
     if printf '%s' "$desc" | grep -qF "$CLEAN_CHECKOUT_TOKEN"; then
       toks="$toks$id"$'\n'
@@ -775,22 +784,27 @@ cmd_snapshot() {
         toks="$toks$id"$'\n'
         continue
       fi
-      # A comment list that SUCCEEDED and carried no token is a definite absence, whichever way the
-      # description read went — the comment scan is the authoritative legacy location.
-      tok_unknown=0
+      # A comment list that SUCCEEDED and carried no token is a definite absence only if the
+      # description was read as well.
+      [ "$desc_known" -eq 1 ] || tok_unknown=1
     else
       tok_unknown=1
     fi
     if [ "$tok_unknown" -eq 1 ]; then unknown_toks="$unknown_toks$id"$'\n'; fi
   done
-  local tok_json; tok_json=$(printf '%s' "$toks" | jq -Rn '[inputs | select(length > 0)]')
+  # Unknown is projected as null, never false: false is the value the review gate parks a task on,
+  # so a transient here would park it, the unblock pass would re-dispatch it, and the next failed read
+  # would park it again. null means "no answer this pass" (CONTRACT.md).
+  local tok_json unk_json
+  tok_json=$(printf '%s' "$toks" | jq -Rn '[inputs | select(length > 0)]')
+  unk_json=$(printf '%s' "$unknown_toks" | jq -Rn '[inputs | select(length > 0)]')
   # `grep -c .` prints 0 and exits 1 on empty input; take the count from stdout, discard the status.
   local n_unknown; n_unknown=$(printf '%s' "$unknown_toks" | grep -c . || true)
   if [ "${n_unknown:-0}" -gt 0 ]; then
-    echo "WARN: clean-checkout token could not be read for $n_unknown task(s); they are reported as having no token. Re-run the snapshot before trusting a review decision on them." >&2
+    echo "WARN: clean-checkout token could not be read for $n_unknown task(s); they are reported as unknown (hasCleanCheckoutToken: null), not as absent. A later snapshot answers them." >&2
   fi
 
-  jq -rs --argjson tok "$tok_json" --arg gen "$(date -u +"%Y-%m-%d %H:%M:%S")" '
+  jq -rs --argjson tok "$tok_json" --argjson unk "$unk_json" --arg gen "$(date -u +"%Y-%m-%d %H:%M:%S")" '
     def splitlist: (. // "") | split(",") | map(gsub("^\\s+";"") | gsub("\\s+$";"")) | map(select(. != "" and . != "none"));
     ( map({
         stem: .metadata.whip_key,
@@ -806,7 +820,10 @@ cmd_snapshot() {
         rejectionCount: (((.metadata.whip_rejections // 0) | tonumber?) // 0),
         blockCount: (((.metadata.whip_blocks // 0) | tonumber?) // 0),
         lastTransitionTs: (.metadata.whip_last_transition_ts // ""),
-        hasCleanCheckoutToken: (.id as $iid | ($tok | index($iid)) != null)
+        hasCleanCheckoutToken: (.id as $iid
+          | if ($tok | index($iid)) != null then true
+            elif ($unk | index($iid)) != null then null
+            else false end)
       }) ) as $tasks
     | ($tasks | map(.folder)) as $f
     | {

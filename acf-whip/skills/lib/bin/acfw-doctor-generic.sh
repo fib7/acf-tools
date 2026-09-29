@@ -106,6 +106,9 @@ while IFS='|' read -r stem folder id status agent rc bc hasTok isCode hasBranch 
   # Only meaningful when the adapter actually answers this field for accepted tasks. Where the answer
   # costs a request, adapters bound the paid set to the review states; `false` on an accepted task
   # then means "not scanned", and warning on it puts a permanent false advisory on every finished task.
+  # `null` is the adapter saying it could not read the token this pass. It renders as "null", never
+  # matches here, and so draws no finding: a failed read is not evidence of absence, and the next
+  # snapshot answers it.
   [ "$TOKEN_ALL_STATES" = "true" ] && [ "$folder" = "accepted" ] && [ "$hasTok" = "false" ] \
     && emit WARN missing-clean-checkout-token "$stem" "accepted without a 'clean-checkout | ok' token"
   [ "$folder" = "in-review" ] && emit WARN lingering-in-review "$stem" "stuck in in-review (quality-reviewer must terminate it)"
@@ -123,7 +126,8 @@ while IFS='|' read -r stem folder id status agent rc bc hasTok isCode hasBranch 
 done < <(printf '%s' "$SNAP" | jq -r '.tasks[]? | select((.slim // false) | not) |
   [.stem, .folder, (.id // ""), (.status // ""), (.agent // ""),
    (.rejectionCount // 0 | tostring), (.blockCount // 0 | tostring),
-   (.hasCleanCheckoutToken // false | tostring), (.isCodeMutating // false | tostring),
+   (if has("hasCleanCheckoutToken") then (.hasCleanCheckoutToken | tostring) else "false" end),
+   (.isCodeMutating // false | tostring),
    (.hasWorktreeBranch // false | tostring), (.hasIntegratedAt // false | tostring),
    (.ageHours // -1 | tostring)] | join("|")')
 

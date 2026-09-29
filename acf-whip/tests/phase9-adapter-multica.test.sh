@@ -223,6 +223,52 @@ check "a row that is not pipe-delimited is a usage error (exit 2)" "[ $LG_RC -eq
 check "...and says what shape it wanted" "printf '%s' \"\$LG_OUT\" | grep -q 'single pipe-delimited table row'"
 
 # ============================================================================
+# A token the snapshot could not read is UNKNOWN (null), never absent (false). false is the value the
+# review gate parks a task on, so a transient projected as false parks the task, the unblock pass
+# re-dispatches it, and the next failed read parks it again. The token has two homes (the description
+# since 3.2.0, comments before that), so "absent" needs BOTH read.
+echo
+echo "== a token that could not be read is null, not false =="
+UNK=$(mkstore "$WORK/unk")
+export ACFW_TRUNK_ROOT="$WORK/unk" MC_FAKE_STATE="$UNK"
+mkrev() {  # <stem> <slug> — create, then walk it to in-review
+  mktask "$WORK/$1.md" "$1" "$2"; "$ADAPTER" create --file "$WORK/$1.md" --stem "$1" --folder pending >/dev/null
+  for st in in-progress completed in-review; do "$ADAPTER" transition "$1" "$st" o d 0 0 >/dev/null; done
+}
+uuid_of() { jq -r --arg k "$1" '.issues | to_entries[] | select(.value.metadata.whip_key==$k) | .key' "$UNK"; }
+tok_of() { printf '%s' "$1" | jq -r --arg s "$2" '.tasks[] | select(.stem==$s) | .hasCleanCheckoutToken | tostring'; }
+mkrev u-tok ua; mkrev u-none ub; mkrev u-cfail uc; mkrev u-gfail ud; mkrev u-nodesc ue
+"$ADAPTER" log-event u-tok --row '| 2026-07-15 10:00:00 | clean-checkout | ok | x | ua | worktree/ua |' >/dev/null 2>&1
+# u-cfail's token is LEGACY (a comment, not in the document): readable it is true, so the null below
+# is hiding a true, which is exactly the task the old false would have parked.
+printf '%s' '| 2026-07-15 10:00:00 | clean-checkout | ok | x | uc | worktree/uc |' \
+  | "$FAKE" issue comment add "$(uuid_of u-cfail)" --content-stdin --output json >/dev/null
+# u-nodesc models a list that omitted the description: only `issue get` can read the document.
+jq --arg u "$(uuid_of u-nodesc)" '.issues[$u].description = ""' "$UNK" > "$UNK.t" && mv "$UNK.t" "$UNK"
+BASE=$("$ADAPTER" snapshot 2>/dev/null)
+check "baseline, no faults: the legacy comment token reads true" "[ \"\$(tok_of \"\$BASE\" u-cfail)\" = 'true' ]"
+
+FAULTS="comment list+$(uuid_of u-cfail):1,issue get+$(uuid_of u-gfail):1,issue get+$(uuid_of u-nodesc):1"
+USNAP=$(MC_FAKE_FAIL="$FAULTS" "$ADAPTER" snapshot 2>"$WORK/unk.err")
+check "a failed comment list is unknown (null), not false" "[ \"\$(tok_of \"\$USNAP\" u-cfail)\" = 'null' ]"
+check "a failed issue get when the list omitted the description is null, even with a clean comment scan" \
+  "[ \"\$(tok_of \"\$USNAP\" u-nodesc)\" = 'null' ]"
+# Control: the listed description WAS read (and carried no token), so a failed get changes nothing.
+check "...but a failed issue get after the list carried the description is still a definite false" \
+  "[ \"\$(tok_of \"\$USNAP\" u-gfail)\" = 'false' ]"
+check "readable tasks still answer true and false" \
+  "[ \"\$(tok_of \"\$USNAP\" u-tok)\" = 'true' ] && [ \"\$(tok_of \"\$USNAP\" u-none)\" = 'false' ]"
+check "the stderr WARN counts the unknowns and says null, not 'no token'" \
+  "grep -q 'could not be read for 2 task(s); they are reported as unknown (hasCleanCheckoutToken: null)' \"$WORK/unk.err\""
+
+# Through the dispatcher's raw path: adapter -> acfw-enrich-snapshot.sh -> relay post-stage.
+DSNAP=$(MC_FAKE_FAIL="$FAULTS" ACFW_STORE=multica bash "$ACF_WHIP/skills/lib/bin/acfw-store" snapshot 2>/dev/null)
+check "null survives enrichment through acfw-store snapshot" \
+  "[ \"\$(tok_of \"\$DSNAP\" u-cfail)\" = 'null' ] && [ \"\$(tok_of \"\$DSNAP\" u-nodesc)\" = 'null' ]"
+check "...alongside unchanged true/false, on a snapshot that really was enriched" \
+  "[ \"\$(tok_of \"\$DSNAP\" u-tok)\" = 'true' ] && [ \"\$(tok_of \"\$DSNAP\" u-gfail)\" = 'false' ] && printf '%s' \"\$DSNAP\" | jq -e '.store == \"multica\" and has(\"relay\") and (has(\"raw\") | not)' >/dev/null"
+
+# ============================================================================
 if [ -n "${MULTICA_TEST_SERVER:-}" ] && [ -n "${MULTICA_TEST_TOKEN:-}" ] && [ -n "${MULTICA_TEST_WORKSPACE_ID:-}" ]; then
   echo
   echo "== ALSO running the frozen suite against the live server $MULTICA_TEST_SERVER =="

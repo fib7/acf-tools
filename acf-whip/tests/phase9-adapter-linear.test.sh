@@ -149,6 +149,14 @@ function dispatch(q, v, st) {
   if (has('issue(')) {
     const iss = (st.issues || []).find(x => x.id === v.id);
     if (has('comments')) {
+      // Fault injection: LIN_EMU_FAIL_COMMENTS=<issueId>[,<issueId>...] makes the comments read for those
+      // issues answer with a GraphQL error on EVERY attempt, so the adapter's one retry fails as well.
+      // Each refusal is appended to LIN_EMU_FAIL_LOG, which is how the test proves the retry happened.
+      const failIds = String(process.env.LIN_EMU_FAIL_COMMENTS || '').split(',').filter(Boolean);
+      if (failIds.indexOf(v.id) !== -1) {
+        if (process.env.LIN_EMU_FAIL_LOG) fs.appendFileSync(process.env.LIN_EMU_FAIL_LOG, v.id + '\n');
+        throw new Error('Rate limit exceeded (emulated)');
+      }
       const nodes = (st.comments || []).filter(c => c.issueId === v.id)
         .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0))
         .map(c => ({ body: c.body, createdAt: c.createdAt }));
@@ -269,6 +277,49 @@ SNAP=$("$ADAPTER" snapshot 2>/dev/null)
 HAS_TOK=$(printf '%s' "$SNAP" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{let j=JSON.parse(d);let t=j.tasks.find(x=>x.stem==="lin-up");process.stdout.write(String(t&&t.hasCleanCheckoutToken))}catch(e){process.stdout.write("ERR")}})' 2>/dev/null || echo ERR)
 # lin-up carries no clean-checkout comment, so its token flag must be false; lin-mat is pending (not scanned) → also false. Assert the scan ran and is boolean-correct for lin-up.
 if [ "$HAS_TOK" = "false" ]; then ok "snapshot token scan returns a correct boolean (lin-up in-review, no token → false)"; else bad "snapshot hasCleanCheckoutToken for lin-up = $HAS_TOK (want false)"; fi
+
+# (G) a token read that FAILS is unknown (null), never absent (false). false is the value the review
+# gate parks a task on, so projecting a rate-limited comments read as false started a park -> unblock
+# -> re-dispatch -> park livelock driven by nothing but the rate limit. lin-unk HAS its token: the
+# failed read must not turn that into false, and must not guess true either.
+for s in lin-tok lin-unk; do
+  mkdoc "$s" "slug-${s#lin-}" none > "$WORK/$s.md"
+  "$ADAPTER" create --file "$WORK/$s.md" --folder pending >/dev/null 2>&1
+  "$ADAPTER" transition "$s" in-progress orchestrator "dispatch" 0 0 >/dev/null 2>&1
+  "$ADAPTER" log-event "$s" --row "| 2026-07-15 10:00:00 | clean-checkout | ok | clean-checkout-before-task | slug-${s#lin-} | worktree/slug-${s#lin-} |" >/dev/null 2>&1
+  "$ADAPTER" transition "$s" completed specialist "done" 0 0 >/dev/null 2>&1
+  "$ADAPTER" transition "$s" in-review orchestrator "review" 0 0 >/dev/null 2>&1
+done
+UIID=$(jq -r --arg u "$(kurl lin-unk)" '.attachments[] | select(.url==$u) | .issueId' "$STATE")
+tok_of() { printf '%s' "$1" | jq -r --arg s "$2" '.tasks[] | select(.stem==$s) | .hasCleanCheckoutToken | tostring' 2>/dev/null; }
+: > "$WORK/fail.log"
+GSNAP=$(LIN_EMU_FAIL_COMMENTS="$UIID" LIN_EMU_FAIL_LOG="$WORK/fail.log" "$ADAPTER" snapshot 2>"$WORK/g.err")
+G_UNK=$(tok_of "$GSNAP" lin-unk); G_TOK=$(tok_of "$GSNAP" lin-tok); G_NO=$(tok_of "$GSNAP" lin-up)
+if [ "$G_UNK" = "null" ]; then ok "a failed comments read projects hasCleanCheckoutToken: null"; else bad "lin-unk token = $G_UNK (want null)"; fi
+if [ "$G_TOK" = "true" ] && [ "$G_NO" = "false" ]; then ok "...while readable issues still answer true (lin-tok) and false (lin-up)"; else bad "lin-tok=$G_TOK (want true) lin-up=$G_NO (want false)"; fi
+G_TRIES=$(grep -c . "$WORK/fail.log" || true)
+if [ "${G_TRIES:-0}" = "2" ]; then ok "the read was retried once before being reported unknown"; else bad "failed comments reads for lin-unk: ${G_TRIES:-0} (want 2: one try + one retry)"; fi
+if grep -q 'reported as unknown (hasCleanCheckoutToken: null)' "$WORK/g.err"; then ok "the stderr WARN says unknown, not 'no token'"; else bad "WARN missing or still says absent: $(cat "$WORK/g.err")"; fi
+G_OK=$("$ADAPTER" snapshot 2>/dev/null)
+if [ "$(tok_of "$G_OK" lin-unk)" = "true" ]; then ok "...and once the read works again the same issue reads true"; else bad "lin-unk without the fault = $(tok_of "$G_OK" lin-unk) (want true)"; fi
+
+# The null must survive the dispatcher's raw path too: adapter -> acfw-enrich-snapshot.sh -> relay
+# post-stage. The enricher used `// false`, which in jq erases null exactly as it fills a missing key.
+DREPO="$WORK/drepo"
+git init -q -b trunk "$DREPO" && ( cd "$DREPO" && git config user.email t@t && git config user.name t \
+  && echo seed > seed && git add -A && git commit -qm seed ) >/dev/null 2>&1
+DSNAP=$(LIN_EMU_FAIL_COMMENTS="$UIID" ACFW_STORE=linear ACFW_TRUNK_ROOT="$DREPO" ACFW_TRUNK_BRANCH=trunk \
+  bash "$ACF_WHIP/skills/lib/bin/acfw-store" snapshot 2>/dev/null)
+if [ "$(tok_of "$DSNAP" lin-unk)" = "null" ] && [ "$(tok_of "$DSNAP" lin-tok)" = "true" ] && [ "$(tok_of "$DSNAP" lin-up)" = "false" ]; then
+  ok "null survives enrichment through acfw-store snapshot (true/false unchanged)"
+else
+  bad "through the dispatcher: lin-unk=$(tok_of "$DSNAP" lin-unk) lin-tok=$(tok_of "$DSNAP" lin-tok) lin-up=$(tok_of "$DSNAP" lin-up) (want null/true/false)"
+fi
+if printf '%s' "$DSNAP" | jq -e '.store == "linear" and .raw == null and (.relay.tasks == (.tasks|length))' >/dev/null 2>&1; then
+  ok "...and that snapshot really took the raw path (store injected, enriched, relay header)"
+else
+  bad "dispatcher snapshot did not look enriched: $(printf '%s' "$DSNAP" | head -c 200)"
+fi
 
 echo
 

@@ -105,7 +105,11 @@ jq \
       hasIntegratedAt: (.stem | IN($ik[])),
       isCodeMutating: codemut,
       hasWorktreeBranch: (codemut and ((.slug // "") | IN($wt[]))),
-      hasCleanCheckoutToken: (.hasCleanCheckoutToken // false),
+      # An explicit null is an ANSWER: the adapter could not read the token this pass (a rate-limited
+      # or failed request) and says so. `// false` would erase it, because the jq alternative operator
+      # treats null exactly like a missing key, and false is the value the review gate parks a task on.
+      # Only a MISSING key still defaults to false, so an adapter that omits the field behaves as before.
+      hasCleanCheckoutToken: (if has("hasCleanCheckoutToken") then .hasCleanCheckoutToken else false end),
       rejectionCount: (.rejectionCount // 0),
       blockCount: (.blockCount // 0),
       lastTransitionTs: (.lastTransitionTs // ""),

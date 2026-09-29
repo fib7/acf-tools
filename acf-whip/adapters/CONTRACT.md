@@ -103,7 +103,7 @@ Capability flags: `snapshot-enriched`, `snapshot-only`, `stage`, `update-field`,
 `commitsToGit` = state writes produce trunk commits (files: true).
 
 ### `snapshot [--digest] [--counts-only] [--mode default|override]`
-One BacklogSnapshot JSON object. Adapter-owned fields per task: `stem`, `id`, `folder` (whip state), `status`, `slug` (worktree), `agent`, `priority`, `deps[]` (stems), `touchesGlobs[]`, `rejectionCount` (number), `blockCount` (number), `lastTransitionTs` (`YYYY-MM-DD HH:MM:SS` UTC), `hasCleanCheckoutToken` (bool), plus top-level `counts{<state>:n,...}` and `generatedAt`. `--digest`/`--counts-only`/`--mode` may be treated as hints (a full snapshot is always acceptable).
+One BacklogSnapshot JSON object. Adapter-owned fields per task: `stem`, `id`, `backendId` (optional: the backend's own identifier for the task, such as a Linear `ENG-123` or a multica issue identifier; seed resolution matches it, see above), `folder` (whip state), `status`, `slug` (worktree), `agent`, `priority`, `deps[]` (stems), `touchesGlobs[]`, `rejectionCount` (number), `blockCount` (number), `lastTransitionTs` (`YYYY-MM-DD HH:MM:SS` UTC), `hasCleanCheckoutToken` (bool, or `null` when the adapter could not read it; see [the token rules](#log-event-and-the-clean-checkout-token)), plus top-level `counts{<state>:n,...}` and `generatedAt`. `--digest`/`--counts-only`/`--mode` may be treated as hints (a full snapshot is always acceptable).
 
 An entry MAY carry `"slim": true` to mark it a **dependency-resolution stub** rather than a task
 record. The `files` scanner emits terminal accepted tasks this way: it keeps only what
@@ -188,7 +188,7 @@ one out would leave it stuck for good and its dependent could never dispatch.
 `body` is present only with `--body`. `--materialize DIR` writes a full task document to `DIR/<key>.md` and prints that path instead of JSON. That is how specialists and `clean-checkout` get a spec file on non-files backends (files prints the real root path). A materialized document MUST contain the current metadata bullets, the body, **and the stored audit trail**: every `log-event` row and `comment`, verbatim. Adapters that already keep rows in the document (files, multica) satisfy this inline through the `## Transition Log` table; anything held outside the document is appended oldest-first under a heading of the adapter's choice (`## Store Comments`, `## Store Audit Trail`). Review depends on it: the quality-reviewer's auto-reject greps the refreshed materialized document for the `| clean-checkout | ok |` token that `log-event` recorded, wherever it lives.
 
 ### `create [--folder pending] [--file PATH | stdin] [--stem KEY] [--set Field=Value]...`
-Ingest one task document. Key = `--stem` or the `--file` basename. Duplicate key → exit 4 (never upsert). `--set` overrides a metadata field after parsing (e.g. `--set 'Dependencies=a, b'`). Optional fields are honored where the backend has them natively: `parent_key`, `stage` (multica `--parent/--stage`, beads `--parent`; files ignores both). Returns `{"key":"..."}`.
+Ingest one task document. Key = `--stem` or the `--file` basename. Duplicate key → exit 4 (never upsert). `--set` overrides a metadata field after parsing (e.g. `--set 'Dependencies=a, b'`). Two optional fields are honored where the backend has them natively, read from the `- **Parent**:` and `- **Stage**:` bullets or `--set Parent=`/`--set Stage=`. `Parent` names another task by its **whip key**. The adapter resolves it to the native issue and fails with exit 3 if it cannot, so the parent must already exist in the store. multica passes it as `issue create --parent`; linear sends it as `parentId` on `issueCreate`. `Stage` is a positive integer that only multica maps (`--stage`); anything else is dropped silently. beads and files ignore both. Returns `{"key":"..."}`.
 
 ### `transition [--stage PATH]... <key> <TO_STATE> [AGENT] [NOTES] [RINC] [BINC]`
 The positional tail mirrors `apply-transition.sh` argument for argument. Semantics:
@@ -216,10 +216,19 @@ Output: `ok:`/`noop:`/`warn:` lines (echoed verbatim into run reports).
 
 A `clean-checkout | ok` row written by `log-event` must show up in later
 `snapshot.hasCleanCheckoutToken` answers **in every task state, not only the review ones**. The field
-is a flat per-task boolean with no state qualifier: `false` means "this task has no token", and a
+is a flat per-task value with no state qualifier: `false` means "this task has no token", and a
 consumer cannot tell a real absence from a state the adapter declined to scan. Two consumers depend on
-it: the review gate auto-rejects on `false`, and the generic doctor WARNs on an accepted task without
-one.
+it: the review gate acts on `false` (it parks the task when its worktree branch exists, and
+auto-rejects it when the branch is missing too), and the generic doctor WARNs on an accepted task
+without one.
+
+**`null` means unknown.** An adapter whose read failed (a timeout, a 5xx, a rate limit, after whatever
+retry it makes) reports `null` for that task, never `false`. Consumers MUST NOT treat `null` as
+absent: the review gate neither parks nor rejects on it, and the doctor raises no token finding for it. Folding a
+failed read into `false` parks a task that may well hold its token, the unblock pass re-dispatches it,
+and the next failed read parks it again. Report `false` only when every place the token can live was
+read and none carried it. `true` and `false` keep their meaning. An adapter that omits the key is
+still read as `false`, as before. Added in 3.5.1; additive, so `ACFW_CONTRACT_VERSION` is still `1`.
 
 Where each answer costs a request, limit the *paid* set to the states where a wrong answer costs
 something now (`in-progress`, `completed`, `in-review`) rather than narrowing the field itself, and

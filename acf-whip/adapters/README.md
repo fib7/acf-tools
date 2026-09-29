@@ -151,7 +151,8 @@ Details per backend: [`files/`](./files/) · [`beads/README.md`](./beads/README.
 3. **Keep the invariants that catch adapters out:** duplicate `create` is exit 4, never an upsert ·
    dependency tokens may name not-yet-created keys; record and report them verbatim ·
    `read --materialize` MUST include the stored audit trail · counters are JSON numbers ·
-   transitions are idempotent (`noop:`, exit 0, no bumps).
+   transitions are idempotent (`noop:`, exit 0, no bumps) · a clean-checkout token you could not
+   read is `hasCleanCheckoutToken: null`, never `false`.
 4. **Drop it in** at `<repo>/.acfwhip/adapters/acfw-store-<backend>` (commit it) or on `$PATH`, and
    set `ACFW_STORE=<backend>` in `.acfwhip/config`. No fork, no dispatcher change.
 5. **Prove it**: `ADAPTER=<path> bash tests/phase9-store-conformance.test.sh` is the executable

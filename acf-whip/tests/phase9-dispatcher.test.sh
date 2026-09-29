@@ -533,6 +533,54 @@ else
   ok "jq absent (3.4.0 scope/digest/relay assertions skipped)"
 fi
 
+# ============================================================================================
+# An UNKNOWN clean-checkout token (null) survives the whole raw path and gates nothing
+# ============================================================================================
+# linear and multica report hasCleanCheckoutToken: null when the read that answers it failed. The
+# review gate parks a task on `=== false`, so a null coerced to false anywhere between the adapter and
+# the workflow turns one rate-limited request into a park -> unblock -> re-dispatch -> park livelock.
+# The enricher used `// false`, which in jq maps null to false exactly as it maps a missing key, and
+# the generic doctor rendered the field the same way. Each hop is asserted, with a false-token control
+# so the "no finding" assertions cannot pass vacuously.
+if command -v jq >/dev/null 2>&1; then
+  TOKCAPS='{"backend":"stub","contractVersion":1,"commitsToGit":false,"capabilities":["snapshot","read","create","transition","doctor","token-all-states"]}'
+  TOK_SNAP='{"raw":true,"generatedAt":"2026-09-29 00:00:00","counts":{},"tasks":[
+    {"stem":"k-rev-unk","id":"k-rev-unk","folder":"in-review","status":"in-review","slug":"sk1","agent":"","deps":[],"touchesGlobs":[],"hasCleanCheckoutToken":null},
+    {"stem":"k-acc-unk","id":"k-acc-unk","folder":"accepted","status":"accepted","slug":"none","agent":"","deps":[],"touchesGlobs":[],"hasCleanCheckoutToken":null},
+    {"stem":"k-acc-no","id":"k-acc-no","folder":"accepted","status":"accepted","slug":"none","agent":"","deps":[],"touchesGlobs":[],"hasCleanCheckoutToken":false},
+    {"stem":"k-rev-omit","id":"k-rev-omit","folder":"in-review","status":"in-review","slug":"sk4","agent":"","deps":[],"touchesGlobs":[]}]}'
+  tok_of(){ printf '%s' "$1" | jq -r --arg s "$2" '.tasks[] | select(.stem==$s) | .hasCleanCheckoutToken | tostring'; }
+
+  TE=$(printf '%s' "$TOK_SNAP" | bash "$ENR" "$REPO" 2>/dev/null)
+  check "enricher: an explicit null token survives (not coerced to false)" "[ \"\$(tok_of \"\$TE\" k-rev-unk)\" = 'null' ]"
+  check "enricher: a MISSING token key still defaults to false (adapters that omit it are unchanged)" \
+    "[ \"\$(tok_of \"\$TE\" k-rev-omit)\" = 'false' ]"
+  check "enricher: a definite false is still false" "[ \"\$(tok_of \"\$TE\" k-acc-no)\" = 'false' ]"
+
+  # Through the dispatcher: adapter -> enrich -> relay post-stage, plain and narrowed.
+  TS=$(ACFW_STORE=stub STUB_CAPS="$TOKCAPS" STUB_SNAPSHOT="$TOK_SNAP" bash "$STORE" snapshot 2>/dev/null)
+  check "dispatcher snapshot: null survives enrichment and the relay post-stage" "[ \"\$(tok_of \"\$TS\" k-rev-unk)\" = 'null' ]"
+  check "...and the relay header still adds up" \
+    "printf '%s' \"\$TS\" | jq -e '.relay.tasks == (.tasks|length) and .relay.bytes == ([.tasks[].stem|utf8bytelength]|add)' >/dev/null"
+  TSO=$(ACFW_STORE=stub STUB_CAPS="$TOKCAPS" STUB_SNAPSHOT="$TOK_SNAP" bash "$STORE" snapshot --only k-rev-unk 2>/dev/null)
+  check "dispatcher snapshot --only: null survives narrowing" "[ \"\$(tok_of \"\$TSO\" k-rev-unk)\" = 'null' ]"
+
+  # The generic doctor, on its own and merged by the dispatcher. tokenAllStates=true is the only
+  # configuration in which it raises a token finding at all, so it is the one that proves anything.
+  TD=$(printf '%s' "$TE" | jq -c '. + {tokenAllStates: true}' | bash "$GEN" "$REPO" 2>/dev/null)
+  check "generic doctor: the control (accepted, token false) still WARNs" \
+    "printf '%s\n' \"\$TD\" | grep -q '^WARN|missing-clean-checkout-token|k-acc-no|'"
+  check "generic doctor: an unknown token draws no token finding" \
+    "! printf '%s\n' \"\$TD\" | grep -qE '\\|missing-clean-checkout-token\\|k-(acc|rev)-unk\\|'"
+  check "generic doctor: ...and nothing FATAL or REPAIRABLE against either unknown task" \
+    "! printf '%s\n' \"\$TD\" | grep -qE '^(FATAL|REPAIRABLE)\\|[^|]*\\|k-(acc|rev)-unk\\|'"
+  TM=$(ACFW_STORE=stub STUB_CAPS="$TOKCAPS" STUB_SNAPSHOT="$TOK_SNAP" bash "$STORE" doctor 2>/dev/null)
+  check "merged doctor: the control WARNs, the unknown does not" \
+    "printf '%s\n' \"\$TM\" | grep -q '^WARN|missing-clean-checkout-token|k-acc-no|' && ! printf '%s\n' \"\$TM\" | grep -q '|missing-clean-checkout-token|k-acc-unk|'"
+else
+  ok "jq absent (unknown-token assertions skipped)"
+fi
+
 echo
 echo "phase9-dispatcher: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
