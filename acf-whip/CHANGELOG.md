@@ -2,6 +2,41 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.4.3: four fixes the next release stands on
+
+- **Harness stages now get their stage rules.** `childPreamble`, the rules that tell every stage of an
+  authored harness that the worktree already exists and that the locked checkout is the only
+  clean-checkout, was defined in 3.2.0 and never called. So every implement, gate-fix and review-lens
+  stage got the bare specialist or reviewer prompt, whose STEP 0 is "run clean-checkout", and
+  clean-checkout.sh is not reentrant: its `stash push -u` can sweep a sibling stage's uncommitted
+  work into the shared `refs/stash`. The rules now wrap `impl` and `review` stages. `direct` and
+  `resolve` prompts are unchanged byte for byte, because "you may only add commits" is false for a
+  task with no worktree and for a resolver sitting in the integrator's mid-cherry-pick tree. The
+  per-stage run-lock heartbeat comes back with it, so a live `/go` is no longer seen as stale.
+- **The clean-checkout token is re-recorded when a harness attaches to an existing worktree.**
+  Skipping STEP 0 removed the only token write in that case, which is normal for every same-slug
+  sibling after the first and for a re-dispatch after a failed token write. Such a task was parked,
+  re-queued and replayed from its ledger with no token, forever. `/go` now re-runs the locked
+  command once per dispatch before the harness, only on a clean attached tree. A tree it cannot
+  read counts as dirty, and a worktree path containing a space is parsed whole, so the probe can
+  never let a stash run over live work. With the review panel on (`escalateReview`), a missing token
+  now leaves the task in review for the token gate instead of costing it a life.
+- **The files store finds a paused or retired task by its full stem.** `read` and every other
+  subcommand matched keys with a substring glob over the active folders, so the full stem of a task
+  in `draft/` or `archive/` came back missing, or as an active task whose stem contains it, and
+  `transition <stem> draft` could park the wrong card. An exact stem now resolves in every state
+  folder before any partial matching, as it already did on beads, multica and linear.
+- **The files doctor reports a paused dependency as `WARN|dep-inactive`.** It raised
+  `FATAL|dangling-dep` for a dependency sitting in `draft/` or `archive/`, which held the dependent
+  task out of the run. The generic battery already warned there. Only a dependency that exists in
+  no folder is still FATAL.
+- **`/research` works without acf-librarian and on every store.** It hard-exited when
+  `docs/acf/organization.md` was missing; it now warns, names what is degraded, and continues. On
+  beads, multica and linear it no longer refuses over a missing `.backlog/`, and it files its
+  follow-up task through `acfw-store create` instead of writing into `.backlog/pending/`, where
+  those stores never look. It no longer refuses over `/go`-only pins it never reads. A new offline
+  suite, `phase19-research-preflight`, runs the skill's own preflight shell.
+
 ## 3.4.2 — what the review found in 3.4.1
 
 The same reviewer read the 3.4.1 fixes. Seven comments, all on code written in that pass; six were
