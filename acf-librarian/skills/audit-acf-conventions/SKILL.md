@@ -1,6 +1,6 @@
 ---
 name: audit-acf-conventions
-description: Check project compliance with ACF naming and organization conventions. Use --fix flag to automatically fix all violations.
+description: Check project compliance with ACF naming and organization conventions. Use the --fix flag to fix the violations the audit is allowed to change; the rest are reported.
 argument-hint: "[--fix]"
 allowed-tools:
   - Read
@@ -13,38 +13,36 @@ allowed-tools:
 
 # ACF Audit: Convention Compliance Checker
 
-**📚 The librarian inspects your project for convention violations.**
-
-Scan the current project for violations of ACF naming and organization conventions defined in `docs/acf/organization.md`.
+Scan the current project for violations of the ACF naming and organization conventions in `docs/acf/organization.md`, and report each one with its fix.
 
 **Modes**:
-- **Audit mode** (default): Report violations with actionable fix suggestions
-- **Fix mode** (`--fix` flag): Automatically fix all identified violations
+- **Audit mode** (default): report violations and how to fix each. Changes nothing.
+- **Fix mode** (`--fix` flag): fix what the audit is allowed to change. Cycle folders, lessons and links in protected documents stay report-only, and verbosity findings are suggestions.
 
-**Note**: The conventions are already in your context (injected by ACF Librarian SessionStart hook).
+**Note**: the ACF Librarian SessionStart hook has already put the conventions in your context. Use them for what to check and what a correct name looks like.
 
 ---
 
 ## Pre-Execution Check
 
-**BEFORE RUNNING**, verify:
-- ✅ You have the ACF conventions in your context (from SessionStart hook)
-- ✅ You're in a project root directory (not inside subdirectories)
-- ✅ `docs/acf/organization.md` exists (should be auto-created by plugin)
+Before running, confirm that:
+- the ACF conventions are in your context (from the SessionStart hook)
+- you are in the project root, not a subdirectory
+- `docs/acf/organization.md` exists (the SessionStart hook normally creates it)
 
 **If `docs/acf/organization.md` is missing or empty**:
-- **Fix mode** (`--fix`): Initialize it from the plugin template at `${CLAUDE_PLUGIN_ROOT}/content/organization-template.md` and continue
-- **Audit mode**: Report as a critical violation and continue checking other categories
+- **Fix mode** (`--fix`): create it from the plugin template at `${CLAUDE_PLUGIN_ROOT}/content/organization-template.md` and continue
+- **Audit mode**: report it as a critical violation and keep checking the other categories
 
 ---
 
 ## Command
 
-Audit the project for convention compliance and report all violations with actionable fixes.
+Parse the arguments and, in fix mode, run the safety check below. Then run Steps 0 to 9 in order. Only Step 0 and Step 8 write anything, and only under `--fix`. Step 9 prints the report.
 
 ### Argument Parsing
 
-**Check for --fix flag** (passed via command arguments):
+**Check for the `--fix` flag** in the command arguments:
 
 ```bash
 # Parse arguments for fix mode
@@ -60,7 +58,7 @@ else
 fi
 ```
 
-**Safety Check** (if fix mode):
+**Safety check** (fix mode only):
 ```bash
 if [ "$fix_mode" = true ]; then
     # Warn if uncommitted changes exist
@@ -77,7 +75,7 @@ fi
 
 #### 0. Initialize Core Files (Fix Mode Bootstrap)
 
-**Before any audit checks**, ensure core ACF files exist. This allows fix mode to bootstrap a project from scratch.
+**Before any check runs**, make sure the core ACF files exist, so fix mode can set up a project that has none of them yet.
 
 **A. Initialize `docs/acf/organization.md`** (if missing or empty):
 
@@ -133,9 +131,9 @@ fi
 - **Audit**: Run `/audit-acf-conventions` to check compliance, `--fix` to auto-fix
 ```
 
-**C. Ensure `CLAUDE.md` references conventions** (if exists but missing reference):
+**C. Make sure `CLAUDE.md` references the conventions** (it exists but has no reference):
 
-If `CLAUDE.md` exists but does NOT contain a reference to `docs/acf/organization.md`:
+If `CLAUDE.md` exists but never mentions `docs/acf/organization.md`:
 
 ```bash
 if [ -f "CLAUDE.md" ] && ! grep -q "docs/acf/organization.md" CLAUDE.md; then
@@ -166,19 +164,19 @@ fi
 
 #### 1. Read Project Conventions
 
-Read `docs/acf/organization.md` to confirm the conventions you'll be checking against:
+Read `docs/acf/organization.md` for the conventions you are checking against:
 
 ```bash
 cat docs/acf/organization.md
 ```
 
-This ensures you're checking against the project's actual conventions (which may be customized). If the file was just initialized in Step 0, the default template conventions apply.
+Check against the project's own version of the file, which may be customized. If Step 0 just created it, the template defaults apply.
 
 ---
 
 #### 2. Check Directory Structure
 
-Scan for required directories as defined in the conventions:
+Check that every required directory from the conventions exists:
 
 **Core directories to check**:
 ```bash
@@ -202,7 +200,7 @@ done
 
 #### 3. Check Naming Conventions
 
-**Temporal directories** (files MUST have YYYYMMDD prefix):
+**Temporal directories** (every file must have a YYYYMMDD prefix):
 
 Scan these directories:
 - `docs/research/`
@@ -213,7 +211,7 @@ Scan these directories:
 - `docs/snapshots/evaluations/`
 - `docs/snapshots/planning/`
 
-Check each `.md` file (except README.md) has YYYYMMDD prefix:
+Check that every `.md` file except README.md has the prefix:
 
 ```bash
 # Example for docs/research/
@@ -224,7 +222,7 @@ if [ -d docs/research ]; then
 fi
 ```
 
-**Timeless directories** (files must NOT have dates/versions):
+**Timeless directories** (file names must not contain a date or version):
 
 Scan these directories:
 - `docs/acf/`
@@ -245,7 +243,7 @@ if [ -d docs/acf ]; then
 fi
 ```
 
-**Lessons** (`docs/acf/lessons/`, written by acf-whip `/retro`): the timeless rule holds for them too, so a slug with `[0-9]{8}` or `-v[0-9]+` in it is a violation. But a lesson's slug is its identity: `/retro` updates a lesson by rewriting the file with the same slug, so a lesson the audit renamed comes back under its old name on the next `/retro`, and the rule then exists twice. The block above therefore skips `docs/acf/lessons/`, and this block reports, never fixes, a lesson slug that breaks the timeless rule or is not `^[a-z][a-z0-9-]*$`. Run it verbatim:
+**Lessons** (`docs/acf/lessons/`, written by acf-whip `/retro`): the timeless rule applies, so a slug containing `[0-9]{8}` or `-v[0-9]+` is a violation. The audit still must not rename one. `/retro` updates a lesson by rewriting the file under the same slug, so a renamed lesson comes back under its old name on the next `/retro` and the rule then exists twice. The block above skips `docs/acf/lessons/` for that reason. This block reports, and never fixes, a lesson slug that breaks the timeless rule or does not match `^[a-z][a-z0-9-]*$`. Run it verbatim:
 
 ```bash
 # acf-librarian:lesson-check (report-only: this block never renames, moves or writes anything)
@@ -259,7 +257,7 @@ if [ -d docs/acf/lessons ]; then
 fi
 ```
 
-**Dated living records** (`docs/cycles/`, REPORT-ONLY): each folder is one acf-whip cycle and its name is the cycle ID, so nothing in this audit renames, moves or writes anything under `docs/cycles/`, in either mode. Ownership is by content: a folder whose `record.md` has no acf `Format` stamp belongs to some other tool and is skipped. The files inside (`plan.md`, `record.md`, `retro.md`) carry no date by design. Run this block verbatim:
+**Dated living records** (`docs/cycles/`, report-only): each folder is one acf-whip cycle, named by its cycle ID. The audit never renames, moves or writes anything under `docs/cycles/`, in either mode. It decides ownership by content: a folder whose `record.md` has no acf `Format` stamp belongs to another tool and is skipped. The files inside (`plan.md`, `record.md`, `retro.md`) have no date in their names, on purpose. Run this block verbatim:
 
 ```bash
 # acf-librarian:cycle-check (report-only: this block never renames, moves or writes anything)
@@ -300,7 +298,7 @@ fi
 
 #### 4. Check Script Organization
 
-Find scripts in forbidden locations (primarily project root):
+Find scripts in the project root:
 
 ```bash
 # Find shell/python scripts in root (excluding framework files)
@@ -320,9 +318,9 @@ done
 
 #### 5. Validate Internal Links
 
-Scan all markdown files under `docs/` for broken internal links. Links inside fenced code blocks or inline code spans (`` `[text](path.md)` ``) are examples and are skipped, as are external links (`http:`, `https:`, `mailto:`, any `scheme:`) and same-page `#anchors`; a `#section` or `?query` suffix is ignored when checking the file and kept when fixing it.
+Scan every markdown file under `docs/` for broken internal links. The check skips links inside fenced code blocks and inline code spans (`` `[text](path.md)` ``), which are examples, and it skips external links (`http:`, `https:`, `mailto:`, any `scheme:`) and same-page `#anchors`. A `#section` or `?query` suffix is ignored when looking for the file and kept when fixing the link.
 
-**Report-only sources**: broken links in `docs/cycles/` and `docs/retrospectives/` are reported and NEVER edited, in either mode. Editing a cycle's `plan.md` changes its content hash and re-arms its approval, `record.md` is written only by acf-whip, and a retrospective is a frozen record of what was true when it was written. A doc that is a symlink is report-only too, wherever it points: an edit would land in the file behind the link (possibly a cycle's `plan.md`), and that file's links resolve from its own folder.
+**Report-only sources**: broken links in `docs/cycles/` and `docs/retrospectives/` are reported and never edited, in either mode. An edit to a cycle's `plan.md` changes its content hash and re-arms its approval. Only acf-whip writes `record.md`. A retrospective is a frozen record of what was true when someone wrote it. A doc that is a symlink is report-only too, wherever it points: the edit would land in the file behind the link (possibly a cycle's `plan.md`), and that file's links resolve from its own folder.
 
 **Plugin-installed documents are report-only too**: `docs/acf/organization.md`, `docs/acf/git/commit-conventions.md`, everything under `docs/acf/backlog/` and `docs/acf/style/` (acf-whip), and any doc whose first line is an `acf-librarian-template` or `acf-whip-artifact` marker. Both plugins refresh an unedited copy of these to the current template by comparing its content. One audit edit makes the copy look customised, so it never gets another template fix.
 
@@ -466,14 +464,7 @@ PY
 
 #### 6. Check Root Directory
 
-Scan project root for forbidden files:
-
-**Forbidden patterns**:
-- Documentation files (except allowed ones)
-- Log files
-- Evidence files
-- Temporary files
-- Scripts (already checked above)
+Scan the project root for files that do not belong there: markdown other than README.md, CLAUDE.md, LICENSE.md and CONTRIBUTING.md; log and evidence files; temporary files. Scripts are Step 4's job.
 
 ```bash
 # Find markdown files in root (except allowed)
@@ -507,9 +498,9 @@ done
 
 #### 7. Check Documentation Verbosity
 
-Scan documentation for token waste patterns that violate Section 10 (Documentation Writing Standards). Ignore any finding in `docs/cycles/*/record.md`: acf-whip writes it and nobody edits it.
+Scan `docs/` for the token-waste patterns that Section 10 of the conventions (Documentation Writing Standards) rules out. Ignore any finding in `docs/cycles/*/record.md`: acf-whip writes it and nobody edits it.
 
-**Verbose code examples** (>10 lines in code blocks):
+**Long code examples** (a code block over 10 lines):
 
 ```bash
 # Find code blocks with excessive length
@@ -528,7 +519,7 @@ find docs -type f -name "*.md" -exec awk '
 ' {} \;
 ```
 
-**Mermaid diagrams** (candidates for text flow conversion):
+**Mermaid diagrams** (a linear one may read better as a text flow):
 
 ```bash
 # Find mermaid diagrams that might be better as text flow
@@ -548,7 +539,7 @@ for word in comprehensive systematic significant substantial robust elegant seam
 done
 ```
 
-**Repeated prohibitions** (emoji per line instead of grouped):
+**Repeated prohibitions** (five or more `- ❌`/`- ✅` bullets in a row that could be grouped on one line):
 
 ```bash
 # Find patterns like "- ❌ Item" repeated 5+ times suggesting grouping opportunity
@@ -586,13 +577,13 @@ find docs -type f -name "*.md" -exec awk '
    💡 Target: 20-30% reduction vs bullet list format
 ```
 
-**Note**: These are optimization suggestions, not violations. They help reduce token usage while preserving information.
+**Note**: these are suggestions, not violations. Fix mode never changes them.
 
 ---
 
 #### 8. Apply Fixes (Only if --fix Flag)
 
-**Execute this step ONLY if `fix_mode=true`**:
+**Run this step only when `fix_mode=true`**:
 
 ```bash
 if [ "$fix_mode" = false ]; then
@@ -619,7 +610,7 @@ done
 
 ### B. Fix Temporal Naming Violations
 
-For files in temporal directories missing YYYYMMDD prefix. Nothing under `docs/cycles/` is ever in this list: a cycle folder's name is its ID, so Step 3 only reports it.
+For files in temporal directories that lack the YYYYMMDD prefix. Nothing under `docs/cycles/` is ever in this list: a cycle folder's name is its ID, so Step 3 only reports it.
 
 ```bash
 # Array of temporal violations from Step 3
@@ -652,7 +643,7 @@ done
 
 ### C. Fix Timeless Naming Violations
 
-For files in timeless directories with dates or versions. Nothing under `docs/acf/lessons/` is ever in this list: Step 3 only reports a lesson, because renaming one forks it into two files on the next `/retro`. The `case` below skips one anyway.
+For files in timeless directories whose names contain a date or version. Nothing under `docs/acf/lessons/` is ever in this list: Step 3 only reports a lesson, because renaming one forks it into two files on the next `/retro`. The `case` below skips one anyway.
 
 ```bash
 # Array of timeless violations from Step 3
@@ -691,7 +682,7 @@ done
 
 ### D. Move Scripts from Root
 
-For scripts found in project root:
+For scripts found in the project root:
 
 ```bash
 # Array of root scripts from Step 4
@@ -719,13 +710,13 @@ fi
 
 Re-run the Step 5 `acf-librarian:link-check` block with `fix_mode=true` on the line before it, in the same Bash call (shell variables do not survive between calls). It rewrites a broken link only when exactly one file under `docs/` has the target's name, keeps any `#section` suffix, preserves line endings, and prints `FIXED` for each rewrite.
 
-- **NEVER** edit a link in `docs/cycles/` or `docs/retrospectives/`, in a plugin-installed document (`docs/acf/organization.md`, `docs/acf/git/commit-conventions.md`, `docs/acf/backlog/`, `docs/acf/style/`, or any file with a plugin marker on its first line), or in a doc that is a symlink, by this block or by hand with the Edit tool: the block prints `REPORT-ONLY` for them and they go into the final report for a human.
+- **Never** edit a link in `docs/cycles/` or `docs/retrospectives/`, in a plugin-installed document (`docs/acf/organization.md`, `docs/acf/git/commit-conventions.md`, `docs/acf/backlog/`, `docs/acf/style/`, or any file with a plugin marker on its first line), or in a doc that is a symlink. That holds for this block and for a hand edit with the Edit tool. The block prints `REPORT-ONLY` for these links, and they go into the final report for a human.
 - Links inside fenced code blocks and inline code spans are examples: the block neither reports nor rewrites them, even when the same link appears broken in prose on the same line.
 - `AMBIGUOUS` and `NOT FOUND` links are reported, not guessed.
 
 ### F. Clean Root Directory
 
-For forbidden files in root directory:
+For the root files Step 6 found:
 
 ```bash
 # Array of root violations from Step 6
@@ -930,17 +921,12 @@ fi
 
 ### Two Modes of Operation
 
-**Audit Mode** (default - read-only):
-- ✅ Scans and reports violations
-- ✅ Provides actionable fix suggestions
-- ❌ Does NOT modify files
-- User or Claude must manually fix violations
-
-**Fix Mode** (`--fix` flag):
-- ✅ Scans for violations
-- ✅ Automatically fixes all identified issues
-- ✅ Verifies fixes by re-running audit
-- ⚠️  Modifies files (recommends git commit/stash first)
+| | Audit (default) | Fix (`--fix`) |
+|---|---|---|
+| Writes files | No | Yes: creates, renames and moves files, appends to CLAUDE.md, rewrites links, and deletes a temporary root file only if you answer y. Commit or stash first |
+| Report-only findings | Reported | Reported, never changed |
+| Verbosity findings | Suggested | Suggested, never changed |
+| Afterwards | Fix by hand (or ask Claude), then re-run | Re-runs Steps 1-7 to confirm the fixes |
 
 ### Usage Examples
 
@@ -949,31 +935,16 @@ fi
 /audit-acf-conventions
 ```
 
-**Audit and auto-fix**:
+**Audit and fix**:
 ```bash
 /audit-acf-conventions --fix
 ```
 
 ### Iterative Workflow
 
-**Manual workflow** (audit mode):
-1. Run `/audit-acf-conventions`
-2. Fix reported violations (manually or ask Claude to fix)
-3. Run `/audit-acf-conventions` again
-4. Repeat until clean
+**Audit mode**: run `/audit-acf-conventions`, fix what it reports (by hand or by asking Claude), and run it again until it comes back clean.
 
-**Automated workflow** (fix mode):
-1. Commit or stash uncommitted changes (recommended)
-2. Run `/audit-acf-conventions --fix`
-3. Review changes
-4. Commit fixes
-
-### Leveraging Context
-
-The conventions are already in your session context from the SessionStart hook. Use them to:
-- Understand what to check
-- Know the correct format for each category
-- Provide context-aware suggestions
+**Fix mode**: commit or stash your changes, run `/audit-acf-conventions --fix`, review the diff, then commit the fixes.
 
 ---
 
@@ -985,7 +956,7 @@ The conventions are already in your session context from the SessionStart hook. 
 - "This is a LIBRARY, not a junk drawer!"
 - "Everything must be in its proper place, in its leanest form."
 
-**Tone for fixes** (fix mode): Efficient and satisfaction-expressing
+**Tone for fixes** (fix mode): Brisk, and pleased when done
 - "*rolls up sleeves* Let's organize this mess."
 - "*files papers with precision*"
 - "*nods with satisfaction* Much better."
@@ -1002,7 +973,7 @@ The conventions are already in your session context from the SessionStart hook. 
 - "Adequate organization. Lean documentation."
 - "You may proceed."
 
-**Remember**: The librarian is strict but fair. She wants order AND efficiency, and with `--fix` mode, she'll help you achieve both directly.
+The librarian is strict but fair. She wants every file in its place and every doc lean, and under `--fix` she does the filing herself.
 
 ---
 
@@ -1016,7 +987,7 @@ If `docs/acf/organization.md` doesn't exist or is empty:
 ✅ Initialized docs/acf/organization.md with default conventions
    (you may customize this file and /clear to reload)
 ```
-The audit creates the file from `${CLAUDE_PLUGIN_ROOT}/content/organization-template.md` and continues normally.
+The audit creates the file from `${CLAUDE_PLUGIN_ROOT}/content/organization-template.md` and carries on.
 
 **Audit mode** (no `--fix`):
 ```
@@ -1029,12 +1000,12 @@ Fix options:
 
 Continuing audit with conventions from session context...
 ```
-The audit still runs using conventions already injected by the SessionStart hook, but reports the missing file as a violation.
+The audit still runs on the conventions the SessionStart hook injected, and reports the missing file as a violation.
 
 If `CLAUDE.md` doesn't exist:
 
-**Fix mode**: Creates minimal CLAUDE.md with project header and ACF conventions reference.
-**Audit mode**: Reports as violation with fix suggestion.
+**Fix mode**: creates a minimal CLAUDE.md with a project header and the conventions reference.
+**Audit mode**: reports it as a violation, with the fix.
 
 ---
 
@@ -1137,12 +1108,6 @@ If `CLAUDE.md` doesn't exist:
 
 ---
 
-## Integration with ACF Workflow
+## When to Run It
 
-This command integrates with ACF quality gates:
-- Run before commits (pre-commit hook potential)
-- Include in PR checklist
-- Use as documentation quality gate
-- Part of `/go` workflow verification
-
-The librarian ensures your project stays organized throughout development.
+Nothing runs this audit for you. The plugin's only hook is SessionStart, which installs and injects the conventions, and acf-whip's `/go` does not call the audit. Run it before a commit, or put a clean run on your PR checklist.

@@ -1,9 +1,9 @@
 # ACF Naming & Organization Conventions
 
-> This file defines the naming and organization conventions for this ACF project.
+> The naming and organization conventions for this ACF project.
 > The ACF Librarian plugin injects these rules into every session.
 >
-> **You may customize these conventions for your project** - just edit this file and `/clear` to reload.
+> **You can change these conventions**: edit this file, then run `/clear` to reload.
 
 ---
 
@@ -176,7 +176,7 @@ These files may use uppercase:
 **Format**: `action-target.{sh|py|bash}`
 - Action: verb (archive, migrate, generate, deploy)
 - Target: what it operates on
-- Clear, descriptive, hyphen-separated
+- Hyphen-separated; the name says what the script does
 
 **Examples**:
 - ✅ `archive-old-docs.sh`
@@ -231,16 +231,15 @@ These files may use uppercase:
 
 ### Cross-Reference Requirements
 
-- Every reference must stay synchronized
-- No duplicated content (link to single source of truth)
-- Update all referencing documents when moving files
+- Keep every reference in sync: when you move a file, update every document that links to it
+- Link to the single source of truth instead of duplicating content
 - Fix broken links under `docs/cycles/` and `docs/retrospectives/` by hand only: editing a cycle's `plan.md` re-arms its approval, and a retrospective is a frozen record
 
 ---
 
 ## 6. Single Source of Truth Principle
 
-**Every piece of information has EXACTLY ONE authoritative location.**
+**Every piece of information has exactly one authoritative location.** Other documents link to it.
 
 ### Rules:
 
@@ -249,9 +248,7 @@ These files may use uppercase:
 
 ### When Information Changes:
 
-1. Update the single authoritative source
-2. All references automatically stay current (they link, not copy)
-3. No synchronization burden
+Update the authoritative source. Documents that link to it are current at once; a copy would have to be found and fixed by hand.
 
 ---
 
@@ -282,19 +279,11 @@ docs/
 
 ## 8. Customization Guide
 
-**This file is YOUR project's conventions document.**
+**This file belongs to your project.** Change it to fit.
 
-To customize for your project:
+1. **Add project-specific conventions**: team naming patterns, extra required directories, tech-stack rules.
 
-1. **Add project-specific conventions**:
-   - Team-specific naming patterns
-   - Additional required directories
-   - Tech-stack-specific rules
-
-2. **Modify existing rules** (if needed):
-   - Adjust directory structure for your needs
-   - Add exceptions for your tech stack
-   - Define custom categories
+2. **Modify existing rules**: change the directory structure, add exceptions for your stack, define your own categories.
 
 3. **Reload session**:
    ```bash
@@ -307,7 +296,7 @@ To customize for your project:
    git commit -m "docs(acf): customize organization conventions for project"
    ```
 
-**The librarian will enforce YOUR conventions**, not just the defaults.
+Once edited, this copy is what every session injects. The plugin never overwrites an edited copy.
 
 ---
 
@@ -319,24 +308,25 @@ To verify project compliance with these conventions:
 /audit-acf-conventions
 ```
 
-This command scans your project and reports:
+It reports:
 - Missing required directories
 - Naming convention violations
 - Scripts in wrong locations
 - Broken internal links
 - Root directory violations
+- Documentation token waste and banned words (suggestions only)
 
-Fix violations and re-run until clean.
+Fix the violations, or let `/audit-acf-conventions --fix` repair the ones it is allowed to, then re-run until clean.
 
 ---
 
 ## 10. Documentation Writing Standards: Token Efficiency
 
-**🚨 CRITICAL**: All documentation MUST follow token optimization patterns.
+All documentation MUST follow the token-efficiency rules in this section.
 
 **Target**: 40-70% token reduction vs verbose baseline while preserving 100% of information.
 
-### Code Snippet Policy (ABSOLUTE PROHIBITIONS)
+### Code Snippet Policy
 
 **NEVER include**:
 - ❌ Function/method implementations (describe requirements instead)
@@ -360,7 +350,7 @@ Fix violations and re-run until clean.
 - ❌ Show 10+ lines of repetitive structure
 - **Target**: 40-70% reduction while preserving pattern understanding
 
-**Before** (12 lines):
+**Before** (9 lines):
 ```javascript
 TodoWrite { todos: [
   { content: "Task 1", status: "pending", activeForm: "Working on 1" },
@@ -373,7 +363,7 @@ TodoWrite { todos: [
 ]}
 ```
 
-**After** (4 lines, 67% reduction):
+**After** (4 lines, 56% reduction):
 ```javascript
 TodoWrite { todos: [
   { content: "Task 1", status: "pending", activeForm: "Working on 1" },
@@ -393,7 +383,7 @@ TodoWrite { todos: [
 - ❌ Avoid paragraph descriptions of structured data
 - **Target**: 50-70% reduction for comparison content
 
-**Before** (5 lines prose):
+**Before** (5 sentences of prose):
 > The pending state indicates work not started. The in_progress state means currently working. The completed state shows finished work. The blocked state indicates dependencies preventing progress. The rejected state means quality gate failure.
 
 **After** (table, 60% reduction):
@@ -422,7 +412,7 @@ TodoWrite { todos: [
 - ❌ Bullet list with ❌ emoji prefix per line
 - **Target**: 20-30% reduction
 
-**Before** (15 lines with emoji per line):
+**Before** (9 lines with emoji per line):
 ```markdown
 🔴 FORBIDDEN ACTIONS:
 - ❌ Edit files
@@ -435,7 +425,7 @@ TodoWrite { todos: [
 - ❌ Install packages
 ```
 
-**After** (1 line, 93% reduction):
+**After** (1 line, 89% reduction):
 ```markdown
 **FORBIDDEN**: Edit/Write, Bash execution, Tests, Build/lint, Git ops, Package install
 ```
@@ -481,7 +471,7 @@ TodoWrite { todos: [
 
 ### Style Requirements
 
-**Tone**: Direct, intellectually rigorous, essential information only
+**Tone**: Direct and exact, essential information only
 **Structure**: Headers, bullets, tables, code blocks (NOT long paragraphs)
 **Sections**: <30 lines per section (break into subsections if needed)
 
@@ -497,7 +487,7 @@ TodoWrite { todos: [
 **All documentation created should achieve**:
 - 40-70% token reduction vs verbose baseline
 - 100% information preservation (zero loss of instructions)
-- Maximum semantic density (every token earns its place)
+- No filler: every sentence carries information
 - Scannable structure (tables, bullets, headers, NOT prose)
 
 ### Validation

@@ -12,15 +12,11 @@
 
 **Subject**: Imperative mood, no capitalization, no period, max 50 chars
 
-## File Staging Rules (CRITICAL)
+## File Staging Rules
 
-**STRICTLY FORBIDDEN** (no automated enforcement - manual discipline required):
-- `git add -A` - NEVER
-- `git add .` - NEVER
-- `git add --all` - NEVER
-- `git commit -a` - NEVER
+**FORBIDDEN**: `git add -A`, `git add .`, `git add --all`, `git commit -a`. Nothing blocks these automatically; the rule holds only if whoever commits follows it.
 
-**MANDATORY**:
+**MANDATORY**: stage every file by name.
 ```bash
 # ✅ CORRECT - Explicit file staging
 git add src/specific/file.go

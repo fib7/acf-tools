@@ -1,8 +1,8 @@
 {
   "_comment": "sha256 of every version of each acf-librarian template ever shipped. A consumer copy matching one is unedited, so the SessionStart hook may refresh it; one matching none was edited and is never overwritten. Regenerate with skills/lib/gen-digests.sh: a digest committed here is never dropped, a --seed is kept under seeded, and an uncommitted draft is.",
   "artifacts": {
-    "content/organization-template.md": ["65c2df740379aa99a1104333f788d3b36d99ae571c9a6dabebd1954aa9143a49", "902ad50fe52dba3a059879b2c20bc6782911f77a0a43984f1e584c30b07708dd", "b0b43f7b70aa0e6e8f2ab22956ff834f71784338d7100d5c158fad21e5b6bb33"],
-    "content/git-commit-conventions-template.md": ["18689a9b8c4eb3964b54d5129d651566d08ff874b6188b65d2bd4c6424e97708", "56450156d0c2a98083df22d847dcdb43d6c1e4d76b148e6ccb5016bda714b681", "985754d50cfe183c3eda4a02e3bdd18a9da866778ce3549c6a671676de93adb4"]
+    "content/organization-template.md": ["0ec313b301b71f58796ac285dd8e269036826a1dee93d5181944afbe28a50dd7", "65c2df740379aa99a1104333f788d3b36d99ae571c9a6dabebd1954aa9143a49", "902ad50fe52dba3a059879b2c20bc6782911f77a0a43984f1e584c30b07708dd", "b0b43f7b70aa0e6e8f2ab22956ff834f71784338d7100d5c158fad21e5b6bb33"],
+    "content/git-commit-conventions-template.md": ["18689a9b8c4eb3964b54d5129d651566d08ff874b6188b65d2bd4c6424e97708", "56450156d0c2a98083df22d847dcdb43d6c1e4d76b148e6ccb5016bda714b681", "76db9a425777f303c688788325a67b352db674db886424b7cfd632b3ee7c0c54", "985754d50cfe183c3eda4a02e3bdd18a9da866778ce3549c6a671676de93adb4"]
   },
   "seeded": []
 }

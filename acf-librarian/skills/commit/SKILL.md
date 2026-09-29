@@ -1,82 +1,63 @@
 ---
 name: commit
-description: Stage and commit changes following conventional commit format. Atomic commits, never bypasses pre-commit hooks, minimal communication style.
+description: Stage and commit changes following conventional commit format. Atomic commits (one logical change each), never bypasses pre-commit hooks, terse reports.
 allowed-tools:
   - Bash
   - Read
   - Grep
 ---
 
-# commit - Create git commit following conventions
+# commit: stage and commit following the project's conventions
 
-> **Universal Command Template** - References project git conventions file
+The rules live in the project's git conventions file: `docs/acf/git/commit-conventions.md`, or the
+equivalent file if the project keeps its conventions elsewhere. This skill runs git directly and
+spawns no agents.
 
-## Pre-execution Check
+## Before you start
 
-**BEFORE EXECUTING**, verify:
-- ✅ Git repository initialized
-- ✅ Pre-commit hooks installed (if configured)
-- ✅ Working directory has uncommitted changes
-- ✅ Quality gates passed (or will be enforced by hooks)
-
-**NOTE**: This command uses direct git operations, no agents required.
-
-## Command
-
-Stage and commit changes following project conventions.
+Check that:
+- the directory is a git repository;
+- pre-commit hooks are installed, if the project configures them;
+- there are uncommitted changes;
+- quality gates pass, or the hooks will enforce them at commit time.
 
 ### Arguments: $ARGUMENTS
 
-## Execution
+## Conventions
 
-**MANDATORY**: Follow ALL conventions from `docs/acf/git/commit-conventions.md` (or equivalent git conventions file in your project):
+You must follow every rule in the conventions file. The ones every commit touches:
 
 - Format: `<type>(<scope>): <subject>`
-- Types (feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert)
-- Subject rules (imperative, no caps, no period, max 50 chars)
-- Body rules (72 char wrap, what/why not how)
-- Attribution rules (no AI-generated footers)
+- Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+- Subject: imperative mood, not capitalized, no trailing period, 50 characters at most
+- Body: wrapped at 72 characters, says what changed and why, not how
+- Attribution: no AI-generated footers
 
-## Algorithm
+## Steps
 
-1. **Analyze Changes**:
-   - Run `git status` to identify modified files
-   - Group changes by logical area/scope
-   - Determine appropriate commit type
+1. **Read the changes.** Run `git status`, group the modified files by logical area or scope, and
+   pick the commit type for each group.
+2. **Stage one group.** Add only the files for the current logical change, by name. Never run
+   `git add -A` or `git add .`.
+3. **Write the message.** Type per the conventions, an optional scope for the affected area, and a
+   subject that completes the sentence "This commit will...". Add a body after a blank line when the
+   change needs context.
+4. **Commit.** Run the commit and report whether it succeeded.
+5. **Verify.** Check the new commit against every rule in the conventions file, not only the format
+   line.
+6. **Repeat** steps 1-5 until `git status` shows no uncommitted changes.
 
-2. **Stage Files**:
-   - Stage related changes together (atomic commits)
-   - Never use `git add -A` or `git add .`
-   - Explicitly add only files for current logical change
+## Rules
 
-3. **Craft Message**:
-   - Type: Based on change nature (per conventions)
-   - Scope: Affected area (optional)
-   - Subject: Complete "This commit will..."
-   - Body: Include context if needed (blank line before)
+- **Atomic commits**: one logical change per commit.
+- **The project must build after every commit.**
+- **No AI attribution or co-authorship lines**, ever.
+- **Never bypass pre-commit hooks**: no `--no-verify`, and no other way around them.
+- **The conventions file decides** anything this page does not cover.
 
-4. **Commit**:
-   - Execute commit with crafted message
-   - Verify commit follows conventions
-   - Report success/failure
+## Reporting
 
-5. **Verify**:
-   - Make sure ALL conventions from `docs/acf/git-commit-conventions.md` (or equivalent) are followed
-
-6. **Repeat**
-   - Repeat steps 1-5 until `git status` shows no uncommitted changes
-
-## Critical Rules
-
-- **Atomic commits**: One logical change per commit
-- **Project builds**: Must compile after every commit
-- **Never include**: AI attribution or co-authorship
-- **Always reference**: Project git conventions documentation for details
-- **No --no-verify**: Never bypass pre-commit hooks using any methods
-
-## Communication Style
-
-Minimal, to the point and direct, no sugar-coating.
+Report the result in as few words as it takes. No softening.
 
 - "Done. Committed 3 files."
 - "Done. Created X commits:\n[well formatted table of all commits with hashes, authors and descriptions]"

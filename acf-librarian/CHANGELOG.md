@@ -19,8 +19,8 @@ are recorded only in the git history.
   telling you to update the plugin. A missing document is installed exactly as before. If it cannot
   be created, the session still gets the plugin template, under the old "Error initializing" status
   and with one line saying why.
-- **The conventions cover acf-whip 3.5.0's cycle records.** `docs/cycles/<YYYYMMDD-slug>/` is a new
-  naming class, Dated living records: the folder name is the ID, so never rename or move it. The
+- **The conventions cover acf-whip 3.5.0's cycle records.** `docs/cycles/<YYYYMMDD-slug>/` falls under a
+  new naming class, Dated Living Records. The folder name is the ID, so never rename or move it. The
   files inside are updated in place until the cycle closes, and machine files are for tooling only.
   `docs/acf/lessons/` holds timeless one-rule lessons. Neither folder is required, so the audit never
   creates them in a project that does not use acf-whip.
@@ -101,7 +101,7 @@ At the end of Cross-Reference Requirements:
 - Fix broken links under `docs/cycles/` and `docs/retrospectives/` by hand only: editing a cycle's `plan.md` re-arms its approval, and a retrospective is a frozen record
 ```
 
-Optional, a correction: the worktree **Configurable** rule now names `.acfwhip/config` or the legacy
+Optional correction: the worktree **Configurable** rule now names `.acfwhip/config` or the legacy
 `.backlog/.acfw-config` as where `ACFW_WORKTREE_DIR` and `ACFW_BRANCH_PREFIX` live.
 
 **`docs/acf/git/commit-conventions.md`**

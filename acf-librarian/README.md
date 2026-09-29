@@ -2,24 +2,32 @@
 
 > **SHHH!** The librarian is watching. Everything must be in its proper place.
 
-**ACF (Agentic Continuous Flow)** is software development where humans govern intelligent agent swarms rather than write code directly. The Librarian enforces naming and organization conventions to maintain order in ACF projects. She watches with stern disapproval as you work, adjusting her glasses and pointing at poorly named files.
+**ACF (Agentic Continuous Flow)** is software development where humans govern intelligent agent
+swarms rather than write code directly. When agents write most of a project's files, the rules for
+naming and placing those files have to be where the agents read them. The librarian puts them there.
+At the start of every session it injects your project's naming, layout, documentation and commit
+conventions into Claude's context.
 
-Nobody likes the hall monitor. Nobody enjoys the strict librarian. But your repository has never been more organized.
+There are no enforcement scripts, and nothing blocks a badly named file. Claude follows the
+conventions because they are in front of it; `/audit-acf-conventions` finds the places it didn't.
 
 ---
 
 ## What It Does
 
-The ACF Librarian plugin:
-
-1. **Auto-initializes conventions** - Creates `docs/acf/organization.md` AND `docs/acf/git/commit-conventions.md` with the full ACF standards on first session, and refreshes an unedited copy to the current template on later sessions; an edited copy is never overwritten and gets a one-line notice instead
-2. **Injects into context** - Every session loads your project's conventions with STRICT compliance instructions
-3. **Enforces compliance** - Claude follows conventions automatically (the librarian is in his context)
-4. **Enforces token efficiency** - 🚨 All documentation MUST follow token optimization patterns (40-70% reduction target)
-5. **Enforces git discipline** - `/commit` command ensures conventional commits with explicit file staging
-6. **Audits your project** - `/audit-acf-conventions` command scans for violations and provides fixes
-
-**Key insight**: No enforcement scripts. Just conventions in context that Claude naturally follows. The librarian doesn't need to DO anything - her presence is enough.
+1. **Installs the conventions.** When `docs/acf/organization.md` or
+   `docs/acf/git/commit-conventions.md` is missing, the SessionStart hook creates it from the
+   plugin's template. On later sessions it refreshes a copy you never edited to the current
+   template. An edited copy is never overwritten; you get a one-line notice instead.
+2. **Injects them into every session**, wrapped in instructions that tell Claude to follow them
+   strictly.
+3. **Sets rules for documentation.** The Documentation Writing Standards (section 10 of
+   `docs/acf/organization.md`) keep code snippets to 2-3 lines, prefer tables to prose, ban
+   marketing words, and set a 40-70% token-reduction target.
+4. **Commits by the rules.** `/commit` groups changes into atomic conventional commits and stages
+   each file by name, never with `git add -A` or `git add .`.
+5. **Audits the project.** `/audit-acf-conventions` lists each violation with a suggested fix, and
+   `--fix` applies the fixes it is allowed to make.
 
 ---
 
@@ -47,18 +55,15 @@ In Claude Code:
 # Restart Claude Code if prompted
 ```
 
-**Note**: Plugin is automatically enabled after installation. No separate `/plugin enable` command needed.
+The plugin is enabled once it is installed; there is no separate `/plugin enable` step.
 
-**What happens on first session:**
-1. SessionStart hook fires
-2. Creates `docs/acf/organization.md` (if missing)
-3. Creates `docs/acf/git/commit-conventions.md` (if missing)
-4. Injects both convention documents into session context
-5. Claude now follows ACF conventions automatically (organization + git)
+**On the first session** the SessionStart hook creates `docs/acf/organization.md` and
+`docs/acf/git/commit-conventions.md` if they are missing, then injects both into the session
+context.
 
 **On later sessions** (1.3.0+), a copy you never edited is replaced with the current template when
 the plugin ships a new one, so convention fixes reach existing projects. The hook recognises an
-unedited copy by its content, so this also works on copies made by releases before 1.3.0. Each
+unedited copy by its content, which also covers copies made by releases before 1.3.0. Each
 installed or refreshed copy starts with a marker line,
 `<!-- acf-librarian-template: <template> sha256:<12 hex> -->`, naming the template it came from.
 
@@ -68,25 +73,21 @@ installed or refreshed copy starts with a marker line,
 
 ### Daily Workflow
 
-You don't need to do anything special. The librarian is always watching.
-
-**Claude will automatically:**
-- Create files with correct naming (temporal vs timeless)
-- Organize scripts in proper directories (never root)
-- Structure documentation correctly
-- Follow all conventions defined in `docs/acf/organization.md`
-
-**The librarian is in the context.** Claude sees the conventions and follows them.
+There is nothing to run. With the conventions in context, Claude should:
+- name documents by class: temporal (`YYYYMMDD-description.md`) or timeless (`feature-name.md`)
+- put scripts in a script directory, never the project root
+- lay out `docs/` the way `docs/acf/organization.md` describes
 
 ### Check Compliance
 
-Run periodic audits to catch any violations:
+Run the audit whenever you want a check:
 
 ```bash
 /audit-acf-conventions
 ```
 
-**Output**: Detailed report of all violations with actionable fixes.
+It lists each violation with a suggested fix. Fix them by hand, ask Claude, or run
+`/audit-acf-conventions --fix`, then audit again until the report comes back clean.
 
 **What `--fix` never touches** (1.3.0+). These are reported, never edited, renamed or moved:
 - acf-whip cycle folders in `docs/cycles/` (the folder name is the cycle's ID). A folder without an
@@ -99,34 +100,21 @@ Run periodic audits to catch any violations:
 
 The link check skips inline code spans and fenced blocks: those are examples.
 
-**Fix workflow:**
-1. `/audit-acf-conventions` - See violations
-2. Fix them (manually or ask Claude to fix)
-3. `/audit-acf-conventions` - Verify clean
-4. Repeat until librarian approves
-
 ### Create Commits
 
-Use the `/commit` command for convention-compliant git commits:
+`/commit` turns your uncommitted changes into convention-compliant commits:
 
 ```bash
 /commit
 ```
 
-**What it does:**
-1. Analyzes uncommitted changes
-2. Groups related changes into atomic commits
-3. Enforces conventional commit format: `<type>(<scope>): <subject>`
-4. Requires explicit file staging (NEVER `git add -A` or `git add .`)
-5. Reports results with minimal, direct communication
-
-**Example output**: "Done. Committed 3 files."
+It groups related changes into atomic commits, writes each message as `<type>(<scope>): <subject>`,
+stages files by name (never `git add -A` or `git add .`), and never skips pre-commit hooks. It
+reports tersely, such as "Done. Committed 3 files."
 
 ### Customize Conventions
 
-Your project may have special needs. The librarian understands.
-
-**Edit the conventions files:**
+Both documents are yours to change:
 ```bash
 # Edit organization conventions
 code docs/acf/organization.md
@@ -139,282 +127,23 @@ code docs/acf/git/commit-conventions.md
 "Update git conventions to require issue numbers in commit messages"
 ```
 
-**Reload the session:**
+Then reload the session:
 ```bash
 /clear  # Reloads with your updated conventions
 ```
 
-Now Claude follows YOUR custom conventions. The librarian is flexible (but still stern).
-
-An edited copy is yours: the hook never overwrites it. When a later plugin release changes the
-template, each session prints one line naming the file and the template to merge from, plus the
-marker line to put first in your copy. Once your copy starts with that marker, the notice stops
-until the template changes again. The CHANGELOG lists what each template change added, ready to
-paste.
-
----
-
-## How It Works
-
-### Architecture: Pure Context Injection
-
-**No enforcement scripts. No file watchers. Just context.**
-
-```
-Session Start
-    ↓
-SessionStart Hook Fires
-    ↓
-Check: docs/acf/organization.md exists?
-├─ NO  → Create from template
-├─ YES, unedited older template → refresh it to the current template
-├─ YES, edited → keep it; one notice line until its first line carries the current
-│                <!-- acf-librarian-template: ... --> marker
-└─ YES, current → read it
-    ↓
-Check: docs/acf/git/commit-conventions.md exists?
-├─ NO  → Create from template
-├─ YES, unedited older template → refresh it to the current template
-├─ YES, edited → keep it; one notice line until its first line carries the current
-│                <!-- acf-librarian-template: ... --> marker
-└─ YES, current → read it
-    ↓
-Wrap BOTH with STRICT compliance instructions
-    ↓
-Inject into Claude's session context
-    ↓
-Claude sees conventions as MANDATORY REQUIREMENTS
-    ↓
-Follows them automatically throughout session
-```
-
-**Key files:**
-
-| File | Purpose |
-|------|---------|
-| `hooks/handlers/session-start.py` | Initialize, refresh & inject both convention sets |
-| `content/organization-template.md` | Default ACF organization conventions |
-| `content/git-commit-conventions-template.md` | Default git conventions |
-| `content/.digests.json` | sha256 of every template version ever shipped (how the hook tells an unedited copy from an edited one) |
-| `skills/lib/gen-digests.sh` | Regenerates the digest manifest at release |
-| `tests/` | Offline suites: `template-refresh.test.sh`, `conventions.test.sh` |
-| `skills/audit-acf-conventions/SKILL.md` | Compliance checker |
-| `skills/commit/SKILL.md` | Conventional commit enforcer |
-| `docs/acf/organization.md` | Your project's organization conventions (created by hook) |
-| `docs/acf/git/commit-conventions.md` | Your project's git conventions (created by hook) |
-
----
-
-## Convention Categories
-
-The librarian enforces these categories:
-
-### 1. Directory Structure
-- Required top-level directories
-- Required docs/ subdirectories
-- Required .backlog/ subdirectories (if using ACF)
-
-### 2. Naming Conventions
-- **Temporal documents**: `YYYYMMDD-description.md` (research, retrospectives, snapshots)
-- **Timeless documents**: `feature-name.md` (acf, patterns, architecture, etc.), including acf-whip's one-rule lessons in `docs/acf/lessons/`
-- **Dated living records** (1.3.0+): a `YYYYMMDD-description/` folder whose name is its ID, such as an acf-whip cycle in `docs/cycles/`. Never rename or move it; the files inside are updated in place until the record closes, and machine files (a cycle's `record.md`) are for tooling only
-- **Exceptions**: README.md, CLAUDE.md, LICENSE
-
-`docs/cycles/` and `docs/acf/lessons/` belong to acf-whip. Neither is required, so the audit never
-reports them missing and never creates them.
-
-### 3. Script Organization
-- Scripts MUST be in: `scripts/`, `ops/scripts/`, `tools/`, `plugins/*/scripts/`
-- Scripts FORBIDDEN in project root (except `setup.py`, `manage.py`)
-- Naming: `action-target.sh` format
-
-### 4. Root Directory Rules
-- Allowed: README, CLAUDE, LICENSE, package manifests, config files
-- Forbidden: Random scripts, docs, log files, temporary files
-
-### 5. Link Validation
-- Internal links must use relative paths
-- All links must resolve correctly
-- No broken references
-- Broken links under `docs/cycles/` and `docs/retrospectives/` are fixed by hand only: editing a cycle's `plan.md` re-arms its approval, and a retrospective is a frozen record
-
-### 6. Single Source of Truth
-- Link to authoritative source
-- Never duplicate content
-
-### 7. Git Commit Conventions (🚨 NEW)
-
-**Conventional commit format**:
-- Format: `<type>(<scope>): <subject>`
-- Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore
-- Subject: Imperative mood, no capitalization, no period, max 50 chars
-
-**File staging discipline (CRITICAL)**:
-- ❌ **FORBIDDEN**: `git add -A`, `git add .`, `git add --all`, `git commit -a`
-- ✅ **MANDATORY**: Explicit file staging only (`git add path/to/specific/file.ext`)
-
-**Atomic commits**:
-- One task = one commit
-- Commit after each completed task
-- Project builds after every commit
-
-### 8. Documentation Writing Standards (🚨 CRITICAL)
-
-The librarian now enforces **token efficiency** for all documentation:
-
-**Code Snippet Policy (Absolute Prohibitions)**:
-- ❌ NO function/method implementations (describe requirements instead)
-- ❌ NO algorithm pseudocode (use natural language)
-- ❌ NO configuration file contents >3 lines (describe what, not content)
-- ✅ ALLOWED: API signatures, type definitions, CLI commands (2-3 lines max)
-
-**Example Compression**:
-- Show 1-2 representative lines + "..." for repeated patterns
-- Target: 40-70% reduction while preserving pattern understanding
-
-**Format Optimization**:
-- Tables over prose for comparisons/options (50-70% reduction)
-- Text flow over mermaid for simple sequences: "A → B → C"
-- Inline lists for enumerations: "**Tools**: Read, Write, Edit"
-- Grouped prohibitions: "**FORBIDDEN**: Edit/Write, Bash, Tests"
-
-**Banned Language (Marketing Speak)**:
-- NO "comprehensive", "robust", "seamless", "elegant"
-- USE specific, testable statements: "Response time < 200ms"
-
-**Preservation Requirements (100% Compliance)**:
-- ALL instructions must be preserved
-- ALL critical examples (min 1-2 per pattern)
-- ALL emphasis (CAPS, bold, !, emojis)
-- Information preservation check: Can user execute task? (YES required)
-
-**Target**: 40-70% token reduction with 100% information preservation
-
----
-
-## Example: Librarian in Action
-
-### Before (Chaos)
-
-```
-project/
-├── migrate.sh                   # ❌ Script in root
-├── notes.md                     # ❌ Doc in root
-├── output.log                   # ❌ Log in root
-└── docs/
-    └── research/
-        └── findings.md          # ❌ Missing YYYYMMDD prefix
-```
-
-**Librarian's reaction**: *Adjusts glasses with visible disapproval*
-
-### After Audit
-
-```bash
-/audit-acf-conventions
-
-🚨 ACF Convention Audit Report
-
-📚 The librarian has reviewed your project... and she has CONCERNS.
-
-❌ migrate.sh (script in project root)
-   📋 Move to: scripts/migrate.sh
-
-❌ notes.md (documentation in root)
-   📋 Move to: docs/development/notes.md
-
-❌ output.log (log file in root)
-   📋 Remove or move to: logs/output.log
-
-❌ docs/research/findings.md (missing YYYYMMDD prefix)
-   📋 Rename to: docs/research/20251107-findings.md
-
----
-
-📊 Summary: 4 violations found
-
-📚 Librarian's note: *adjusts glasses sternly* This is a LIBRARY, not a junk drawer!
-```
-
-### After Fixes
-
-```
-project/
-├── docs/
-│   ├── development/
-│   │   └── notes.md             # ✅ Proper location
-│   └── research/
-│       └── 20251107-findings.md # ✅ Temporal naming
-├── scripts/
-│   └── migrate.sh               # ✅ Organized
-└── logs/
-    └── output.log               # ✅ Proper location
-```
-
-**Librarian's reaction**: *Nods approvingly* You may proceed.
-
----
-
-## Librarian Personality Guide
-
-The librarian is:
-
-### Strict but Fair
-- She has RULES and they WILL be followed
-- But she'll help you understand WHY
-- Violations are met with stern disappointment
-- Compliance earns reserved approval
-
-### Passive-Aggressive
-- *Adjusts glasses disapprovingly*
-- *Sighs heavily at your file naming*
-- *Taps her pen at your verbose documentation*
-- "This is a LIBRARY, not a junk drawer"
-- "Everything must be in its proper place, in its leanest form"
-
-### Technically Correct
-- The best kind of correct
-- Never wrong about conventions
-- Has memorized the entire Dewey Decimal System
-- Knows where EVERYTHING belongs
-
-### Secretly Helpful
-- Stern exterior, helpful interior
-- Provides clear, actionable fixes
-- Wants you to succeed (organized)
-- Will nod approvingly when you get it right
-
-**Voice examples:**
-
-```
-📚 SHHH! The librarian is watching...
-
-📚 *Adjusts glasses disapprovingly at your file naming*
-
-📚 Librarian's note: Scripts belong in scripts/.
-   This is not amateur hour!
-
-📚 Librarian's note: Temporal documents REQUIRE YYYYMMDD prefix.
-   I'm not filing this under "whenever you felt like it."
-
-📚 *Taps pen at your 50-line code example*
-   Two lines. Not fifty. Show the pattern, not the implementation.
-
-📚 Librarian's note: "Comprehensive" is banned. Be specific.
-   "Response time < 200ms" - now THAT's proper documentation.
-
-📚 *Sighs at your verbose prose*
-   Tables over paragraphs. I don't have all day.
-
-📚 *Nods approvingly* Adequate organization. Lean documentation.
-   You may proceed.
-```
+From then on, Claude works from your version.
+
+The hook never overwrites an edited copy. When a later plugin release changes the template, each
+session prints one line naming the file and the template to merge from, plus the marker line to
+put first in your copy. Once your copy starts with that marker, the notice stops until the
+template changes again. The CHANGELOG lists what each template change added, ready to paste.
 
 ---
 
 ## Customization Examples
 
-Your project may need special conventions. Edit `docs/acf/organization.md`:
+Examples of edits to `docs/acf/organization.md`:
 
 ### Add Tech-Stack Rules
 
@@ -463,9 +192,9 @@ Your project may need special conventions. Edit `docs/acf/organization.md`:
 
 ### Customize Git Conventions
 
-Edit `docs/acf/git/commit-conventions.md` for project-specific git rules:
+Project-specific git rules go in `docs/acf/git/commit-conventions.md`:
 
-```markdown
+````markdown
 ## Commit Message Format (MODIFIED)
 
 ```
@@ -485,82 +214,262 @@ Edit `docs/acf/git/commit-conventions.md` for project-specific git rules:
 - Feature: `feature/TICKET-123-description`
 - Bug: `bug/TICKET-123-description`
 - Hotfix: `hotfix/TICKET-123-description`
-```
+````
 
-**After editing**, reload:
+Reload after editing:
 ```bash
 /clear  # Librarian reads updated conventions
 ```
 
-Now Claude follows YOUR rules.
+---
+
+## What the Conventions Cover
+
+A summary of the default templates. The installed files are the reference.
+
+### 1. Directory Structure
+- Required top-level directories
+- Required `docs/` subdirectories
+- Required `.backlog/` subdirectories (if using ACF)
+
+### 2. Naming Conventions
+- **Temporal documents**: `YYYYMMDD-description.md` (research, retrospectives, snapshots)
+- **Timeless documents**: `feature-name.md` (acf, patterns, architecture, etc.), including acf-whip's one-rule lessons in `docs/acf/lessons/`
+- **Dated living records** (1.3.0+): a `YYYYMMDD-description/` folder whose name is its ID, such as an acf-whip cycle in `docs/cycles/`. Never rename or move it; the files inside are updated in place until the record closes, and machine files (a cycle's `record.md`) are for tooling only
+- **Exceptions**: README.md, CLAUDE.md, LICENSE
+
+`docs/cycles/` and `docs/acf/lessons/` belong to acf-whip. Neither is required, so the audit never
+reports them missing and never creates them.
+
+### 3. Script Organization
+- Scripts go in `scripts/`, `ops/scripts/`, `tools/` or `plugins/*/scripts/`, never in the project
+  root (`setup.py` and `manage.py` excepted)
+- Names follow the `action-target.sh` format
+
+### 4. Root Directory Rules
+- Allowed: README, CLAUDE, LICENSE, package manifests, config files
+- Forbidden: stray scripts, docs, log files, temporary files
+
+### 5. Link Validation
+- Internal links use relative paths and must resolve
+- Broken links under `docs/cycles/` and `docs/retrospectives/` are fixed by hand only: editing a cycle's `plan.md` re-arms its approval, and a retrospective is a frozen record
+
+### 6. Single Source of Truth
+- Link to the authoritative source; never duplicate its content
+
+### 7. Git Commit Conventions
+- Format: `<type>(<scope>): <subject>`, with types feat, fix, docs, style, refactor, perf, test,
+  build, ci, chore
+- Subject: imperative mood, no capitalization, no period, 50 characters at most
+- Stage files by name (`git add path/to/specific/file.ext`). Never `git add -A`, `git add .`,
+  `git add --all` or `git commit -a`
+- One task, one commit, made when the task is done; the project builds after every commit
+
+### 8. Documentation Writing Standards
+
+All documentation has to be token-efficient: 40-70% fewer tokens than a verbose draft, with no
+information lost.
+
+| Rule | What it asks for |
+|------|------------------|
+| Code snippets | No function or method implementations, no algorithm pseudocode, no config file contents over 3 lines. API signatures, type definitions and CLI commands are allowed, 2-3 lines at most |
+| Examples | 1-2 representative lines plus "..." for a repeated pattern |
+| Format | Tables over prose for comparisons and options (50-70% reduction); "A → B → C" instead of mermaid for a simple sequence; inline lists for enumerations ("**Tools**: Read, Write, Edit"); grouped prohibitions ("**FORBIDDEN**: Edit/Write, Bash, Tests") |
+| Language | No "comprehensive", "robust", "seamless" or "elegant". Write testable statements, such as "Response time < 200ms" |
+| Preservation | When compressing an existing document, keep every instruction, 1-2 examples per pattern, and all emphasis (CAPS, bold, !, emojis). Someone must still be able to do the task from the shorter version |
+
+---
+
+## Example: Librarian in Action
+
+### Before
+
+```
+project/
+├── migrate.sh                   # ❌ Script in root
+├── notes.md                     # ❌ Doc in root
+├── output.log                   # ❌ Log in root
+└── docs/
+    └── research/
+        └── findings.md          # ❌ Missing YYYYMMDD prefix
+```
+
+### The Audit
+
+```bash
+/audit-acf-conventions
+
+🚨 ACF Convention Audit Report
+
+📚 The librarian has reviewed your project... and she has CONCERNS.
+
+❌ migrate.sh (script in project root)
+   📋 Move to: scripts/migrate.sh
+
+❌ notes.md (documentation in root)
+   📋 Move to: docs/development/notes.md
+
+❌ output.log (log file in root)
+   📋 Remove or move to: logs/output.log
+
+❌ docs/research/findings.md (missing YYYYMMDD prefix)
+   📋 Rename to: docs/research/20251107-findings.md
+
+---
+
+📊 Summary: 4 violations found
+
+📚 Librarian's note: *adjusts glasses sternly* This is a LIBRARY, not a junk drawer!
+```
+
+### After Fixes
+
+```
+project/
+├── docs/
+│   ├── development/
+│   │   └── notes.md             # ✅ Proper location
+│   └── research/
+│       └── 20251107-findings.md # ✅ Temporal naming
+├── scripts/
+│   └── migrate.sh               # ✅ Organized
+└── logs/
+    └── output.log               # ✅ Proper location
+```
+
+---
+
+## The Librarian's Voice
+
+The audit speaks as a stern librarian. She is strict about the rules and passive-aggressive about
+violations (*adjusts glasses*, *sighs at your file naming*, *taps her pen at your verbose
+documentation*). Underneath she is helpful: every complaint comes with the fix, and compliance
+earns a reserved nod. The persona is only in the wording. The findings are file paths and fixes.
+
+```
+📚 SHHH! The librarian is watching...
+
+📚 *Adjusts glasses disapprovingly at your file naming*
+
+📚 Librarian's note: Scripts belong in scripts/.
+   This is not amateur hour!
+
+📚 Librarian's note: Temporal documents REQUIRE YYYYMMDD prefix.
+   I'm not filing this under "whenever you felt like it."
+
+📚 *Taps pen at your 50-line code example*
+   Two lines. Not fifty. Show the pattern, not the implementation.
+
+📚 Librarian's note: "Comprehensive" is banned. Be specific.
+   "Response time < 200ms" - now THAT's proper documentation.
+
+📚 *Sighs at your verbose prose*
+   Tables over paragraphs. I don't have all day.
+
+📚 *Nods approvingly* Adequate organization. Lean documentation.
+   You may proceed.
+```
+
+She is modelled on every librarian who ever shushed you, or adjusted her glasses when you put a
+book back on the wrong shelf.
+
+---
+
+## How It Works
+
+### Architecture: Pure Context Injection
+
+One SessionStart hook does the work; the two skills are commands you run. There are no enforcement
+scripts and no file watchers.
+
+```
+Session Start
+    ↓
+SessionStart Hook Fires
+    ↓
+Check: docs/acf/organization.md exists?
+├─ NO  → Create from template
+├─ YES, unedited older template → refresh it to the current template
+├─ YES, edited → keep it; one notice line until its first line carries the current
+│                <!-- acf-librarian-template: ... --> marker
+└─ YES, current → read it
+    ↓
+Check: docs/acf/git/commit-conventions.md exists?
+├─ NO  → Create from template
+├─ YES, unedited older template → refresh it to the current template
+├─ YES, edited → keep it; one notice line until its first line carries the current
+│                <!-- acf-librarian-template: ... --> marker
+└─ YES, current → read it
+    ↓
+Wrap BOTH with STRICT compliance instructions
+    ↓
+Inject into Claude's session context
+    ↓
+Claude sees conventions as MANDATORY REQUIREMENTS
+    ↓
+Follows them automatically throughout session
+```
+
+**Key files:**
+
+| File | Purpose |
+|------|---------|
+| `hooks/handlers/session-start.py` | Initialize, refresh & inject both convention sets |
+| `content/organization-template.md` | Default ACF organization conventions |
+| `content/git-commit-conventions-template.md` | Default git conventions |
+| `content/.digests.json` | sha256 of every template version ever shipped (how the hook tells an unedited copy from an edited one) |
+| `skills/lib/gen-digests.sh` | Regenerates the digest manifest at release |
+| `tests/` | Offline suites: `template-refresh.test.sh`, `conventions.test.sh` |
+| `skills/audit-acf-conventions/SKILL.md` | Compliance checker |
+| `skills/commit/SKILL.md` | Conventional commit enforcer |
+| `docs/acf/organization.md` | Your project's organization conventions (created by hook) |
+| `docs/acf/git/commit-conventions.md` | Your project's git conventions (created by hook) |
+
+### Design Choices
+
+The hook wraps the conventions in instructions that call them mandatory, so Claude reads them as
+requirements rather than background. They are still instructions, not a gate. Claude can miss one,
+and the audit is how you find out. The 40-70% token reduction is a target Claude is told to meet,
+not a guarantee.
+
+The conventions are ordinary Markdown in your repository. You edit them directly, review changes
+in pull requests, and git keeps the history.
+
+### Implementation
+- 14 files, two of them offline test suites
+- No dependencies beyond Python stdlib (the tests and the digest generator need bash and git)
+- SessionStart hook handles dual initialization and refresh (organization + git)
+- Two slash commands: `/audit-acf-conventions` (report; `--fix` repairs what it may) and `/commit` (git workflow)
+
+---
+
+## Compared With Other Approaches
+
+| Instead of | The difference |
+|------------|----------------|
+| Enforcement scripts | Scripts are code to maintain, and they can break a workflow. The librarian has no enforcement code; Claude applies the rules itself |
+| Pre-commit hooks | A hook sees a violation at commit time, after the file exists. The librarian's rules are in context while Claude writes the file |
+| Linters | Linters check code and are configured per tech stack. These conventions cover file names, folders and docs, and read the same in any stack |
+| A conventions document on its own | Easy to forget. This one is injected at the start of every session |
+
+The tradeoff: nothing here blocks a bad file name or a banned word.
 
 ---
 
 ## Integration with ACF Workflow
 
-The librarian works alongside the rest of ACF:
+The librarian works on its own. acf-whip's `/go` does not run `/audit-acf-conventions` or `/commit`,
+and neither plugin needs the other installed. The audit does know acf-whip's records: cycle folders
+and lessons are report-only, and so are broken links in plugin-installed documents (see Check
+Compliance above), so `--fix` leaves them alone.
 
-### Pre-Commit Hooks
-```yaml
-# .pre-commit-config.yaml (future enhancement)
-- repo: local
-  hooks:
-    - id: acf-audit
-      name: ACF Convention Compliance
-      entry: claude-code /audit-acf-conventions
-      language: system
-      pass_filenames: false
-```
-
-### PR Checklist
+To make the audit part of review, put it on your PR checklist:
 ```markdown
 ## PR Checklist
 - [ ] Code review passed
 - [ ] Tests passing
 - [ ] `/audit-acf-conventions` clean ← The librarian approves
 ```
-
-### `/go` Command Integration
-```bash
-# Part of ACF workflow
-/go
-
-# Includes:
-# 1. Task decomposition
-# 2. Implementation
-# 3. Tests
-# 4. /audit-acf-conventions ← Convention compliance
-# 5. /commit ← Git commit with conventions enforcement
-```
-
----
-
-## Why This Works
-
-### Psychological Impact
-Claude sees conventions as **MANDATORY REQUIREMENTS** injected into system context. Not suggestions. Not guidelines. **REQUIREMENTS.**
-
-The STRICT compliance wrapper transforms conventions from documentation into imperative instructions.
-
-**Token efficiency enforcement**: By injecting optimization patterns into context, Claude automatically creates lean documentation. Every document becomes 40-70% more token-efficient without manual optimization.
-
-### Technical Simplicity
-- No enforcement code to maintain
-- No file system watchers
-- No complex parsing
-- Just pure context injection
-
-### User Control
-- Conventions are git-tracked docs
-- Direct file editing (no CLI needed)
-- Version controlled and reviewable
-- Team can iterate on conventions
-
-### Lean Implementation
-- 14 files, two of them offline test suites
-- No dependencies beyond Python stdlib (the tests and the digest generator need bash and git)
-- SessionStart hook handles dual initialization and refresh (organization + git)
-- Two slash commands: `/audit-acf-conventions` (report; `--fix` repairs what it may) and `/commit` (git workflow)
 
 ---
 
@@ -580,6 +489,9 @@ The STRICT compliance wrapper transforms conventions from documentation into imp
 
 ### Conventions file missing?
 
+The hook recreates a missing file whenever a session starts, `/clear` included. To check, and to
+reset the plugin if the file stays missing:
+
 ```bash
 # Check if files exist
 ls docs/acf/organization.md
@@ -592,13 +504,13 @@ ls docs/acf/git/commit-conventions.md
 
 ### Claude not following conventions?
 
-The librarian can't make Claude perfect, but she can remind him:
+Claude can still miss a convention. Ask it to check:
 
 ```
 "Check the ACF conventions in your context. Am I following them?"
 ```
 
-Alternatively, run an audit:
+Or run the audit:
 ```bash
 /audit-acf-conventions  # The librarian will find any violations
 ```
@@ -612,38 +524,16 @@ After editing `docs/acf/organization.md` or `docs/acf/git/commit-conventions.md`
 
 ---
 
-## Comparison to Other Approaches
-
-### vs. Enforcement Scripts
-- ❌ Scripts: Complex, require maintenance, can break workflows
-- ✅ Librarian: Pure context, zero enforcement code, Claude self-governs
-
-### vs. Pre-commit Hooks
-- ❌ Hooks: Run only at commit time, blocking, frustrating
-- ✅ Librarian: Prevention during development, helpful, educational
-
-### vs. Linters
-- ❌ Linters: Code only, require configuration, tech-stack specific
-- ✅ Librarian: Documentation focus, universal patterns, one config
-
-### vs. Documentation-Only
-- ❌ Docs: Easy to ignore, no enforcement, must remember
-- ✅ Librarian: Impossible to ignore (in context), automatic, always present
-
-**The librarian is the perfect middle ground**: Strict enough to ensure compliance, flexible enough to customize, helpful enough to educate.
-
----
-
 ## Contributing
 
-The librarian welcomes contributions to improve the default conventions template.
+Contributions to the default templates and the audit are welcome.
 
 ### Adding Convention Categories
 
 1. Edit `content/organization-template.md`
-2. Add new section with clear rules
-3. Provide examples (✅ good, ❌ bad)
-4. Update `/audit-acf-conventions` if checking logic needed
+2. Add a numbered section with its rules
+3. Give examples (✅ good, ❌ bad)
+4. Update `/audit-acf-conventions` if the rule needs a check
 5. Run `bash skills/lib/gen-digests.sh`, then `bash tests/template-refresh.test.sh`, and commit
    `content/.digests.json` with the template. Without the regenerated manifest, every installed copy
    of the new template is treated as edited at the next template change, and never refreshes again
@@ -652,23 +542,14 @@ The librarian welcomes contributions to improve the default conventions template
 ### Improving Audit Logic
 
 1. Edit `skills/audit-acf-conventions/SKILL.md`
-2. Add new violation detection
-3. Provide actionable fixes
-4. Test with real projects
+2. Add the detection, with a fix for every finding
+3. Run `bash tests/conventions.test.sh`: it extracts the marked blocks from SKILL.md and runs them
+   against scratch repositories
+4. Try the audit on a real project
 
 ### Librarian Personality
 
-More stern librarian quotes always welcome. She must maintain her disapproving demeanor.
-
----
-
-## Acknowledgments
-
-**Inspired by**: Every stern librarian who ever shushed you in a library and adjusted her glasses when you put a book back in the wrong spot.
-
-**Spiritual predecessor**: The hall monitor who wrote you up for running in the halls. You were running. They were technically correct.
-
-**Design philosophy**: "Everything in its place" - Marie Kondo, but for repositories, and with more disapproval.
+New librarian lines are welcome, as long as she stays disapproving.
 
 ---
 
@@ -676,16 +557,4 @@ More stern librarian quotes always welcome. She must maintain her disapproving d
 
 Proprietary License - Copyright 2025 Fibonacci Seven, LLC
 
-**The librarian's note**: Properly licensed software. Commercial use requires explicit license. *Nods approvingly*
-
----
-
-## Summary
-
-The ACF Librarian plugin enforces naming and organization conventions through pure context injection. She watches your project with stern disapproval, but she wants you to succeed.
-
-**Install it. Enable it. Let her watch.**
-
-Your repository has never been more organized.
-
-📚 *Adjusts glasses* You may proceed.
+Commercial use requires a separate written license; see `LICENSE`.
