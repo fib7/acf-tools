@@ -7,11 +7,13 @@
 #   --slug     explicit Worktree slug (optional); default is the TASK_FILE's Worktree: field.
 #
 # Resolves the task's Worktree slug, lazy-creates an isolated git worktree on
-# worktree/<slug> forked from the LIVE trunk tip, validates the branch, records the
+# worktree/<slug> forked from the LIVE trunk tip (or re-attaches that branch, untouched,
+# when it outlived its worktree directory), validates the branch, records the
 # per-slug fork-base, stashes unrelated changes, logs the clean-checkout OK token, and
 # prints the worktree path.
-# The lock is git itself: `git worktree add -b <branch>` fails when the branch is
-# already checked out elsewhere — that failure is the mutual-exclusion primitive.
+# The lock is git itself: `git worktree add -b <branch>` fails when the branch already
+# exists, and a re-attach fails when it is already checked out elsewhere — that failure is
+# the mutual-exclusion primitive.
 #
 # LP-CAS (3.0.0): this is a PRODUCER-side primitive only. It NEVER rebases/resets the
 # branch onto a cached trunk snapshot — the keystone defect (#1) was exactly that snapshot
@@ -24,7 +26,8 @@
 # Exit codes (all fatal to the caller unless noted):
 #   0  success (worktree path printed on stdout)
 #   1  Worktree: field missing on a code-touching task
-#   2  branch in use elsewhere (lock held by another agent — defer, try another task)
+#   2  branch in use elsewhere (lock held by another agent — defer, try another task); when the
+#      branch is checked out in another worktree, stderr names that worktree's path
 #   3  worktree exists but on the wrong branch (manual intervention)
 #   5  trunk branch not resolvable (detached HEAD)
 #   6  the durable clean-checkout token could not be written to a non-files task store (retry)
@@ -56,7 +59,12 @@ if [ -z "$TASK_FILE" ]; then
   exit 1
 fi
 SLUG="$SLUG_OVERRIDE"
-[ -n "$SLUG" ] || SLUG=$(grep -E '^- \*\*Worktree\*\*:' "$TASK_FILE" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
+# FIRST matching line only (-m1). A materialized spec on a non-files store appends the store's comments
+# after the task document (multica's `## Store Comments`), and a comment that restates the field is a
+# second `- **Worktree**:` line. Reading every match and deleting the whitespace between them glued the
+# two values into one slug (`api` + `api` = `apiapi`), so the task checked out a worktree and branch
+# that belong to no task. The metadata block always comes first, so the first match is the field.
+[ -n "$SLUG" ] || SLUG=$(grep -m1 -E '^- \*\*Worktree\*\*:' "$TASK_FILE" | sed -E 's/.*Worktree\*\*:[[:space:]]*//' | tr -d '[:space:]')
 
 if [ -z "$SLUG" ]; then
   echo "FATAL: task $TASK_FILE has no Worktree: field. Run '/whip-doctor --fix' to derive and backfill the slug (or have task-engineer set it)." >&2
@@ -75,9 +83,9 @@ if [ -z "$TRUNK_BRANCH" ]; then
   exit 5
 fi
 
-# ---- Step 3: Lazy-create the worktree ----
+# ---- Step 3: Lazy-create the worktree (or re-attach a branch that outlived its directory) ----
 WORKTREE_WAS_CREATED=0
-if [ ! -d "$WORKTREE_PATH" ]; then
+if [ ! -d "$WORKTREE_PATH" ] && ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
   # Run it UNNEGATED and read $? directly. Inside `if ! cmd; then`, $? is the status of the NEGATION
   # - always 1 - so `rc=$?` could never be 99 and the lock-contention exit below was unreachable
   # code. A worktree add that lost the index.lock backoff was reported as "another agent owns this
@@ -97,6 +105,77 @@ if [ ! -d "$WORKTREE_PATH" ]; then
   # never replays trunk history. The fork-base need not track trunk (it is the 3-way base, not a
   # rebase target), which is precisely why no snapshot can go stale here.
   git -C "$REPO_ROOT" update-ref "refs/acfw/forkbase/$SLUG" "$(git -C "$REPO_ROOT" rev-parse "$TRUNK_BRANCH")" 2>/dev/null || true
+elif [ ! -d "$WORKTREE_PATH" ]; then
+  # The BRANCH outlived its DIRECTORY: the worktree was reaped or deleted by hand, or an older release
+  # made it, and the branch survived. `add -b` cannot create a branch that exists, so this used to exit 2
+  # "another agent owns branch" for a branch nobody had checked out. That was a livelock: a task whose
+  # clean-checkout token is missing gets it back only by running this script again, so whip-go parked
+  # it, the re-dispatch hit the same exit 2, and so on. The branch's commits ARE the task's work, so it
+  # is re-attached exactly as it is: never reset, never rebased, never re-forked from trunk.
+  #   Where is the branch checked out? One "<state> <path>" line per registration, state live, locked
+  # or prunable (git never reports a locked worktree as prunable). The path is the REST of the
+  # `worktree ` line, not $2, because a worktree path may contain spaces.
+  REGS=$(git -C "$REPO_ROOT" worktree list --porcelain | awk -v b="branch refs/heads/$BRANCH" '
+    function flush() { if (hit) print st, p; hit = 0 }
+    /^worktree / { flush(); p = substr($0, 10); st = "live"; next }
+    $0 == b      { hit = 1; next }
+    /^locked/    { st = "locked"; next }
+    /^prunable/  { st = "prunable"; next }
+    END          { flush() }')
+  REG1=${REGS%%$'\n'*}
+  REG_STATE=${REG1%% *}
+  REG_PATH=${REG1#* }
+  # git reports a resolved real path; ours is built from $REPO_ROOT and may run through a symlink (on
+  # macOS $TMPDIR is /var -> /private/var). The directory is gone, so resolve its deepest existing
+  # ancestor instead and compare those.
+  _cc_phys() {
+    local d="$1" tail=""
+    while [ ! -d "$d" ]; do tail="/$(basename "$d")$tail"; d=$(dirname "$d"); done
+    printf '%s%s\n' "$(cd "$d" && pwd -P)" "$tail"
+  }
+  ADD_FORCE=""
+  if [ -z "$REGS" ]; then
+    : # checked out nowhere: a plain re-attach
+  elif [ "$REG1" = "$REGS" ] && [ "$REG_STATE" = "prunable" ] \
+       && [ "$(_cc_phys "$REG_PATH")" = "$(_cc_phys "$WORKTREE_PATH")" ]; then
+    # Its only registration is THIS path, whose directory was deleted without `git worktree prune`.
+    # A plain add refuses ("missing but already registered worktree") and git names -f as the
+    # override, which drops the dead registration. -f also waives git's refusal to check out a branch
+    # that is checked out elsewhere, which is safe only because this dead path is the sole place it is.
+    ADD_FORCE="-f"
+  else
+    # Really checked out somewhere else. Name the place: "another agent owns it" gave an operator
+    # nothing to act on, and a directory that is already gone needs a prune, not a wait.
+    echo "FATAL: cannot attach $BRANCH at $WORKTREE_PATH: it is checked out in the worktree at $REG_PATH." >&2
+    case "$REG_STATE" in
+      prunable) echo "       That directory no longer exists; 'git worktree prune' clears the stale registration." >&2 ;;
+      locked)   echo "       That worktree is locked; 'git worktree unlock' it only if nothing still uses it." >&2 ;;
+    esac
+    exit 2
+  fi
+  # $ADD_FORCE unquoted on purpose: empty must expand to NO argument, not to "".
+  # The exclusion here is git's own refusal (a non-empty target path, a branch already checked out)
+  # rather than branch creation, so a checkout racing a fresh `add -b` of the same slug can in principle
+  # slip into the few milliseconds between that branch appearing and its worktree being registered.
+  # whip-go never runs two checkouts of one slug at once (the slug partition), so it is not guarded.
+  git_with_lock_backoff -C "$REPO_ROOT" worktree add $ADD_FORCE "$WORKTREE_PATH" "$BRANCH" >&2
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    [ $rc -eq 99 ] && exit 99
+    echo "FATAL: cannot re-attach existing branch $BRANCH at $WORKTREE_PATH (git's reason is above)." >&2
+    exit 2
+  fi
+  WORKTREE_WAS_CREATED=1
+  # The fork base is NOT today's trunk tip. This branch forked long ago, and the candidate is
+  # commit-tree(branch-tree, parent=fork-base): recording the current tip would make it revert everything
+  # trunk has gained since. A fork-base recorded when the branch was created is kept, because LP-CAS
+  # never moves a branch and so that commit is still its ancestor. One that is NOT an ancestor belongs to
+  # an earlier branch of this slug and describes nothing on this one, so it is dropped, and Step 5
+  # backfills the missing ref with merge-base(branch, trunk): the commit the branch actually forked from.
+  if git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/acfw/forkbase/$SLUG" >/dev/null 2>&1 \
+     && ! git -C "$REPO_ROOT" merge-base --is-ancestor "refs/acfw/forkbase/$SLUG" "$BRANCH" 2>/dev/null; then
+    git -C "$REPO_ROOT" update-ref -d "refs/acfw/forkbase/$SLUG" 2>/dev/null || true
+  fi
 fi
 
 # ---- Step 3.5: Worktree env hydration (.worktreeinclude) ----
@@ -127,8 +206,9 @@ fi
 # on a rewritten trunk, freezing every worktree's base ~1292 commits stale. There is no snapshot now.
 # The branch simply carries the specialist's code on top of its fork-base; the integrator applies
 # that change onto the LIVE trunk at integration time (cherry-pick, base = fork-base), so the branch
-# can never be stale. All we do here is BACKFILL a missing fork-base for a pre-3.0.0 worktree so the
-# integrator has a 3-way base; if even that is unavailable the integrator falls back to merge-base.
+# can never be stale. All we do here is BACKFILL a missing fork-base (a pre-3.0.0 worktree, or a branch
+# Step 3 re-attached without a usable one) so the integrator has a 3-way base; if even that is
+# unavailable the integrator falls back to merge-base.
 BASE_REF="refs/acfw/forkbase/$SLUG"
 if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$BASE_REF" >/dev/null 2>&1; then
   MB=$(git -C "$REPO_ROOT" merge-base "$BRANCH" "$TRUNK_BRANCH" 2>/dev/null || true)

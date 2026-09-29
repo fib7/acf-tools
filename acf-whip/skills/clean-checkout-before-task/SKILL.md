@@ -24,16 +24,22 @@ bash "${CLAUDE_PLUGIN_ROOT}/skills/clean-checkout-before-task/bin/clean-checkout
 store. On success the script prints the worktree path on **stdout** and sends all git output to
 stderr. `cd` into that path and do all further work there.
 
-Git is the lock. `git worktree add -b worktree/<slug>` fails when the branch is already checked out
-in another worktree, and that failure is the mutual exclusion. There is no lock file, daemon or
-scheduler.
+Git is the lock. `git worktree add -b worktree/<slug>` fails when the branch already exists, a
+re-attach fails when the branch is already checked out in another worktree, and that failure is the
+mutual exclusion. There is no lock file, daemon or scheduler.
 
 ## What the script does
 
-1. Resolve the `Worktree:` slug from the task front-matter (missing → exit 1 for code tasks).
+1. Resolve the `Worktree:` slug from the task front-matter (missing → exit 1 for code tasks). Only
+   the first `Worktree:` line counts, so a store comment appended to a materialized spec that
+   repeats the field cannot change the slug.
 2. Resolve trunk from `$ACFW_TRUNK_ROOT` / `$ACFW_TRUNK_BRANCH` (set by `/go`), else from git.
 3. Lazy-create `.worktree/<slug>` on `worktree/<slug>` from the local trunk, and record the fork
-   base (`refs/acfw/forkbase/<slug>` = the trunk SHA the branch's code sits on).
+   base (`refs/acfw/forkbase/<slug>` = the trunk SHA the branch's code sits on). If the branch
+   already exists but its directory is gone (a reaped worktree, or one an older release made), the
+   script re-attaches the branch as it is, with its commits, instead of failing. It never resets or
+   rebases it, and it does not record today's trunk tip as its fork base: step 6 backfills
+   `merge-base` when no fork base is recorded.
 4. **Hydrate** a newly created worktree from `.worktreeinclude` (the script's Step 3.5). This
    copies or symlinks untracked dev files such as `.env` and `node_modules`, so the worktree can run
    the full dev environment. No manifest, no hydration. See `hydrate-worktree.sh`.
@@ -74,7 +80,7 @@ It is safe to re-run. Targets that already exist are skipped, and a missing mani
 |---|---|---|
 | 0 | success (worktree path on stdout) | `cd` into it; proceed |
 | 1 | `Worktree:` field missing on a code task | Send back to task-engineer; do not pick up |
-| 2 | branch in use elsewhere (lock held) | Defer; try a different task |
+| 2 | branch in use elsewhere (lock held); stderr names the worktree it is checked out in | Defer; try a different task. If that worktree's directory is gone, `git worktree prune` clears it |
 | 3 | worktree on the wrong branch | Stop; manual intervention |
 | 5 | trunk branch not resolvable (detached HEAD) | Operator must check out a branch at root |
 | 6 | the durable clean-checkout token could not be written to a non-`files` task store | Transient; orchestrator retries next iteration |
@@ -105,4 +111,4 @@ dropping it silently.
 
 ---
 
-**Last Updated**: 2026-05-28
+**Last Updated**: 2026-09-29

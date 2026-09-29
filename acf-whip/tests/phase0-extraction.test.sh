@@ -71,13 +71,25 @@ mktask pending feat-noslug ""
 bash "$CC" "$REPO/.backlog/pending/feat-noslug.md" >/dev/null 2>&1; RC=$?
 check "missing-slug exit 1" "[ $RC -eq 1 ]"
 
-echo "== clean-checkout.sh branch-in-use -> exit 2 =="
-# A second task with the SAME slug while the worktree dir is removed but branch exists.
+echo "== clean-checkout.sh re-attaches a branch that outlived its worktree -> exit 0 (3.5.1) =="
+# A second task with the SAME slug while the worktree dir is removed but the branch exists. Until 3.5.1
+# this exited 2, "another agent owns branch", although nobody had the branch checked out: `worktree add
+# -b` fails on any existing branch. That exit was the root of the ENG-101 token-park livelock.
 git -C "$REPO" worktree remove --force "$REPO/.worktree/alpha" 2>/dev/null || true
 mktask pending feat-002 alpha
-bash "$CC" "$REPO/.backlog/pending/feat-002.md" >/dev/null 2>&1; RC=$?
-# branch worktree/alpha still exists -> `git worktree add -b` fails -> exit 2
+OUT=$(bash "$CC" "$REPO/.backlog/pending/feat-002.md" 2>/dev/null); RC=$?
+check "re-attach exit 0" "[ $RC -eq 0 ]"
+check "re-attach prints the worktree path" "[ \"\$OUT\" = '$REPO/.worktree/alpha' ]"
+check "re-attached tree is on worktree/alpha" "[ \"\$(git -C '$REPO/.worktree/alpha' branch --show-current)\" = worktree/alpha ]"
+
+echo "== clean-checkout.sh branch-in-use -> exit 2 =="
+# Really in use: worktree/beta is checked out at another path, so .worktree/beta cannot attach it.
+git -C "$REPO" worktree add -q -b worktree/beta "$WORK/elsewhere-beta" trunk >/dev/null 2>&1
+mktask pending feat-003 beta
+ERR=$(bash "$CC" "$REPO/.backlog/pending/feat-003.md" 2>&1 >/dev/null); RC=$?
 check "branch-in-use exit 2" "[ $RC -eq 2 ]"
+check "branch-in-use names the worktree that holds it" "printf '%s' \"\$ERR\" | grep -q 'elsewhere-beta'"
+rm -f "$REPO/.backlog/pending/feat-003.md"
 
 echo "== apply-transition.sh + idempotency =="
 bash "$AT" "$REPO/.backlog/pending/feat-002.md" in-progress orchestrator dispatch >/dev/null; RC=$?

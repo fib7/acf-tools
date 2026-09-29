@@ -7,11 +7,12 @@
 # clean-checkout's reentrancy the single highest-risk detail in the design. The mutual-exclusion
 # primitive does NOT protect you here:
 #
-#   clean-checkout.sh:78-84  the lazy-create guard is a bare `[ ! -d "$WORKTREE_PATH" ]`, and exit 2
-#                            ("branch in use elsewhere") fires ONLY inside that create branch. A second
-#                            invocation against an ALREADY-CREATED worktree sails straight past it.
-#   clean-checkout.sh:104-109 the branch check then passes (it IS the right branch)...
-#   clean-checkout.sh:127-129 ...and Step 6 runs `git stash push -u ... || true` on ANY dirty state,
+#   clean-checkout.sh:88-179 the lazy-create guard is a bare `[ ! -d "$WORKTREE_PATH" ]`, and exit 2
+#                            ("branch in use elsewhere") fires ONLY inside that create/re-attach
+#                            branch. A second invocation against an ALREADY-CREATED worktree sails
+#                            straight past it.
+#   clean-checkout.sh:195-201 the branch check then passes (it IS the right branch)...
+#   clean-checkout.sh:218-222 ...and Step 6 runs `git stash push -u ... || true` on ANY dirty state,
 #                            silently, into the SHARED refs/stash. "Unrelated" is not modelled and -u
 #                            sweeps untracked files. A sibling agent's in-flight work is GONE.
 #
@@ -31,6 +32,12 @@
 #   D  the Transition Log survives a legitimate second checkout: not truncated, ## Metadata intact,
 #      and the clean-checkout token rows are well-formed
 #   E  two concurrent clean-checkout processes on a FRESH slug do not BOTH fail — exactly one wins
+#   F  a branch that OUTLIVED its worktree directory is re-attached, not refused: whip-go re-records a
+#      lost token only by re-running clean-checkout, so the old exit 2 here livelocked the task. The
+#      branch keeps its commits, and the fork-base is the real fork point, never today's trunk tip
+#   G  a branch checked out in ANOTHER worktree still exits 2, and stderr names that worktree
+#   H  only the FIRST `- **Worktree**:` line is the slug: a store comment restating the field no longer
+#      glues a second slug on (`api` + `api` = `apiapi`)
 # Run: bash acf-whip/tests/phase11-checkout-reentrancy.test.sh
 
 set -u
@@ -173,6 +180,96 @@ check 'E6 the seed transition row was not lost to the race' \
   'grep -q "Initial task creation" "$RF"'
 check 'E7 no .acfw-log temp left behind by the losing writer' \
   '[ -z "$(ls -a "$REPO/.backlog/pending" | grep "^\.acfw-log\." || true)" ]'
+
+echo "== F. a branch that outlived its worktree directory is re-attached, untouched =="
+# The field livelock: the worktree directory was gone, the branch survived, and `add -b` cannot create
+# a branch that exists — exit 2 "another agent owns branch", on every re-dispatch, for a branch nobody
+# had checked out.
+mktask reattach ra
+RAF="$REPO/.backlog/pending/reattach.md"
+WTF=$(bash "$CC" "$RAF" 2>/dev/null)
+FORK0=$(git -C "$REPO" rev-parse trunk)
+echo "ra work" > "$WTF/ra-work.txt"; git -C "$WTF" add ra-work.txt; git -C "$WTF" commit -qm "feat: ra work"
+RA_SHA=$(git -C "$REPO" rev-parse worktree/ra)
+# Trunk moves on, so "the fork point" and "today's trunk tip" are different commits.
+echo adv > trunk-adv; git add trunk-adv; git commit -qm "trunk advances"
+# The reaper removes the worktree (directory AND registration); the branch survives. Drop the fork-base
+# too, as for a worktree made before 3.0.0, so the re-attach has to derive one.
+git -C "$REPO" worktree remove --force "$WTF"
+git -C "$REPO" update-ref -d refs/acfw/forkbase/ra
+# A re-attached tree is a fresh checkout, so hydration must run on it like on a created one.
+echo cfg > local.cfg; echo local.cfg >> .git/info/exclude; printf 'copy: local.cfg\n' > .worktreeinclude
+OUT=$(bash "$CC" "$RAF" 2>"$WORK/f.err"); rc=$?
+rm -f .worktreeinclude
+check 'F1 re-attach exits 0 (it used to exit 2 for a branch nobody had checked out)' '[ "$rc" = "0" ]'
+check 'F2 stdout is exactly the worktree path and nothing else' '[ "$OUT" = "$REPO/.worktree/ra" ]'
+check 'F3 the re-attached worktree is on the task branch' \
+  '[ "$(git -C "$OUT" branch --show-current)" = worktree/ra ]'
+check 'F4 the branch was NOT reset or rebased (its tip is still the task commit)' \
+  '[ "$(git -C "$REPO" rev-parse worktree/ra)" = "$RA_SHA" ]'
+check 'F5 the committed task work is in the re-attached tree' '[ -f "$OUT/ra-work.txt" ]'
+check 'F6 fork-base backfilled to the real fork point (merge-base), NOT the current trunk tip' \
+  '[ "$(git -C "$REPO" rev-parse refs/acfw/forkbase/ra)" = "$FORK0" ] && [ "$FORK0" != "$(git -C "$REPO" rev-parse trunk)" ]'
+check 'F7 the re-attached tree was hydrated from .worktreeinclude' '[ -f "$OUT/local.cfg" ]'
+check 'F8 the re-attach logged its clean-checkout token (the whole point of re-dispatching)' \
+  '[ "$(grep -c "| clean-checkout | ok | clean-checkout-before-task | ra | worktree/ra |" "$RAF")" = "2" ]'
+
+# The directory is deleted by hand WITHOUT a prune: the registration survives and names THIS path, and
+# git refuses a plain add there ("missing but already registered worktree").
+FB_BEFORE=$(git -C "$REPO" rev-parse refs/acfw/forkbase/ra)
+rm -rf "$REPO/.worktree/ra"
+OUT=$(bash "$CC" "$RAF" 2>"$WORK/f2.err"); rc=$?
+check 'F9 a dead registration of the SAME path is re-attached too' \
+  '[ "$rc" = "0" ] && [ "$OUT" = "$REPO/.worktree/ra" ] && [ "$(git -C "$OUT" branch --show-current)" = worktree/ra ]'
+check 'F10 ...with the branch tip untouched' '[ "$(git -C "$REPO" rev-parse worktree/ra)" = "$RA_SHA" ]'
+check 'F11 the branch is registered exactly once afterwards (the dead registration was dropped)' \
+  '[ "$(git -C "$REPO" worktree list --porcelain | grep -cx "branch refs/heads/worktree/ra")" = "1" ]'
+check 'F12 a recorded fork-base that IS an ancestor of the branch is kept' \
+  '[ "$(git -C "$REPO" rev-parse refs/acfw/forkbase/ra)" = "$FB_BEFORE" ]'
+
+# A fork-base that is NOT an ancestor of the branch belongs to an earlier branch of the slug; used as
+# the candidate's parent it would carry changes that are not this branch's.
+git -C "$REPO" worktree remove --force "$REPO/.worktree/ra"
+git -C "$REPO" update-ref refs/acfw/forkbase/ra trunk
+bash "$CC" "$RAF" >/dev/null 2>&1; rc=$?
+check 'F13 a non-ancestor fork-base is replaced by the merge-base on re-attach' \
+  '[ "$rc" = "0" ] && [ "$(git -C "$REPO" rev-parse refs/acfw/forkbase/ra)" = "$FORK0" ]'
+
+echo "== G. a branch checked out in ANOTHER worktree still exits 2, and says where =="
+mktask owned ow
+OWF="$REPO/.backlog/pending/owned.md"
+OTHER="$WORK/other place/ow"   # a space in the path: the porcelain parse must keep the whole line
+git -C "$REPO" worktree add -q "$OTHER" -b worktree/ow trunk
+OTHER_PHYS=$(cd "$OTHER" && pwd -P)
+OUT=$(bash "$CC" "$OWF" 2>"$WORK/g.err"); rc=$?
+check 'G1 exit 2 (the branch really is in use elsewhere)' '[ "$rc" = "2" ]'
+check 'G2 nothing on stdout' '[ -z "$OUT" ]'
+check 'G3 stderr names the worktree that holds the branch, spaces and all' \
+  'grep -qF "checked out in the worktree at $OTHER_PHYS." "$WORK/g.err"'
+check 'G4 no second worktree was created for the slug' '[ ! -e "$REPO/.worktree/ow" ]'
+# That directory is then deleted without a prune. Still exit 2 (the registration is not this path), but
+# the message now says what clears it; after the prune the branch re-attaches normally.
+rm -rf "$WORK/other place"
+bash "$CC" "$OWF" >/dev/null 2>"$WORK/g2.err"; rc=$?
+check 'G5 a dead registration ELSEWHERE exits 2 and names the remedy' \
+  '[ "$rc" = "2" ] && grep -q "git worktree prune" "$WORK/g2.err"'
+git -C "$REPO" worktree prune
+OUT=$(bash "$CC" "$OWF" 2>/dev/null); rc=$?
+check 'G6 after the prune the branch is re-attached at the slug path' \
+  '[ "$rc" = "0" ] && [ "$OUT" = "$REPO/.worktree/ow" ]'
+
+echo "== H. only the FIRST Worktree: line is the slug =="
+# A materialized non-files spec appends the store's comments after the task document, and a comment can
+# repeat the field. Every match used to be concatenated into one slug.
+mktask doubled dbl
+DBF="$REPO/.backlog/pending/doubled.md"
+printf '\n## Store Comments\n\n- **Worktree**: api\n' >> "$DBF"
+OUT=$(bash "$CC" "$DBF" 2>/dev/null); rc=$?
+check 'H1 exit 0 and the worktree is the first line slug' '[ "$rc" = "0" ] && [ "$OUT" = "$REPO/.worktree/dbl" ]'
+check 'H2 it is on the first line branch' '[ "$(git -C "$OUT" branch --show-current)" = worktree/dbl ]'
+check 'H3 neither the glued slug (dblapi) nor the comment slug (api) got a branch' \
+  '! git -C "$REPO" show-ref --verify --quiet refs/heads/worktree/dblapi && ! git -C "$REPO" show-ref --verify --quiet refs/heads/worktree/api'
+check 'H4 the token row carries the first line slug' 'grep -q "| dbl | worktree/dbl |" "$DBF"'
 
 echo
 echo "phase11-checkout-reentrancy: $PASS passed, $FAIL failed"
