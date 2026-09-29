@@ -884,12 +884,18 @@ function reviewerPrompt(t) {
   // Both arms, mirroring the deterministic gate exactly. A single-arm version reintroduces the false
   // positive fixed in c941764: a lost token with a live branch is a MECHANISM fault (append_log_row is
   // an unlocked read-modify-write), not the task's fault, and must not cost it a life.
+  //
+  // The pass arm does not say "continue to Step 0" (it did until 3.4.3). This same prompt is also the
+  // BASE of every review-harness stage, where childPreamble forbids Step 0, so that wording would point
+  // a stage at the one command its later rules prohibit. "The rest of this prompt as written" is right
+  // in both places: the lone 3.1.0 reviewer still reaches Step 0, a harness stage reaches the override.
   const tokenProbe = filesStore
     ? `read the task's Transition Log at ${sq(rootPath)}`
     : `run  ${materializeCmd(t)}  and read the Transition Log of the document it prints`
   const tokenRule = `PRE-STEP-0 CHECK — do this FIRST, before Step 0, because Step 0 writes this very row:
   ${tokenProbe} and look for a "| clean-checkout | ok |" row.
-    - Row present  -> the implementer did enter a worktree. Continue to Step 0 and review normally.
+    - Row present  -> the implementer did enter a worktree; this check passes. Carry on with the rest of
+        this prompt as written (STEP 0 included, unless a later section tells you to skip it) and review.
     - Row ABSENT   -> run  git -C ${sq(trunkRoot)} rev-parse --verify refs/heads/${branchPrefix}/${t.slug}
         * command FAILS (no branch): nothing was ever checked out. Return transition "rejected",
           rejection_increment 1, fault_class quality, notes naming this. Do NOT run Step 0.
@@ -1187,14 +1193,49 @@ const scriptPathFor = (ctx) => `${childDirFor(ctx)}/harness.workflow.js`
 
 // The child inherits the VERBATIM 3.1.x seam prompt as `BASE`, prepended to every stage — so a stage
 // agent is told exactly what a 3.1.0 specialist was told, plus the ledger discipline. Nothing is retyped.
+//
+// Applied by childCtx for kinds 'impl' and 'review' ONLY (3.4.3). From 3.2.0 until then it was defined
+// and never called, so every authored stage got the bare specialist/reviewer prompt, whose STEP 0 is
+// "run clean-checkout" (the specialist's is even labelled mandatory), with nothing countermanding it:
+// implement, gate-fix, and the read-only lenses runWave fans out concurrently were each told to run
+// their own checkout, and clean-checkout.sh is not reentrant — its silent `stash push -u` sweeps a
+// sibling stage's uncommitted work into the shared refs/stash. "The locked checkout stage is the ONLY
+// clean-checkout" was stated to the ARCHITECT (WORKTREE_CONTRACT_CODE); no stage prompt carried it.
+//   'direct' and 'resolve' stay UNWRAPPED, byte for byte. A non-code task has no worktree and no branch,
+// so "the worktree ALREADY EXISTS / you may only ADD commits" is false there and invites a commit on the
+// trunk root that bypasses the orchestrator's single writer; a resolver sits in the integrator's
+// MID-CHERRY-PICK tree, where the integrator owns the one commit, and a commit made there anyway
+// concludes the pick behind its back (CHERRY_PICK_HEAD vanishes, and verify-resolve reports unresolved).
+//   The locked-stage exception below is load-bearing, not politeness. BASE prefixes the locked checkout
+// and review-gate stages too, and on a first dispatch no worktree exists yet: a shell-tier agent that
+// took an unqualified "do NOT run clean-checkout" literally would drop the else-branch, report a
+// non-zero exit, and the prologue would finish 'none' (mechanism) on every attempt — a task that can
+// never start, retried forever as transient.
+//   The exception is keyed to the stage's KEY, never to what its instructions say. Keying it to "the
+// stage whose instructions spell out the checkout command" sanctioned any AUTHORED stage that did the
+// same: the validator's only guard is a literal `clean-checkout` substring, and `bash ${sq(A.cleanCheckout)}`
+// — the interpolation the locked stages use, visible in the scaffold — passes it. The key is printed
+// by the skeleton's locked rule() ("PROGRESS LEDGER for stage '<key>'"), and an authored stage cannot
+// run under a locked key: the prologue has already filled results[key], so runStage replays it in zero
+// agents, and an iteration spec's key carries a '#N' suffix.
+//   Forbidding STEP 0 has a cost the old accident hid: the implement stage's STEP 0 was the second,
+// sequential token write that made a lost first one heal itself, and on an ATTACHED worktree (a
+// same-slug sibling, a re-dispatch) it was the only one. restoreCheckoutToken puts that write back
+// in the parent, where it can be guarded on a clean tree — never as prose a stage may or may not obey.
 function childPreamble(t, kind, basePrompt) {
+  const lockedKey = kind === 'review' ? 'review-gate' : 'checkout'
   return `${basePrompt}
 
 ──────────── acf-whip child-harness stage rules (3.2.0) ────────────
-You are ONE STAGE of a multi-stage harness for this task. ${NO_BACKLOG_WRITES}
-The worktree ALREADY EXISTS and its path was given to you as text. Do NOT run clean-checkout — exactly
-one checkout happens per task, in the harness prologue, and a second one silently stashes another
-stage's in-flight work into the shared refs/stash.
+You are ONE STAGE of a multi-stage harness for this task. These rules OVERRIDE the instructions above
+and below wherever they disagree. ${NO_BACKLOG_WRITES}
+SKIP the STEP 0 above: do NOT run clean-checkout. Exactly one checkout happens per task, in the
+harness's locked '${lockedKey}' stage, and a second one silently stashes another stage's in-flight work
+into the shared refs/stash. The ONE exception is decided by your stage's KEY, printed below on the line
+"PROGRESS LEDGER for stage '<key>'": if that key is EXACTLY '${lockedKey}', run the attach-or-create
+command your stage instructions give, exactly as written — that stage IS the one checkout. For ANY other
+key, never run clean-checkout (nor the script behind it) even if your stage instructions spell out such
+a command: the worktree ALREADY EXISTS and its path was given to you as text.
 FORBIDDEN in the worktree: git merge, git rebase, git pull, git reset, git stash, deleting the worktree
 or branch, switching branches, and any write to .backlog/ or .acfwhip/. You may only ADD commits to
 this task's own branch — the integrator rebuilds the candidate from the branch tree, so rewriting
@@ -1203,13 +1244,20 @@ Best effort FIRST, ignore failure:  mkdir -p ${sq(RUN_LOCK_DIR)} && touch ${sq(R
 `
 }
 
+// The porcelain `worktree <path>` line, parsed WHOLE. `p=$2` (what this file used until 3.4.3, and what
+// the skeleton's locked stages still use) cuts a path at its first space, and a repo under
+// `~/My Projects/` or iCloud's `Mobile Documents/` is ordinary. In the scout a cut path only misreports
+// worktreeExists=false; in restoreCheckoutToken it fed the clean-tree probe that guards the one
+// command that stashes. substr from column 10 = everything after the 9-byte "worktree " prefix.
+const WT_BY_BRANCH_AWK = (branch) => `awk -v b="branch refs/heads/${branch}" '/^worktree /{p=substr($0,10)} $0==b{print p; exit}'`
+
 function scoutPrompt(ctx) {
   return `${ENV}
 Read-only reconnaissance for one acf-whip task's harness. Change NOTHING.
 
 1. Resolve the worktree BY QUERY (never by constructing a path — the worktree dir is config-driven and
    the constructed path can differ from the real one):
-     WT=$(git -C ${sq(trunkRoot)} worktree list --porcelain | awk -v b="branch refs/heads/${ctx.branch}" '/^worktree /{p=$2} $0==b{print p; exit}')
+     WT=$(git -C ${sq(trunkRoot)} worktree list --porcelain | ${WT_BY_BRANCH_AWK(ctx.branch)})
    Report it as worktree, and worktreeExists=true only if it is non-empty and the directory exists.
 2. If it exists, report:
      git -C "$WT" log --oneline ${sq(ctx.forkbaseRef)}..HEAD | head -40          -> commits
@@ -1447,6 +1495,8 @@ const WORKTREE_CONTRACT_CODE = `Exactly ONE agent may write in this task's workt
 running git add or git commit, AND RUNNING THE BUILD OR TEST SUITE (which produces target/,
 __pycache__, node_modules/.cache, coverage output, generated code and formatter rewrites).
   * The locked checkout stage is the ONLY clean-checkout. Every other stage receives WT as text.
+    Never put A.cleanCheckout (or TASKPATH as a script argument) in an authored stage: every stage's
+    rules deny that command to every key but the locked one, so such a stage fails instead of running.
   * Mark every writing stage mutates:true. runWave FORCES mutating specs sequential after its
     read-only chunk, so a mislabelled mutates costs throughput but never correctness.
   * Read-only is the parallel lane: recon, call-site census, dependency mapping, review lenses,
@@ -1468,7 +1518,13 @@ function childCtx(kind, t, basePrompt, folder, waveWidth) {
     taskPath: taskLoc(t, folder),
     materialize: filesStore ? '' : materializeCmd(t),
     rejectionCount: t.rejectionCount || 0, blockCount: t.blockCount || 0,
-    basePrompt, phase: 'Iterate',
+    // The stage rules are appended HERE, by kind, rather than at the call sites: this is the one place
+    // every harness's BASE passes through, so a future call site cannot forget them. impl/review only —
+    // childPreamble says why direct/resolve must stay byte-identical. The legacy fallbacks never read
+    // ctx.basePrompt (each calls agentC with its own bare prompt), and that matters: a single 3.1.0
+    // agent MUST run its own STEP 0, and the preamble would tell it to skip the only checkout it gets.
+    basePrompt: (kind === 'impl' || kind === 'review') ? childPreamble(t, kind, basePrompt) : basePrompt,
+    phase: 'Iterate',
     metaName: `whip-${kind}-${t.stem}`.slice(0, 90),
     agentBudget: FULL_BUDGET, fanoutMax: fanoutFor(waveWidth),
     enabled: true, worktreeContract: WORKTREE_CONTRACT_CODE,
@@ -1538,6 +1594,107 @@ Report the final porcelain output. Change nothing else. Never run clean-checkout
   log(`  ${ctx.stem}: committed ${prior.dirty.length} in-flight path(s) as WIP before the fallback dispatch`)
 }
 
+// Put back the token write that wiring childPreamble took away (3.4.3). The locked checkout stage runs
+// clean-checkout.sh only when NO worktree exists; when one does it just echoes the path, because a
+// second clean-checkout on a dirty tree stashes that work into the shared refs/stash. Until 3.4.3 the
+// gap was covered by accident: every stage got the bare specialist prompt, whose mandatory STEP 0
+// re-ran clean-checkout on the freshly attached (clean) tree and re-recorded the token as a side
+// effect. The preamble now forbids STEP 0, so a harness that ATTACHES writes no token at all — and that
+// is not a corner case. The worktree is per SLUG and outlives integration, so every same-slug sibling
+// after the first attaches; so does every re-dispatch after clean-checkout created the worktree and then
+// failed to record the token (a non-files log-event refusal, exit 6). Such a task completes, its review
+// finds the branch without the token (a mechanism fault), the tokenStrand arm parks it, the unblock pass
+// re-queues it, and — attempt key unchanged — the harness replays every stage in zero agents, checkout
+// included, writing no token again. Parked, re-queued, parked: forever.
+//   So here, deterministically and BEFORE the harness: when the scan saw the branch but no token, run
+// the SAME command the locked stage would, and only on a CLEAN attached tree. There clean-checkout skips
+// creation, has nothing to stash, re-validates the branch and records the token. A dirty tree is left
+// alone (the one case where a second stash destroys work; the harness's verify commits it, so the next
+// re-dispatch finds it clean), and so is a missing worktree (the locked stage creates it and records
+// the token itself). It never DEFERS the harness: clean-checkout can fail for reasons no retry fixes —
+// it tests the CONSTRUCTED path, so a worktree whose real path differs exits 2 every time — and a task
+// that never starts is worse than one the review gate parks. Escalation-off and budget-rung dispatches
+// never get here: their 3.1.0 specialist runs its own STEP 0.
+//   The scan-time object is a sound witness HERE, unlike on the inline review path: it was read at this
+// iteration's plan, after every earlier dispatch of the task had ended (parallel() is a barrier). `!==
+// true`, not `=== false`: an unanswered field costs one cheap re-record, which is idempotent on a clean
+// tree; guessing "present" costs the forever-loop above.
+function needsTokenRestore(t) {
+  return !!t && !!t.slug && t.slug !== 'none' && t.hasWorktreeBranch === true && t.hasCleanCheckoutToken !== true
+}
+const TOKENRESTORE = {
+  type: 'object', additionalProperties: false, required: ['outcome', 'exitCode'],
+  properties: {
+    outcome: { type: 'string', enum: ['restored', 'unrecorded', 'dirty', 'unreadable', 'no-worktree', 'failed'] },
+    exitCode: { type: 'integer' },
+  },
+}
+async function restoreCheckoutToken(ctx) {
+  // files: clean-checkout only WARNs when append_log_row refuses and still exits 0, so exit 0 proves
+  // nothing there — the row itself is the evidence. A non-files store fails log-event LOUDLY (exit 6),
+  // so there exit 0 already means the durable write landed.
+  const verify = filesStore
+    ? `
+    elif ! grep -qE '\\| clean-checkout \\| ok \\|' ${sq(ctx.taskPath)}; then echo 'OUTCOME unrecorded'`
+    : ''
+  const mat = ctx.materialize ? `${ctx.materialize} >/dev/null; ` : ''
+  // The clean-tree probe FAILS CLOSED, because the command it guards is the stashing one. The 3.4.3
+  // original read `[ -n "$(git -C "$WT" status --porcelain)" ]`: when `git -C` cannot enter the tree
+  // (a path cut at a space, a worktree directory deleted by hand) git prints its fatal to stderr and
+  // NOTHING to stdout, the empty string reads as CLEAN, and clean-checkout — which finds the real tree
+  // from the constructed path — stashes the live work into refs/stash and reports success. So the
+  // status call's own exit is tested first, and an unreadable tree is never treated as a clean one.
+  const r = await safeAgent(`${ENV}
+Re-record this task's clean-checkout token before its harness runs. Run EXACTLY this, ONCE:
+  WT=$(git -C ${sq(trunkRoot)} worktree list --porcelain | ${WT_BY_BRANCH_AWK(ctx.branch)})
+  if [ -z "$WT" ]; then echo 'OUTCOME no-worktree'
+  elif ! S=$(git -C "$WT" status --porcelain); then echo 'OUTCOME unreadable'
+  elif [ -n "$S" ]; then echo 'OUTCOME dirty'
+  else ${mat}bash ${sq(CLEAN_CHECKOUT)} ${sq(ctx.taskPath)} >/dev/null; rc=$?
+    if [ "$rc" -ne 0 ]; then echo "OUTCOME failed $rc"${verify}
+    else echo 'OUTCOME restored'; fi
+  fi
+Report outcome (the word after OUTCOME) and exitCode (the number after "failed", else 0). Change nothing
+else: never run clean-checkout a second time or any other way, never stash, reset, commit or edit a file.`,
+    shellOpts({ label: `token:${ctx.key}`, phase: ctx.phase, schema: TOKENRESTORE }), () => null)
+  const o = r && r.outcome
+  if (o === 'restored') log(`  ${ctx.stem}: clean-checkout token re-recorded on the existing ${ctx.branch} worktree before its harness`)
+  else if (o === 'dirty') log(`⚠ ${ctx.stem}: no clean-checkout token, and ${ctx.branch}'s worktree has uncommitted work — NOT re-running clean-checkout (it would stash that work into the shared refs/stash); the harness runs, and the review gate treats the missing token as a mechanism fault`)
+  else if (o === 'unreadable') log(`⚠ ${ctx.stem}: no clean-checkout token, and git could not read ${ctx.branch}'s worktree status — NOT re-running clean-checkout (an unread tree is never assumed clean: that is the one command that can stash its work); the harness runs, and the review gate treats the missing token as a mechanism fault`)
+  else if (o !== 'no-worktree') log(`⚠ ${ctx.stem}: could not re-record the clean-checkout token on ${ctx.branch} (${o ? `${o}${r.exitCode ? ` exit ${r.exitCode}` : ''}` : 'no emit'}) — the harness runs anyway; the review gate treats the missing token as a mechanism fault`)
+  return o || 'no-emit'
+}
+
+// Before an INLINE review panel only: is the clean-checkout token actually there? (3.4.3)
+// On the inline path the scan-time object predates the implementer, so runReviewAndIntegrate skips its
+// deterministic token gate and leaves the question to reviewerPrompt's PRE-STEP-0 CHECK — whose
+// "branch exists -> rejected, fault_class mechanism" arm only a single ACFW_RESULT reviewer can
+// express. A panel lens answers REVIEW_LENS (accept | reject, no fault class), and the locked
+// aggregate() has no token-shaped mechanism exit, so every lens rejects, the strict majority folds to
+// finish('rejected', …, 'quality'), and reviewVerdict charges one of the task's three lives for a
+// mechanism fault. restoreCheckoutToken's dirty/unreadable/failed/unrecorded outcomes all end here.
+//   So the parent asks first, deterministically, and anything short of a positively observed row —
+// absent, unreadable, a probe that never emits — skips the panel and leaves the task in in-review/.
+// That is not a new verdict path: the next scan observes the task AFTER its implementation, so the
+// existing typed gate decides it (branch exists -> mechanism, re-reviewed then parked with inc 0;
+// no branch -> the same inc-1 auto-reject the lone reviewer would have returned). The deferral is
+// bounded by construction — only the inline path probes, and a task is inline once per completion.
+const TOKENPROBE = {
+  type: 'object', additionalProperties: false, required: ['token'],
+  properties: { token: { type: 'string', enum: ['present', 'absent'] } },
+}
+async function reviewTokenObserved(ctx) {
+  const probe = filesStore
+    ? `if grep -qE '\\| clean-checkout \\| ok \\|' ${sq(ctx.taskPath)}; then echo 'TOKEN present'; else echo 'TOKEN absent'; fi`
+    : `if P=$(${ctx.materialize}) && [ -n "$P" ] && grep -qE '\\| clean-checkout \\| ok \\|' "$P"; then echo 'TOKEN present'; else echo 'TOKEN absent'; fi`
+  const r = await safeAgent(`${ENV}
+Check this task's clean-checkout token before its review panel runs. Run EXACTLY this, ONCE:
+  ${probe}
+Report token (the word after TOKEN). Change nothing: never run clean-checkout, never edit or commit.`,
+    shellOpts({ label: `token-probe:${ctx.key}`, phase: ctx.phase, schema: TOKENPROBE }), () => null)
+  return { present: !!r && r.token === 'present', why: r ? `token ${r.token}` : 'probe non-emit' }
+}
+
 async function runAuthoredUnit(ctx) {
   if (!ESCALATE) return { via: 'legacy', why: 'escalation off' }
   if (!ctx.enabled) return { via: 'legacy', why: `${ctx.kind} escalation disabled` }
@@ -1551,7 +1708,18 @@ async function runAuthoredUnit(ctx) {
     const budget = tier === 'LEAN' ? LEAN_BUDGET : ctx.agentBudget
     ctx.agentBudget = budget
 
+    // AFTER the tier check, so the probe is paid only when a panel is really about to run (a DIRECT or
+    // CLOSE rung hands the review to the lone 3.1.0 reviewer, whose PRE-STEP-0 CHECK types the fault
+    // itself), and BEFORE the scout, which a panel that will not run has no use for.
+    if (ctx.kind === 'review' && ctx.tokenStale) {
+      const tk = await reviewTokenObserved(ctx)
+      if (!tk.present) return { via: 'defer', why: tk.why }
+    }
+
     let prior = await scout(ctx)   // before round 0 too: a re-dispatch may already have progress
+    // Once per dispatch, never per amend round: after round 0 the harness itself may have dirtied the
+    // tree, and the whole point of the guard is that no second checkout ever runs against live work.
+    if (ctx.kind === 'impl' && needsTokenRestore(ctx.t)) await restoreCheckoutToken(ctx)
     let lastErr = '', round = 0
 
     while (round <= MAX_AMEND) {
@@ -2345,6 +2513,10 @@ Return the ScanResult.`
         // run ends no-progress with committed work never integrated, and claim(t.slug) starves every
         // same-slug sibling for the whole run, every run. Re-review once — the token is usually back
         // next iteration when the cause was a lost append_log_row race — then park it.
+        //   Parking is also what RESTORES it: inc/binc 0 keep the task under both caps, so the unblock
+        // pass re-queues it, and the re-dispatch's restoreCheckoutToken re-records the token on its
+        // (by then committed, clean) worktree before the harness replays. Until 3.4.3 wired the stage
+        // preamble that replay could never write one — which is why the note's remedy must stay true.
         const seen = (tokenStrandSeen.get(t.stem) || 0) + 1
         tokenStrandSeen.set(t.stem, seen)
         if (seen < 2) {
@@ -2355,7 +2527,7 @@ Return the ScanResult.`
         tokenStrandedStems.push(t.stem)
         // inc: 0 — this is mechanical. Charging a life for a token the orchestrator itself could not
         // write would spend the task's three rejections on a fault it never caused.
-        await streamWrite([{ stem: t.stem, toState: 'blocked', agent: 'orchestrator', notes: `clean-checkout token absent on ${seen} consecutive reviews while ${branchPrefix}/${t.slug} exists. The token's only writer runs at dispatch, so no further review can restore it — verify the branch, then re-run /go to re-dispatch.`, inc: 0 }], `review#${iter}:${t.stem}`)
+        await streamWrite([{ stem: t.stem, toState: 'blocked', agent: 'orchestrator', notes: `clean-checkout token absent on ${seen} consecutive reviews while ${branchPrefix}/${t.slug} exists. The token's only writer runs at dispatch, so no further review can restore it; a re-dispatch re-records it once that worktree is clean — verify the branch, then re-run /go to re-dispatch.`, inc: 0 }], `review#${iter}:${t.stem}`)
         productiveDispatch = true
         return
       }
@@ -2376,7 +2548,15 @@ Return the ScanResult.`
     let rr = null
     if (ESCALATE && ESCALATE_REVIEW && !isNone) {
       const rctx = childCtx('review', t, rprompt, 'in-review', 1)
+      // The inline path skipped the typed gate above, and a panel cannot express its mechanism arm —
+      // reviewTokenObserved says why. 'defer' charges nothing and moves nothing: the next scan's
+      // observed fields put the task through that gate instead.
+      rctx.tokenStale = !tokenObserved
       const res = await runAuthoredUnit(rctx)
+      if (res.via === 'defer') {
+        log(`↷ ${t.stem}: clean-checkout token not observed before the review panel (${res.why}) — left in in-review/ for the next scan's token gate, no rejection charged`)
+        return
+      }
       if (res.via === 'workflow') rr = coerceAcfwResult(res.raw, ['accepted', 'rejected', 'none'])
       if (!rr) rr = await agentC(rprompt, typedOpts({ label: `review:${t.slug}`, phase: 'Iterate', schema: ACFW_RESULT, agentType: 'quality-reviewer' }, 'review'))
     } else {
