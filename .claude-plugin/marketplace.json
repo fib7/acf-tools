@@ -20,7 +20,7 @@
     {
       "name": "acf-arazor-mode",
       "description": "Production verification mode - Ruthless honesty enforcer with zero tolerance for false production claims. Binary outcomes only. Perfect for deployment readiness checks and status reporting.",
-      "version": "1.0.3",
+      "version": "1.0.4",
       "author": {
         "name": "ACF Project",
         "email": "acf@fib7.ai"

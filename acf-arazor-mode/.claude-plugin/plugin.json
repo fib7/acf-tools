@@ -1,6 +1,6 @@
 {
   "name": "acf-arazor-mode",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Production verification mode - Ruthless honesty enforcer with zero tolerance for false production claims. Binary outcomes only. Perfect for deployment readiness checks and status reporting.",
   "author": {
     "name": "ACF Project",
