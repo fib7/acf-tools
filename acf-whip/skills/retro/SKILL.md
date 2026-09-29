@@ -1,6 +1,6 @@
 ---
 name: retro
-description: Close a planned acf-whip cycle, and learn from it when something went wrong. A clean cycle closes in one script call with zero agents. When a trigger fired (a task reworked, a task stuck, a deliverable not met), a retro agent writes the frozen analysis, at most 3 one-rule lessons, and a retro-actions cycle you approve like any plan. Works on every task store. It never creates tasks, edits agent files, or deletes a lesson itself.
+description: Close a planned acf-whip cycle, and learn from it when something went wrong. A clean cycle closes in one script call with zero agents. When a trigger fired (a task reworked, a task stuck, a deliverable not met), a retro agent writes the frozen analysis, at most 3 one-rule lessons, and a retro-actions cycle you approve like any plan. Works on every task store. It never creates tasks or edits agent files, and it leaves deleting a lesson to you.
 argument-hint: "[<cycle>] [--force] [<task>...]   (no args = the cycle waiting for its retro)"
 allowed-tools:
   - Bash
@@ -12,10 +12,10 @@ allowed-tools:
 # /retro: close a cycle, and learn when something went wrong
 
 The RETRO stage of the cycle (`/whip` → `/task` → `/go` → `/retro`). A clean cycle closes with one
-script call and no agents. A cycle where something went wrong gets a retro agent that finds the
-root cause and writes three kinds of output, each where the next cycle reads it: a frozen analysis
-next to the plan, one-rule lessons that `/task` planners read, and action items that become work
-only after you approve them on the same card as any plan.
+script call and no agents. When something went wrong, a retro agent finds the root cause and
+writes three kinds of output, each in the place the next cycle reads it: a frozen analysis next to
+the plan, one-rule lessons for `/task` planners, and action items that become work only after you
+approve them on the same card as any plan.
 
 ## Stop rules (read these first)
 
@@ -23,10 +23,10 @@ only after you approve them on the same card as any plan.
    what may be committed. Print its output verbatim. On a non-zero exit, print it, add the remedy
    from **Exit codes** below, and stop. Never decide a trigger or a stage yourself, and never work
    around a refusal.
-2. **Two doors only.** The retro agent writes files; `acfw-cycle close` or `acfw-cycle note`
-   commits them. `/retro` never writes the task store, never creates or moves a task, never runs
-   `git rm`, and never commits by hand.
-3. **A clean cycle costs zero agents.** No trigger, no agent.
+2. **The agent writes, the script commits.** The retro agent writes files; `acfw-cycle close` or
+   `acfw-cycle note` commits them. `/retro` never writes the task store, never creates or moves a
+   task, never runs `git rm`, and never commits by hand.
+3. **A clean cycle costs zero agents.** If no trigger fired, dispatch nothing.
 4. **Refuse only while `/go` runs.** A fresh `/go` run lock shows up two ways: `acfw-cycle status`
    prints `wait: /go is running` and still exits 0, so step 1 looks for that text; `retro-begin`,
    `close` and `note` exit 7. Either one: print the output, say "wait: /go is running", and stop.
@@ -159,11 +159,14 @@ bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-cycle" close '<plan>' none
 ```
 
 It prints the previous retro's follow-through, stamps `Status: closed` and `Retro: none`, appends
-the `closed` row and commits `docs(plan): close <slug>`. Print its output verbatim. It prints no
-NEXT line; on `CLOSE|ok` the cycle is done, so print `NEXT /whip "<next goal>"`. Done.
+the `closed` row and commits `docs(plan): close <slug>`. Print its output verbatim.
+
 A stderr line `note: retro actions <ID> are done, so they were closed (commit <sha>)` is not an
-error: `close` and `note` first close a finished retro-actions cycle in a commit of its own, so the
-follow-through then reads `FOLLOW|<ID>|status=closed|...`.
+error. `close` and `note` first close a finished retro-actions cycle in a commit of its own, and
+the follow-through then reads `FOLLOW|<ID>|status=closed|...`.
+
+`close` prints no NEXT line. On `CLOSE|ok` the cycle is done: print `NEXT /whip "<next goal>"`.
+Done.
 
 ## Step 4: begin the triggered retro
 
@@ -322,18 +325,17 @@ INPUTS (read-only)
   docs/cycles/<ID>/retro.md. You rewrite that file; carry its findings and proposed actions forward.
 
 WHAT TO DO
-For each trigger, find the root cause (Five Whys; stop at a cause this project controls). A manual
-trigger with nothing else fired asks for a review of every task listed: look for rework, slow or
-surprising tasks, and say plainly when nothing went wrong. Then pick the fix, in this order of
-preference:
+For each trigger, find the root cause (Five Whys; stop at a cause this project controls). When only
+the manual trigger fired, review every task listed: look for rework and for slow or surprising
+tasks, and say plainly when nothing went wrong. Then pick the fix, in this order of preference:
 1. sensor: a test, type, lint rule or ACFW_GATE_CMD step that would have caught it mechanically;
 2. guide: a sentence in a project-owned file the responsible agent reads (an agent file under
    .claude/agents/, a quality-gates doc, CLAUDE.md);
 3. lesson: a one-rule note that future /task planners read;
 4. nothing: a one-off, or something a check already catches.
-If a declared spec tool flagged this root cause at the approved content (a `reviewed` row with a nogo
-verdict whose findings name it, or an `overridden` row), the sensor already existed and was not
-listened to. Propose tightening that declaration as a `[sensor] [loosens: no]` item, for example
+If a declared spec tool flagged this root cause in the approved content (a `reviewed` row with a nogo
+verdict whose findings name it, or an `overridden` row), the sensor already existed and its finding
+was ignored. Propose tightening that declaration as a `[sensor] [loosens: no]` item, for example
 `policy=block` and `at=plan,task` in .acfwhip/spec-tools/<name>. Never propose loosening a declaration.
 
 THE BAR FOR A LESSON
@@ -394,8 +396,8 @@ HARD LIMITS
   docs/acf/backlog/ or docs/acf/style/, not CLAUDE.md, not this cycle's plan.md or record.md, and
   no lesson beyond the 3 you write.
 - Create and move no tasks. Action items become tasks only after a human approves their cycle.
-- Your agent file may say you may modify agent instructions, update quality standards, or commit
-  process changes. acf-whip 3.5.0 withdrew that: propose the change as an action item instead.
+- Your agent file may still say you can modify agent instructions, update quality standards, or
+  commit process changes. acf-whip 3.5.0 withdrew that: propose the change as an action item instead.
 
 FINISH with these lines and nothing after them:
 RETRO-DOC|<path>
@@ -504,7 +506,7 @@ fi
   exactly these, change nothing else, and finish with the same final lines"), then verify again.
 - A second failure: stop. Commit nothing and never fix the agent's files yourself. Print the
   `VERIFY|` lines and `git status --short`, then tell the user the agent's files are in the working
-  tree and give them the two ways on, with every `<...>` filled in:
+  tree and give them both options, with every `<...>` filled in:
   - Fix the listed problems by hand, then run the **Step 8** command for this mode (plan-less: the
     commit command from **Plan-less retro**).
   - Or drop the attempt and rerun `/retro`. When the agent created an actions cycle, drop it first:
@@ -534,8 +536,8 @@ the retro doc, the named lesson files, the actions folder, and the cycle's `reco
 
 ## Step 9: hand off
 
-1. For every `RETIRE|<slug>` line, print one line. /retro never runs it, and `close` refuses a
-   deleted lesson:
+1. For every `RETIRE|<slug>` line, print the `git rm` the user runs, in this form (/retro never
+   runs it, and `close` refuses a deleted lesson):
    `RETIRE (yours): git rm docs/acf/lessons/<slug>.md   # a test or gate now enforces it, see ## Retire`
 2. **Actions cycle created:** invoke the `acf-whip:whip` skill via the Skill tool as the last action,
    with args `<AID>` (the cycle ID). `/whip` renders that cycle's approval card and owns what happens on
@@ -549,9 +551,10 @@ the retro doc, the named lesson files, the actions folder, and the cycle's `reco
 
 ## Plan-less retro (`--force` with no cycle)
 
-For work that went through `/task "<scope>"` and `/go` without a plan. It reads the tasks you name,
-or your `/go` focus when you name none. It has no record to stamp, so it commits nothing: you
-commit its output. Step 1 already refused while `/go` runs, so it reads a store no run is writing.
+Use it for work that went through `/task "<scope>"` and `/go` without a plan: it reads the tasks you
+name, or your `/go` focus when you name none. It commits nothing. There is no record to stamp, so
+the output is yours to commit. Step 1 already refused while `/go` runs, so no run is writing the
+store it reads.
 
 1. Run **Step 5** with `MODE='planless'`, `CYC=''`, `FORCE='1'`, `IN=''` and
    `set -- <the task tokens>` (or bare `set --` for the focus).

@@ -81,17 +81,18 @@ and commit to stop sending plans.
 - **Every plan edit is new bytes.** Because the driver reports a cost, `acfw-spec` treats GapTrap as
   `rerun=ask`: it reviews on the first card, then shows the last result as stale until you reply
   `review`.
-- **The driver never bills twice for the same bytes.** The spec id is saved the moment the
+- **Within one clone, the same bytes are billed once.** The spec id is saved the moment the
   `create_spec` reply is read, even when the watchdog stops the run in that instant. A timeout, a
   watchdog kill or a crash leaves it saved, and the next review of the same bytes resumes polling it
   at no cost. A finished result is re-read for free. A `failed` analysis is remembered as failed, so
   the next card does not pay again; edit the plan, or review with `--fresh` to pay for one more try.
-- **A lost reply is looked up, never resent.** GapTrap bills the unit before it answers, so a
-  `create_spec` that timed out, got a 5xx, or was killed mid-request may already be paid for. The
-  driver writes down the attempt before it sends it, and the next review asks the free
-  `list_specs` for a spec with that attempt's file name. If GapTrap made it, the review uses it for
-  free. If it is still missing after 90 seconds, GapTrap made nothing and the review sends it again.
-  The only blind resend is a request that never left your machine (no DNS, no connection).
+- **A lost reply is looked up before anything is resent.** GapTrap bills the unit before it
+  answers, so a `create_spec` that timed out, got a 5xx, or was killed mid-request may already be
+  paid for. The driver writes down the attempt before it sends it, and the next review asks the
+  free `list_specs` for a spec with that attempt's file name. If GapTrap made it, the review uses
+  it for free. If it is still missing after 90 seconds, GapTrap made nothing and the review sends
+  it again. The only blind resend is a request that never left your machine (no DNS, no
+  connection).
 - **When the quota runs out** the card says `SKIPPED: quota_exceeded`. Under `policy=advisory` your
   `yes` still approves.
 
@@ -120,9 +121,9 @@ from another clone, since each clone keeps its own state.
 
 The full report JSON is kept next to the review output as `gaptrap-report.json`.
 
-If the deadline arrives while GapTrap is still checking the template, a NO-GO is reported (the
-second write can only add NO-GO) and a GO is reported as an error, never as GO. Either way the spec
-stays saved and the next review picks it up for free.
+If the deadline arrives while GapTrap is still checking the template, the driver reports a
+first-write NO-GO as NO-GO, since the second write can only add NO-GO. A first-write GO becomes an
+error, never a GO. Either way the spec stays saved and the next review picks it up for free.
 
 GapTrap sometimes never finishes the second write, for example when its server stops between the
 two. Fifteen minutes after the spec was created, the driver takes the first write's verdict, the
@@ -140,22 +141,23 @@ The driver lists pull and from, but GapTrap cannot serve them yet. It has no MCP
 spec text or your answers, the Fork editor copies plain text, and Export is shaped by GapTrap's
 template. Until GapTrap ships them, `/whip --pull` and `/whip --from gaptrap <link>` stop with
 `pull is not offered yet` or `from is not offered yet` and a hint: read the report in GapTrap, then
-edit the plan here, or copy the spec's text into a `.md` file and run `/whip <that file>`. Note that
-GapTrap's Enrich and Re-analyze rewrite a plan into Feature Contract headings, which a pull would
-refuse because `## Deliverables` is gone.
+edit the plan here, or copy the spec's text into a `.md` file and run `/whip <that file>`.
+GapTrap's Enrich and Re-analyze rewrite a plan into Feature Contract headings. A pull would refuse
+the result, because `## Deliverables` is gone.
 
 ## GapTrap features the driver turns on by itself
 
 The driver asks GapTrap which tools it has (`tools/list`, free) before each paid `create_spec` and
-on each push, pull and from, and uses each of these the day GapTrap lists it. There is nothing to configure and nothing to re-add:
-the verbs the driver reports never change, so a cached answer cannot hide a new feature.
+on each push, pull and from, and uses each of these the day GapTrap lists it. There is nothing to
+configure and nothing to re-add: the verbs the driver reports never change, so a cached answer
+cannot hide a new feature.
 
 | When GapTrap lists | You get |
 |---|---|
 | `get_spec` | Pull as text: the newest version of the pushed spec (drafts skipped), checked against its `contentSha256`, then merged into the plan. From: the exact spec you link, as the start of a new cycle |
 | `list_answers` | Pull as decisions: the answers you typed in GapTrap come back as `ANSWER` records tied to the card's findings, and the session folds them in like typed replies |
 | `parentSpecId` on `create_spec` | Each re-review continues the plan's lineage in GapTrap, which makes re-analysis free there and stops GapTrap asking questions you already answered |
-| `idempotencyKey` on `create_spec` | A reply lost in transit is simply resent: GapTrap hands back the same spec instead of a second charge. A `--fresh` review gets a new key, so it really does run again |
+| `idempotencyKey` on `create_spec` | A reply lost in transit is resent at once: GapTrap hands back the same spec instead of charging again. A `--fresh` review gets a new key, so GapTrap runs a new analysis |
 
 ## Settings
 

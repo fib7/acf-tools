@@ -1,10 +1,14 @@
 # Quality Gates - [Your Stack]
 
-> **Template Instructions**: Replace [bracketed sections] with your tech stack specifics.
+> **Template instructions**: replace every [bracketed] placeholder with your stack's details, then
+> work through the Customization Checklist at the end.
+
+A [Your Stack] task is not done until every command under Quality Requirements passes.
 
 ## Zero Bypass Tolerance
 
-**ABSOLUTELY FORBIDDEN**: Bypassing quality gates is STRICTLY PROHIBITED. **NO EXCEPTIONS.**
+Never bypass a quality gate, for any reason. Fix the code until the gate passes, or report the task
+blocked under the Quality Gate Protocol below.
 
 ## Quality Requirements
 
@@ -21,7 +25,7 @@
 
 ### Test Coverage
 
-**CUSTOMIZE**: Set thresholds appropriate for your project maturity and risk tolerance.
+**Customize:** set thresholds that fit how mature your project is and how much risk it can carry.
 
 - **[Category 1]**: [X]% minimum (e.g., Core Logic: 90%)
 - **[Category 2]**: [X]% minimum (e.g., API Endpoints: 95%)
@@ -76,9 +80,8 @@
 
 ### [Feature Area 1]
 
-**CUSTOMIZE**: Add framework/library-specific requirements
+**Customize:** add the requirements your framework and libraries impose, for example:
 
-Example sections:
 - API route standards
 - Component patterns
 - State management rules
@@ -107,8 +110,8 @@ Example sections:
 
 ### When Checks Fail
 
-1. **Attempts 1-10**: Fix actual issues
-2. **After 10 attempts**: Move task to blocked with report
+1. **Attempts 1-10**: fix the underlying problem, not the check, and rerun.
+2. **After 10 attempts**: stop and report the task blocked, with this report.
 
 ### Failure Report Format
 
@@ -139,11 +142,11 @@ Example sections:
 
 ## Forbidden Bypass Methods
 
-**NEVER use**:
+**Customize:** list every way to bypass a gate on your stack. The entries below are examples from
+several stacks: keep the ones that apply and add your own.
 
-**CUSTOMIZE**: List your stack's bypass methods
+Never use any of these:
 
-Examples:
 - `git commit --no-verify`
 - `git push --no-verify`
 - `// @ts-ignore` (TypeScript)
@@ -156,7 +159,8 @@ Examples:
 
 ## Performance Requirements (Optional - Customize)
 
-**CUSTOMIZE**: Define performance targets if critical for your project
+**Customize:** fill this in only if your project has performance targets it must meet. Otherwise
+delete the section.
 
 ### Example Targets
 
@@ -172,7 +176,7 @@ Examples:
 
 ## Dependencies Management
 
-**CUSTOMIZE**: Your dependency management workflow
+**Customize:** the commands your project uses to manage dependencies.
 
 ```bash
 # Add dependency
@@ -198,7 +202,7 @@ Examples:
 
 ## Continuous Integration
 
-**CUSTOMIZE**: Your CI pipeline configuration
+**Customize:** your CI pipeline, running the gates above.
 
 ```yaml
 # [CI Platform: GitHub Actions, GitLab CI, etc.]
@@ -230,15 +234,15 @@ jobs:
         run: [build command]
 ```
 
-Failed CI blocks merge. NO exceptions.
+A failed CI run blocks the merge, with no exceptions.
 
 ---
 
 ## Customization Checklist
 
-Use this checklist to customize this template for your stack:
+Before anyone works from this doc:
 
-- [ ] Replace `[Your Stack]` with actual tech stack name
+- [ ] Replace `[Your Stack]` with the stack's name
 - [ ] Define linting command and configuration
 - [ ] Define type checking command (if applicable) and configuration
 - [ ] Define formatting command and configuration
@@ -251,5 +255,5 @@ Use this checklist to customize this template for your stack:
 - [ ] Document dependency management workflow
 - [ ] Set up CI pipeline configuration
 - [ ] Add security audit requirements
-- [ ] Test all commands work in your project
-- [ ] Train team on quality gate requirements
+- [ ] Run every command in your project and confirm it works
+- [ ] Walk the team through the gates

@@ -1,27 +1,29 @@
 # Research Protocol
 
-## Naming Convention (MANDATORY)
+How to name a research document, which tool answers which question, and what the finished document
+must contain.
 
-**ALL research documents MUST use temporal naming**:
+## File Naming
+
+Every research document must use a temporal name:
 
 - **Format**: `docs/research/YYYYMMDD-description.md`
-- **Date**: Current date in YYYYMMDD format (NO hyphens in date portion)
-- **Description**: lowercase, hyphen-separated topic
-- **Reference**: See [Organization Conventions](organization.md#2-naming-conventions-temporal-vs-timeless)
+- **Date**: the current date as `YYYYMMDD`, with no hyphens inside the date
+- **Description**: lowercase words joined by hyphens
+- **Reference**: [Organization Conventions](organization.md#2-naming-conventions-temporal-vs-timeless)
 
-**Examples**:
-- ✅ `docs/research/20251117-postgresql-performance-tuning.md`
-- ✅ `docs/research/20251030-figma-component-extraction.md`
-- ✅ `docs/research/20251115-react-server-components.md`
-- ❌ `docs/research/database-research.md` (missing date)
-- ❌ `docs/research/2025-11-17-performance.md` (hyphens in date)
-- ❌ `docs/research/PostgreSQL-Performance.md` (not lowercase)
+| Filename | Verdict |
+|---|---|
+| `docs/research/20251117-postgresql-performance-tuning.md` | valid |
+| `docs/research/20251030-figma-component-extraction.md` | valid |
+| `docs/research/20251115-react-server-components.md` | valid |
+| `docs/research/database-research.md` | invalid: no date |
+| `docs/research/2025-11-17-performance.md` | invalid: hyphens in the date |
+| `docs/research/PostgreSQL-Performance.md` | invalid: not lowercase |
 
-**Why temporal naming**:
-- Research findings are time-bound (frameworks evolve, best practices change)
-- Multiple snapshots track evolution of understanding
-- Clear historical context (avoid outdated guidance)
-- Enables retrospective analysis
+Research goes stale: frameworks change and best practice moves on. The date in the name tells a
+reader how old a finding is before they act on it. It also lets several snapshots of one topic sit
+side by side, so a later retrospective can see what the team knew when it decided.
 
 ---
 
@@ -29,35 +31,32 @@
 
 | Need | Tool | When to Use |
 |------|------|-------------|
-| **UI/UX Design Analysis** | Figma MCP | **MANDATORY** when Figma links/nodes provided |
-| **Library Documentation** | Context7 | Adding new libraries, updating versions, API questions |
-| **Best Practices** | Perplexity | Architecture, patterns, industry standards |
-| **Security Research** | Perplexity | Vulnerabilities, patches, security practices |
-| **Performance Research** | Perplexity | Optimization techniques, benchmarks |
-| **Technology Comparison** | Perplexity | Evaluating alternatives, migration paths |
-| **Code Examples** | Context7 | Library usage patterns, implementation examples |
+| UI/UX design analysis | Figma MCP | Required whenever the task gives a Figma link or node |
+| Library documentation | Context7 | Adding new libraries, updating versions, API questions |
+| Best practices | Perplexity | Architecture, patterns, industry standards |
+| Security research | Perplexity | Vulnerabilities, patches, security practices |
+| Performance research | Perplexity | Optimization techniques, benchmarks |
+| Technology comparison | Perplexity | Evaluating alternatives, migration paths |
+| Code examples | Context7 | Library usage patterns, implementation examples |
 
 ---
 
 ## Figma MCP Usage (mcp__figma-dev-mode-mcp-server)
 
-### 🎨 MANDATORY Use Cases
+### When Figma Is Required
 
-1. **Task Includes Figma URL/Node**
-   ```
-   Trigger: Task mentions Figma design or includes Figma link
-   Action: MUST extract node ID and analyze BEFORE any other work
-   Priority: ALWAYS FIRST when Figma reference exists
-   ```
+1. **The task includes a Figma URL or node.** If a task mentions a Figma design or links to one,
+   extract the node ID and analyze the design before any other work. Figma always goes first when a
+   Figma reference exists.
 
-2. **Node ID Extraction**
+2. **Node ID extraction.** The URL writes the node ID with a hyphen; the tools take a colon:
    ```
    URL: https://figma.com/design/:fileKey/:fileName?node-id=1-2
    Extract: nodeId = "1:2" (replace - with :)
    Call: get_code(nodeId="1:2")
    ```
 
-3. **Design Analysis Flow**
+3. **Design analysis flow.** Call the three tools in this order:
    ```javascript
    // 1. Get component code
    mcp__figma-dev-mode-mcp-server__get_code {
@@ -79,73 +78,34 @@
 
 ### Figma Integration Protocol
 
-**CRITICAL RULES**:
-1. **ALWAYS** use Figma tools when URL/node provided
-2. **NEVER** skip Figma analysis for UI tasks with designs
-3. **EXTRACT** node IDs from URLs before calling tools
-4. **INCLUDE** design insights in task descriptions
-5. **REFERENCE** specific Figma nodes in implementation tasks
+1. When a task gives a Figma URL or node, use the Figma tools.
+2. Never skip Figma analysis on a UI task that has a design.
+3. Extract node IDs from URLs before calling any tool.
+4. Put what the design tells you into the task descriptions.
+5. Name the specific Figma nodes in implementation tasks.
 
 ### Common Figma Patterns
 
-**Pattern 1: Full Page Implementation**
-```
-Input: "Implement dashboard from [Figma URL]"
-1. Extract node ID from URL
-2. get_code() for component structure
-3. get_variable_defs() for styling
-4. Create tasks with design specs
-```
-
-**Pattern 2: Component Update**
-```
-Input: "Update button component per Figma"
-1. get_code() for new design
-2. Compare with existing implementation
-3. Create migration task
-```
-
-**Pattern 3: Design System Sync**
-```
-Input: "Sync design tokens from Figma"
-1. get_variable_defs() for all tokens
-2. Create token update tasks
-3. Include CSS variable mappings
-```
+| Request | Steps |
+|---|---|
+| Full page: "Implement dashboard from [Figma URL]" | Extract the node ID; `get_code()` for component structure; `get_variable_defs()` for styling; create tasks carrying the design specs |
+| Component update: "Update button component per Figma" | `get_code()` for the new design; compare it with the current implementation; create a migration task |
+| Design system sync: "Sync design tokens from Figma" | `get_variable_defs()` for all tokens; create token update tasks; include the CSS variable mappings |
 
 ---
 
 ## Context7 Usage (mcp__context7)
 
-### MANDATORY Use Cases
+### When Context7 Is Required
 
-1. **Adding New Libraries**
-   ```
-   Before: Installing new library
-   Action: Use Context7 to understand API, patterns, best practices
-   After: Implement with correct patterns
-   ```
-
-2. **Updating Existing Libraries**
-   ```
-   Before: Updating library version
-   Action: Check breaking changes, migration guide
-   After: Update code for compatibility
-   ```
-
-3. **Resolving Usage Questions**
-   ```
-   Question: "How to implement X with library Y?"
-   Action: Context7 lookup for current documentation
-   Result: Accurate, up-to-date implementation
-   ```
-
-4. **Checking Deprecations**
-   ```
-   Warning: Method might be deprecated
-   Action: Verify with Context7
-   Result: Use recommended alternative
-   ```
+1. **Adding a library.** Before you install it, use Context7 to learn its API, usage patterns and
+   recommended practice, then implement with those patterns.
+2. **Updating a library.** Before you change the version, check the breaking changes and the
+   migration guide, then update the code to match.
+3. **Usage questions.** For "how do I do X with library Y?", look up the current documentation in
+   Context7.
+4. **Possible deprecations.** When a method might be deprecated, check it in Context7 and use the
+   recommended replacement.
 
 ### Context7 Protocol
 
@@ -173,35 +133,14 @@ mcp__context7__get-library-docs {
 
 ## Perplexity Usage (mcp__perplexity)
 
-### MANDATORY Use Cases
+### When Perplexity Is Required
 
-1. **Architecture Decisions**
-   ```
-   Question: "Microservices vs monolith for [use case]?"
-   Filter: recency=month
-   Focus: Scalability, complexity, team size
-   ```
-
-2. **Best Practices Research**
-   ```
-   Topic: "[Framework] best practices [year]"
-   Filter: recency=week
-   Focus: Recent patterns, performance
-   ```
-
-3. **Security Research**
-   ```
-   Issue: "[Technology] security vulnerabilities [year]"
-   Filter: recency=day
-   Focus: Latest exploits, mitigations
-   ```
-
-4. **Performance Optimization**
-   ```
-   Problem: "[Specific performance issue]"
-   Filter: recency=month
-   Focus: Optimization techniques, benchmarks
-   ```
+| Case | Example query | Recency | Focus |
+|---|---|---|---|
+| Architecture decisions | "Microservices vs monolith for [use case]?" | `month` | Scalability, complexity, team size |
+| Best practices | "[Framework] best practices [year]" | `week` | Recent patterns, performance |
+| Security research | "[Technology] security vulnerabilities [year]" | `day` | Latest exploits, mitigations |
+| Performance optimization | "[Specific performance issue]" | `month` | Optimization techniques, benchmarks |
 
 ### Perplexity Protocol
 
@@ -212,11 +151,11 @@ mcp__perplexity__perplexity_search_web {
 }
 ```
 
-**Recency Guidelines**:
-- `day`: Breaking changes, security patches, critical bugs
-- `week`: Recent releases, new features, emerging patterns
-- `month`: Best practices, architecture patterns (default)
-- `year`: Historical context, stable patterns
+Pick the recency filter by how fast the answer changes:
+- `day`: breaking changes, security patches, critical bugs
+- `week`: recent releases, new features, emerging patterns
+- `month`: best practices, architecture patterns (the default)
+- `year`: historical context, stable patterns
 
 ---
 
@@ -224,7 +163,7 @@ mcp__perplexity__perplexity_search_web {
 
 ### Document Structure
 
-```markdown
+````markdown
 # Research: [Topic]
 
 ## Summary
@@ -233,9 +172,9 @@ Key findings (2-3 sentences)
 
 ## Context
 
-**Why this research matters**:
+**Why this research was needed**:
 - Problem statement
-- Current approach limitations
+- Limits of the current approach
 - Research objectives
 
 **Scope**:
@@ -278,21 +217,21 @@ interface Example { ... }
 ## Recommendations
 
 **Immediate** (This sprint):
-1. Quick win with high impact
-2. Security/performance fix
+1. [Small, high-impact change that can land this sprint]
+2. [Security or performance fix]
 
 **Short-term** (Next month):
-1. Feature enhancement
-2. Optimization opportunity
+1. [Feature change the findings support]
+2. [Optimization the findings justify]
 
 **Long-term** (Quarterly):
-1. Architecture evolution
-2. Scaling preparation
+1. [Architecture change]
+2. [Scaling work]
 
 ## Implementation Path
 
 **Next Steps**:
-1. Create task in `.backlog/pending/`
+1. Create a task in the store's `pending` state (`.backlog/pending/` on the default `files` store)
 2. Reference this research doc
 3. Include specific acceptance criteria
 
@@ -311,76 +250,67 @@ interface Example { ... }
 - Prefer official documentation
 - Recency within 6 months (for fast-moving tech)
 - Cross-reference 3+ sources for critical decisions
-```
+````
 
 ### Style Requirements
 
-**Follow** `docs/acf/style/research-documents.md`:
-- Direct, factual analysis (no promotional language)
-- Evidence-based claims with source attribution
-- Objective assessment with tradeoffs
-- Token-optimized (tables > prose)
-- Compressed examples (2-3 lines max)
+Follow `docs/acf/style/research-documents.md`:
+- State facts directly, with no promotional language.
+- Attribute every claim to a source.
+- Weigh tradeoffs, not only benefits.
+- Prefer tables to prose; they cost fewer tokens.
+- Keep examples to 2-3 lines.
 
-**Forbidden**:
+Forbidden:
 - Marketing language ("comprehensive", "robust", "elegant")
-- Implementation code (show signatures/shapes only)
+- Implementation code (show signatures and shapes only)
 - Subjective claims without evidence
-- Outdated sources (>1 year for fast-moving tech)
+- Outdated sources (older than 1 year for fast-moving tech)
 
 ---
 
 ## Project Context Awareness
 
-**Before starting research**, review:
+Before starting research, read:
 1. `README.md` - Project overview, tech stack
 2. `CLAUDE.md` - Project-specific conventions
 3. `package.json` / `go.mod` / `requirements.txt` - Current dependencies
 4. `docs/architecture/` - Existing architecture decisions
 5. `docs/development/` - Development patterns
 
-**Research relevance filter**:
-- Does this apply to {project_name}'s tech stack?
-- Does this solve an actual project need?
-- Is this compatible with existing architecture?
-- What's the migration path from current state?
+Then check that the research is relevant:
+- Does it apply to {project_name}'s tech stack?
+- Does it solve a real project need?
+- Is it compatible with the existing architecture?
+- What is the migration path from the current state?
 
 ---
 
 ## Common Research Anti-Patterns
 
-❌ **Don't**: Generic research without project context
-✅ **Do**: Research tailored to {project_name}'s specific needs
-
-❌ **Don't**: Include full implementation code
-✅ **Do**: Show signatures, shapes, patterns (2-3 lines max)
-
-❌ **Don't**: Use outdated sources for fast-moving tech
-✅ **Do**: Prefer sources from last 6 months, cross-reference 3+
-
-❌ **Don't**: Skip Figma MCP when Figma URL provided
-✅ **Do**: MANDATORY Figma analysis for design tasks
-
-❌ **Don't**: Create research docs without temporal naming
-✅ **Do**: Always use `YYYYMMDD-description.md` format
-
-❌ **Don't**: Research without creating follow-up task
-✅ **Do**: Generate task in `.backlog/pending/` from findings
+| Don't | Do |
+|---|---|
+| Research with no project context | Tailor the research to {project_name}'s needs |
+| Include full implementation code | Show signatures, shapes and patterns (2-3 lines max) |
+| Use outdated sources for fast-moving tech | Prefer sources from the last 6 months and cross-reference 3 or more |
+| Skip Figma MCP when a Figma URL is provided | Analyze the Figma design first on every design task |
+| Create research docs without a temporal name | Always use the `YYYYMMDD-description.md` format |
+| Finish research without a follow-up task | Create a task from the findings in the store's `pending` state (`.backlog/pending/` on `files`) |
 
 ---
 
 ## Integration with ACF Workflow
 
-**Research → Task → Implementation**:
-1. `/research "topic"` → Creates `YYYYMMDD-topic.md` + task
-2. `/task` reads research doc → Decomposes into subtasks
-3. `/go` executes tasks → Implements findings
+Research → Task → Implementation:
+1. `/research "topic"` writes `YYYYMMDD-topic.md` and a follow-up task.
+2. `/task` reads the research doc and decomposes it into subtasks.
+3. `/go` executes the tasks and implements the findings.
 
-**Quality Gates**:
-- Research doc must pass style guide validation
-- Sources must be credible and recent
-- Recommendations must be specific and actionable
-- Follow-up task must reference research doc
+Quality gates:
+- The research doc must pass the style guide's validation checklist.
+- Sources must be credible and recent.
+- Recommendations must be specific enough to act on.
+- The follow-up task must reference the research doc.
 
 ---
 

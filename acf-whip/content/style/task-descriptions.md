@@ -1,63 +1,64 @@
 # Task Description Style
 
-## For: task-engineer when creating task files in .backlog/
+## For: task-engineer, whenever it writes a task
+
+A task says what to build, why, and how anyone can tell it is done. How to build it is the specialist's call.
 
 ## Core Principles
 
-- **Tone**: Blunt, direct statements
-- **Requirements**: Binary (works or doesn't)
-- **Evidence**: Concrete, measurable criteria
-- **Language**: Direct, no cushioning
+- **Tone**: blunt and direct, no cushioning
+- **Requirements**: binary. It works or it doesn't.
+- **Evidence**: concrete, measurable criteria
 
 ## Banned Language
 
-**NEVER use**:
+**Never use**:
 - "comprehensive", "systematic", "significant", "substantial", "robust", "elegant"
-- "achievement", "progress", "improvement" (unless 100% complete)
-- "enhance", "optimize", "streamline" (be specific instead)
+- "achievement", "progress", "improvement" (unless the work is 100% complete)
+- "enhance", "optimize", "streamline" (name the actual change instead)
 
 ## Required Language
 
-- **Binary**: "API endpoint validates token" NOT "improve validation"
-- **Specific**: "Response time < 200ms" NOT "fast response"
-- **Testable**: "Returns 401 for missing token" NOT "handles auth errors"
+- **Binary**: "API endpoint validates token", not "improve validation"
+- **Specific**: "Response time < 200ms", not "fast response"
+- **Testable**: "Returns 401 for missing token", not "handles auth errors"
 
 ## Abstraction Level Rules
 
-**CRITICAL**: Tasks specify WHAT and WHY, NEVER HOW.
+A task states WHAT and WHY. It never states HOW.
 
-**Task-engineer responsibilities**:
-- WHAT needs to be done (outcomes, capabilities, interfaces)
-- WHY it's needed (business value, architectural alignment)
-- WHAT constraints apply (performance, security, compatibility)
+**task-engineer writes**:
+- WHAT needs to be done: outcomes, capabilities, interfaces
+- WHY it's needed: business value, fit with the architecture
+- WHAT constraints apply: performance, security, compatibility
 
-**Specialist agent responsibilities** (NOT in task descriptions):
-- HOW to implement (algorithms, data structures, patterns)
-- WHICH libraries/frameworks to use (unless mandated by architecture)
-- HOW to structure code (file organization, class design)
+**The specialist agent decides** (keep these out of the task):
+- HOW to implement it: algorithms, data structures, patterns
+- WHICH libraries or frameworks to use, unless the architecture mandates one
+- HOW to structure the code: file layout, class design
 
-**Boundary test**: If you're describing step-by-step implementation, STOP. You've crossed into specialist territory.
+**Boundary test**: if you are writing step-by-step implementation, stop. That work belongs to the specialist.
 
 ## Code Snippet Policy
 
-**ABSOLUTE PROHIBITIONS**:
+**Never include**:
 - Function/method implementations
-- Algorithm pseudocode (use natural language)
-- Configuration file contents (describe requirements instead)
-- Database queries (specify data requirements)
-- API call sequences (describe workflow outcomes)
+- Algorithm pseudocode (describe the algorithm in words)
+- Configuration file contents (state the requirements)
+- Database queries (state the data requirements)
+- API call sequences (describe what the workflow must achieve)
 
-**ALLOWED** (sparingly, 2-3 lines max):
+**Allowed**, sparingly and 2-3 lines at most:
 - API endpoint signatures: `POST /api/v1/pipelines`
 - Response shape: `{"pipeline_id": "uuid", "status": "pending"}`
 - Error codes: `Returns 400 for invalid YAML`
 - Type signatures: `func ProcessYAML(input []byte) (*Workflow, error)`
 
-**When in doubt**: Use natural language, not code.
+When in doubt, write it in words.
 
 ## Technical Requirements Boundaries
 
-### ✅ CORRECT - Specification Level
+### Right: specification level
 
 **What to modify**:
 - "Modify services/user-api/handlers/pipeline.go"
@@ -79,7 +80,7 @@
 - "Support YAML files up to 1MB"
 - "Zero database queries in validation path"
 
-### ❌ WRONG - Implementation Level
+### Wrong: implementation level
 
 **Detailed algorithms**:
 - "Parse YAML using yaml.Unmarshal, iterate through sources array, for each source call ValidateMethod..."
@@ -111,14 +112,14 @@ database:
 
 ### Acceptance Criteria Examples
 
-**✅ GOOD - Binary, Testable, Outcome-Focused**:
+**Good: binary, testable, about the outcome**:
 - [ ] user-api returns 201 with pipeline_id when YAML is valid
 - [ ] yaml-processor rejects YAML with unknown methods (returns 400)
 - [ ] Integration test covers YAML submission → Temporal workflow creation
 - [ ] YAML validation completes in < 200ms for 100KB files
 - [ ] catalog-stub returns method schema for "social.twitter.search"
 
-**❌ BAD - Vague, Implementation-Focused**:
+**Bad: vague, or about the implementation**:
 - [ ] Enhance API error handling
 - [ ] Improve YAML validation robustness
 - [ ] Comprehensively test the pipeline flow
@@ -127,13 +128,13 @@ database:
 
 ### Verifiability Boundary
 
-Every acceptance criterion MUST be verifiable inside the task's worktree and quality-gate environment. Criteria that need a **live deployed environment** (a staging URL, a real cluster, production telemetry) belong in a separate operator/deploy-gated task.
+Every acceptance criterion must be verifiable inside the task's worktree and quality-gate environment. A criterion that needs a **live deployed environment** (a staging URL, a real cluster, production telemetry) belongs in its own operator- or deploy-gated task.
 
-A reviewer who cannot verify a criterion must reject the task — so an unverifiable criterion burns the 3-rejection budget without any defect existing.
+A reviewer who cannot verify a criterion has to reject the task. So an unverifiable criterion spends the 3-rejection budget on a task that has no defect.
 
 ### Technical Requirements Examples
 
-**✅ GOOD - Specification Level**:
+**Good: specification level**:
 
 ```markdown
 ### Implementation Details
@@ -149,7 +150,7 @@ A reviewer who cannot verify a criterion must reject the task — so an unverifi
 - Error case: unknown method name returns 400 with method name in error
 ```
 
-**❌ TERRIBLE - Implementation Level with Code Snippets**:
+**Terrible: implementation level, with code**:
 
 ```markdown
 ### Implementation Details
@@ -170,14 +171,14 @@ func ValidateMethod(name string) error {
 }
 ```
 
-**Why TERRIBLE**:
+**Why it's terrible**:
 - 50+ lines of implementation code
-- Prescribes exact algorithm
-- Dictates code structure
-- Leaves nothing for specialist agent to decide
-- Creates maintenance burden (code duplicated in task + implementation)
+- Prescribes the exact algorithm
+- Dictates the code structure
+- Leaves the specialist agent nothing to decide
+- Duplicates the code in the task and the implementation, and both then need maintaining
 
-**✅ CORRECT Alternative**:
+**The same task, written correctly**:
 
 ```markdown
 ### Implementation Details
@@ -203,7 +204,7 @@ func ValidateMethod(name string) error {
 
 ### Edge Cases Examples
 
-**✅ GOOD - Describes Scenario and Expected Outcome**:
+**Good: the scenario and the expected outcome**:
 ```markdown
 ## Edge Cases to Handle
 - Empty YAML file: Return 400 "pipeline must have at least one source"
@@ -213,7 +214,7 @@ func ValidateMethod(name string) error {
 - Circular dependencies in transforms: Return 400 "circular dependency detected: A → B → A"
 ```
 
-**❌ BAD - Implementation Details**:
+**Bad: implementation details**:
 ```markdown
 ## Edge Cases to Handle
 - Empty YAML: Check len(yamlBytes) == 0 before unmarshaling, if true return early with error
@@ -224,7 +225,7 @@ func ValidateMethod(name string) error {
 
 ### Out of Scope Examples
 
-**✅ GOOD - Clear Boundaries**:
+**Good: clear boundaries**:
 ```markdown
 ## Out of Scope
 - Pipeline execution (handled by Temporal workflows in separate task)
@@ -234,7 +235,7 @@ func ValidateMethod(name string) error {
 - YAML syntax highlighting in UI (frontend task)
 ```
 
-**❌ BAD - Vague**:
+**Bad: vague**:
 ```markdown
 ## Out of Scope
 - Other features
@@ -242,13 +243,11 @@ func ValidateMethod(name string) error {
 - Non-critical items
 ```
 
-## Summary
+## The Test
 
-**For task-engineer**: Your job is to create specifications that empower specialist agents, not constrain them.
+A specialist who reads your task should be able to say "I know WHAT to build and WHY." If they say "I just need to copy-paste this code", the task has failed.
 
-**Golden Rule**: If a specialist agent can read your task and say "I know WHAT to build and WHY", you've succeeded. If they say "I just need to copy-paste this code", you've failed.
-
-**Enforcement**: quality-reviewer MUST reject tasks with extensive code snippets or implementation algorithms. Rejected tasks move back to pending/ with comments citing this guide.
+**Enforcement**: quality-reviewer must reject a task with extensive code snippets or implementation algorithms. A rejected task moves back to pending/ with comments that cite this guide.
 
 ---
 

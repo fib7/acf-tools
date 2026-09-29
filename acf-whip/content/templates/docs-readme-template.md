@@ -1,31 +1,31 @@
 # Project Documentation
 
-This file serves as the documentation hub for this project. AI agents read this to discover available documentation.
+Index of this project's documentation. Agents read it first to learn what documentation exists.
 
 ## Core Documentation
 
-- **[Architecture](./architecture/)** - System design, service boundaries, technical architecture
+- **[Architecture](./architecture/)** - System design, service boundaries
 - **[Development](./development/)** - Developer guides, coding standards, quality gates
-- **[Operations](./operations/)** - Deployment procedures, monitoring setup, troubleshooting
+- **[Operations](./operations/)** - Deployment, monitoring, troubleshooting
 
 ## Guides
 
-- **[Getting Started](./guides/getting-started.md)** - Initial setup and onboarding
+- **[Getting Started](./guides/getting-started.md)** - Setup for a new developer
 - **[API Development](./guides/api-development.md)** - Building and testing APIs
-- **[Testing Guide](./guides/testing.md)** - Test patterns and best practices
+- **[Testing Guide](./guides/testing.md)** - Test patterns and conventions
 
 ## Reference
 
-- **[API Reference](./reference/api.md)** - Complete API documentation
+- **[API Reference](./reference/api.md)** - Endpoints, requests, responses
 - **[Database Schema](./reference/schema.md)** - Database structure and migrations
 - **[Configuration](./reference/configuration.md)** - Environment variables and settings
 
 ## ACF Workflow
 
-- **[Task Descriptions](./acf/style/task-descriptions.md)** - Mandatory task description style guide
+- **[Task Descriptions](./acf/style/task-descriptions.md)** - Required style for task descriptions
 - **[Workflow](./acf/backlog/workflow.md)** - Backlog state machine and rules
-- **[Quality Gates](./development/quality-gates-{stack}.md)** - Stack-specific quality requirements
+- **[Quality Gates](./development/quality-gates-{stack}.md)** - Quality requirements for each stack
 
 ---
 
-**Tip**: Keep this index updated as you add documentation. Agents use it to discover relevant resources instead of blind directory scanning.
+**Tip**: Add a line here for every new document. Agents use this index to find documents instead of scanning directories blind.

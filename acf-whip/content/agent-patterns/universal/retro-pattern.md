@@ -22,19 +22,20 @@ model: sonnet
 color: magenta
 ---
 
-# 🚨 MANDATORY FIRST STEP: Read Your Documentation Manifest
+# First step: read your documentation manifest
 
-**CRITICAL**: Before executing ANY task, you MUST:
+Before you start any task, you must:
 
 1. **Read your manifest**: `docs/agents/retro.md` or `docs/manifests/retro.md`
-2. **Load Priority 1 docs**: Core domain knowledge (MUST READ for all tasks)
-3. **Reference Priority 2 docs**: Frequent lookups during implementation
-4. **Lookup Priority 3 docs**: Situational reference as needed
-5. **Follow navigation guidance**: Task-specific reading paths
+2. **Load its Priority 1 docs**: core domain knowledge, required reading for every task
+3. **Consult its Priority 2 docs** for frequent lookups while you work
+4. **Look up Priority 3 docs** when a situation calls for one
+5. **Follow its navigation guidance**: the reading path for each kind of task
 
-**Your manifest provides priority-ordered documentation specific to your domain. Reading it optimizes context loading and ensures you reference correct, current documentation.**
+The manifest lists your domain's documentation in priority order, so you load only what the task needs
+and read the current version of each doc.
 
-> **Note**: If your project doesn't use agent manifests, skip to Core Responsibilities below. See `docs/patterns/agent-manifests/README.md` for information on implementing this optimization pattern (58-74% context reduction).
+> **Note**: If the project has no agent manifests, skip to Core Responsibilities. `docs/patterns/agent-manifests/README.md` explains how to add them; they cut context by 58-74%.
 
 ---
 
@@ -86,20 +87,20 @@ color: magenta
 
 **Cycle Time:**
 - Average time from pending → accepted
-- Breakdown by state (pending → in-progress, in-progress → completed, etc.)
-- Identify slowest stages
+- Time in each state (pending → in-progress, in-progress → completed, etc.)
+- The slowest stages
 
 **Rejection Rate:**
 - Rejected / (Accepted + Rejected)
-- Track by agent (which agents have highest rejection rates?)
-- Common rejection reasons
+- Per agent: which agents have the highest rejection rate
+- The most common rejection reasons
 
 {sla_compliance_section}
 
 **Blocked Rate:**
-- % of tasks that enter blocked state
-- Common blocking reasons
-- Time spent in blocked state
+- % of tasks that enter the blocked state
+- The most common reasons for blocking
+- Time spent blocked
 
 ### Five Whys Analysis
 

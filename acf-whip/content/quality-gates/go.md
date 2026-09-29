@@ -1,8 +1,11 @@
 # Quality Gates - Go
 
+A Go task is not done until every command under Quality Requirements passes.
+
 ## Zero Bypass Tolerance
 
-**ABSOLUTELY FORBIDDEN**: Bypassing quality gates is STRICTLY PROHIBITED. **NO EXCEPTIONS.**
+Never bypass a quality gate, for any reason. Fix the code until the gate passes, or report the task
+blocked under the Quality Gate Protocol below.
 
 ## Quality Requirements
 
@@ -18,10 +21,12 @@ go mod tidy && git diff --exit-code go.mod go.sum  # Dependency hygiene
 
 ### Test Coverage
 
-- **Core Logic**: 80% minimum
-- **Handlers/Controllers**: 85% minimum
-- **Services**: 80% minimum
-- **Utilities**: 75% minimum
+| Code Type | Minimum Coverage |
+|-----------|------------------|
+| Core logic | 80% |
+| Handlers/controllers | 85% |
+| Services | 80% |
+| Utilities | 75% |
 
 ## Code Standards
 
@@ -267,11 +272,17 @@ func BenchmarkProcessRequest(b *testing.B) {
 
 ## Pre-commit Hooks
 
-The installed `.pre-commit-config.yaml` enforces these gates on commit: gofmt, `go vet ./...`,
-`go mod tidy` when go.mod or go.sum changes, `go test ./...` on push, and golangci-lint when it is
-installed (required once a `.golangci.yml` exists). It never touches `docs/cycles/` (cycle records),
-`docs/acf/` (plugin-managed docs), `.backlog/` (task state) or `.acfwhip/` (config and the LP-CAS
-ledger): acf-whip commits those itself, and a hook that rewrites one fails that commit.
+The `.pre-commit-config.yaml` that `/whip-init` installs runs a lighter set of checks. On commit:
+gofmt, `go vet ./...`, `go mod tidy` when go.mod or go.sum changed, and golangci-lint on code changed
+since HEAD if the binary is installed. A `.golangci.yml` without the binary fails the commit. On push:
+`go test ./...`. The hooks do not replace the commands above, and they run only after
+`pre-commit install` (plus `pre-commit install --hook-type pre-push` for the test hook).
+
+The hooks never touch `docs/cycles/` (cycle records), `docs/acf/` (plugin-managed docs), `.backlog/`
+(task state) or `.acfwhip/` (config and the LP-CAS ledger). acf-whip commits those itself, and a hook
+that rewrites one fails that commit.
+
+To run the commit hooks against every file:
 
 ```bash
 pre-commit run --all-files
@@ -281,8 +292,8 @@ pre-commit run --all-files
 
 ### When Checks Fail
 
-1. **Attempts 1-10**: Fix actual issues
-2. **After 10 attempts**: Move task to blocked with report
+1. **Attempts 1-10**: fix the underlying problem, not the check, and rerun.
+2. **After 10 attempts**: stop and report the task blocked, with a failure report in the format below.
 
 ### Failure Report Format
 
@@ -314,7 +325,7 @@ pre-commit run --all-files
 
 ## Forbidden Bypass Methods
 
-**NEVER use**:
+Never use any of these:
 
 - `//nolint` comments (except with documented justification)
 - `git commit --no-verify`
@@ -323,23 +334,25 @@ pre-commit run --all-files
 - `// +build !test` to skip tests
 - Ignoring race detector warnings
 
-## Performance Requirements (Optional - Customize)
+## Performance Requirements (Optional)
+
+The numbers below are examples. A project sets its own.
 
 ### Example for API Services
 
 - API response time: < 100ms (p90)
-- Memory allocation: Minimize in hot paths
-- Goroutine leaks: Zero tolerance
+- Memory allocation: minimal in hot paths
+- Goroutine leaks: none
 - Database connection pool: 10-25 connections
 
 ### Optimization Patterns
 
 - Use `sync.Pool` for frequently allocated objects
 - Prefer value receivers for small structs
-- Use buffered channels appropriately
+- Give a channel a buffer only when you can say why it needs one
 - Profile before optimizing (`pprof`)
 
-## Dependencies Management
+## Dependency Management
 
 ```bash
 # Add dependency
@@ -393,4 +406,4 @@ jobs:
         run: go build ./...
 ```
 
-Failed CI blocks merge. NO exceptions.
+A failed CI run blocks the merge, with no exceptions.

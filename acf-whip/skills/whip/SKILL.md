@@ -67,10 +67,11 @@ The scripts are `${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-cycle` and `acfw-spec
 Every call below spells the path out, because shell variables do not survive from one Bash call to
 the next. Run them from inside the repository: they find its root themselves. Pass a cycle ID rather
 than a relative path wherever you can, so the current directory inside the repo never matters. The
-placeholders below are already in single quotes: fill them in as stop rule 12 says, so a heading
+placeholders below are already in single quotes. Fill them in as stop rule 12 says, so a heading
 like `# Invoice export $(date) now` stays text.
+
 `status` and `approve` may walk the task store, which takes minutes on a large shared board, and
-spec tools run inside a 540 s budget: give every `acfw-cycle status`, `acfw-cycle approve` and
+spec tools run inside a 540 s budget. Give every `acfw-cycle status`, `acfw-cycle approve` and
 `acfw-spec` Bash call `timeout: 600000`.
 
 ## What the argument means
@@ -121,9 +122,11 @@ with exactly one `NEXT` line and either `NEED YOU: nothing` or one or more cards
 `RISK` and `REPLY` lines. A card's REPLY is what the user types or does next; do not run it for
 them. An approval card (one with a `content=` line) is answered through **The yes**, and its NEXT
 line (`NEXT yes: approve docs/cycles/<ID>/plan.md (content=<c12>)`) is a reply for the user to
-type, not a command. Bare status reports on one cycle, the one in flight or your single draft, and
-never lets a draft take NEXT from a cycle in flight. When several could be meant it prints a
-`/whip <ID>` card for each. A draft it does not mention opens with `/whip <ID>`.
+type, not a command.
+
+Bare status reports on one cycle: the one in flight, or your single draft. A draft never takes NEXT
+from a cycle in flight. When several cycles could be meant, it prints a `/whip <ID>` card for each.
+A draft it does not mention opens with `/whip <ID>`.
 
 ## Goal: pick the route
 
@@ -167,10 +170,10 @@ Do not run `/task`. If the user answers "plan", take the planned route with the 
    ```
    If it prints `this cycle is abandoned` or `this cycle is closed`, the folder is finished and
    nobody can continue it: pick another slug (add one more word of the goal) and run `init` once
-   more. Otherwise print the refusal and stop, and not that status: it was only a check, and a card
-   shown from it would skip the review. The user continues that cycle with `/whip <ID>` or closes
-   it with `/whip --abandon <ID>`. Any other exit 3 (`exists at HEAD`, say) is a plain refusal:
-   print it and stop.
+   more. Otherwise print the refusal and stop. Do not print that status: it was only a check, and a
+   card shown from it would skip the review. The user continues that cycle with `/whip <ID>` or
+   closes it with `/whip --abandon <ID>`. Any other exit 3 (`exists at HEAD`, say) is a plain
+   refusal: print it and stop.
 2. Read the recorded lessons:
    ```bash
    bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-cycle" lessons
@@ -296,9 +299,9 @@ A **plain yes** approves the plan and asks for nothing else: "yes", "y", "approv
    args copied character for character from that NEXT line: `--plan docs/cycles/<ID>/plan.md`.
    Loading the skill does not start anything by itself. Follow the instructions it loads, to the
    end: it resolves the environment and launches the `/task --plan` workflow, which sets your `/go`
-   focus, and it reports what the run returns. While a `/go` run is in flight that run stops at its
-   first check with `wait: /go is running`: that is its report, not a failure to work around. Do
-   nothing of /whip's own after it (no summary, no NEXT line of your own).
+   focus, and it reports what the run returns. While a `/go` run is in flight, the `/task --plan`
+   run stops at its first check with `wait: /go is running`. That is its report, not a failure to
+   work around. Do nothing of /whip's own after it (no summary, no NEXT line of your own).
 5. **Otherwise, stop** after printing `approve`'s output. Its exit code and message say why (for
    example 9: this is not the plan on the last card; 8: a D-id was renumbered; 22: a blocking spec
    tool has not said GO; 26: the plan is out in a workbench). A refusal ends with
@@ -489,9 +492,10 @@ push, pull or `--from` the user asked for. If only a status card showed it, stop
   ```
   Print it verbatim. The task stays in draft until someone moves it. The user fixes the task where
   it lives (its `.backlog/draft/` file on `files`, the backend's own editor elsewhere; `--push` and
-  `--pull` take plans only, never a task), runs `/whip --review <task>` again, and then releases it with two commands: `/whip-move <task>
-  pending`, then `/whip-focus add <task>`. A held task was never added to the `/go` focus, so
-  without the second one a bare `/go` never runs it. Print both; run neither.
+  `--pull` take plans only, never a task) and runs `/whip --review <task>` again. Two commands then
+  release it: `/whip-move <task> pending`, then `/whip-focus add <task>`. A held task was never
+  added to the `/go` focus, so without the second one a bare `/go` never runs it. Print both; run
+  neither.
 
 ### Workbench round-trip: push and pull
 
@@ -508,9 +512,8 @@ push, pull or `--from` the user asked for. If only a status card showed it, stop
   bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-spec" pull '<ID>'
   ```
   Pass exactly the flags the user typed, each as its own argument, and no others (a `--file` path
-  and a `--tool` name in single quotes). `--clipboard`
-  and `--file <path>` merge text without a push (a paste, or a changed original of an adopted plan).
-  Then:
+  and a `--tool` name in single quotes). `--clipboard` and `--file <path>` merge text without a
+  push: a paste, or a changed original of an adopted plan. Then:
   - `PULLED|<tool>|<how>|content=<c12>`: the merge is in `plan.md`. Run **Show the card** (the
     review runs on the new bytes). A pull never approves and never commits, and it is an edit:
     never approve in the same turn.

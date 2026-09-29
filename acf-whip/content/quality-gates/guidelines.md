@@ -1,62 +1,38 @@
 # Guidelines for Creating Custom Quality Gates
 
-This guide helps you create quality gates for tech stacks not covered by ready-made templates.
+acf-whip ships gates docs for Go, Python, Node.js and Next.js. For any other stack (`--backend=rust`,
+say), `/whip-add-agents` writes a starter `docs/development/quality-gates-<stack>.md` from a template
+of its own. This guide covers what a complete gates doc needs, whether you are filling out that
+starter or starting from [template.md](template.md).
 
 ## Process Overview
 
-1. **Identify Core Tools** - What tools enforce quality in your stack?
-2. **Define Standards** - What configuration ensures quality?
-3. **Set Thresholds** - What coverage/score minimums?
-4. **Configure Automation** - How to enforce automatically?
-5. **Document Bypasses** - What bypass methods to prohibit?
-6. **Integrate with ACF** - How agents/commands reference gates?
+1. **Identify core tools**: which tools lint, type-check, format, test and build your stack
+2. **Define standards**: the configuration those tools run with
+3. **Set thresholds**: coverage minimums, and performance targets if you need them
+4. **Configure automation**: pre-commit hooks and CI
+5. **Document bypasses**: every way to skip a check, each one banned
+6. **Integrate with ACF**: point the agents at the doc
 
 ## Step 1: Identify Core Tools
 
-### Questions to Answer
+### Tools by Stack
 
-**Linting**: What tools check code style and potential bugs?
-- JavaScript/TypeScript: ESLint
-- Python: Ruff, Pylint, Flake8
-- Go: golangci-lint
-- Rust: clippy
-- Ruby: RuboCop
-- Java: Checkstyle, PMD
-- C#: Roslyn analyzers
-
-**Type Checking**: Does your language have static typing?
-- TypeScript: tsc
-- Python: mypy, pyright
-- Go: built into compiler
-- Rust: built into compiler
-- Flow (JavaScript): flow
-
-**Formatting**: What enforces consistent formatting?
-- Multi-language: Prettier
-- Python: Black, Ruff format
-- Go: gofmt, goimports
-- Rust: rustfmt
-- Ruby: RuboCop
-- Java: google-java-format
-
-**Testing**: What runs your tests?
-- JavaScript: Jest, Vitest, Mocha
-- Python: pytest, unittest
-- Go: go test
-- Rust: cargo test
-- Ruby: RSpec, Minitest
-- Java: JUnit
-
-**Build Verification**: How do you ensure code compiles/builds?
-- Next.js: `next build`
-- Python: `python -m compileall`
-- Go: `go build`
-- Rust: `cargo build`
-- Java: `mvn compile` or `gradle build`
+| Stack | Lint | Type check | Format | Test | Build |
+|-------|------|------------|--------|------|-------|
+| JavaScript/TypeScript | ESLint | tsc; flow for Flow | Prettier (multi-language) | Jest, Vitest, Mocha | `next build` (Next.js) |
+| Python | Ruff, Pylint, Flake8 | mypy, pyright | Black, Ruff format | pytest, unittest | `python -m compileall` |
+| Go | golangci-lint | built into the compiler | gofmt, goimports | `go test` | `go build` |
+| Rust | clippy | built into the compiler | rustfmt | `cargo test` | `cargo build` |
+| Ruby | RuboCop | | RuboCop | RSpec, Minitest | |
+| Java | Checkstyle, PMD | | google-java-format | JUnit | `mvn compile` or `gradle build` |
+| C# | Roslyn analyzers | | | | |
 
 ### Document Your Stack's Tools
 
-```markdown
+List the commands in the doc. Leave out any slot your stack has no tool for.
+
+````markdown
 ## Quality Requirements for [Your Stack]
 
 ### Core Quality Tools
@@ -77,28 +53,29 @@ This guide helps you create quality gates for tech stacks not covered by ready-m
 # Build Verification
 [command]
 ```
-```
+````
 
 ## Step 2: Define Standards
 
 ### Linting Standards
 
-**Strictness Philosophy**: Start strict, loosen if necessary (not the reverse).
+Start strict and loosen a rule only when you have to, never the reverse.
 
-**Common Rules Across Languages**:
-- No unused variables/imports
-- No debug statements (console.log, print, etc.)
-- Proper error handling (no ignored errors)
-- No commented code
-- Consistent naming conventions
+Rules worth having in any language:
+- No unused variables or imports
+- No debug statements (`console.log`, `print` and the like)
+- No ignored errors
+- No commented-out code
+- Consistent naming
 
-**Configuration Principles**:
-1. **Use community standards** - Extend well-known configs
+Three principles for the configuration:
+
+1. **Extend a community config** instead of writing rules from scratch:
    - JavaScript: `eslint:recommended`, `next/core-web-vitals`
    - Python: Ruff's default rule set
    - Go: golangci-lint's recommended linters
 
-2. **Enforce, don't warn** - Rules should be errors, not warnings
+2. **Make every rule an error, not a warning**:
    ```javascript
    // ✅ GOOD
    "rules": {
@@ -111,7 +88,7 @@ This guide helps you create quality gates for tech stacks not covered by ready-m
    }
    ```
 
-3. **Document exceptions** - If you disable a rule, explain why
+3. **Say why whenever you disable a rule**, in a comment beside it:
    ```yaml
    # .golangci.yml
    linters-settings:
@@ -122,34 +99,29 @@ This guide helps you create quality gates for tech stacks not covered by ready-m
 
 ### Type Checking Standards
 
-**Strict Mode**: Always enable strict mode if available.
-
-**No `any` Types**: Prohibit untyped values (TypeScript `any`, Python `Any`).
-
-**Complete Coverage**: All functions must have type annotations.
+Always turn on strict mode when the checker has one. Prohibit untyped values (`any` in TypeScript,
+`Any` in Python). Every function must have type annotations.
 
 ### Testing Standards
 
-**Coverage Tiers**: Set different thresholds by code criticality.
+Set coverage thresholds by how critical the code is:
 
 | Code Criticality | Coverage Threshold | Rationale |
 |------------------|-------------------|-----------|
 | **Customer-facing APIs** | 90-95% | High impact, must work |
-| **Core business logic** | 90% | Critical to functionality |
+| **Core business logic** | 90% | Everything else depends on it |
 | **Internal services** | 85-90% | Integration layer |
-| **Utilities/helpers** | 80-85% | Lower criticality |
-| **UI components** | 75-80% | Visual testing supplements |
+| **Utilities/helpers** | 80-85% | Lower risk |
+| **UI components** | 75-80% | Visual tests cover part of it |
 
-**Test Quality**: Coverage alone isn't enough.
-- **Meaningful assertions**: Not just "doesn't crash"
-- **Edge cases**: Test boundaries, errors, edge conditions
-- **Integration tests**: Test actual workflows, not just units
+Coverage alone isn't enough. Assert on results, not only that the code ran without crashing. Test
+boundaries and error paths. Write integration tests that run real workflows, not only units.
 
 ## Step 3: Set Thresholds
 
 ### Coverage Thresholds
 
-**Conservative Starting Point** (can adjust based on experience):
+A conservative starting point, to adjust as you learn what your project needs:
 
 ```yaml
 # Start here, adjust based on your project's maturity
@@ -159,17 +131,17 @@ Services: 85%
 Utilities: 80%
 ```
 
-**Factors to Consider**:
-- **Project maturity**: New projects can start at 80%, mature at 90%+
-- **Team size**: Larger teams need higher coverage (harder to communicate edge cases)
-- **Domain criticality**: Financial/medical = higher, internal tools = lower
-- **Change frequency**: Fast-changing code needs better tests
+Then adjust for:
+- **Project maturity**: a new project can start at 80%, a mature one at 90% or more
+- **Team size**: larger teams need more, since edge cases are harder to communicate across them
+- **Domain**: financial or medical code higher, internal tools lower
+- **Change frequency**: code that changes often needs better tests
 
 ### Performance Thresholds (If Applicable)
 
-Only set performance gates if performance is critical.
+Set performance gates only when performance is a requirement.
 
-**Web Applications**:
+**Web applications**:
 - Lighthouse score: > 90
 - LCP: < 2.5s
 - FID: < 100ms
@@ -189,17 +161,15 @@ Only set performance gates if performance is critical.
 
 ### Pre-commit Hooks
 
-**Tools**:
-- Universal: [pre-commit](https://pre-commit.com/) (multi-language)
+Tools:
+- Any language: [pre-commit](https://pre-commit.com/)
 - JavaScript: Husky + lint-staged
-- Git hooks: native `.git/hooks/`
+- Plain git: native `.git/hooks/`
 
-**What to Run in Pre-commit**:
-- ✅ Fast checks: Linting, formatting
-- ✅ Modified file checks: Only check staged files
-- ❌ Slow checks: Full test suite, build (save for CI)
+Keep the commit hook fast. Run the linter and formatter on staged files only, and leave the full test
+suite and the build to CI.
 
-**Example: Husky + lint-staged (JavaScript)**:
+Husky and lint-staged (JavaScript):
 
 ```json
 {
@@ -210,7 +180,7 @@ Only set performance gates if performance is critical.
 }
 ```
 
-**Example: pre-commit (Python)**:
+pre-commit (Python):
 
 ```yaml
 repos:
@@ -223,16 +193,16 @@ repos:
 
 ### Continuous Integration
 
-**CI Must Run Full Suite**:
-1. All linting (full codebase, not just changes)
-2. All type checking
-3. All tests with coverage
+CI must run the full suite:
+1. Linting, on the whole codebase rather than only the changes
+2. Type checking
+3. Every test, with coverage
 4. Build verification
-5. Security audit (optional but recommended)
+5. A security audit (optional, recommended)
 
-**Block on Failure**: CI failure MUST block merge. No exceptions.
+A CI failure must block the merge, with no exceptions.
 
-**Example: GitHub Actions (Universal Pattern)**:
+A GitHub Actions workflow that fits any stack:
 
 ```yaml
 name: Quality Gates
@@ -272,9 +242,7 @@ jobs:
 
 ### Identify Bypass Methods
 
-Every stack has ways to bypass quality checks. Document and prohibit them.
-
-**Common Bypass Patterns**:
+Every stack has ways to skip a check. List them in the doc and ban them.
 
 | Stack | Bypass Methods |
 |-------|----------------|
@@ -286,7 +254,7 @@ Every stack has ways to bypass quality checks. Document and prohibit them.
 
 ### Acceptable Exceptions
 
-**Rare exceptions with justification**:
+A rare exception is acceptable when the comment gives the reason:
 
 ```typescript
 // ✅ ACCEPTABLE - Documented reason
@@ -300,7 +268,7 @@ const result = brokenLibrary.method();
 defer buf.Close()
 ```
 
-**Unacceptable exceptions**:
+Without one, it is not:
 
 ```typescript
 // ❌ FORBIDDEN - No justification
@@ -328,7 +296,7 @@ const result = someCode();
 
 ### Reference in Agent Files
 
-Agents should know their quality gates:
+Point each specialist's agent file at its gates doc, and give it a pre-completion checklist:
 
 ```markdown
 # .claude/agents/[stack]-engineer.md
@@ -352,6 +320,8 @@ See [Quality Gates - [Stack]](../../docs/acf/quality-gates-[stack].md)
 
 ### Reference in Quality Reviewer
 
+List the gates doc for every stack in the project in the quality-reviewer's agent file:
+
 ```markdown
 # .claude/agents/quality-reviewer.md
 
@@ -373,11 +343,9 @@ See [Quality Gates - [Stack]](../../docs/acf/quality-gates-[stack].md)
 
 ## Example: Creating Quality Gates for Rust
 
-Let's walk through creating gates for Rust as an example.
-
 ### Step 1: Identify Tools
 
-```markdown
+````markdown
 ## Quality Requirements for Rust
 
 ### Core Quality Tools
@@ -395,7 +363,7 @@ cargo test
 # Build
 cargo build --release
 ```
-```
+````
 
 ### Step 2: Define Standards
 
@@ -412,7 +380,7 @@ rustflags = ["-D", "warnings"]  # Deny warnings
 
 ### Step 3: Set Thresholds
 
-Rust doesn't have built-in coverage, but you can use tarpaulin:
+Cargo has no coverage command of its own. cargo-tarpaulin adds one:
 
 ```bash
 cargo install cargo-tarpaulin
@@ -456,52 +424,37 @@ repos:
 
 ### Step 6: Complete Quality Gate Document
 
-Create `docs/patterns/quality-gates/rust.md` with all above sections combined.
+Combine the sections above into `docs/patterns/quality-gates/rust.md`.
 
 ## Testing Your Quality Gates
 
 ### Validation Checklist
 
-Before considering your quality gates complete:
+Prove each gate both ways before you call the doc finished:
 
-- [ ] All commands run successfully on passing code
-- [ ] All commands fail appropriately on bad code
-- [ ] Pre-commit hooks prevent bad commits
-- [ ] CI blocks merge on quality failure
-- [ ] Team understands all requirements
-- [ ] Documentation is clear and complete
-- [ ] Bypass methods are documented and prohibited
-
-### Test Scenarios
-
-1. **Passing code**: All gates pass
-2. **Linting errors**: Gates fail, clear error messages
-3. **Type errors**: Gates fail (if applicable)
-4. **Low coverage**: Gates fail with coverage report
-5. **Build failure**: Gates catch compilation errors
-6. **Bypass attempt**: Pre-commit hooks prevent or CI catches
+- [ ] Clean code passes every command
+- [ ] Lint errors and type errors (where the stack has types) fail their gate with a clear message
+- [ ] Low coverage fails with a coverage report
+- [ ] A build failure is caught
+- [ ] Pre-commit hooks stop a bad commit, and CI blocks the merge
+- [ ] A bypass attempt is stopped by the hooks or caught by CI
+- [ ] The doc lists every bypass method and bans it
+- [ ] The team knows the requirements
 
 ## Maintenance
 
-### When to Update Quality Gates
-
-- **New linters available**: Evaluate and potentially add
-- **Team feedback**: Adjust thresholds if too strict/loose
-- **Project maturity**: Increase coverage requirements over time
-- **Stack upgrades**: Review breaking changes in tools
-
-### Review Schedule
-
-- **Quarterly**: Review thresholds and rules
-- **After major version updates**: Review tool configurations
-- **When team grows**: Consider stricter gates
-- **When velocity drops**: Check if gates too restrictive
-
----
+| When | What to do |
+|------|------------|
+| Every quarter | Review thresholds and rules |
+| A new linter comes out | Evaluate it and decide whether to add it |
+| A tool ships a major version | Review its breaking changes and your configuration |
+| The team says a gate is too strict or too loose | Adjust the threshold |
+| The project matures | Raise coverage requirements |
+| The team grows | Consider stricter gates |
+| Velocity drops | Check whether the gates are too restrictive |
 
 ## Additional Resources
 
-- [Template](template.md) - Start with this template
-- [Next.js/TypeScript Example](nextjs-typescript.md) - Reference implementation
-- [Python/FastAPI Example](python-fastapi.md) - Reference implementation
-- [Go Example](go.md) - Reference implementation
+- [Template](template.md): start here
+- Finished examples: [Next.js/TypeScript](nextjs-typescript.md), [Python/FastAPI](python-fastapi.md),
+  [Go](go.md), [Node.js](nodejs.md)

@@ -2,11 +2,12 @@
 
 ## Overview
 
-The `.backlog/` directory contains all task specifications in a structured workflow. Tasks move through states from `pending` to terminal states (`accepted` or `blocked`).
+`.backlog/` holds this project's task files, one per task, each in the folder for its current state.
+A task starts in `pending` and stops in one of the two terminal states, `accepted` or `blocked`.
 
 This README summarizes the task workflow for this project. `docs/acf/backlog/workflow.md` owns the
 state machine and the State Transition Authority table: where this README disagrees with either of
-those two, workflow.md wins. All agents MUST read this README as Priority 1 documentation.
+those two, workflow.md wins. Every agent must read this README as Priority 1 documentation.
 
 ## Directory Structure
 
@@ -32,13 +33,11 @@ pending → in-progress → completed → in-review → [accepted|rejected]
 ```
 
 **Terminal States**:
-- `accepted` - Passed quality review
-- `blocked` - Stopped: its specialist blocked it, it timed out, or it hit `/go`'s retry cap. `/go`
+- `accepted`: passed quality review.
+- `blocked`: stopped. Its specialist blocked it, it timed out, or it hit `/go`'s retry cap. `/go`
   returns it to `pending` when its dependencies resolve and it is still under the cap.
 
 ## Installed Agents
-
-The following agents are available in this project:
 
 ### Universal Agents
 - **task-engineer**: Task decomposition (WHAT/WHY only, no HOW)
@@ -51,57 +50,65 @@ The following agents are available in this project:
 ### Implementation Agents
 - **{{IMPLEMENTER_AGENTS}}**: Specialist implementation agents
 
-## Priority 1 Documentation (MUST READ for Every Task)
+## Priority 1 Documentation (read for every task)
 
-ALL agents MUST read on receiving a task:
+Every agent must read these when it receives a task:
 
-1. **This README** (`.backlog/README.md`) - Workflow, priorities, evidence requirements
-2. **Task Description Style Guide** (`docs/acf/style/task-descriptions.md`) - ABSOLUTE requirements
-3. **Task Template** (`docs/acf/backlog/task-template.md`) - Task file structure
-4. **Workflow Details** (`docs/acf/backlog/workflow.md`) - State machine, transition rules
-5. **Agent Manifest** (`docs/agents/{agent-name}.md`) - Agent-specific Priority 1/2/3 docs
+1. **This README** (`.backlog/README.md`): workflow, priorities, evidence requirements
+2. **Task Description Style Guide** (`docs/acf/style/task-descriptions.md`): its rules have no exceptions
+3. **Task Template** (`docs/acf/backlog/task-template.md`): task file structure
+4. **Workflow Details** (`docs/acf/backlog/workflow.md`): state machine, transition rules
+5. **Agent Manifest** (`docs/agents/{agent-name}.md`): the agent's own Priority 1/2/3 docs
 
-## Concurrency Model (CRITICAL)
+## Concurrency Model
 
 **Parallel across worktrees, sequential within a worktree.** Every code-mutating task declares:
 
-- `Worktree: <slug>` (required) — implementer specialists run one-at-a-time per worktree slug
-- `PR Group: <slug>` (defaults to Worktree value) — sibling tasks ship together
+- `Worktree: <slug>` (required). Implementer specialists run one at a time per slug.
+- `PR Group: <slug>` (defaults to the Worktree value). Sibling tasks ship together.
 
-Implementer specialists and quality-reviewer invoke the `clean-checkout-before-task` skill as Step 0. The skill creates a git worktree at `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and logs the `clean-checkout: ok` token to the task transition log. Without that token, quality-reviewer auto-rejects.
+Implementer specialists and quality-reviewer invoke the `clean-checkout-before-task` skill as Step 0.
+It creates a git worktree at `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch,
+stashes unrelated changes, and logs the `clean-checkout: ok` token to the task's transition log.
+Without that token, quality-reviewer rejects the task automatically.
 
 Specialist commits land on `worktree/<slug>` and hold code only: never a task file, never anything
 under `.backlog/`, never a commit on trunk. quality-reviewer commits nothing.
 
-**Integration is automatic by default.** Once a task is accepted, `/go` cherry-picks its change onto the **local** trunk and CAS-lands it with an in-tree ledger marker (LP-CAS). Nothing is pushed and no PR is opened — the change is on your local trunk, waiting for you to push. If your process requires a PR per group with human review, pin the mode instead of relying on prose:
+**Integration is automatic by default.** Once a task is accepted, `/go` cherry-picks its change onto
+the **local** trunk and lands it by compare-and-swap, together with an in-tree ledger marker (LP-CAS).
+Nothing is pushed and no PR is opened: the change waits on your local trunk until you push it. If your
+process needs a PR per group with human review, pin the mode in config rather than describing it in
+prose:
 
 ```bash
 # .acfwhip/config (committed) — or .backlog/.acfw-config, whichever this project has
 ACFW_INTEGRATION_MODE=override
 ```
 
-In `override` mode `/go` stops at `accepted`, writes no marker, keeps each `worktree/<slug>` branch alive for you to push and PR from, and hands ordering to you. Unpinned, `/go` decides per run by reading `CLAUDE.md`. See `docs/acf/backlog/workflow.md` § Integration.
-
-See `docs/acf/backlog/workflow.md` for the full state machine and dispatch rules.
+In `override` mode `/go` stops at `accepted`, writes no marker, keeps each `worktree/<slug>` branch
+alive for you to push and open a PR from, and leaves the ordering to you. Unpinned, `/go` decides each
+run by reading `CLAUDE.md`. `docs/acf/backlog/workflow.md` has the full state machine and dispatch
+rules, and covers both modes under § Integration.
 
 ## Task File Template
 
-Every task file MUST follow this structure (from `docs/acf/backlog/task-template.md`):
+Every task file must follow this structure, from `docs/acf/backlog/task-template.md`:
 
 1. **Metadata**: ID, status, priority, hours, agent, **Worktree**, **PR Group**, dependencies, rejection_count, timestamps
-2. **Description**: Binary outcome (WHAT/WHY only, no HOW)
-3. **Acceptance Criteria**: Checkboxes, testable, binary
-4. **Technical Requirements**: Implementation details, testing, performance
-5. **Edge Cases to Handle**: Explicit handling requirements
-6. **Out of Scope**: What NOT to do (MANDATORY section)
-7. **Quality Review Checklist**: For implementer and quality-reviewer
+2. **Description**: the binary outcome (WHAT/WHY only, no HOW)
+3. **Acceptance Criteria**: checkboxes, each testable and binary
+4. **Technical Requirements**: implementation details, testing, performance
+5. **Edge Cases to Handle**: each case and how it must be handled
+6. **Out of Scope**: what not to do. The section is required.
+7. **Quality Review Checklist**: for the implementer and quality-reviewer
 8. **Transition Log**: Timestamped state changes with agent names. task-engineer writes the creation
    row. After that, `/go` writes the state rows, clean-checkout writes its token row, `/task` adds a
    hold row to a task it parks in `draft`, and `/whip-move` logs a manual move. Never a specialist or
    the reviewer.
-9. **Implementation Notes**: Developer notes during work
-10. **Quality Review Comments**: Round-by-round review feedback
-11. **Evidence of Completion**: Quality gate outputs (complete commands + results)
+9. **Implementation Notes**: the implementer's notes while working
+10. **Quality Review Comments**: review feedback, one block per round
+11. **Evidence of Completion**: every quality gate command with its full output
 
 ## Priority Levels
 
@@ -121,16 +128,16 @@ partitions; the partition rule does that.
 
 ## Evidence Requirements
 
-**Every completed task MUST provide complete evidence**:
+Every completed task must carry complete evidence:
 
-1. **Quality Gate Outputs**: ALL commands with complete output (not truncated)
-2. **Test Results**: Full test output with coverage report
+1. **Quality Gate Outputs**: every command, with its whole output, never truncated
+2. **Test Results**: the full test output, with a coverage report
 3. **Implementation Commit**: SHA, files changed, commit message
 4. **Transition Log**: written by `/go` (state rows) and clean-checkout (its token row), never by a
    specialist or the reviewer. A task under review must carry the clean-checkout token
-5. **Task-Specific Verification**: Screenshots, API samples, metrics (as appropriate)
+5. **Task-Specific Verification**: screenshots, API samples or metrics, as the task needs
 
-**Authenticity Checks** (quality-reviewer validates):
+quality-reviewer also checks that the evidence is authentic:
 - Command outputs complete (no "..." omissions)
 - Timestamps present
 - Exit codes shown
@@ -141,7 +148,7 @@ partitions; the partition rule does that.
 
 All state moves happen at the repo root, on the trunk branch.
 
-| From | To | WHO performs the move |
+| From | To | Who performs the move |
 |------|----|-----------------------|
 | N/A | pending | task-engineer, through `/task` (creation only) |
 | pending | in-progress | `/go`, before it dispatches the specialist |
@@ -166,11 +173,11 @@ by hand with `/whip-move`, also at the repo root and never in a worktree.
 
 ### For task-engineer
 
-1. **Read Style Guide**: `docs/acf/style/task-descriptions.md` (MANDATORY)
-2. **Decompose Requirements**: Create atomic tasks with binary acceptance criteria
-3. **WHAT/WHY Only**: NEVER specify HOW (specialists decide implementation)
-4. **Max 2-3 Line Code Snippets**: Signatures/shapes only, NO implementations
-5. **Use Task Template**: Follow structure from `docs/acf/backlog/task-template.md`
+1. **Read the Style Guide**: `docs/acf/style/task-descriptions.md`. Required.
+2. **Decompose Requirements**: split the scope into atomic tasks with binary acceptance criteria
+3. **WHAT/WHY Only**: never specify HOW; the specialist decides the implementation
+4. **Max 2-3 Line Code Snippets**: signatures and shapes only, never an implementation
+5. **Use the Task Template**: follow the structure in `docs/acf/backlog/task-template.md`
 6. **Pre-Creation Validation**: Uniqueness, size ≤8h, tech stack specified, "Out of Scope" present
 7. **Create in pending/** at the repo root, never in a worktree: filename `{category}-{XXX}-{descriptive-name}.md`
 8. **Creation is the only move you make**: `/task` commits the new task (`task: create ...`). Every
@@ -178,12 +185,14 @@ by hand with `/whip-move`, also at the repo root and never in a worktree.
 
 ### For Implementer Agents (Specialists)
 
-1. **Step 0: clean-checkout-before-task**: Invoke the skill before any edit; it creates the worktree, validates the branch, logs the OK token. Without the token, quality-reviewer rejects.
-2. **Read Priority 1 Docs**: This README, style guide, task template, manifest
+1. **Step 0: clean-checkout-before-task**: invoke the skill before any edit. It creates the worktree,
+   validates the branch and logs the OK token; without the token, quality-reviewer rejects.
+2. **Read Priority 1 Docs**: this README, the style guide, the task template, your manifest
 3. **Leave task state alone**: `/go` moved the task to `in-progress` before it dispatched you. Do not
    move the task file, edit its `Status`, or write Transition Log rows.
-4. **Implement Task**: Decide HOW (task specifies WHAT/WHY); all edits happen inside `.worktree/<slug>` on branch `worktree/<slug>`
-5. **Run Quality Gates**: ALL stack-specific quality gates MUST pass
+4. **Implement the Task**: you decide HOW; the task gives WHAT and WHY. Every edit happens inside
+   `.worktree/<slug>` on branch `worktree/<slug>`.
+5. **Run Quality Gates**: every stack-specific quality gate must pass
 6. **Commit code only** on `worktree/<slug>`: never the task file, never anything under `.backlog/`,
    never a commit on trunk
 7. **Provide Complete Evidence**: Command outputs, test results, coverage, commit SHA on
@@ -193,24 +202,25 @@ by hand with `/whip-move`, also at the repo root and never in a worktree.
 
 ### For quality-reviewer
 
-1. **Verify the clean-checkout token FIRST** — before Step 0, because Step 0 writes that same row.
+1. **Check the clean-checkout token first, before Step 0**, because Step 0 writes that same row.
    The transition log must contain a `clean-checkout | ok` line. If it does not: no worktree branch
    means nothing was ever checked out (reject, charge a rejection); a branch that exists means the row
    was lost (reject as a *mechanism* fault, charge nothing).
-2. **Step 0: clean-checkout-before-task**: Invoke the skill (idempotent; validates the worktree the implementer used)
-3. **Read Priority 1 Docs**: This README, workflow, quality gates
-4. **Verify ALL Acceptance Criteria**: Every checkbox must be checked
-5. **Validate Quality Gates**: ALL commands must have complete output
+2. **Step 0: clean-checkout-before-task**: invoke the skill. It is idempotent and validates the
+   worktree the implementer used.
+3. **Read Priority 1 Docs**: this README, the workflow, the quality gates
+4. **Verify every acceptance criterion**: each checkbox must be checked
+5. **Validate Quality Gates**: every command must show its complete output
 6. **Check Test Coverage**: Meet thresholds (API 90-95%, Core 90%, Services 85-90%, Utils 85%)
-7. **Binary Decision**: Accept OR reject (no partial approvals)
+7. **Binary Decision**: accept or reject; there is no partial approval
 8. **Return the `ACFW-RESULT` marker**: `transition: accepted | rejected`, with `fault_class` set to
    `mechanism` when the failure is not the task's fault. **The orchestrator performs the state move,
    on every backend.** Do not move the task, do not edit its `Status`, and do not maintain
-   `rejection_count` — the runtime owns the retry cap and blocks a task that exhausts it.
+   `rejection_count`. The runtime owns the retry cap and blocks a task that exhausts it.
 
-> Moving the task yourself is worse than useless: the orchestrator's writer is idempotent, so a task
-> you already moved makes its transition a no-op — which silently drops the rejection increment and
-> leaves a `Status`/folder mismatch for `/whip-doctor` to find.
+> Moving the task yourself does damage. The orchestrator's writer is idempotent, so it finds the task
+> already moved and makes its transition a no-op. That drops the rejection increment without a trace
+> and leaves a `Status`/folder mismatch for `/whip-doctor` to find.
 
 ## Quality Gates Integration
 
@@ -220,11 +230,10 @@ installed one for your stack. Without one, each specialist's gate commands are i
 `.backlog/.acfw-config`, whichever exists), when set, is the gate `/go` runs on every change before it
 lands on trunk.
 
-**Zero Bypass Tolerance**:
-- ❌ FORBIDDEN: `git commit --no-verify`, `SKIP={hook}`, lowering thresholds
-- ✅ REQUIRED: Fix actual issues, maintain quality standards
+**Zero Bypass Tolerance**: no `git commit --no-verify`, no `SKIP={hook}`, no lowered thresholds. Fix
+the failure instead.
 
-## Git Commit Protocol (MANDATORY)
+## Git Commit Protocol
 
 Two kinds of commit, made by different hands. Never mix them.
 
@@ -237,15 +246,15 @@ Two kinds of commit, made by different hands. Never mix them.
 - **Code commits** land on `worktree/<slug>`, made by the specialist. They hold code only: never the
   task file, never anything under `.backlog/`.
 
-**FORBIDDEN**:
-- ❌ `git add -A` or `git add .`
-- ❌ `git commit -a`
-- ❌ Staging a task file or anything under `.backlog/` on a `worktree/<slug>` branch
-- ❌ `git commit --no-verify`
+**Never**:
+- `git add -A` or `git add .`
+- `git commit -a`
+- Stage a task file or anything under `.backlog/` on a `worktree/<slug>` branch
+- `git commit --no-verify`
 
-**REQUIRED**:
-- ✅ Explicit file staging
-- ✅ Conventional commit messages
+**Always**:
+- Stage files by explicit path
+- Write conventional commit messages
 
 ## Commands
 
@@ -261,7 +270,8 @@ straight to `/task`; risky work gets a plan you approve with one "yes".
 ```bash
 /task "Scope description"
 ```
-Decomposes scope into atomic tasks. Uses task-engineer agents in parallel. NEVER implements.
+Splits a scope into atomic tasks, with task-engineer agents working in parallel. It never implements
+anything.
 
 ### Continuous Backlog Execution
 ```bash
@@ -288,7 +298,8 @@ agent files, or deletes a lesson itself. `/retro --force <task>...` analyzes wor
 /whip-add-agents
 /whip-add-agents --backend=go --frontend=react
 ```
-Analyzes repo and creates missing specialist agents + manifests following ACF conventions.
+Scans the repo and creates the specialist agents and manifests it is missing, following ACF
+conventions.
 
 ## References
 
@@ -296,10 +307,11 @@ Analyzes repo and creates missing specialist agents + manifests following ACF co
 - **Task Template**: `docs/acf/backlog/task-template.md` (task file structure)
 - **Task Style Guide**: `docs/acf/style/task-descriptions.md` (WHAT/WHY only, binary criteria)
 - **Quality Gates**: `docs/development/quality-gates-{stack}.md` (stack-specific requirements, if present)
-- **Git Conventions**: `docs/acf/git/commit-conventions.md` (if exists)
+- **Git Conventions**: `docs/acf/git/commit-conventions.md` (if present)
 - **Agent Manifests**: `docs/agents/{agent-name}.md` (Priority 1/2/3 documentation)
 
 ---
 
-**Last Updated**: Auto-generated by ACF Whip SessionStart hook
+**Generated by**: `/whip-init`, or `/whip-add-agents` when this file is missing. Afterwards both only
+update the Implementation Agents line.
 **Installed Agents**: Scanned from `.claude/agents/*.md`

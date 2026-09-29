@@ -1,6 +1,6 @@
 ---
 name: go
-description: Continuous backlog execution until 100% tasks reach terminal states (accepted/blocked)
+description: Continuous backlog execution until 100% of tasks reach a terminal state (accepted/blocked)
 argument-hint: "[--all | task-ids | filter description]   (no args = your focus)"
 allowed-tools:
   - Bash
@@ -13,9 +13,9 @@ allowed-tools:
 
 # /go - Continuous Backlog Execution
 
-Fire-and-forget automation. Runs your tasks to completion without manual intervention — your saved
-**focus** when you give no arguments, exactly what you name when you do, and the whole backlog on
-`/go --all` (see **Run scope** below).
+`/go` runs tasks to completion and does not stop to ask between them (fire-and-forget). With no
+arguments it runs your saved **focus**; with arguments, the tasks you name; with `--all`, the whole
+backlog (see **Run scope** below).
 
 ## State Machine (User-Specified)
 
@@ -25,22 +25,22 @@ pending → in-progress → completed → in-review → [accepted | rejected]
          blocked                                    pending (retry)
 ```
 
-**Terminal States**:
-- `accepted` - Successfully completed and passed quality review
-- `blocked` - Failed after max retries (3) or unresolvable dependencies
+**Terminal states**:
+- `accepted`: finished and passed quality review
+- `blocked`: failed after the maximum retries (3), or has dependencies that cannot be resolved
 
 ## Purpose
 
-Execute backlog continuously:
-1. Capture trunk identity at startup (refuse on detached HEAD).
-2. Loop until ALL tasks reach terminal states.
-3. Process ALL state transitions each iteration, gating on dependencies.
-4. Partition pending tasks by `Worktree:` slug; dispatch at most one specialist per slug, in parallel across slugs.
-5. After dispatch returns, integrate every newly-accepted worktree into the local trunk in dependency-topological order (default behavior; see "Integration mode" below).
-6. Quality gate auto-fix before processing.
-7. Exit only when 100% complete OR user intervention needed.
+What one `/go` run does:
+1. Capture the trunk identity at startup, and refuse on a detached HEAD.
+2. Loop until every task is in a terminal state.
+3. Process every due state transition each iteration, gated on dependencies.
+4. Partition pending tasks by `Worktree:` slug and dispatch at most one specialist per slug, in parallel across slugs.
+5. After dispatch returns, integrate every newly accepted worktree into the local trunk in dependency (topological) order. This is the default; see "Integration mode" below.
+6. Run the quality-gate auto-fix before processing.
+7. Exit only when 100% of tasks are terminal, or when a human has to step in.
 
-**CRITICAL**: This command does NOT terminate after one pass. It continues looping until backlog complete AND every accepted worktree is folded into trunk.
+**`/go` does not stop after one pass.** It keeps looping until the backlog is complete and every accepted worktree has been folded into trunk.
 
 ## Run scope
 
@@ -55,72 +55,72 @@ Execute backlog continuously:
 /go high priority backend                    any predicate over the backlog
 ```
 
-**A bare `/go` runs your focus.** The focus is a small, per-checkout list of the tasks *you* are
-working on. `/task` sets it to the tasks it just created, so the ordinary path — plan, `/task`,
-`/go` — needs no arguments at all and still runs only your own work. `/whip-focus` manages it by
-hand. It is never committed and never shared: two people on one board have two focuses, which is the
-whole point.
+**A bare `/go` runs your focus**: a short list, kept per checkout, of the tasks *you* are working
+on. `/task` sets it to the tasks it just created, so the usual sequence (plan, `/task`, `/go`) needs
+no arguments and still runs only your own work. `/whip-focus` edits it by hand. The focus is never
+committed or shared, so two people on one board each have their own.
 
-**With no focus set**, what a bare `/go` does is a per-store policy (`bareGo`, from `acfw-store
-info`). On the `files` backend the backlog is this checkout's own, so it drains the whole thing,
-unchanged. On a shared API-backed board it does **not**: one person's bare `/go` would be everyone's,
-so it says what would run and asks you to choose. `/go --all` is always the explicit "yes, everything".
+**With no focus set**, a bare `/go` follows a per-store policy (`bareGo`, from `acfw-store info`).
+On the `files` backend the backlog belongs to this checkout, so `/go` drains all of it, as it always
+has. On a shared, API-backed board it does **not** launch: one person's bare `/go` would run
+everyone's work, so it reports what would run and asks you to choose. `/go --all` is always the
+explicit "yes, everything".
 
-Every form resolves to the same thing before launch: a concrete list of task stems (`args.only`).
-Ids go straight through; a natural-language filter is matched against the task store in **step 3**
-below, shown to you, and confirmed once. The orchestrator itself is deterministic either way — it
-never re-interprets your words mid-run, and the set cannot drift.
+Every scoped form resolves, before launch, to a concrete list of task stems (`args.only`). Ids go
+straight through. A natural-language filter is matched against the task store in **step 3** below,
+shown to you, and confirmed once. Either way the orchestrator gets a fixed list. It never re-reads
+your words mid-run, so the set cannot drift.
 
-**Pausing is not a focus operation.** Dropping a task from a focus does not stop it running: a scoped
-run pulls in unmet dependencies, so a dropped task something else needs comes straight back. To park
-a task where the scheduler and the doctor both understand it: `/whip-move <task> draft` (pause) or
-`/whip-move <task> archive` (cancel).
+**Dropping a task from the focus does not pause it.** A scoped run pulls in unmet dependencies, so if
+another task in the run needs the one you dropped, it comes straight back. To park a task in a way
+the scheduler and the doctor both understand, use `/whip-move <task> draft` to pause it or
+`/whip-move <task> archive` to cancel it.
 
-Three properties worth knowing:
+Three rules hold for every scoped run:
 
-- **Unmet dependencies are pulled in.** A scoped task whose dependency is outside your list would
-  otherwise sit gated forever. The orchestrator adds non-terminal transitive deps and names them in
-  the run log. Dependencies that are already accepted/integrated are left alone.
-- **Everything stays inside the scope.** Out-of-scope tasks are never dispatched, never transitioned,
-  and never integrated — including by the post-loop drain. This is what makes `/go` safe to run
-  against a backlog shared with other people.
+- **Unmet dependencies are pulled in.** Otherwise a scoped task whose dependency sits outside your
+  list would wait forever. The orchestrator adds the non-terminal transitive deps and names them in
+  the run log. Deps already accepted or integrated are left alone.
+- **Nothing outside the scope is touched.** Out-of-scope tasks are never dispatched, transitioned or
+  integrated, not even by the post-loop drain. That is why `/go` is safe to run on a backlog other
+  people share.
 - **Completion is measured over your scope**, not the whole backlog, so a scoped run ends when
-  *your* tasks are done. A stem the store cannot resolve at all aborts the run instead of quietly
-  running less than you asked for; one that vanishes mid-run (someone else retired it) is held out
-  and named, because by then the rest of the scope is already in flight.
+  *your* tasks are done. A stem the store cannot resolve at all aborts the run rather than quietly
+  running less than you asked for. A stem that vanishes mid-run (someone else retired it) is held
+  out and named instead, because by then the rest of the scope is already running.
 
 The `RunReport` echoes `scopeFilter` (your words), `scopedTo` (what you asked for) and
-`scopeResolved` (what actually ran, including pulled-in dependencies).
+`scopeResolved` (what ran, including pulled-in dependencies).
 
 ## Integration mode
 
-**Default (LP-CAS, 3.0.0)**: the orchestrator lands every newly-accepted task onto the live trunk via the `integrate-lpcas` skill — a single-parent candidate cherry-picked onto the live tip, co-committed with an in-tree ledger marker, union-gated, and CAS-landed. The marker's presence on trunk is the sole integration oracle (no cached snapshot, no rebase); conflicts route to the task's `assigned_agent` as a resolver. See `skills/integrate-lpcas/SKILL.md`. (`workflows/whip-go.workflow.js` is the authoritative implementation; the bash loop further down is the fallback for when the Workflow tool is unavailable, and mirrors it.)
+**Default (LP-CAS, 3.0.0)**: the orchestrator lands each newly accepted task on the live trunk through the `integrate-lpcas` skill. The task's change becomes a single-parent candidate, is cherry-picked onto the live tip, is committed together with an in-tree ledger marker, passes the union gate, and lands by compare-and-swap. The marker's presence on trunk is the only integration oracle: no cached snapshot, no rebase. Conflicts go to the task's `assigned_agent`, acting as resolver. See `skills/integrate-lpcas/SKILL.md`. `workflows/whip-go.workflow.js` is the authoritative implementation; the bash loop further down mirrors it and runs only when the Workflow tool is unavailable.
 
-**Override**: if the project's `CLAUDE.md` (or any other persistent agent instructions) directs a different integration strategy — for example "open a PR per PR Group via `gh pr create` instead of merging locally" — follow those instructions and skip Step 4.5. In that mode, the loop reverts to the 1.2.0 terminal check (`accepted ∪ blocked`); operator handles integration.
+**Override**: if the project's `CLAUDE.md` (or other persistent agent instructions) asks for a different integration strategy, such as "open a PR per PR Group via `gh pr create` instead of merging locally", follow it and skip Step 4.5. The loop then goes back to the 1.2.0 terminal check (`accepted ∪ blocked`), and the operator handles integration.
 
-The mode can be **pinned machine-readably**: `ACFW_INTEGRATION_MODE=override|default` — env var, or a key in `.acfwhip/config` (committed, so the repo's delivery discipline travels with the repo). `acfw-store info` reports the pinned value as `integrationMode`, empty when unpinned. When it is empty, the orchestrator decides by reading project instructions (already loaded into Claude's context), exactly as before.
+You can **pin the mode** in a form a script reads: set `ACFW_INTEGRATION_MODE=override|default` as an env var or as a key in `.acfwhip/config`. The config file is committed, so the delivery rules travel with the repo. `acfw-store info` reports the pin as `integrationMode`, empty when unpinned. When it is empty, the orchestrator decides by reading the project instructions already in Claude's context, as before.
 
-An **unrecognized value is FATAL** (`acfw-store` exits 2) — it does not degrade to unpinned. This key decides whether accepted work folds into a branch a human may never review, so guessing is not an option, and degrading to unpinned would hand the decision back to the model that the pin exists to stop depending on. Note the config parser strips quotes and trailing whitespace but **not a trailing comment**, so `ACFW_INTEGRATION_MODE=override  # PR per group` is an unrecognized value, not a pin. Put comments on their own line.
+An **unrecognized value is FATAL** (`acfw-store` exits 2). It never falls back to unpinned. This key decides whether accepted work lands on a branch a human may never review, and falling back would hand that decision to the model, which is what the pin exists to prevent. The config parser strips quotes and trailing whitespace but **not a trailing comment**, so `ACFW_INTEGRATION_MODE=override  # PR per group` is an unrecognized value, not a pin. Put comments on their own line.
 
 ### What override mode does and does not do
 
 | | |
 |---|---|
-| **Does** | Skips Step 4.5, so nothing is cherry-picked onto trunk and no ledger marker is written. Treats `accepted` as terminal (`accepted ∪ blocked`). Keeps each accepted task's `worktree/<slug>` branch and worktree alive instead of reaping them, so the deliverable has a home to PR from. Relaxes the cross-slug dependency gate — acceptance alone satisfies a dep, and **ordering becomes yours**. |
-| **Does not** | Push anything. Run `gh pr create`. Read or set `PR Group` (it is authored, validated and stored, but drives no behavior). Check whether trunk is protected, has a remote, or is behind `origin`. Integration is entirely the operator's — acf-whip stops at accepted and gets out of the way. |
+| **Does** | Skips Step 4.5, so nothing is cherry-picked onto trunk and no ledger marker is written. Treats `accepted` as terminal (`accepted ∪ blocked`). Keeps each accepted task's `worktree/<slug>` branch and worktree alive instead of reaping them, so the deliverable has a branch to open a PR from. Relaxes the cross-slug dependency gate: acceptance alone satisfies a dep, and **ordering becomes your job**. |
+| **Does not** | Push anything. Run `gh pr create`. Read or set `PR Group` (it is authored, validated and stored, but drives no behavior). Check whether trunk is protected, has a remote, or is behind `origin`. Integration is left entirely to the operator: acf-whip stops at accepted. |
 
-**If a clean trunk matters as much as review gating, use a non-files task store.** `/go` commits `.backlog/` state transitions onto the trunk branch in **both** modes, and the writer refuses to run anywhere else (`skills/go/bin/apply-transition.sh`), so a files-backed run puts a stream of `task: <stem> pending -> in-progress` commits on local trunk regardless of integration mode. With `beads`, `multica`, or `linear` (see `adapters/`), task state lives outside git entirely and trunk sees only deliverables. The LP-CAS ledger stays git-native on every backend.
+**If a clean trunk matters as much as review gating, use a non-files task store.** `/go` commits `.backlog/` state transitions to the trunk branch in **both** modes, and the writer (`skills/go/bin/apply-transition.sh`) refuses to run anywhere else. A files-backed run therefore puts a stream of `task: <stem> pending -> in-progress` commits on local trunk whatever the integration mode. With `beads`, `multica` or `linear` (see `adapters/`), task state lives outside git and trunk sees only deliverables. The LP-CAS ledger stays in git on every backend.
 
 ---
 
 ## Execution: workflow-first, legacy fallback
 
 acf-whip ships a **dynamic-workflow orchestrator** (`workflows/whip-go.workflow.js`) that runs the
-entire loop — scan, slug partition, dependency gate, the full state machine (including
-**blocked→pending unblock** when deps resolve and **in-progress→blocked timeout** past the operator
-threshold), topological integration, stall/terminal bookkeeping — inside a deterministic script. The intermediate state lives in script variables, so
-**your context stays flat across iterations** (this is the fix for the context-bloat problem the
-legacy loop has). Prefer it.
+whole loop inside a deterministic script: the scan, the slug partition, the dependency gate, the full
+state machine (including the **blocked→pending unblock** once deps resolve and the
+**in-progress→blocked timeout** past the operator threshold), topological integration, and the stall
+and terminal bookkeeping. Intermediate state lives in script variables, so **your context stays flat
+across iterations**. The legacy loop grows your context every iteration. Prefer the workflow.
 
 **If the `Workflow` tool is available to you** (dynamic workflows enabled, Claude Code ≥ 2.1.154):
 
@@ -131,115 +131,116 @@ legacy loop has). Prefer it.
    echo "TRUNK_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)"
    bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" info
    ```
-   If `TRUNK_BRANCH` is empty, STOP — `/go` requires a branch checked out at the repo root.
+   If `TRUNK_BRANCH` is empty, **stop**: `/go` needs a branch checked out at the repo root.
    The `acfw-store info` line is one JSON object carrying everything the rest of this procedure
    needs: the active **task-store backend** (`store`, default `files`), its adapter, the run-lock path
    (`runLock`), the **integration pin** (`integrationMode`) that step 2 reads, the **run focus**
    (`focusFile`, `focusCount`) and the bare-`/go` policy (`bareGo`) that step 3 branches on, and the
    per-tier **model routing** (`models`) and **effort pin** (`efforts`) that step 4 passes through.
    Read it once here; do not re-run it.
-2. Decide the integration mode from the pin you just read: if `integrationMode` is non-empty, use it
-   **verbatim** as `args.mode`, no further reasoning. Only when it is empty, decide by reading the
-   project's `CLAUDE.md`/`AGENTS.md` (already in your context): `override` if they direct
-   PR-per-group / non-local-merge integration, otherwise `default` (auto-merge into local trunk).
+2. Decide the integration mode from the pin you just read. If `integrationMode` is non-empty, use it
+   **verbatim** as `args.mode` and do not reason about it further. Only when it is empty, decide by
+   reading the project's `CLAUDE.md`/`AGENTS.md` (already in your context): `override` if they ask
+   for PR-per-group or non-local-merge integration, otherwise `default` (auto-merge into local trunk).
 3. **Resolve the run scope** from whatever the user typed after `/go`. Four branches, in this order:
 
-   **(0) `--all`** — omit `only` entirely. The whole backlog, explicitly. This always bypasses the
-   focus and the `bareGo` policy; it is how you say "yes, everything" on a shared board.
+   **(0) `--all`**: omit `only`. This runs the whole backlog and always bypasses the focus and the
+   `bareGo` policy. It is how someone says "yes, everything" on a shared board.
 
-   `--all` takes no other arguments. `/go --all api-014-token` reads like a narrowing and would run
-   the entire board, which on a shared store is exactly what the `bareGo` policy exists to prevent —
-   so **stop and ask which they meant** (`/go --all`, or `/go api-014-token`) rather than picking one.
+   `--all` takes no other arguments. `/go --all api-014-token` reads like a narrowing but would run
+   the entire board, which on a shared store is the outcome the `bareGo` policy exists to prevent.
+   **Stop and ask which they meant** (`/go --all` or `/go api-014-token`) instead of picking one.
 
-   **(a) No arguments** — the FOCUS branch. Step 2's `acfw-store info` already told you
+   **(a) No arguments**: the focus branch. The `acfw-store info` line from step 1 already gave you
    `focusCount`, `focusFile` and `bareGo`.
 
-   - **`focusCount` > 0** — read it and check it is still worth running, in one call:
+   - **`focusCount` > 0**: read the focus and check it is still worth running, in one call:
      ```bash
      bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-focus" show --live
      ```
      Two answers are not a list of tasks, and both need handling before you read one:
-     - **exit 2 with a store mismatch** — the focus was written against a different backend.
-       `focusCount` is a raw line count and does not read that header, so this is reachable with
+     - **exit 2 with a store mismatch**: the focus was written against a different backend.
+       `focusCount` is a raw line count that ignores that header, so you can hit this with
        `focusCount > 0`. Report it and stop; the remedy it prints (`/whip-focus clear`) is the answer.
-     - **`live state unavailable (jq not installed)`** — the stems are the stored selection, not a
-       report of what is still runnable. You cannot answer the "is it still worth running" question
-       here, so say that plainly, show the list, and let the operator decide.
+     - **`live state unavailable (jq not installed)`**: the stems are the stored selection, not a
+       report of what can still run. You cannot tell whether the focus is still worth running, so
+       say so, show the list, and let the operator decide.
 
      If every task is already terminal, **do not launch**. Say so and give the three ways forward:
      `/whip-focus clear`, `/task <scope>` to create new work, or `/go --all`. Otherwise show the
      list with each task's live state and the `set by … at …` line, take **one confirmation**, and
      launch with `only: [<the stems>]`, `scopeSource: "focus"`, and
      `scopeFilter: "focus set by <setBy> <ts>"`. The confirmation matters because a focus is
-     *standing* state — it may have been set by a `/task` run hours ago, or in another session.
+     *standing* state: a `/task` run may have set it hours ago, or in another session.
 
-     **One exception skips that confirmation: a focus that is exactly an approved cycle.** When you
-     approved a plan with `/whip` and `/task --plan` set the focus, you already said yes to this
-     work on the approval card, so asking again is noise. The script decides this, never you (Bash
-     `timeout: 600000`; it reads the store only when the focus touches a cycle):
+     **One case skips that confirmation: a focus that matches an approved cycle exactly.** If the
+     operator approved a plan with `/whip` and `/task --plan` then set the focus, they already said
+     yes to this work on the approval card, and asking again adds nothing. A script makes this call,
+     never you. Run it with Bash `timeout: 600000`; it reads the store only when the focus touches a
+     cycle:
      ```bash
      out=$(bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-cycle" status --if-cycle 2>/dev/null) \
        && printf '%s\n' "$out" \
        | grep -E '^  focus = the [0-9]+ runnable task\(s\) of approved cycle [0-9]{8}-[a-z0-9][a-z0-9-]*$'
      ```
-     The `&&` is load-bearing: a non-zero `acfw-cycle` exit (store unreachable, bad config) ends the
-     command there, so the grep never runs and nothing is printed. A printed line means `acfw-cycle`
-     exited 0 and derived from git and the task store that every focus task belongs to that one
-     cycle, every unfinished task of the cycle is in the focus, its approval is valid at HEAD, and at
-     least one task can run. Then say one line (`running the focus: approved cycle <ID>, <n>
+     The `&&` matters. When `acfw-cycle` exits non-zero (store unreachable, bad config), the command
+     stops there: the grep never runs and nothing prints. A printed line means `acfw-cycle` exited 0
+     and confirmed four things from git and the task store: every focus task belongs to that one
+     cycle, every unfinished task of the cycle is in the focus, the approval is valid at HEAD, and at
+     least one task can run. In that case say one line (`running the focus: approved cycle <ID>, <n>
      task(s)`) and launch with `only: [<the stems>]`, `scopeSource: "focus"` and `scopeFilter:
-     "focus = approved cycle <ID>"`. Anything else (no line, a non-zero exit, a plan-less focus,
-     which prints nothing at all) means you take the confirmation as above. Never decide the match
+     "focus = approved cycle <ID>"`. Anything else (no line, a non-zero exit, or a focus with no
+     plan, which prints nothing) means you take the confirmation as above. Never decide the match
      yourself by comparing the focus list to a plan.
-   - **`focusCount` is 0 and `bareGo` is `all`** (the `files` default) — omit `only`. Full-backlog
-     behaviour, unchanged from every release before 3.4.0.
-   - **`focusCount` is 0 and `bareGo` is `refuse`** (the default on every shared, API-backed store) —
-     **do not launch.** Report how many tasks are actionable (`acfw-store snapshot --digest`, count
-     `counts.pending` + `counts.rejected`) and offer exactly three options: name the ids
-     (`/go <ids>`), set a focus (`/task …`, or `/whip-focus set <ids>`), or run everything
+   - **`focusCount` is 0 and `bareGo` is `all`** (the `files` default): omit `only`. This runs the
+     full backlog, as every release before 3.4.0 did.
+   - **`focusCount` is 0 and `bareGo` is `refuse`** (the default on every shared, API-backed store):
+     **do not launch.** Report how many tasks are actionable (run `acfw-store snapshot --digest` and
+     add `counts.pending` and `counts.rejected`), then offer these three options and no others: name
+     the ids (`/go <ids>`), set a focus (`/task …` or `/whip-focus set <ids>`), or run everything
      (`/go --all`). Do not pick one for them. On a board several people share, a bare `/go` that
-     drains the whole thing is one person deciding for everyone, which is the failure this branch
-     exists to prevent.
+     drains everything is one person deciding for the whole team. This branch exists to stop that.
 
-   **(b) The arguments name tasks** — a stem (`api-014-token-refresh`), an id (`API-14`), a **native
+   **(b) The arguments name tasks**: a stem (`api-014-token-refresh`), an id (`API-14`), a **native
    backend id** (`MUL-4821`, a Linear URL), or a unique stem prefix. Pass them straight through as
-   `only: ["api-014-token-refresh", ...]`. No confirmation: the user named exact tasks, and the store
-   resolves each token itself (exact id → exact stem → exact backend id → unique prefix), reporting an
-   ambiguous prefix with its candidates instead of guessing. Do **not** send a native id to branch (c)
-   because it does not look like a stem — there is no title or body in the snapshot to match it
-   against, so the filter branch would fail on a token the store resolves perfectly.
+   `only: ["api-014-token-refresh", ...]`. Do not ask for confirmation: the user named exact tasks,
+   and the store resolves each token itself (exact id → exact stem → exact backend id → unique
+   prefix). An ambiguous prefix comes back with its candidates instead of a guess. A native id may
+   not look like a stem, but do **not** send it to branch (c) for that reason. The snapshot has no
+   title or body to match it against, so the filter branch would fail on a token the store resolves
+   without trouble.
 
-   **(c) Anything else is a filter predicate** — "frontend tasks only", "bugfixes",
-   "high priority backend", "the auth work". Resolve it to a concrete list *here*, before launching:
+   **(c) Anything else is a filter predicate**, such as "frontend tasks only", "bugfixes",
+   "high priority backend" or "the auth work". Resolve it to a concrete list *here*, before launching:
    ```bash
    bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" snapshot --digest
    ```
-   Match the predicate against the fields the snapshot projects on every backend —
-   `stem` · `id` · `folder` · `slug` · `agent` · `priority` · `deps` · `touchesGlobs`:
+   Match the predicate against the fields the snapshot projects on every backend
+   (`stem` · `id` · `folder` · `slug` · `agent` · `priority` · `deps` · `touchesGlobs`):
 
    | Predicate | Match on |
    |---|---|
    | "frontend tasks" | `agent` (e.g. `frontend-engineer`), `touchesGlobs` (`src/web/**`), `slug` |
-   | "bugfixes" | `stem` (`fix-*`, `bug-*`) — stems are descriptive kebab by convention |
+   | "bugfixes" | `stem` (`fix-*`, `bug-*`); stems are descriptive kebab-case by convention |
    | "high priority" / "blockers" | `priority` (blocker \| critical \| high \| medium \| low) |
    | "the auth work" | `slug`, `stem` |
 
-   There is **no title or body in the snapshot**. If the predicate cannot be decided from these
-   fields, say so and ask for ids rather than guessing. Then **show the matched task list and get one
-   confirmation before launching.** This does not violate the fire-and-forget rule below — that rule
-   forbids interrupting *between tasks*; this is a single check at launch, and a natural-language
-   filter is fuzzy enough that silently committing a long, expensive run to it is worse.
-   **If nothing matches, stop and say so — never fall back to the whole backlog.**
+   The snapshot has **no title or body**. If these fields cannot decide the predicate, say so and
+   ask for ids instead of guessing. Then **show the matched task list and get one confirmation before
+   launching.** The fire-and-forget rule below still holds: it forbids interrupting *between tasks*,
+   and this is one check at launch. A natural-language filter is fuzzy, and committing a long,
+   expensive run to it unchecked costs more than one question.
+   **If nothing matches, stop and say so. Never fall back to the whole backlog.**
 
-   Scope is resolved **once, at launch**: the workflow receives a fixed stem list, so tasks created
-   while the run is in flight do not join it. Unmet dependencies of a scoped task *are* pulled in
-   automatically by the orchestrator and named in the run log.
+   Scope is resolved **once, at launch**. The workflow receives a fixed stem list, so tasks created
+   mid-run do not join it. The orchestrator does pull in a scoped task's unmet dependencies and names
+   them in the run log.
 
-   **Branches (b) and (c) never write the focus.** An explicit `/go <ids>` is a one-off selection,
-   and silently making it the new standing default would mean the next bare `/go` ran something the
-   operator never chose — and, once those tasks finished, would keep reporting "nothing to do"
-   against a stale list. Only `/task` and `/whip-focus` set a focus. Pass `scopeSource: "args"` for
-   both branches.
+   **Branches (b) and (c) never write the focus.** An explicit `/go <ids>` is a one-off selection.
+   If it quietly became the standing default, the next bare `/go` would run something the operator
+   never chose, and once those tasks finished it would keep reporting "nothing to do" against a
+   stale list. Only `/task` and `/whip-focus` set a focus. Pass `scopeSource: "args"` for both
+   branches.
 4. Launch the orchestrator (it runs in the background; bootstrap runs a doctor `--fix` hard gate and
    the loop re-checks integrity every iteration):
    ```
@@ -257,89 +258,91 @@ legacy loop has). Prefer it.
    })
    ```
 
-   **Launch by NAME, never by path.** `scriptPath` is checked against the readable set — the working
-   directory plus any `--add-dir`/`permissions.additionalDirectories` entry — and on a real
-   marketplace install the plugin lives under `~/.claude/plugins/cache/`, which is in neither. So a
-   `scriptPath` launch is refused for every user who installed this plugin normally. A plugin cannot
-   declare permissions (plugins are not a settings source), but the registry resolves
-   `acf-whip:whip-go` without touching a path at all.
+   **Launch by name, never by path.** `scriptPath` is checked against the readable set: the working
+   directory plus any `--add-dir` or `permissions.additionalDirectories` entry. A normal marketplace
+   install puts the plugin under `~/.claude/plugins/cache/`, which is in neither, so a `scriptPath`
+   launch is refused for everyone who installed the plugin the usual way. A plugin cannot declare
+   permissions (plugins are not a settings source), but the registry resolves `acf-whip:whip-go`
+   without touching a path.
 
-   **If the `Workflow` call is refused or the workflow cannot be found**: do NOT edit the user's
-   settings, and do NOT retry with `scriptPath`. Say in one line why the orchestrator could not start,
-   then run the legacy loop below. One case genuinely has no workflow route: under
-   `CLAUDE_WORKFLOW_NAME_ONLY` the runtime enumerates only built-in workflows, so neither `name` nor
-   `scriptPath` resolves and the legacy loop is the only correct path — and that loop is
-   **files-backend only**, so on another store report the refusal and stop rather than improvising.
+   **If the `Workflow` call is refused or the workflow cannot be found**, do **not** edit the user's
+   settings and do **not** retry with `scriptPath`. Say in one line why the orchestrator could not
+   start, then run the legacy loop below. One case has no workflow route at all: under
+   `CLAUDE_WORKFLOW_NAME_ONLY` the runtime lists only built-in workflows, so neither `name` nor
+   `scriptPath` resolves and the legacy loop is the only correct path. That loop is
+   **files-backend only**, so on any other store report the refusal and stop.
 
    **Optional args (3.2.0 per-task child workflows).** Every dispatched unit runs as its own nested
    workflow by default; these tune or disable that:
 
    | Arg | Default | Effect |
    |-----|---------|--------|
-   | `escalate` | `true` | `false` reverts to byte-identical 3.1.0 single-agent dispatch. **Reach for this first if a run looks hung** — expect roughly 2-4× the per-iteration wall clock at the default depth. |
+   | `escalate` | `true` | `false` reverts to byte-identical 3.1.0 single-agent dispatch. **Try this first if a run looks hung**: at the default depth, expect roughly 2-4× the per-iteration wall clock. |
    | `escalateReview` | `false` | Turns on the multi-lens review panel. Off by default because it is the only *subtractive* seam: it can reject work that would otherwise have shipped, against a hard 3-rejection terminal. |
    | `maxAmend` | `2` | Repair rounds when an authored harness throws. Two convergence gates usually cut it to one. |
-| `maxReject` | `3` | How many rejections a task may take before the orchestrator blocks it for redesign. Raise it for exploratory work; lower it to fail fast. Bound at all four decision sites (scheduler, retry self-heal, needsOperator report, and the architect's attempt briefing), so a run under a non-default cap stays internally consistent — and the value is echoed in the run report. |
-| `maxBlock` | `3` | How many times a specialist may re-block the same task before it stops being re-unblocked and is surfaced for an operator. |
+   | `maxReject` | `3` | How many rejections a task may take before the orchestrator blocks it for redesign. Raise it for exploratory work; lower it to fail fast. It applies at all four decision sites (scheduler, retry self-heal, needsOperator report, and the architect's attempt briefing), so a run under a non-default cap stays consistent. The run report echoes the value. |
+   | `maxBlock` | `3` | How many times a specialist may re-block the same task before it stops being re-unblocked and is surfaced for an operator. |
    | `agentBudget` | `8` | Agent ceiling for one harness (enforced inside the child, not advisory). |
    | `agentCap` | `1000` | The run's total agent budget. Drives the FULL → LEAN → DIRECT → CLOSE ladder. |
    | `shellModel` | `haiku` | Alias for `models.shell`, kept for compatibility. |
 
-   **Model routing (3.4.0).** Agents are routed by what they DO. Pass `models` through from
+   **Model routing (3.4.0).** Agents are routed by what they do. Pass `models` through from
    `acfw-store info`; a project pins it once in `.acfwhip/config` (`ACFW_MODEL_SHELL`,
    `ACFW_MODEL_JUDGE`, `ACFW_MODEL_AUTHOR`) rather than per invocation.
 
    | Tier | Default | What it covers |
    |------|---------|----------------|
-   | `models.shell` | `haiku` | Bootstrap, scan, the single writer, integrate, drain, scout, harness validator, unlock — every agent that runs a fixed command and copies stdout into a schema. |
+   | `models.shell` | `haiku` | Bootstrap, scan, the single writer, integrate, drain, scout, harness validator, unlock: every agent that runs a fixed command and copies stdout into a schema. |
    | `models.judge` | *(session)* | `/task` planners, the judge, the critic. |
    | `models.author` | *(session)* | `/task` task-document authors. |
    | *(per agent)* | *(their frontmatter)* | Specialists and reviewers run on the `model:` declared in `.claude/agents/<name>.md`, when it declares one. |
    | *(fixed)* | *(session)* | The workflow architect and the conflict resolver. Not knobs. |
 
    `efforts.shell` pins reasoning effort for the shell tier (`ACFW_EFFORT_SHELL`, env >
-   `.acfwhip/config`, reported by `acfw-store info` as `efforts.shell`). It ships **unset**
-   deliberately — the shell tier's model is absent from the documented effort-support table, and the
-   effect of a low setting on verbatim-copy fidelity is undocumented — so it is an opt-in a team can
-   measure safely, now that a short relay is detected rather than believed. An unrecognised value is
-   refused (`acfw-store` exits 2) rather than passed through, because a rejected option would fail
+   `.acfwhip/config`, reported by `acfw-store info` as `efforts.shell`). It ships **unset** on
+   purpose. The shell tier's model is missing from the documented effort-support table, and the
+   effect of a low setting on verbatim-copy fidelity is undocumented. Now that a short relay is
+   detected instead of trusted, a team can opt in and measure the effect safely. An unrecognised
+   value is refused (`acfw-store` exits 2), not passed through, because a rejected option would fail
    every agent call in the run.
 
-   The report's `agentsByTier` counts agents where they are **charged**, so a retried call and every
-   agent a child harness spends are both in it (`child` is its own tier; `untiered` is a bucket that
-   exists so a dispatch through neither helper shows up as a number instead of vanishing).
+   The report's `agentsByTier` counts agents where they are **charged**, so it includes a retried
+   call and every agent a child harness spends. `child` is its own tier. `untiered` catches any
+   dispatch that went through neither helper, so it shows up as a number instead of vanishing.
 
-   **Run-scope args (3.2.3).** Both come from step 3 and are omitted together on a full-backlog run:
+   **Run-scope args (3.2.3).** All three come from step 3 and are omitted together on a
+   full-backlog run:
 
    | Arg | Default | Effect |
    |-----|---------|--------|
-   | `scopeSource` | `"args"` when `only` is set | `"focus"` marks a bare-`/go` run of the saved focus. It changes one decision: a paused or retired member of a FOCUS is skipped and reported, while one named EXPLICITLY aborts the run — you asked for a task that cannot run. |
+   | `scopeSource` | `"args"` when `only` is set | `"focus"` marks a bare-`/go` run of the saved focus. It changes one decision: a paused or retired member of a focus is skipped and reported, while one named explicitly aborts the run, because you asked for a task that cannot run. |
    | `only` | *(none)* | Task stems/ids to run **instead of** the whole backlog. The orchestrator plans, transitions, integrates and counts completion over just these, plus any **unmet dependencies**, which it pulls in and names in the log. An id that does not exist aborts the run rather than silently running a smaller set. |
-   | `scopeFilter` | `""` | The operator's raw words, recorded in the `RunReport` — for a natural-language filter this is the only record of what was actually asked for, since `only` holds the resolved stems. |
-   The per-iteration scan runs
+   | `scopeFilter` | `""` | The operator's raw words, recorded in the `RunReport`. For a natural-language filter it is the only record of what was asked for, since `only` holds the resolved stems. |
+
+   The per-iteration scan runs two commands:
 
    ```
    acfw-store snapshot --digest --mode <mode> [--only <stem>...] --full-to <run-dir>/snap-full.json
    acfw-store doctor --quiet --active-only [--snapshot <that file>]
    ```
 
-   — a small scheduling snapshot (counts + actionable tasks + a compact `satisfiedDeps` list, with
-   terminal-accepted tasks collapsed, narrowed to the scope when there is one) and full integrity over
-   the active folders, with accepted fed as cheap stubs. So a lived-in backlog scans in seconds
-   instead of tens of seconds. Both go through the dispatcher (`acfw-store`), never the battery by
-   path — that is what makes them work on every backend.
+   The first is a small scheduling snapshot: counts, actionable tasks and a compact `satisfiedDeps`
+   list, with terminal-accepted tasks collapsed and the result narrowed to the scope when there is
+   one. The second checks full integrity over the active folders, with accepted tasks fed in as
+   cheap stubs. A lived-in backlog scans in seconds instead of tens of seconds. Both go through the
+   dispatcher (`acfw-store`), never a battery by path, which is why they work on every backend.
 
-   Which model runs what is the **Model routing** table above, not this paragraph: the shell tier
-   covers every agent that runs a fixed command and copies stdout into a schema, specialists and
-   reviewers take the `model:` their own agent file declares, and only the architect and the conflict
-   resolver are pinned to the session model.
+   The **Model routing** table above decides which model runs what. In short: the shell tier covers
+   every agent that runs a fixed command and copies stdout into a schema, specialists and reviewers
+   take the `model:` their own agent file declares, and only the architect and the conflict resolver
+   are pinned to the session model.
 5. When it completes, report the returned `RunReport` (completed?, iterations, finalCounts,
-   integrated[], stopReason). If it returns `aborted: true`, surface `reason` + `fatals` and STOP.
-   An aborted report can carry `integrationWarnings[]` too, when the run landed work before it
-   aborted. Relay those first, exactly as described below.
-   On a scoped run also report `scopeResolved`, so the operator sees which tasks actually ran and
-   which dependencies were pulled in. Re-running `/go` is the documented resume — git + the task
-   store (`.backlog/` on the default files backend) are the only durable state.
+   integrated[], stopReason). If it returns `aborted: true`, surface `reason` and `fatals` and
+   **stop**. An aborted report can still carry `integrationWarnings[]` if the run landed work before
+   it aborted; relay those first, as described below. On a scoped run, also report `scopeResolved`
+   so the operator sees which tasks ran and which dependencies were pulled in. Re-running `/go` is
+   the documented resume: git and the task store (`.backlog/` on the default files backend) are the
+   only durable state.
 
    **Four fields change what you should say, and none of them is `completed` alone:**
    - **`integrationWarnings[]`**: `WARN:` lines the integrator printed, each prefixed with its
@@ -347,81 +350,80 @@ legacy loop has). Prefer it.
      edit cycles; a plan changes only through `/whip`). Another says a landing overwrote
      uncommitted work at the root, and ends with a `Recover:` command. Relay every line verbatim,
      before anything else in your summary: that command is printed nowhere else.
-   - **`heldOut[]`** — tasks the run REFUSED to touch, and still refuses at the end:
+   - **`heldOut[]`**: tasks the run refused to touch, and still refuses at the end. Each is
      `quarantined` (a task-level integrity FATAL), `paused` (an inactive member of a focus), or
      `vanished` (someone retired it mid-run). Name them. A run with anything held out inside its
-     scope reports `stopReason: 'partial'` and `completed: false` — it finished everything it was
-     *allowed* to touch, which is not the same as finishing the backlog, and the difference is
-     exactly what an operator must not have to infer.
-     **`heldOutEver[]`** is the same list plus the entries whose hold was LIFTED mid-run (`lifted:
-     true`) — an operator fixed the card and it went on to run. Those do not make a run `partial`
-     and are not in `heldOut`; mention them only if asked, but never claim a lifted task never ran.
-   - **`fatalsNotGating[]`** — integrity findings that name nothing this run could act on. Mention
-     the count and point at `/whip-doctor`; do **not** treat them as failures. A single malformed
-     card no longer stops runs that never touch it.
-   - **`relay{}`** — whether the snapshot hop was verified. `stopReason: 'relay-truncated'` means the
-     board was read correctly but the snapshot could not be relayed intact through the scan agent:
-     nothing was mis-scheduled and nothing is lost. Tell the operator to narrow the run (`/go <ids>`,
-     or set a focus) or raise `models.shell`. Never report it as missing task ids.
-     Every backend acf-whip ships stamps this header, so on `files`, `beads`, `multica` and `linear`
-     a snapshot arriving *without* one is also `relay-truncated` — a model that drops entries is at
-     least as likely to drop a header it does not understand. Only a third-party adapter is allowed
-     to omit it, and there the run says once that completeness could not be verified and proceeds.
+     scope reports `stopReason: 'partial'` and `completed: false`. It finished everything it was
+     *allowed* to touch, which is not the same as finishing the backlog, and the operator should not
+     have to work that out from the counts.
+     **`heldOutEver[]`** is the same list plus the entries whose hold was lifted mid-run (`lifted:
+     true`): an operator fixed the card and the task went on to run. Those do not make a run
+     `partial` and are not in `heldOut`. Mention them only if asked, but never claim a lifted task
+     never ran.
+   - **`fatalsNotGating[]`**: integrity findings that name nothing this run could act on. Mention
+     the count and point at `/whip-doctor`; do **not** treat them as failures. One malformed card no
+     longer stops runs that never touch it.
+   - **`relay{}`**: whether the snapshot hop was verified. `stopReason: 'relay-truncated'` means the
+     board was read correctly but the snapshot did not survive the relay through the scan agent
+     intact. Nothing was mis-scheduled and nothing is lost. Tell the operator to narrow the run
+     (`/go <ids>`, or set a focus) or raise `models.shell`. Never report it as missing task ids.
+     Every backend that ships with acf-whip stamps this header, so on `files`, `beads`, `multica` and `linear`
+     a snapshot that arrives *without* one is also `relay-truncated`: a model that drops entries is
+     at least as likely to drop a header it does not understand. Only a third-party adapter may omit
+     it. There the run says once that it could not verify completeness, and carries on.
 
-   `stopReason: 'scope-unresolved'` still means an id in `only` matched no task — but only when the
-   store itself could not resolve it. A resolved id absent from the relayed snapshot is reported as a
-   relay failure instead, because "check the ids" is the wrong thing to tell someone whose ids were
+   `stopReason: 'scope-unresolved'` still means an id in `only` matched no task, but only when the
+   store itself could not resolve it. A resolved id missing from the relayed snapshot is reported as
+   a relay failure instead, because "check the ids" is the wrong advice for someone whose ids were
    fine. `'gated[]'` explains a `no-progress` exit by naming the dependency each pending task is
    waiting on.
 
-   Also surface `escalation{}` and `agentsUsed`/`agentCap`. They are how an operator tells a fully
-   escalated run from one that silently degraded to 3.1.0 dispatch — the two are otherwise
-   indistinguishable. In particular:
-   - `stopReason: 'agent-cap-reached'` is a **clean** stop, not a failure: in-flight work was finished
-     and integrated, every completed harness stage is on disk under the same attempt key, and
-     re-running `/go` replays them for free and continues.
-   - `escalation.authored === 0` with `escalation.fellBack > 0` means no harness was ever authored —
-     check that `skills/lib/bin/acfw-child-*` are executable and `.claude/agents/` is populated.
+   Also surface `escalation{}` and `agentsUsed`/`agentCap`. Without them an operator cannot tell a
+   fully escalated run from one that silently degraded to 3.1.0 dispatch. In particular:
+   - `stopReason: 'agent-cap-reached'` is a **clean** stop, not a failure. In-flight work was
+     finished and integrated, every completed harness stage is on disk under the same attempt key,
+     and re-running `/go` replays them for free and continues.
+   - `escalation.authored === 0` with `escalation.fellBack > 0` means no harness was ever authored.
+     Check that `skills/lib/bin/acfw-child-*` are executable and `.claude/agents/` is populated.
    - `escalation.stagesReplayed` is work a re-run did **not** have to redo.
 
-   **After reporting the RunReport, do what its `nextStep` says.** This is a pointer only: the
-   exact command and its flags live in the field, because the completion payload is what a resumed
-   turn reliably reads after a long background run. It prints nothing outside a planned cycle, so a
-   plan-less run ends exactly as before. Inside one, print its output verbatim and add nothing of
-   your own. A report with no `nextStep` (every `aborted: true` one) ends here; never build the
-   command yourself.
-6. Do **not** also run the legacy loop below — the workflow replaces it.
+   **After reporting the RunReport, do what its `nextStep` says.** This paragraph only points at the
+   field; the exact command and flags live there, because after a long background run the completion
+   payload is what a resumed turn reliably reads. The command prints nothing outside a planned cycle,
+   so a run with no plan ends as it always did. Inside a cycle, print its output verbatim and add
+   nothing of your own. A report with no `nextStep` (every `aborted: true` report) ends here. Never
+   build the command yourself.
+6. Do **not** also run the legacy loop below. The workflow replaces it.
 
-**Only if the `Workflow` tool is NOT available** (dynamic workflows disabled, or older Claude Code):
-run the legacy single-context loop below. It enforces the same slug rules, but the loop lives in your
-context (and grows it).
+**Only if the `Workflow` tool is not available** (dynamic workflows disabled, or an older Claude
+Code), run the legacy single-context loop below. It enforces the same slug rules, but the loop lives
+in your context and grows it.
 
-**The legacy loop's integrity gate is STRICTER**, and deliberately so: it refuses on ANY FATAL, where
-the orchestrator holds out only the task a task-level finding names. Per-task quarantine needs an
-index to attribute a finding to a task and a place to record what was held out — both of which are
-script state the prose loop does not have. Guessing which findings are safe to ignore, by hand, in
-your context, is exactly the failure mode the classification exists to remove. If a single malformed
-card is blocking this path, fix or retire it (`/whip-move <task> archive`) rather than working around
-the gate.
+**The legacy loop's integrity gate is stricter, on purpose**: it refuses on any FATAL, where the
+orchestrator holds out only the task a task-level finding names. Per-task quarantine needs an index
+that ties a finding to a task and a place to record what was held out. Both are script state the
+prose loop does not have. Deciding by hand, in your context, which findings are safe to ignore is the
+failure the classification was built to remove. If one malformed card blocks this path, fix it or
+retire it (`/whip-move <task> archive`) instead of working around the gate.
 
-**Run scope on the legacy path.** That loop is prose you execute, not a script taking args, so a scope
-cannot be threaded into it mechanically. Resolve it exactly as in step 3 — including the focus branch,
-so a bare `/go` here means the same thing it means on the workflow path — then treat the resolved stem
-list, plus any unmet dependencies, as the *entire* backlog for this run: never select, transition or
-integrate a task outside it, and state the resolved list before you begin. The `bareGo: refuse` policy
-applies here too; a shared board does not become drainable because the orchestrator is unavailable.
+**Run scope on the legacy path.** That loop is prose you execute, not a script that takes args, so
+nothing threads the scope into it for you. Resolve the scope as in step 3, focus branch included, so a
+bare `/go` means the same thing on both paths. Then treat the resolved stem list, plus any unmet
+dependencies, as the *entire* backlog for this run: never select, transition or integrate a task
+outside it, and state the resolved list before you begin. The `bareGo: refuse` policy applies here
+too. A shared board does not become drainable because the orchestrator is unavailable.
 
 ---
 
 # Legacy fallback loop (no dynamic workflows)
 
 > Everything below runs only when the `Workflow` tool is unavailable. It is the byte-compatible
-> Claude-as-orchestrator implementation of the same `.backlog/` state machine.
+> version of the same `.backlog/` state machine, with Claude as the orchestrator.
 >
-> **files backend only**: this legacy loop reads and moves `.backlog/<state>/` files directly, so it
-> requires the default `files` task store. A project configured with another store backend
-> (`ACFW_STORE` in `.acfwhip/config` — e.g. `beads` or `multica`) needs dynamic workflows; if the
-> `Workflow` tool is unavailable there, STOP and tell the operator instead of running this loop.
+> **files backend only**: this loop reads and moves `.backlog/<state>/` files directly, so it needs
+> the default `files` task store. A project configured with another backend (`ACFW_STORE` in
+> `.acfwhip/config`, such as `beads` or `multica`) needs dynamic workflows. If the `Workflow` tool is
+> unavailable there, **stop** and tell the operator instead of running this loop.
 
 ## Continuous Execution Loop
 
@@ -443,7 +445,7 @@ POST-LOOP: Final integration drain (defensive).
 
 ## Pre-Loop: Capture Trunk Identity
 
-Before iteration begins, snapshot the branch checked out at the repo root and export it as environment variables for every dispatched skill (`clean-checkout-before-task`, `integrate-lpcas`).
+Before the first iteration, record the branch checked out at the repo root and export it as environment variables for every dispatched skill (`clean-checkout-before-task`, `integrate-lpcas`).
 
 ```bash
 export ACFW_TRUNK_ROOT=$(git rev-parse --show-toplevel)
@@ -471,7 +473,7 @@ echo "🌳 Trunk: $ACFW_TRUNK_BRANCH @ $ACFW_TRUNK_SHA_AT_START"
 
 ## Pre-Loop: Backlog Integrity Gate (doctor)
 
-Before the loop, run the integrity doctor as a **HARD GATE** over the ACTIVE backlog. The `--fix` pass self-heals the REPAIRABLE class first — including **deriving a missing `Worktree:` slug** for any active code task, so a pre-2.0.0 backlog dispatches instead of hard-failing. Only a remaining **FATAL** aborts. Findings on `accepted/` tasks are **advisory (WARN), never blocking**: an accepted task is terminal / out of the dispatch path, so a missing slug or stale `Status:` there does not gate the run.
+Before the loop, run the integrity doctor over the active backlog as a **hard gate**. The `--fix` pass repairs the REPAIRABLE class first, including **deriving a missing `Worktree:` slug** for any active code task, so a pre-2.0.0 backlog dispatches instead of failing outright. Only a **FATAL** that survives the repair aborts. Findings on `accepted/` tasks are **advisory (WARN) and never block**: an accepted task is terminal and out of the dispatch path, so a missing slug or stale `Status:` there does not gate the run.
 
 ```bash
 # Always the dispatcher, never a battery by path: the batteries are per-backend and the `files` one
@@ -495,15 +497,15 @@ The same doctor runs once per iteration (lite recheck, Step 0 below); a FATAL in
 
 ## Backlog state lives at root (single writer)
 
-The orchestrator (this skill, running as the parent agent at `$ACFW_TRUNK_ROOT` on the trunk branch) is the **only writer of `.backlog/` files**. Specialists and quality-reviewer **do not** move task files between state folders; they signal their decision via the `ACFW-RESULT` marker (defined below) on Task() return. The orchestrator parses the marker, performs the file move + `git mv` + commit on the trunk branch, then continues.
+The orchestrator (this skill, running as the parent agent at `$ACFW_TRUNK_ROOT` on the trunk branch) is the **only writer of `.backlog/` files**. Specialists and quality-reviewer **do not** move task files between state folders. They report their decision in the `ACFW-RESULT` marker (defined below) when their Task() returns. The orchestrator parses the marker, does the file move, `git mv` and commit on the trunk branch, and continues.
 
-**task-engineer transitions** (creation N/A→pending, retry rejected→pending, unblock blocked→pending, redesign rejected→blocked at the retry cap, `MAX_REJECT_RETRY`/`maxReject`, currently 3) are likewise performed at root. task-engineer never invokes `clean-checkout-before-task` and never enters a worktree.
+**task-engineer transitions** (creation N/A→pending, retry rejected→pending, unblock blocked→pending, redesign rejected→blocked at the retry cap, `MAX_REJECT_RETRY`/`maxReject`, currently 3) also happen at root. task-engineer never invokes `clean-checkout-before-task` and never enters a worktree.
 
-**Specialists** still do code work in their worktrees on `worktree/<slug>` (no change). Their commits on the worktree branch contain code only; no `.backlog/` deltas.
+**Specialists** do code work in their worktrees on `worktree/<slug>`. Their commits on the worktree branch hold code only, never `.backlog/` changes.
 
 ### ACFW-RESULT marker
 
-Every implementer specialist and quality-reviewer ends its Task() output with a single marker block parsed by the orchestrator:
+Every implementer specialist and every quality-reviewer ends its Task() output with one marker block, which the orchestrator parses:
 
 ```
 ACFW-RESULT:
@@ -514,16 +516,16 @@ ACFW-RESULT:
 ```
 
 `transition` is one of:
-- `completed` (implementer finished implementation; orchestrator moves pending→completed at root, then schedules quality-reviewer)
+- `completed` (implementer finished the work; orchestrator moves in-progress→completed at root, then schedules quality-reviewer)
 - `blocked` (implementer hit an unresolvable blocker mid-work; orchestrator moves in-progress→blocked at root)
 - `accepted` (quality-reviewer accepted; orchestrator moves in-review→accepted at root)
 - `rejected` (quality-reviewer rejected; orchestrator moves in-review→rejected at root and increments Rejection Count)
 
-If the marker is missing or malformed, the orchestrator treats the dispatch as a transient failure (leave task in current state, retry next iteration).
+If the marker is missing or malformed, the orchestrator treats the dispatch as a transient failure: the task stays in its current state and is retried next iteration.
 
 ### Lock-file backoff helper (shared, extracted)
 
-`git_with_lock_backoff` is defined once in `${CLAUDE_PLUGIN_ROOT}/skills/lib/acfw-git.sh` — the single source of truth for all acf-whip git logic. Source it before any orchestrator git operation:
+`git_with_lock_backoff` is defined once, in `${CLAUDE_PLUGIN_ROOT}/skills/lib/acfw-git.sh`, which holds all of acf-whip's shared git logic. Source it before any orchestrator git operation:
 
 ```bash
 . "${CLAUDE_PLUGIN_ROOT}/skills/lib/acfw-git.sh"
@@ -533,7 +535,7 @@ Backoff: 1s → 2s → 4s. Never `rm` the lock; let the holding process finish. 
 
 ### Integration oracle (LP-CAS)
 
-The same file provides the **only** sanctioned integration test. A task is integrated **iff** its in-tree ledger marker (`.acfwhip/integrated/<shard>/<key>.json`, `key` = task stem) is present in the tree of the live trunk tip. Never grep `Integrated-At:` — that field is inert display/ack metadata and can diverge from reality.
+The same file provides the **only** approved integration test. A task is integrated **iff** its in-tree ledger marker (`.acfwhip/integrated/<shard>/<key>.json`, `key` = task stem) is present in the tree of the live trunk tip. Never grep `Integrated-At:`. That field is inert display/ack metadata and can disagree with what is on trunk.
 
 ```bash
 acfw_is_integrated "$ACFW_TRUNK_ROOT" "$ACFW_TRUNK_BRANCH" "$(basename "$f" .md)"   # exit 0 = integrated
@@ -688,7 +690,7 @@ done
 
 ## Step 0: Per-Iteration Integrity Recheck (doctor-lite)
 
-At the top of each iteration, re-run the doctor (report only — repairs were applied at the pre-loop gate). A FATAL introduced mid-run (e.g. a task-engineer retry that produced a cycle, or a half-applied transition after a crash) aborts the loop rather than dispatching against inconsistent state.
+At the top of each iteration, re-run the doctor in report-only mode; the pre-loop gate already applied the repairs. A FATAL introduced mid-run (say, a task-engineer retry that created a cycle, or a half-applied transition after a crash) aborts the loop instead of dispatching against inconsistent state.
 
 ```bash
 if ! REPORT=$(ACFW_TRUNK_ROOT="$ACFW_TRUNK_ROOT" bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" doctor --quiet); then
@@ -698,9 +700,9 @@ if ! REPORT=$(ACFW_TRUNK_ROOT="$ACFW_TRUNK_ROOT" bash "${CLAUDE_PLUGIN_ROOT}/ski
 fi
 ```
 
-## Step 1: Quality Gate Auto-Fix (PRE-PROCESSING)
+## Step 1: Quality Gate Auto-Fix (pre-processing)
 
-Before processing ANY tasks, attempt to fix common quality issues automatically.
+Before processing any task, try to auto-fix common quality issues.
 
 ### Go
 
@@ -741,13 +743,13 @@ rm -rf .next 2>/dev/null || true  # Clear build cache
 git_with_lock_backoff stash push -m "acf-whip-go-autofixes" || true
 ```
 
-**Purpose**: Eliminate trivial quality gate failures (formatting, linting) before processing tasks.
+**Purpose**: clear trivial quality-gate failures (formatting, linting) before any task runs.
 
 ---
 
-## Step 2: Scan ALL Workflow States
+## Step 2: Scan All Workflow States
 
-Scan every state folder to identify transitions needed:
+Scan every state folder to find the transitions that are due:
 
 ```bash
 # Pending tasks (ready to start)
@@ -781,18 +783,18 @@ fi
 
 ---
 
-## Step 3: Process ALL Transitions
+## Step 3: Process All Transitions
 
-Build complete transition list in single TodoWrite call.
+Build the complete transition list in a single TodoWrite call.
 
 ### Transition Logic
 
 #### A. Retry Rejected Tasks
 
 For each task in `.backlog/rejected/`:
-1. Read `rejection_count` from task metadata
-2. If `rejection_count < 3`: Retry (increment attempt)
-3. If `rejection_count >= 3`: Block (abandon)
+1. Read `rejection_count` from the task metadata.
+2. If `rejection_count < 3`: retry it (increment the attempt).
+3. If `rejection_count >= 3`: block it for redesign.
 
 ```javascript
 // Example todo
@@ -808,7 +810,7 @@ For each task in `.backlog/rejected/`:
 For each task in `.backlog/blocked/`:
 1. Read `Dependencies` from task metadata.
 2. For each dependency `dep`, check the **dependency-gating rule** below.
-3. If all deps satisfied: Unblock (blocked→pending).
+3. If every dep is satisfied, unblock it (blocked→pending).
 
 #### C. Start Pending Tasks
 
@@ -822,9 +824,9 @@ For each task in `.backlog/pending/`:
 A task may dispatch only from a codebase that already contains all its dependencies. For each dep:
 
 - **Same-slug dep** (dep's `Worktree:` equals this task's `Worktree:`): satisfied as soon as `dep` is in `.backlog/accepted/`. Its commits already live on the shared `worktree/<slug>` branch and will be present in the worktree when the within-slug serializer picks the next task.
-- **Cross-slug dep** (different `Worktree:` slug): `dep` must be in `.backlog/accepted/` **AND** its commits must already be on the local trunk — i.e. its **ledger marker is on trunk**, **or** it is a historical task with no `worktree/<slug>` branch (already merged the old way; nothing left to integrate). A cross-slug dep blocks only while it is genuinely pending integration (accepted, a live branch, no marker). A non-code (`none`) dep never integrates, so it is satisfied on acceptance.
+- **Cross-slug dep** (different `Worktree:` slug): `dep` must be in `.backlog/accepted/` **and** its commits must already be on the local trunk. That means its **ledger marker is on trunk**, **or** it is a historical task with no `worktree/<slug>` branch (merged the old way, nothing left to integrate). A cross-slug dep blocks only while it is still pending integration: accepted, a live branch, no marker. A non-code (`none`) dep never integrates, so acceptance satisfies it.
 
-In override (PR) mode no marker is ever written, so treat acceptance as sufficient for cross-slug deps too (operator is responsible for ordering). The doctor's `cross-slug-dep-not-integrated` FATAL is relaxed in lockstep (`--mode override`, or the resolved pin) — **the scheduler and the doctor must agree here**. When they did not, this gate dispatched the dependent and the next per-iteration doctor recheck aborted the run on the state the scheduler had just chosen.
+In override (PR) mode no marker is ever written, so acceptance satisfies cross-slug deps too, and the operator owns the ordering. The doctor relaxes its `cross-slug-dep-not-integrated` FATAL to match (`--mode override`, or the resolved pin). **The scheduler and the doctor must agree here.** When they disagreed, this gate dispatched the dependent and the next per-iteration doctor recheck aborted the run on the state the scheduler had just chosen.
 
 ```javascript
 {
@@ -834,12 +836,12 @@ In override (PR) mode no marker is ever written, so treat acceptance as sufficie
 }
 ```
 
-#### D. Review Completed Tasks (MANDATORY)
+#### D. Review Completed Tasks (mandatory)
 
 For each task in `.backlog/completed/`:
-1. **Orchestrator** at root: pre-move completed→in-review (atomic mv + commit on trunk).
+1. The **orchestrator**, at root, pre-moves completed→in-review (atomic mv + commit on trunk).
 2. Dispatch quality-reviewer with `TASK_FILE=$ACFW_TRUNK_ROOT/.backlog/in-review/<file>.md`.
-3. On Task() return, orchestrator parses ACFW-RESULT and applies in-review→accepted or in-review→rejected via `acfw_apply_result`.
+3. When the Task() returns, the orchestrator parses ACFW-RESULT and applies in-review→accepted or in-review→rejected through `acfw_apply_result`.
 
 ```javascript
 {
@@ -852,8 +854,8 @@ For each task in `.backlog/completed/`:
 #### E. Timeout In-Progress Tasks (operator threshold, default 8h)
 
 For each task in `.backlog/in-progress/`:
-1. Read timestamp from transition log
-2. If older than `ACFW_INPROGRESS_TIMEOUT_HOURS` (env > `.backlog/.acfw-config` > default **8h**): Timeout (in-progress→blocked)
+1. Read the timestamp from the transition log.
+2. If it is older than `ACFW_INPROGRESS_TIMEOUT_HOURS` (env > `.backlog/.acfw-config` > default **8h**), time it out (in-progress→blocked).
 
 ```javascript
 {
@@ -891,7 +893,7 @@ TodoWrite({
 
 ## Step 4: Partition by Worktree, Then Spawn
 
-**Concurrency rule (MANDATORY)**: parallel across worktrees, sequential within a worktree. Each task declares `Worktree: <slug>` in its front-matter. Specialists invoke `clean-checkout-before-task` as Step 0; that skill uses git's worktree branch registry as the lock. Do not bypass the partition.
+**Concurrency rule (mandatory)**: parallel across worktrees, sequential within one. Each task declares `Worktree: <slug>` in its front-matter. Specialists invoke `clean-checkout-before-task` as Step 0, and that skill uses git's worktree branch registry as the lock. Do not bypass the partition.
 
 ### Step 4a: Partition pending tasks by Worktree
 
@@ -972,7 +974,7 @@ return 0
 
 ### Step 4b: Spawn one specialist per worktree-group
 
-For each task in `DISPATCH_QUEUE`, spawn the assigned specialist. All spawns happen in parallel because each operates on a distinct `Worktree:` slug, hence a distinct branch and worktree. There is no shared `.git/index` between them.
+For each task in `DISPATCH_QUEUE`, spawn the assigned specialist. The spawns run in parallel: each works on a distinct `Worktree:` slug, so on a distinct branch and worktree, and they share no `.git/index`.
 
 The orchestrator pre-moves each task `pending → in-progress` at root (single writer, atomic), then dispatches:
 
@@ -987,7 +989,7 @@ for f in "${DISPATCH_QUEUE[@]}"; do
 done
 ```
 
-Then issue Task() calls in a single message (one per slug), passing the **root path** as `TASK_FILE`. The specialist prompt explicitly forbids moving the task file:
+Then issue the Task() calls in a single message (one per slug), passing the **root path** as `TASK_FILE`. The specialist prompt forbids moving the task file:
 
 ```markdown
 Agent 1 (Worktree: alpha): go-engineer
@@ -999,18 +1001,18 @@ Agent 2 (Worktree: beta): react-engineer (same rules)
 Agent 3 (Worktree: gamma): quality-reviewer (same rules; transition is accepted | rejected)
 ```
 
-After all Task() calls return, the orchestrator parses each agent's ACFW-RESULT marker and calls `acfw_apply_result` to perform the corresponding `.backlog/` move at root (in-progress→completed, or accepted→rejected, etc.).
+After all Task() calls return, the orchestrator parses each agent's ACFW-RESULT marker and calls `acfw_apply_result` to make the matching `.backlog/` move at root (in-progress→completed, in-review→rejected, and so on).
 
-**Within-group serialization**: tasks sharing a slug are NOT dispatched in the same iteration; they wait until the in-progress task in their slug terminates.
+**Within-group serialization**: tasks that share a slug are never dispatched in the same iteration. They wait until the in-progress task in their slug terminates.
 
 ### Step 4b-bis: Dispatch the non-code tasks (`Worktree: none`)
 
-`DIRECT_DISPATCH` holds the tasks the partition set aside: research, docs, retro — no worktree, no
-clean-checkout, no branch. They are **not** subject to slug serialization (they have no slug), so all
-of them dispatch every iteration alongside 4b. Skipping this step is a livelock: a non-code task that
-is never dispatched is never terminalized, and the loop cannot reach 100%.
+`DIRECT_DISPATCH` holds the tasks the partition set aside: research, docs and retro tasks, which have
+no worktree, no clean-checkout and no branch. Having no slug, they are **not** serialized by slug, so
+all of them dispatch every iteration alongside 4b. Skipping this step livelocks the loop: a non-code
+task that is never dispatched never reaches a terminal state, so the loop cannot reach 100%.
 
-Pre-move exactly as 4b does, then dispatch:
+Pre-move them the same way 4b does, then dispatch:
 
 ```bash
 for f in ${DIRECT_DISPATCH[@]+"${DIRECT_DISPATCH[@]}"}; do
@@ -1023,7 +1025,7 @@ for f in ${DIRECT_DISPATCH[@]+"${DIRECT_DISPATCH[@]}"}; do
 done
 ```
 
-Their agent works in the **root tree** and does not commit, so its `ACFW-RESULT` marker MUST list
+Their agent works in the **root tree** and does not commit, so its `ACFW-RESULT` marker **must** list
 every file it created or changed:
 
 ```markdown
@@ -1036,49 +1038,49 @@ Agent (Worktree: none): research-agent
   committed, and the next clean-checkout stashes it away permanently.
 ```
 
-`acfw_apply_result` turns `deliverable_files` into `--stage` flags, so the deliverables are committed
-in the same commit as the state move — the earliest possible moment, which is the narrowest window in
-which a concurrent checkout can destroy them.
+`acfw_apply_result` turns `deliverable_files` into `--stage` flags, so the deliverables go into the
+same commit as the state move. That is the earliest moment possible, and it leaves a concurrent
+checkout the smallest window in which to destroy them.
 
 ### Agent Type Selection
 
 | Transition | Performed by | Notes |
 |------------|--------------|-------|
-| retry (rejected→pending) | task-engineer at root | Adjusts rejection_count narrative; orchestrator commits the move on trunk after task-engineer returns. task-engineer NEVER enters a worktree. |
+| retry (rejected→pending) | task-engineer at root | Adjusts rejection_count narrative; orchestrator commits the move on trunk after task-engineer returns. task-engineer never enters a worktree. |
 | unblock (blocked→pending) | task-engineer at root | Validates dependencies satisfied (cross-slug deps need their ledger marker on trunk). |
 | dispatch (pending→in-progress) | **orchestrator** at root, before Task() | Single writer; atomic mv + commit on trunk before specialist starts. |
-| start work | specialist agent inside worktree | Reads task at root path; does code work in `.worktree/<slug>`; commits CODE only on `worktree/<slug>`; never moves task file. Returns ACFW-RESULT. |
+| start work | specialist agent inside worktree | Reads task at root path; does code work in `.worktree/<slug>`; commits code only on `worktree/<slug>`; never moves task file. Returns ACFW-RESULT. |
 | in-progress→completed | **orchestrator** at root, on specialist's `transition: completed` signal | acfw_apply_result moves + commits on trunk. |
 | in-progress→blocked | **orchestrator** at root, on specialist's `transition: blocked` signal | Same. |
 | completed→in-review | **orchestrator** at root, before reviewer Task() | Pre-move + commit on trunk (mirrors dispatch). |
 | in-review→accepted | **orchestrator** at root, on reviewer's `transition: accepted` signal | acfw_apply_result. |
 | in-review→rejected | **orchestrator** at root, on reviewer's `transition: rejected` signal | acfw_apply_result; increments Rejection Count. |
-| timeout (in-progress→blocked, stale past `ACFW_INPROGRESS_TIMEOUT_HOURS`, default 8h) | orchestrator at root | Synthesizes a `transition: blocked` with notes "timeout >=Nh — stale dispatch". |
+| timeout (in-progress→blocked, stale past `ACFW_INPROGRESS_TIMEOUT_HOURS`, default 8h) | orchestrator at root | Synthesizes a `transition: blocked` with the note `timeout >=Nh — stale dispatch`. |
 
-**The orchestrator is the only writer of `.backlog/` files.** Specialists' worktree-side commits contain code only. task-engineer transitions execute serially at root (no code mutation).
+**The orchestrator is the only writer of `.backlog/` files.** Specialists' worktree-side commits contain code only. task-engineer transitions run one at a time at root and change no code.
 
 ### Specialist Agent Assignment
 
-Read `assigned_agent` field from task metadata:
+Read the `assigned_agent` field from the task metadata:
 - `go-engineer`: Go backend tasks
 - `python-engineer`: Python backend tasks
 - `react-engineer`: React frontend tasks
 - `nextjs-engineer`: Next.js tasks
 - etc.
 
-If no specialist assigned, use task-engineer for guidance.
+If no specialist is assigned, use task-engineer for guidance.
 
 ---
 
 ## Step 4.5: Integrate Newly-Accepted (default mode only)
 
-After dispatch returns and specialists have moved their tasks to `.backlog/accepted/`, land every newly-accepted task onto the live trunk with the **LP-CAS integrator**, one task at a time. The orchestrator (this skill, running as the parent agent) is the **only writer of trunk's `.git/index`**; no parallelism here.
+After dispatch returns and the orchestrator has moved the reviewer-accepted tasks to `.backlog/accepted/`, land each newly accepted task on the live trunk with the **LP-CAS integrator**, one task at a time. The orchestrator (this skill, running as the parent agent) is the **only writer of trunk's `.git/index`**, so nothing in this step runs in parallel.
 
-**Skip this step entirely in override mode** — pinned via `ACFW_INTEGRATION_MODE=override`, or directed by project instructions (CLAUDE.md, AGENTS.md, etc.) when unpinned. In that case no ledger marker is ever written, the operator handles integration, and the loop's terminal check falls back to `accepted ∪ blocked`.
+**Skip this step entirely in override mode**, whether it is pinned via `ACFW_INTEGRATION_MODE=override` or, when unpinned, directed by project instructions (CLAUDE.md, AGENTS.md, etc.). Then no ledger marker is ever written, the operator handles integration, and the loop's terminal check falls back to `accepted ∪ blocked`.
 
-The skip is **executable, not advisory**. Until 3.2.1 it was prose only: `ACFW_INTEGRATION_OVERRIDE` gated the terminal counts and the post-loop drain but *not* this step, so a correctly-pinned override run still cherry-picked every accepted task onto the local trunk — the pin changed how tasks were counted and nothing about where the code went.
+The skip is **executable, not advisory**. Until 3.2.1 it was prose only: `ACFW_INTEGRATION_OVERRIDE` gated the terminal counts and the post-loop drain but *not* this step, so a correctly pinned override run still cherry-picked every accepted task onto the local trunk. The pin changed how tasks were counted and nothing about where the code went.
 
-**Run this check before Step 4.5a.** If it prints the skip line, do not run 4.5a or 4.5b at all — go straight to Step 5:
+**Run this check before Step 4.5a.** If it prints the skip line, do not run 4.5a or 4.5b; go straight to Step 5:
 
 ```bash
 if [ "${ACFW_INTEGRATION_OVERRIDE:-}" = "1" ]; then
@@ -1086,9 +1088,9 @@ if [ "${ACFW_INTEGRATION_OVERRIDE:-}" = "1" ]; then
 fi
 ```
 
-**If the mode is unpinned and you decided `override` by reading project instructions**, then `export ACFW_INTEGRATION_OVERRIDE=1` yourself during Pre-Loop. That one switch is what the terminal counts (Step 5), the post-loop drain, and this guard all read — set it and they agree; leave it unset while acting as if in override mode and the loop will still fold every accepted task into trunk.
+**If the mode is unpinned and you decided `override` by reading project instructions**, then `export ACFW_INTEGRATION_OVERRIDE=1` yourself during Pre-Loop. That one switch is what the terminal counts (Step 5), the post-loop drain and this guard all read. Set it and they agree. Leave it unset while acting as if in override mode, and the loop still folds every accepted task into trunk.
 
-The integrator mutates **only git** (the trunk ref + a disposable integration worktree). It never moves a task file — `.backlog/` moves stay the orchestrator's job (see exit 6 below).
+The integrator changes **only git**: the trunk ref and a disposable integration worktree. It never moves a task file; `.backlog/` moves stay the orchestrator's job (see exit 6 below).
 
 ### Step 4.5a: Topologically sort unintegrated accepted tasks
 
@@ -1162,7 +1164,7 @@ Map each exit code exactly as `workflows/whip-go.workflow.js` does:
 |------|---------|---------------------|
 | 0 | integrated / already-integrated | Change + marker are on trunk. Nothing to write. |
 | 3 | contaminated (quarantine) | Malformed or poison candidate. **Park this task for an operator**; do not retry, do not reject the others. |
-| 4 | skipped | No candidate ref — historical task already on trunk. Terminal; do not retry. |
+| 4 | skipped | No candidate ref: a historical task already on trunk. Terminal; do not retry. |
 | 6 | rejected (quality-fault) | The union gate failed on the candidate tree. **You** move `accepted → rejected` and increment Rejection Count, so the task re-enters the rejection self-heal instead of being re-queued as a candidate every iteration. |
 | 7 | resolver-needed | Cherry-pick conflict. Dispatch the resolver, then re-invoke `--post-resolver`. |
 | 9, 11, 12, 99 | transient | Mechanism fault / `cas-lost` / trunk unobservable / git lock. **Never** a quality reject: leave the task accepted and retry next iteration. |
@@ -1175,15 +1177,15 @@ The integration worktree printed on the `worktree:` line is a **detached** check
 
 - **Allowed**: edit the conflicted files in place, then `git -C <worktree> add <file>` for each. Preserve **both** intents (the task's change and what is already on trunk).
 - **Forbidden**: `git cherry-pick --continue` / `--commit` / `--abort` / `--quit` (the integrator owns the commit); `git reset`, `checkout`/`switch` to another commit, `rebase`, deleting the worktree; editing anything under `.backlog/` or `.acfwhip/`.
-- If the conflict is genuinely irreconcilable, leave the markers **unstaged** — `--post-resolver` then reports a mechanism fault (exit 9) and the task stays accepted for a later attempt.
+- If the conflict cannot be reconciled, leave the markers **unstaged**. `--post-resolver` then reports a mechanism fault (exit 9) and the task stays accepted for a later attempt.
 
-Resolver dispatch is hoisted to the orchestrator because bash cannot spawn a subagent. Everything else — the already-integrated check, the single-parent and poison guards, the marker co-commit, the sanity + union gate, and the compare-and-swap land — belongs to the script.
+Resolver dispatch lives in the orchestrator because bash cannot spawn a subagent. The script owns everything else: the already-integrated check, the single-parent and poison guards, the marker co-commit, the sanity and union gates, and the compare-and-swap landing.
 
 ---
 
 ## Step 5: Check Completion
 
-After all agents complete in iteration AND Step 4.5 has integrated newly-accepted tasks:
+Once every agent in the iteration has returned and Step 4.5 has integrated the newly accepted tasks:
 
 ```bash
 # Count terminal states. Override mode: accepted alone is terminal. Default mode: an accepted task
@@ -1220,7 +1222,7 @@ echo "📊 Progress: $terminal_count / $total_count terminal ($integrated_count 
 
 ### Exit Conditions
 
-**SUCCESS: 100% Complete**
+**Success: 100% complete**
 ```bash
 if [ $terminal_count -eq $total_count ] && [ $total_count -gt 0 ]; then
   echo "✅ Backlog 100% complete!"
@@ -1231,7 +1233,7 @@ if [ $terminal_count -eq $total_count ] && [ $total_count -gt 0 ]; then
 fi
 ```
 
-**CONTINUE: Work Remaining**
+**Continue: work remaining**
 ```bash
 if [ $terminal_count -lt $total_count ]; then
   echo "⏳ Work remaining. Continuing to next iteration..."
@@ -1239,7 +1241,7 @@ if [ $terminal_count -lt $total_count ]; then
 fi
 ```
 
-**INTERVENTION: No Progress**
+**Intervention: no progress**
 ```bash
 if [ $no_progress_count -ge 3 ]; then
   echo "⚠️  No progress for 3 iterations."
@@ -1249,7 +1251,7 @@ if [ $no_progress_count -ge 3 ]; then
 fi
 ```
 
-**ABORT: Infinite Loop Prevention**
+**Abort: infinite-loop guard**
 ```bash
 if [ $iteration -ge $max_iterations ]; then
   echo "❌ Maximum iterations reached ($max_iterations)"
@@ -1263,7 +1265,7 @@ fi
 
 ## Step 6: Loop Continuation
 
-If completion check passes, return to Step 1 for next iteration:
+If Step 5 did not exit, go back to the top of the loop for the next iteration:
 
 ```bash
 echo "🔄 Starting iteration $((iteration + 1))..."
@@ -1274,7 +1276,7 @@ echo "🔄 Starting iteration $((iteration + 1))..."
 
 ## Post-Loop: Final Integration Drain (default mode)
 
-Defensive: in case the last iteration accepted tasks but exited the loop before reaching Step 4.5 (e.g. progress-detector early-exit), run the integration step once more before returning. Skip in override mode.
+A defensive pass. If the last iteration accepted tasks but left the loop before reaching Step 4.5 (for example, through the no-progress exit), run the integration step once more before returning. Skip it in override mode.
 
 ```bash
 if [ "$ACFW_INTEGRATION_OVERRIDE" != "1" ]; then
@@ -1295,14 +1297,14 @@ fi
 
 ## Priority Enforcement (Optional)
 
-If using 5-level priority system with SLAs:
+If the project uses the 5-level priority system with SLAs:
 
 ### Priority Processing Order
 
-1. **blocker**: Process ALL before any other priority (sequential within chain)
-2. **critical**: Process ALL before high/medium/low (sequential)
-3. **high**: Can run parallel with other high
-4. **medium/low**: Full parallel execution
+1. **blocker**: process all of them before any other priority (sequential within a chain)
+2. **critical**: process all of them before high, medium and low (sequential)
+3. **high**: can run in parallel with other high tasks
+4. **medium/low**: fully parallel
 
 ```bash
 # Filter pending tasks by priority
@@ -1317,26 +1319,26 @@ Process in order: blocker → critical → high → medium/low
 
 ## State Transition Authority
 
-| From | To | WHO performs transition |
-|------|----|-------------------------|
+| From | To | Decided by |
+|------|----|------------|
 | N/A | pending | task-engineer |
-| pending | in-progress | Specialist agent |
-| in-progress | completed | Specialist agent |
-| in-progress | blocked | Specialist agent or timeout |
-| completed | in-review | quality-reviewer |
-| in-review | accepted | quality-reviewer |
-| in-review | rejected | quality-reviewer |
+| pending | in-progress | orchestrator, when it dispatches the specialist |
+| in-progress | completed | specialist agent (`transition: completed`) |
+| in-progress | blocked | specialist agent (`transition: blocked`) or the timeout |
+| completed | in-review | orchestrator, when it dispatches the quality-reviewer |
+| in-review | accepted | quality-reviewer (`transition: accepted`) |
+| in-review | rejected | quality-reviewer (`transition: rejected`) |
 | rejected | pending | task-engineer (retry) |
 | rejected | blocked | task-engineer (≥3 retries) |
 | blocked | pending | task-engineer (resolved) |
 
-**The agent DOING the work moves the file and updates the transition log.**
+**Specialists and quality-reviewer decide; they never move the file.** They report through the `ACFW-RESULT` marker, and the orchestrator makes the move and writes the transition log at root, as the **Agent Type Selection** table above describes.
 
 ---
 
 ## Quality Gate Protocol
 
-Each specialist agent MUST run quality gates before marking task complete:
+Every specialist agent **must** run the quality gates before it reports `transition: completed`:
 
 ```bash
 # Example: Go quality gates
@@ -1346,21 +1348,22 @@ go build ./...
 ```
 
 **Failure Protocol**:
-- Attempts 1-10: Fix actual issues
-- After 10 attempts: Move to blocked with failure report
+- Attempts 1-10: fix the real issues.
+- After 10 attempts: report `transition: blocked` with a failure report.
 
-See stack-specific quality gates: `docs/development/quality-gates-{stack}.md`
+Stack-specific quality gates: `docs/development/quality-gates-{stack}.md`
 
 ---
 
 ## Success Criteria
 
-✅ Loops until 100% terminal states
-✅ Quality gate auto-fix runs each iteration
-✅ ALL state transitions processed each iteration
-✅ Agents spawned in parallel for independent tasks
-✅ Completion checked after each iteration
-✅ Exits on 100% complete OR intervention needed
+A correct run:
+- loops until 100% of tasks are terminal
+- runs the quality-gate auto-fix every iteration
+- processes every due state transition every iteration
+- spawns agents in parallel for independent tasks
+- checks completion after every iteration
+- exits when 100% complete, or when intervention is needed
 
 ---
 
@@ -1466,26 +1469,12 @@ See stack-specific quality gates: `docs/development/quality-gates-{stack}.md`
 
 ## Anti-Patterns
 
-### ❌ Single Pass Execution
-
-**Never**: Process one iteration and exit
-**Always**: Loop until 100% complete
-
-### ❌ Manual Intervention Per Task
-
-**Never**: Ask user after each task (one confirmation at launch for a natural-language scope filter
-is fine and expected — see step 3; what is forbidden is interrupting *between* tasks)
-**Always**: Fire-and-forget until completion or blockage
-
-### ❌ Skipping Quality Gate Auto-Fix
-
-**Never**: Process tasks with known quality issues
-**Always**: Run auto-fix first to eliminate trivial failures
-
-### ❌ Sequential Processing
-
-**Never**: Process one task at a time
-**Always**: Spawn agents in parallel for independent tasks
+| Anti-pattern | Never | Always |
+|---|---|---|
+| Single-pass execution | Process one iteration and exit | Loop until 100% complete |
+| Manual intervention per task | Ask the user after each task. One confirmation at launch (step 3) is fine and expected; what is forbidden is interrupting *between* tasks. | Fire-and-forget until completion or blockage |
+| Skipping the quality-gate auto-fix | Process tasks with known quality issues | Run the auto-fix first to clear trivial failures |
+| Sequential processing | Process one task at a time | Spawn agents in parallel for independent tasks |
 
 ---
 
@@ -1503,7 +1492,7 @@ is fine and expected — see step 3; what is forbidden is interrupting *between*
 **Quality Gate Failures**:
 - Auto-fix applied
 - Specialist retries (max 10)
-- Move to blocked after failures
+- Specialist reports blocked after 10 failed attempts
 
 **User Intervention Needed**:
 - No progress for 3 iterations

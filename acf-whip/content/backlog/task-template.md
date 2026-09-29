@@ -1,6 +1,6 @@
 # Task Template
 
-## MANDATORY: Use this exact format for all task files
+## Use this exact format for every task file
 
 ```markdown
 # Task: [Clear Task Title]
@@ -11,21 +11,21 @@
 - **Status**: pending
 - **Priority**: [blocker|critical|high|medium|low]
 - **Estimated Hours**: [realistic estimate]
-- **Assigned Agent**: [one of the project's INSTALLED agents — check `ls .claude/agents/*.md` (whip-init generates e.g. go-engineer, python-engineer, nodejs-engineer, nextjs-engineer, react-engineer, vue-engineer, infrastructure-engineer, quality-reviewer, task-engineer, research-agent). Must resolve to `.claude/agents/<name>.md`, else the doctor flags FATAL unknown-agent.]
-- **Worktree**: [kebab-case-slug] (REQUIRED for code-mutating tasks; use "none" ONLY for research/docs-only tasks. Orchestrator dispatches one specialist per worktree-slug; tasks sharing a slug run strictly sequentially. An empty slug on a code task is a FATAL doctor violation and blocks `/go`.)
+- **Assigned Agent**: [one of the project's installed agents; check `ls .claude/agents/*.md` (whip-init generates e.g. go-engineer, python-engineer, nodejs-engineer, nextjs-engineer, react-engineer, vue-engineer, infrastructure-engineer, quality-reviewer, task-engineer, research-agent). It must resolve to `.claude/agents/<name>.md`, or the doctor flags FATAL unknown-agent.]
+- **Worktree**: [kebab-case-slug] (Required for code-mutating tasks; use "none" only for research or docs-only tasks. The orchestrator dispatches one specialist per slug at a time, so tasks that share a slug run one after another. If an active code task has no slug, `/whip-doctor --fix` (which `/go` runs at startup) derives one from its id.)
 - **PR Group**: [kebab-case-slug] (defaults to the same value as Worktree; sibling tasks ship together as one PR)
-- **Touches Globs**: [comma-separated file globs this task will modify, e.g. `services/user-api/**, go.mod`] or "none" (used by the doctor to WARN when two different-slug pending tasks overlap — a mis-partition signal)
+- **Touches Globs**: [comma-separated file globs this task will modify, e.g. `services/user-api/**, go.mod`] or "none" (the doctor WARNs when two pending tasks on different slugs overlap, a sign the partition is wrong)
 - **Dependencies**: [task-id-1, task-id-2] or "none"
-- **Integrated-At**: (INERT as of 3.0.0 / LP-CAS — kept only for display. Integration truth is the in-tree ledger marker `.acfwhip/integrated/<shard>/<key>.json` on trunk, written by `integrate-lpcas`; nothing reads this field.)
-- **Rejection Count**: 0 (max 3; quality-reviewer increments on reject; at the cap the task is blocked for task-engineer redesign. A review reporting `faultClass: mechanism` — a broken environment, a lost clean-checkout token — does NOT increment it.)
-- **Block-Count**: 0 (per-task re-block counter; `/go` increments when a specialist re-blocks a dispatched task and stops re-dispatching once it reaches the cap, parking the task for an operator)
+- **Integrated-At**: (Since 3.0.0 / LP-CAS this is display and operator-ack metadata. The integrator never reads or writes it: integration truth is the in-tree ledger marker `.acfwhip/integrated/<shard>/<key>.json` on trunk, written by `integrate-lpcas`. Set it only through `/whip-move --integrated-at`.)
+- **Rejection Count**: 0 (max 3. `/go` adds 1 when quality-reviewer rejects; at the cap it blocks the task for task-engineer to redesign. A review reporting `faultClass: mechanism`, such as a broken environment or a lost clean-checkout token, does not add to it.)
+- **Block-Count**: 0 (per-task re-block counter. `/go` adds 1 each time a specialist re-blocks a dispatched task, and stops re-dispatching at the cap, parking the task for an operator)
 - **Created By**: task-engineer
 - **Created At**: $(date +"%Y-%m-%d %H:%M:%S") UTC
 - **Documentation**: [existing docs agent must read first, or "none"]
 
 ## Description
 
-[Clear description of what needs to be done, why it's needed, and expected outcome]
+[What needs to be done, why it is needed, and the expected outcome]
 
 ## Acceptance Criteria
 
@@ -66,7 +66,7 @@
 
 ## Out of Scope
 
-- [Explicitly what NOT to do]
+- [What not to do, stated explicitly]
 - [What's handled elsewhere]
 - [Future considerations]
 
@@ -110,19 +110,18 @@
 
 Do **not** copy that line into a task document by hand. `<status>` is a placeholder here on purpose:
 the completed row is what `snapshot.hasCleanCheckoutToken` and the reviewer's pre-review check both
-grep for, so a document containing it claims a checkout that never happened — and silently disables
+grep for, so a document containing it claims a checkout that never happened, and silently disables
 the one diagnostic aimed at that condition.
 
 Quality-reviewer auto-rejects any task in `.backlog/in-review/` whose transition log lacks at least one `clean-checkout | ok` line.
 
-**Integration (default mode, 3.0.0 / LP-CAS)**: `integrate-lpcas` lands the task's in-tree ledger marker
-(`.acfwhip/integrated/<shard>/<key>.json`) on trunk, co-committed with the change in one single-parent
-commit, after the union gate passes. The marker's presence on trunk IS the integration record; the
-integrator does **not** write the task markdown. If the union gate fails, the orchestrator moves the task
-to `.backlog/rejected/` (rejection +1) so it re-enters the self-heal; a cherry-pick conflict routes to a
-resolver (mechanism), never a silent drop.
-
-The existing rejection/retry/block machinery picks up from there.
+**Integration (default mode, 3.0.0 / LP-CAS)**: once the union gate passes, `integrate-lpcas` lands the
+task's in-tree ledger marker (`.acfwhip/integrated/<shard>/<key>.json`) on trunk, in one single-parent
+commit together with the change. The marker on trunk is the integration record; the integrator never
+writes the task markdown.
+If the union gate fails, the orchestrator moves the task to `.backlog/rejected/` (rejection +1),
+and the usual rejection, retry and block handling takes over from there. A cherry-pick conflict goes
+to a resolver as a mechanism fault; it is never dropped silently.
 
 ## Implementation Notes
 
@@ -215,12 +214,12 @@ nothing to commit, working tree clean
 
 ### Documentation Field Usage
 
-- **PURPOSE**: Lists EXISTING documentation for input context
-- **NOT FOR**: Output files this task will create (that goes in Description)
-- **AUTO-LOADED** (don't list): CLAUDE.md, agent manifests (docs/agents/*.md)
-- **VERIFY**: task-engineer validates all referenced files exist before task creation
-- **USE "none"**: When only auto-loaded docs needed
-- **PLANNED TASKS**: a task decomposed from an approved cycle plan (`/task --plan`) lists that plan with a
+- **Purpose**: lists documentation that already exists, as input context
+- **Not for**: output files this task will create (those go in Description)
+- **Auto-loaded** (do not list): CLAUDE.md, agent manifests (docs/agents/*.md)
+- **Verify**: task-engineer checks that every referenced file exists before it creates the task
+- **Use "none"**: when the auto-loaded docs are enough
+- **Planned tasks**: a task decomposed from an approved cycle plan (`/task --plan`) lists that plan with a
   `(D<n>, ...)` suffix naming the deliverables it implements: `docs/cycles/<ID>/plan.md (D2, D4)`. The
   field is still a path list; the suffix points at the `### D<n>` sections of that plan. `/task` stamps
   this value, so do not edit it by hand. Deliverable coverage is read from the cycle's `record.md`, never
@@ -243,47 +242,60 @@ nothing to commit, working tree clean
 
 ### 1. Task Creation (task-engineer)
 
-- MUST use this exact template
-- MUST fill all required fields
-- MUST verify Documentation field references exist
-- MUST NOT include implementation code
-- MUST commit task file when creating
+task-engineer must:
+
+- use this exact template
+- fill every required field
+- verify that every file named in the Documentation field exists
+- leave out implementation code
+- commit the task file when it creates it
 
 ### 2. Task Pickup (implementation agents)
 
-- MUST invoke `clean-checkout-before-task` as Step 0 with `TASK_FILE` = the **root** path the orchestrator passed (creates worktree, validates branch, appends OK token to the root file)
-- All CODE reads, edits, and commits happen inside the worktree on `worktree/<slug>` (never on the trunk branch)
-- MUST NOT move task files between `.backlog/<state>/` folders — that's the orchestrator's job at root
-- MUST NOT commit `.backlog/` changes on `worktree/<slug>`
-- MUST add evidence of completion to the root task file (write the file directly at its root path)
-- MUST end response with the ACFW-RESULT marker (`transition: completed | blocked`)
+An implementation agent must:
+
+- invoke `clean-checkout-before-task` as Step 0, with `TASK_FILE` set to the **root** path the
+  orchestrator passed. The skill creates the worktree, validates the branch and appends the OK token
+  to the root file.
+- do every code read, edit and commit inside the worktree on `worktree/<slug>`, never on the trunk
+  branch
+- never move a task file between `.backlog/<state>/` folders; the orchestrator does that at the root
+- never commit `.backlog/` changes on `worktree/<slug>`
+- add evidence of completion to the root task file, writing the file directly at its root path
+- end its response with the ACFW-RESULT marker (`transition: completed | blocked`)
 
 ### 3. Task Completion (implementation agents)
 
-- MUST check all acceptance criteria
-- MUST run quality gates and capture output (see docs/development/quality-gates.md)
-- MUST add evidence to the root task file BEFORE returning the marker
-- MUST commit code (and only code) on `worktree/<slug>`
-- MUST return ACFW-RESULT with the final code commit SHA
+An implementation agent must:
+
+- check every acceptance criterion
+- run the quality gates and capture their output (see docs/development/quality-gates.md)
+- add the evidence to the root task file **before** it returns the marker
+- commit code, and only code, on `worktree/<slug>`
+- return ACFW-RESULT with the final code commit SHA
 
 ### 4. Quality Review (quality-reviewer)
 
-- MUST invoke `clean-checkout-before-task` as Step 0 (idempotent; validates the worktree the implementer used)
-- MUST verify the transition log contains at least one `clean-checkout | ok` line; emit `transition: rejected` with `rejection_increment: 1` if absent
-- MUST add review comments in designated section of the root task file
-- MUST end response with the ACFW-RESULT marker (`transition: accepted | rejected`)
-- MUST NOT move the task file (the orchestrator performs the in-review→accepted/rejected move at root)
-- MUST provide specific feedback in `notes` and the Quality Review Comments section if rejecting
+quality-reviewer must:
+
+- invoke `clean-checkout-before-task` as Step 0 (idempotent; it validates the worktree the
+  implementer used)
+- verify that the transition log contains at least one `clean-checkout | ok` line, and emit
+  `transition: rejected` with `rejection_increment: 1` if it does not
+- add review comments in the designated section of the root task file
+- end its response with the ACFW-RESULT marker (`transition: accepted | rejected`)
+- never move the task file; the orchestrator performs the in-review→accepted/rejected move at the root
+- when rejecting, give specific feedback in `notes` and in the Quality Review Comments section
 
 ---
 
 ## Git Commit Protocol
 
 **Where commits land**:
-- **task-engineer** commits on the trunk branch at the repo root (`.backlog/pending/` creations, retry/unblock/redesign moves). NEVER enters a worktree.
-- **`/go` orchestrator** commits all `.backlog/` state-machine moves on the trunk branch at the repo root (pending→in-progress, in-progress→completed/blocked, completed→in-review, in-review→accepted/rejected, accepted→accepted with `Integrated-At:`).
-- **Implementer specialists and quality-reviewer** commit only **code** inside `.worktree/<slug>` on `worktree/<slug>`. They do NOT move task files and do NOT commit `.backlog/` changes on the worktree branch — they signal state via the ACFW-RESULT marker; the orchestrator performs the move at root.
-- **`integrate-lpcas`** (orchestrator-driven, default mode) cherry-picks each accepted task's single-parent candidate onto the live trunk and CAS-lands it with a co-committed ledger marker. Override via `CLAUDE.md` (e.g. PR-per-group) is honored automatically.
+- **task-engineer** commits on the trunk branch at the repo root: new tasks in `.backlog/pending/`, plus the retry, unblock and redesign moves on the legacy markdown loop. It never enters a worktree.
+- **The `/go` orchestrator** commits every other `.backlog/` state move, on the trunk branch at the repo root: pending→in-progress, in-progress→completed/blocked, completed→in-review, in-review→accepted/rejected, and on the workflow path rejected→pending, rejected→blocked and blocked→pending. An operator's `/whip-move` also commits one move at a time, at the root.
+- **Implementer specialists** commit only **code**, inside `.worktree/<slug>` on `worktree/<slug>`. quality-reviewer commits nothing. Neither moves task files or commits `.backlog/` changes on the worktree branch: they signal state through the ACFW-RESULT marker, and the orchestrator performs the move at the root.
+- **`integrate-lpcas`** (driven by the orchestrator in default mode) cherry-picks each accepted task's single-parent candidate onto the live trunk and lands it by compare-and-swap, with a co-committed ledger marker. An override in `CLAUDE.md` (for example, a PR per group) is honored automatically.
 
 ### When Creating Task (task-engineer)
 
@@ -371,16 +383,16 @@ ml-001-bentoml-face-recognition-deployment.md
 
 ## Template Validation
 
-**task-engineer MUST validate**:
+**task-engineer must check**:
 - All required fields populated
-- Priority is valid enum (blocker|critical|high|medium|low)
+- Priority is a valid value (blocker|critical|high|medium|low)
 - Dependencies exist or "none"
-- Assigned agent exists and is valid for ODP
+- Assigned agent exists and is valid for this project
 - At least 3 acceptance criteria
-- Technical requirements specific
+- Technical requirements are specific
 - Edge cases identified
 
-**quality-reviewer MUST validate**:
+**quality-reviewer must check**:
 - All acceptance criteria have evidence
 - Transition log complete
 - Implementation notes present
@@ -390,5 +402,5 @@ ml-001-bentoml-face-recognition-deployment.md
 
 ---
 
-**Last Updated**: 2025-10-27
+**Last Updated**: 2026-09-29
 **Document Owner**: task-engineer

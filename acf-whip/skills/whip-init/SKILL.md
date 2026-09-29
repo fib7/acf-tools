@@ -1,6 +1,6 @@
 ---
 name: whip-init
-description: Initialize ACF Whip backlog workflow system in project
+description: Initialize ACF Whip backlog workflow in a project (task store, quality gates, agents, CLAUDE.md sections)
 argument-hint: "[--with-specialists]"
 allowed-tools:
   - Bash
@@ -14,36 +14,34 @@ allowed-tools:
 
 # /whip-init - Initialize Backlog Workflow
 
-Explicit initialization command. Sets up complete backlog workflow system with quality gates and universal agents.
+Sets up the acf-whip backlog workflow in the current project. It has to be run explicitly: the
+SessionStart hook installs the managed docs and nothing else, so the task store, agents and quality
+gates all come from this skill.
 
 ## Purpose
 
-Initialize ACF Whip backlog workflow in the current project:
-- Create `.backlog/` directory structure (9 state folders)
-- **Generate** universal agents to `.claude/agents/` (customized from patterns)
-- **Optionally generate** specialized agents (with `--with-specialists` flag)
-- Generate agent manifests in `docs/agents/` (Priority 1/2/3 structure)
-- Install stack-specific quality gate configuration
-- Initialize core documentation (via SessionStart hook)
-- Add CLAUDE.md section for backlog workflow
-- Pin `ACFW_INTEGRATION_MODE=default` for a **new** project only (an existing pin, or an existing
-  project's choice to stay unpinned, is never changed), and keep formatters away from the paths
-  acf-whip writes and commits itself: `docs/cycles/` (planned cycles), `docs/acf/` (managed docs,
-  refreshed by content digest), `.backlog/` (task state) and `.acfwhip/` (config and the LP-CAS
-  ledger). The pre-commit config this skill installs gets a top-level exclude, and existing ignore
-  files get a line
-
-**Key Changes**:
-- Universal agents are now **GENERATED** from patterns and customized for each project's tech stack, not copied verbatim
-- **NEW**: `--with-specialists` flag auto-generates specialized agents (python-engineer, react-engineer, etc.) based on tech stack detection, eliminating the need for separate `/whip-add-agents` command
+- Create the `.backlog/` directory structure (9 state folders).
+- Generate the universal agents into `.claude/agents/` from the plugin's patterns, filled in for this
+  project's stack rather than copied verbatim.
+- With `--with-specialists`, also generate specialist agents (python-engineer, react-engineer, ...)
+  for the detected stack, so no separate `/whip-add-agents` run is needed.
+- Generate agent manifests in `docs/agents/` (Priority 1/2/3 structure).
+- Install the pre-commit config and quality-gates docs for the detected stack.
+- Install the core docs under `docs/acf/` (the SessionStart hook keeps the managed ones current).
+- Add the Pure Delegation and Backlog Workflow sections to `CLAUDE.md`, creating the file if needed.
+- Pin `ACFW_INTEGRATION_MODE=default` in a **new** project only. An existing pin, or an existing
+  project's choice to stay unpinned, is never changed.
+- Keep formatters away from the paths acf-whip writes and commits itself: `docs/cycles/` (planned
+  cycles), `docs/acf/` (managed docs, refreshed by content digest), `.backlog/` (task state) and
+  `.acfwhip/` (config and the LP-CAS ledger). The pre-commit config this skill installs gets a
+  top-level exclude, and existing ignore files get a line.
 
 ## Execution Flow
 
-**Note**: This command uses Read/Write tools to:
-1. Copy configuration files (pre-commit, docs) from the plugin directory to the project
-2. **Generate** agents by reading pattern templates and customizing them for this project
-
-The `${CLAUDE_PLUGIN_ROOT}` variable is automatically resolved by Claude Code and points to the installed plugin location. If files cannot be read, Claude will report clear errors.
+Steps 4 and 5 copy files (the pre-commit config, gates docs and core docs) from the plugin into the
+project. Steps 6, 6.5 and 7 read pattern templates and fill them in for this project. Claude Code
+replaces `${CLAUDE_PLUGIN_ROOT}` with the installed plugin's path when it loads this skill. If a file
+cannot be read, report which one.
 
 ### Step 1: Detect Tech Stack
 
@@ -110,7 +108,7 @@ Use AskUserQuestion to gather preferences:
 | **DevOps Agent** | "Yes, create devops" (for Docker/K8s/CI/CD), "No, skip devops" (add later via /whip-add-agents) | "Yes" if `suggest_devops=true`, else "No" | `create_devops` |
 
 Only offer the Task Store question when the user asks about it or a non-files store is already
-configured — `files` is the right default for almost everyone. Skip the question otherwise.
+configured; otherwise skip it. `files` is the right default for almost everyone.
 
 ### Step 2.5: Non-files Task Store (only when `task_store` ≠ files)
 
@@ -150,14 +148,16 @@ non-files store:
    an unpinned project decides the mode per run by reading prose. A run that guessed `override` never
    integrates, so the cycle would never finish. An existing unpinned project gets a `/whip` card
    asking you to pin instead of a silent change.
-   Note `acfw_resolve_config_file` takes the **first existing** file — `.acfwhip/config`, then the
-   legacy `.backlog/.acfw-config`. A project with both only ever reads `.acfwhip/config`, so the pin
-   belongs in whichever one that project actually has.
-   Backend env goes to the operator's shell, never into the repo: beads needs a **cgo-enabled
-   `bd`** on PATH, currently built from beads `main` (optional `ACFW_BEADS_PREFIX`) — see
-   `adapters/beads/README.md` for the version floor; multica needs `MULTICA_SERVER_URL`, `MULTICA_TOKEN`,
-   `MULTICA_WORKSPACE_ID` (optional `ACFW_MULTICA_PROJECT`); linear needs `LINEAR_API_KEY` and
-   `ACFW_LINEAR_TEAM` (team key, e.g. `ENG`; optional `ACFW_LINEAR_PROJECT`, `ACFW_LINEAR_LABEL`).
+   `acfw_resolve_config_file` reads the **first existing** file: `.acfwhip/config`, then the legacy
+   `.backlog/.acfw-config`. A project with both only ever reads `.acfwhip/config`, so put the pin in
+   the file the project reads.
+   Backend env goes in the operator's shell, never in the repo:
+   - beads: a **cgo-enabled `bd`** on PATH, currently built from beads `main` (optional
+     `ACFW_BEADS_PREFIX`). `adapters/beads/README.md` has the version floor.
+   - multica: `MULTICA_SERVER_URL`, `MULTICA_TOKEN`, `MULTICA_WORKSPACE_ID` (optional
+     `ACFW_MULTICA_PROJECT`).
+   - linear: `LINEAR_API_KEY` and `ACFW_LINEAR_TEAM` (team key, e.g. `ENG`; optional
+     `ACFW_LINEAR_PROJECT`, `ACFW_LINEAR_LABEL`).
 2. Initialize the store and verify it:
    ```bash
    bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" init
@@ -165,13 +165,13 @@ non-files store:
    ```
    On **beads**, `init` runs `bd init`, which creates one commit of its own and appends a
    beads section to the project `.gitignore`. Because `bd init` commits the whole index, the
-   adapter **refuses with exit 8 when anything is staged** — commit or unstash first. It
-   passes `--skip-hooks --skip-agents`, so bd will not set `core.hooksPath` or write
+   adapter **refuses with exit 8 when anything is staged**. Commit or unstage it first. The
+   adapter passes `--skip-hooks --skip-agents`, so bd will not set `core.hooksPath` or write
    `AGENTS.md`/`CLAUDE.md` into the repo.
-3. **Skip Step 3 entirely** (there is no `.backlog/` on a non-files store) and in Step 3.5a drop
-   the `.backlog/.acfw-run.json` line — the `.acfwhip/run/` and `.acfwhip/specs/` entries are
-   unconditional and already cover the run state on every backend.
-   Everything else (agents, quality gates, docs) proceeds unchanged.
+3. **Skip Step 3 entirely** (a non-files store has no `.backlog/`), and in Step 3.5a drop the
+   `.backlog/.acfw-run.json` line. Keep the `.acfwhip/run/` and `.acfwhip/specs/` entries: they
+   cover the run state on every backend.
+   Everything else (agents, quality gates, docs) runs unchanged.
 
 ### Step 3: Create .backlog/ Structure (files store only)
 
@@ -202,7 +202,7 @@ ls -1 .backlog/ | grep -v README.md | xargs -I {} echo "  - {}"
 
 ### Step 3.5: Configure Worktree Concurrency, Env Hydration, and Doctor Config
 
-**3.5a — gitignore entries.** Add the per-task worktree dir (default `.worktree/`, or the
+**3.5a: gitignore entries.** Add the per-task worktree dir (default `.worktree/`, or the
 `ACFW_WORKTREE_DIR` you set in 3.5c), `.backlog/.acfw-run.json` (the `/go` run heartbeat), and the
 `/go` run-state directories to `.gitignore`. ACF convention: per-task worktrees live at
 `<repo-root>/.worktree/` and are gitignored (see `docs/acf/organization.md` → "Per-Task Worktree
@@ -221,21 +221,22 @@ ensure_gitignore '.acfwhip/run/' 'ACF Whip /go run state (per-task harness scrip
 ensure_gitignore '.acfwhip/specs/' 'ACF Whip materialized task specs (non-files stores)'
 ```
 
-**Managed documents refresh themselves.** `docs/acf/style/task-descriptions.md`,
-`docs/acf/backlog/task-template.md` and `docs/acf/backlog/workflow.md` are plugin-owned. The
-SessionStart hook stamps each one with the plugin version on install and, on later sessions, refreshes
-any copy whose content matches a version this plugin has shipped — i.e. one that is merely stale. A
-copy that has been **edited locally is never overwritten**; the hook reports that it is behind and
-leaves the decision to the operator. So do not re-copy these here, and never overwrite one by hand.
+**Managed documents refresh themselves.** The plugin owns `docs/acf/style/task-descriptions.md`,
+`docs/acf/backlog/task-template.md`, `docs/acf/backlog/workflow.md` and
+`docs/acf/backlog/recovery-runbook.md`. The SessionStart hook stamps each one with the plugin version
+on install. On later sessions it refreshes any copy whose content matches a version this plugin has
+shipped, because such a copy is only stale. A copy **edited locally is never overwritten**: the hook
+reports that it is behind and leaves the decision to the operator. So do not re-copy these here, and
+never overwrite one by hand.
 
-If a managed document changes in the plugin, regenerate the pristine-content manifest before release:
-`bash skills/lib/bin/acfw-gen-digests.sh`. Without it a freshly shipped file is unrecognisable on the
-next session and every consumer is permanently classed as "edited" —
+For maintainers: if a managed document changes in the plugin, regenerate the pristine-content
+manifest before release with `bash skills/lib/bin/acfw-gen-digests.sh`. Without it the next session
+cannot recognise the newly shipped file, and every consumer's copy is classed as "edited" for good.
 `tests/phase18-artifact-provenance.test.sh` fails when that happens.
 
 **Recommended project setting (not written by this skill).** On a large backlog the store walk and
-the integrity battery each take minutes, and the Bash tool's default timeout can kill them mid-walk —
-which returns partial output that reads like an empty backlog. `/go` now asks for an explicit
+the integrity battery each take minutes, and the Bash tool's default timeout can kill them mid-walk.
+The partial output that comes back reads like an empty backlog. `/go` asks for an explicit
 per-command timeout, which covers the orchestrator. For interactive work on a big board, tell the
 operator they may also want these in `.claude/settings.json`:
 
@@ -247,18 +248,18 @@ Do **not** write that file from this skill: it is the operator's, it is frequent
 git-ignored, and silently editing a user's settings to make a plugin work is the wrong trade. Say what
 the values are and why, and let them decide.
 
-> **Never gitignore `.acfwhip/` wholesale.** `.acfwhip/config` is a COMMITTED file and is the
-> namespace source of truth whose values *overwrite* inherited env (`ACFW_STORE`,
-> `ACFW_WORKTREE_DIR`, `ACFW_BRANCH_PREFIX`). Ignoring the whole directory would silently revert
-> those settings on a fresh clone. Ignore only `run/` and `specs/`. The LP-CAS ledger at
-> `.acfwhip/integrated/` is likewise committed by design — it is the integration oracle.
+> **Never gitignore `.acfwhip/` wholesale.** `.acfwhip/config` is committed. It is the namespace
+> source of truth, and its values *overwrite* inherited env (`ACFW_STORE`, `ACFW_WORKTREE_DIR`,
+> `ACFW_BRANCH_PREFIX`), so ignoring the whole directory would silently revert those settings on a
+> fresh clone. The LP-CAS ledger at `.acfwhip/integrated/` is committed too, by design: it is the
+> integration oracle. Ignore only `run/` and `specs/`.
 
-**3.5b — `.worktreeinclude` manifest.** Scaffold a starter manifest (if missing) listing
-untracked dev files to copy/symlink into each fresh worktree so specialists can run a full
-dev sandbox. Default mode is **copy**; `link:` symlinks; `secret:` copies with stripped
-perms. Every listed path MUST be git-ignored (a tracked path is a hard error). Large dep
-trees default to **copy** (isolated, race-free) — switch a line to `link:` only if tasks
-never run installs inside the worktree.
+**3.5b: `.worktreeinclude` manifest.** If there is none, scaffold a starter manifest listing the
+untracked dev files to copy or symlink into each fresh worktree, so specialists can run a full dev
+sandbox. The default mode is **copy**; `link:` symlinks, and `secret:` copies with stripped perms.
+Every listed path must be git-ignored: a tracked path is a hard error. Large dependency trees are
+copied too (isolated, race-free). Switch a line to `link:` only if tasks never run installs inside
+the worktree.
 
 ```bash
 if [ ! -f .worktreeinclude ]; then
@@ -287,10 +288,10 @@ else
 fi
 ```
 
-**3.5c — doctor config.** Scaffold `.backlog/.acfw-config` with the operator-tunable
-in-progress timeout (default 8h; lower it for overnight runs so an agent killed mid-edit
-frees its slug sooner) and the worktree namespace acf-whip owns. Read by `doctor.sh`,
-`scan-backlog.sh`, `clean-checkout.sh`, `integrate-lpcas.sh`, and `/go`.
+**3.5c: doctor config.** Scaffold `.backlog/.acfw-config` with the in-progress timeout
+(default 8h; lower it for overnight runs so an agent killed mid-edit frees its slug sooner) and
+the worktree namespace acf-whip owns. `doctor.sh`, `scan-backlog.sh`, `clean-checkout.sh`,
+`integrate-lpcas.sh` and `/go` all read it.
 
 A **new** project also gets `ACFW_INTEGRATION_MODE=default` pinned (same rule and reason as
 Step 2.5: no config file and no task documents yet). An existing project keeps whatever it has, and
@@ -343,8 +344,8 @@ EOF
 fi
 ```
 
-**3.5d — verify shipped scripts.** The worktree/integrity scripts ship in the plugin and
-are invoked by both the legacy and workflow paths. Verify availability:
+**3.5d: verify shipped scripts.** The legacy and workflow paths both call the worktree and
+integrity scripts that ship in the plugin. Check that they are there:
 
 ```bash
 for s in skills/clean-checkout-before-task/bin/clean-checkout.sh \
@@ -537,7 +538,7 @@ Store values for agent generation (Step 6).
 
 ### Step 6: Generate Universal Agents from Patterns
 
-Create `.claude/agents/` directory if missing. **Generate** 7-8 agents from patterns in `${CLAUDE_PLUGIN_ROOT}/content/agent-patterns/universal/{agent}-pattern.md`:
+Create `.claude/agents/` if it is missing, then generate 7-8 agents from the patterns in `${CLAUDE_PLUGIN_ROOT}/content/agent-patterns/universal/{agent}-pattern.md`:
 
 **Always generate**: task-engineer, quality-reviewer, lean-architect, precommit, retro, research-agent, workflow-architect
 **Conditional**: devops (if `create_devops=true`)
@@ -552,7 +553,7 @@ Create `.claude/agents/` directory if missing. **Generate** 7-8 agents from patt
 | **precommit** | `{backend_stack}`, `{frontend_stack}`, `{backend_linter}`, `{backend_formatter}`, `{pre_commit_config_path}` | golangci-lint, gofmt, .pre-commit-config.yaml |
 | **retro** | `{project_name}`, `{has_sla_priorities}` | sla=true if 5-level |
 | **research-agent** | `{project_name}` | Replace project references |
-| **workflow-architect** | `{project_name}` | Replace project references. Do **not** add a `model:` pin — `/go` dispatches it with no model option so it runs on the session model. |
+| **workflow-architect** | `{project_name}` | Replace project references. Do **not** add a `model:` pin: `/go` dispatches it with no model option, so it runs on the session model. |
 | **devops** | `{LOCAL_ORCHESTRATION}`, `{DEPLOYMENT_TARGET}`, `{CI_TOOL}`, `{MONITORING_STACK}`, `{CLOUD_PROVIDER}`, `{HAS_K8S}`, `{PROJECT_NAME}`, `{ORCHESTRATION_RESPONSIBILITY}`, `{K8S_DELEGATION_SECTION}` | docker-compose, github-actions, prometheus-grafana, gke |
 
 **Coverage threshold logic**: 95% → api 95-98%, core 95% | 80% → api 90-95%, core 90% | 60% → api 75-80%, core 70%
@@ -682,15 +683,14 @@ fi
 echo "✅ Created ${#created_specialists[@]} specialized agents: ${created_specialists[*]}"
 ```
 
-**Result**: 1-3 specialized agents generated automatically based on tech stack, ready for manifest generation in Step 7.
+**Result**: 1-3 specialist agents for the detected stack. Step 7 writes their manifests.
 
 ---
 
 ### Step 6.75: Check Documentation Index
 
-**Check for docs/README.md as documentation hub**:
-
-If `docs/README.md` exists, read it to discover available documentation. Otherwise fall back to directory scanning.
+If `docs/README.md` exists, use it as the documentation index: read it to find the project's docs.
+Otherwise Step 7 scans the standard directories.
 
 ```bash
 # Check if project has a documentation index
@@ -705,17 +705,17 @@ else
 fi
 ```
 
-**Result**: If docs/README.md exists, Claude reads it and naturally understands what documentation is available. Otherwise, falls back to directory scanning in Step 7.
-
 ---
 
 ### Step 7: Generate Agent Manifests
 
-Create `docs/agents/` directory. **Generate** manifests from patterns with Priority 1/2/3 structure:
+Create `docs/agents/`, then generate the manifests from the patterns, each with the Priority 1/2/3
+structure:
 
 **Process**: Read pattern → Extract agent section → Apply customizations → Write to `docs/agents/{agent}.md`
 
-**Documentation discovery**: Claude reads docs/README.md (if exists) or scans standard directories.
+**Documentation discovery**: the `docs/README.md` index if Step 6.75 found one, otherwise a scan of
+the standard directories.
 
 #### Universal Agent Manifests (Always Created)
 
@@ -772,11 +772,12 @@ Create `docs/agents/` directory. **Generate** manifests from patterns with Prior
 echo "✅ Generated ${#created_specialists[@]} specialist manifests: ${created_specialists[*]}"
 ```
 
-**Result**: 6-7 universal manifests + 0-3 specialist manifests (if flag used), all with 58-74% token reduction, deeply customized for existing docs and tech stack.
+**Result**: 6-7 universal manifests plus 0-3 specialist manifests (with the flag). Each uses the
+Priority 1/2/3 structure (58-74% token reduction) and points at this project's own docs and stack.
 
 ### Step 8: Generate .backlog/README.md
 
-Trigger README generation with installed agents:
+Generate `.backlog/README.md` from the template, listing the installed agents:
 ```bash
 # Scans .claude/agents/*.md
 # Replaces {{IMPLEMENTER_AGENTS}} in template
@@ -790,7 +791,7 @@ leave the rest of the document alone.
 
 ### Step 8.25: Initialize CLAUDE.md if Missing
 
-**Purpose**: Ensure CLAUDE.md exists before adding ACF workflow sections in Steps 8.5 and 9.
+Steps 8.5 and 9 append to `CLAUDE.md`, so make sure it exists first.
 
 **Detection**:
 ```bash
@@ -803,7 +804,7 @@ else
 fi
 ```
 
-**If CLAUDE.md is missing**, create minimal template:
+**If CLAUDE.md is missing**, create it from the minimal template below:
 
 **Implementation**:
 1. Get project name: `project_name=$(basename $(pwd))`
@@ -825,17 +826,13 @@ fi
 **Template variables**:
 - `{PROJECT_NAME}`: Directory basename (`$(basename $(pwd))`)
 
-**Design rationale**:
-- **Project header**: Establishes context for AI assistant
-- **ACF definition**: Core philosophy (verbatim from distribution CLAUDE.md)
-- **Separator**: Clean break before workflow sections (Steps 8.5, 9)
-- **Minimal**: No repository metadata, license, or contact info (user can add later)
+The template holds a project header, the ACF definition (verbatim from the distribution CLAUDE.md)
+and a `---` separator for the sections Steps 8.5 and 9 add. It leaves out repository metadata,
+license and contact info; the user can add those later.
 
 **Output**:
 - If created: `✓ Created CLAUDE.md with minimal AI instructions`
 - If exists: `✓ CLAUDE.md found - will enhance with ACF workflow sections`
-
-**Result**: CLAUDE.md guaranteed to exist before Steps 8.5 and 9.
 
 ---
 
@@ -989,7 +986,7 @@ Compare expected state (Steps 1-9) with actual state on disk:
 
 ### Step 10: Success Report
 
-**Conditional reporting based on `--with-specialists` flag**:
+Print this report. A line or span marked `{IF ...}` appears only when its condition holds.
 
 ```
 ✅ ACF Whip Initialized Successfully
@@ -1035,9 +1032,9 @@ Compare expected state (Steps 1-9) with actual state on disk:
 💡 Key Features: Pattern-based generation (YOUR stack) | Deep manifest customization | Gap analysis on re-init | Pure Delegation (3x+ speedup){IF create_devops} | DevOps agent (infrastructure-aware){IF with_specialists} | Auto-specialist generation (--with-specialists)
 ```
 
-## Command Options (Optional)
+## Command Options
 
-Allow optional flags for automation:
+All flags are optional. A scripted run might use:
 
 ```bash
 /whip-init --priority=5-level --coverage=95 --strict
@@ -1048,25 +1045,25 @@ Allow optional flags for automation:
 - `--coverage=60|80|95` - Skip coverage threshold question
 - `--strict` - Use aggressive quality gates (5 retry attempts)
 - `--standard` - Use standard quality gates (10 retry attempts)
-- `--with-specialists` - Auto-generate specialized agents based on tech stack detection (backend/frontend/infrastructure)
-- `--backend=go|python|nodejs|<stack>`, `--frontend=nextjs|react|vue|<stack>` - Override detection for that slot (Steps 1 and 4 pass them to the detector as `FLAGS`). A stack with no shipped gates doc gets no pre-commit config and no gates doc; `/whip-add-agents` writes its doc from a template
+- `--with-specialists` - Generate specialist agents for the detected stack (backend/frontend/infrastructure)
+- `--backend=go|python|nodejs|<stack>`, `--frontend=nextjs|react|vue|<stack>` - Override detection for that slot (Steps 1 and 4 pass them to the detector as `FLAGS`). A stack with no shipped gates doc gets no pre-commit config and no gates doc; `/whip-add-agents` writes its doc from a template.
 
 ## Validation
 
-Before completing, validate:
-- ✅ All 9 .backlog/ folders exist
-- ✅ CLAUDE.md exists (created or enhanced)
-- ✅ 6 universal agents **generated** in .claude/agents/ (customized for project)
-- ✅ 6 agent manifests **generated** in docs/agents/ (with Priority 1/2/3 structure)
-- ✅ If `--with-specialists` flag used:
-  - ✅ Specialist agents **generated** in .claude/agents/ (1-3 based on tech stack)
-  - ✅ Specialist manifests **generated** in docs/agents/ (matching specialist count)
-  - ✅ CLAUDE.md agent matrix includes specialists (not "TBD")
-- ✅ Core docs exist in docs/acf/
-- ✅ Quality gates configured for tech stack
-- ✅ .backlog/README.md generated
+Before finishing, check that:
+- All 9 `.backlog/` folders exist (files store only; Step 2.5 skips them on the others)
+- `CLAUDE.md` exists (created or enhanced)
+- 6 universal agents were generated in `.claude/agents/`, filled in for this project
+- 6 agent manifests were generated in `docs/agents/`, with the Priority 1/2/3 structure
+- If `--with-specialists` was used:
+  - 1-3 specialist agents (by detected stack) were generated in `.claude/agents/`
+  - one specialist manifest per specialist agent was generated in `docs/agents/`
+  - the `CLAUDE.md` agent matrix lists the specialists, not "TBD"
+- Core docs exist in `docs/acf/`
+- Quality gates are configured for the detected stack
+- `.backlog/README.md` was generated
 
-**Generated files should contain project-specific customizations**, not generic templates.
+Generated files should carry this project's values, not generic template text.
 
 ## Error Handling
 
@@ -1090,12 +1087,12 @@ Please specify manually: --backend=go|python|nodejs --frontend=react|nextjs
 
 ## Success Criteria
 
-✅ .backlog/ structure created with 9 folders
-✅ CLAUDE.md created or enhanced
-✅ Universal agents installed (7-8 agents)
-✅ Specialist agents installed (if --with-specialists flag used)
-✅ Agent manifests generated (universal + specialists)
-✅ Core documentation initialized
-✅ Quality gates configured
-✅ .backlog/README.md generated
-✅ Validation passed
+- `.backlog/` structure created with 9 folders (files store)
+- `CLAUDE.md` created or enhanced
+- Universal agents installed (7-8 agents)
+- Specialist agents installed (if `--with-specialists` was used)
+- Agent manifests generated (universal + specialists)
+- Core documentation installed
+- Quality gates configured
+- `.backlog/README.md` generated
+- The Validation checks above pass

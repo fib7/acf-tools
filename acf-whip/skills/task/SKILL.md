@@ -1,6 +1,6 @@
 ---
 name: task
-description: Decompose scope into atomic tasks using task-engineer agents. Pure orchestration - NEVER implements anything.
+description: Decompose a scope into atomic tasks using task-engineer agents. It only orchestrates and never implements anything.
 argument-hint: "[scope description] | --plan [<cycle ID or docs/cycles/<ID>/plan.md>]"
 allowed-tools:
   - Read
@@ -16,11 +16,39 @@ allowed-tools:
   - mcp__figma-dev-mode-mcp-server__get_code
 ---
 
-# /task - Pure Orchestration & Task Decomposition
+# /task: decompose a scope into backlog tasks
 
-**CRITICAL**: This command ONLY orchestrates. It NEVER implements anything.
+`/task` splits a scope into independent, atomic tasks that `/go` can run in parallel. It only
+orchestrates. It **never** implements anything: writing the code is the job of the specialists `/go`
+dispatches later.
 
-Pure delegation tool that decomposes complex scope into independent atomic tasks for parallel execution.
+## Usage
+
+A scope in free text:
+
+```bash
+/task "Implement user authentication system with JWT tokens"
+```
+
+With a Figma link:
+
+```bash
+/task "Add real-time notifications using WebSocket. Figma: https://figma.com/design/ABC123/App?node-id=1-2"
+```
+
+A larger scope with a constraint attached:
+
+```bash
+/task "Migrate user service from REST to GraphQL API. Maintain backward compatibility with v1 endpoints during transition."
+```
+
+From an approved cycle plan (see Plan mode below):
+
+```bash
+/task --plan 20260928-owner-seat-notice
+/task --plan docs/cycles/20260928-owner-seat-notice/plan.md
+/task --plan        # the cycle /whip says is next
+```
 
 ---
 
@@ -33,7 +61,7 @@ run is free text and everything below applies unchanged.
 
 Do these in order:
 
-1. **Read the argument.** Everything after `--plan` is ONE plan reference: a cycle ID
+1. **Read the argument.** Everything after `--plan` is exactly one plan reference: a cycle ID
    (`20260928-owner-seat-notice`) or a path (`docs/cycles/<ID>/plan.md`, `docs/cycles/<ID>/`). If
    anything else follows it (free text, a second path), refuse and stop with:
    `--plan takes the plan and nothing else. Put extra work in the plan and re-approve it with /whip <cycle>, or run it separately as /task "<scope>".`
@@ -49,7 +77,7 @@ Do these in order:
    not map those tasks to deliverables, so `/whip` cannot show coverage for them. Say so.
 4. **Launch** with steps 1 and 2 of the workflow path below, passing `planPath: "<the reference, verbatim>"`
    and **no `scope`**. The workflow validates the reference and re-checks the approval against HEAD
-   itself. Do not pre-check approval, coverage or locks in prose.
+   itself. Do not pre-check approval, coverage or locks yourself.
 5. **Report** by what comes back:
    - `aborted: true` with `stopReason: "check-refused"`: print `reason` and `nextStep` verbatim and
      stop. The plan is not approved at HEAD, another decomposition of it holds the lock, `/go` is
@@ -65,10 +93,11 @@ Do these in order:
      deliverables this run planned), `cycle.record` (the task map line), and `cycle.coverageGaps`
      (deliverables still without a task; advisory, and a re-run of `/task --plan` decomposes exactly
      those). Say that the focus now holds this plan's unfinished tasks, so a bare `/go` runs the cycle
-     and nothing else. If `cycle.dropped` is not empty, name those ids: each one already belonged to
-     an existing task, so the store refused it and this run's claim on it was taken back out of the
-     cycle record. Someone else's task is then neither in the cycle record nor in your focus. One of
-     this cycle's own tasks from an earlier run keeps the deliverables it already had.
+     and nothing else. If `cycle.dropped` is not empty, name those ids. Each one already belonged to
+     an existing task, so the store refused it and the writer took this run's claim on it back out of
+     the cycle record. If the id is someone else's task, it ends up in neither the cycle record nor
+     your focus. If it is one of this cycle's own tasks from an earlier run, that task keeps the
+     deliverables it already had.
    - `phase: "complete"` with a `review` block: a spec tool reviewed the tasks (see "Task-stage spec
      review" below). A task in `review.held` is still this cycle's task and still covers its
      deliverables, but it sits in draft and the focus leaves it out. Print its `next` command. A task
@@ -88,16 +117,16 @@ What plan mode does that free text does not:
   or names only deliverables that other tasks already cover (a duplicate).
 - Each task carries `- **Documentation**: docs/cycles/<ID>/plan.md (D2, D4)` and, in its Out of Scope,
   `Implement only D2, D4 of docs/cycles/<ID>/plan.md; plan.md is read-only.`
-- The writer runs `acfw-cycle record` **first**, so the task map is committed before any task exists.
-  Every command that creates, stages, commits or sets the focus runs only after record succeeded, so
-  a refused record creates nothing.
+- The writer runs `acfw-cycle record` **first**, which commits the task map before any task exists.
+  Every command that creates, stages, commits or sets the focus runs only after the record succeeds.
+  A refused record creates nothing.
 - A new task never reuses an existing id. The validation gate refuses an id the backlog already has.
   If one still collides when the store creates it, the writer takes it back out of the cycle record in
   the same command, so a teammate's task never counts as this plan's coverage or enters your focus.
 - The run focus is **set** (replaced) to the cycle's unfinished tasks. A free-text `/task` adds to it.
-- The decomposition lock is released on every exit the run controls, and only while it still carries
-  this run's stamp, so a run never deletes another run's lock. If a run is killed, the lock expires
-  after 30 minutes, and `/whip` prints its age and the `rm` command to clear it sooner. A run that
+- The run releases the decomposition lock on every exit it controls, and only while the lock still
+  carries its own stamp, so a run never deletes another run's lock. If a run is killed, the lock
+  expires after 30 minutes; `/whip` prints its age and the `rm` command to clear it sooner. A run that
   outlives the 30 minutes and finds its lock taken over stops before recording anything.
 
 **Lessons apply in both modes.** The planners and the critic run
@@ -108,12 +137,12 @@ into it. `/retro` records those rules in `docs/acf/lessons/`.
 
 ## Execution: workflow-first, legacy fallback
 
-acf-whip ships a deterministic decomposition **workflow** that enforces worktree slugs and an
-acyclic dependency graph **before any task file is written** (schema-required slugs → a JS
-validation gate → a create-time doctor). Prefer it: the loop and the intermediate plan live in a
-script, not in your context.
+Prefer the **workflow**. It is a deterministic script that enforces worktree slugs and an acyclic
+dependency graph **before it writes any task file**: the schema requires a slug on every task, a JS
+validation gate rejects cycles, duplicate ids and malformed slugs, and a doctor runs at create time.
+The loop and the intermediate plan live in the script, not in your context.
 
-**If the `Workflow` tool is available to you** (dynamic workflows enabled, Claude Code ≥ 2.1.154):
+**If the `Workflow` tool is available to you** (dynamic workflows turned on, Claude Code ≥ 2.1.154):
 
 1. Resolve the environment with one bash call at the repo root:
    ```bash
@@ -123,18 +152,19 @@ script, not in your context.
    bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" info
    echo "SPEC_TASK_TOOLS=$(bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-spec" list --at task --machine 2>/dev/null | grep -c '^TOOL|')"
    ```
-   The `acfw-store info` line is one JSON object; step 2 consumes three fields from it: the active
+   The `acfw-store info` line is one JSON object. Step 2 uses three of its fields: the active
    task-store backend (`store`, default `files`), the per-tier model routing (`models`) and the
-   shell-tier effort pin (`efforts`). Pass all three through verbatim. `SPEC_TASK_TOOLS` is the number
-   of spec tools that review tasks (declared in `.acfwhip/spec-tools/` with `at=` naming `task`); it is
+   shell-tier effort pin (`efforts`). Pass all three through verbatim. `SPEC_TASK_TOOLS` counts the
+   spec tools that review tasks (declared in `.acfwhip/spec-tools/` with `at=` naming `task`). It is
    `0` in a project without them, and then nothing about the run changes.
-2. Launch the workflow (runs in the background; intermediate state never enters your context):
+2. Launch the workflow. It runs in the background, and its intermediate state never enters your
+   context:
    ```
    Workflow({
      name: "acf-whip:whip-task",
      args: {
        scope: "<the full /task argument text, verbatim>",
-       // Plan mode ONLY (3.5.0): the --plan reference, verbatim, INSTEAD of scope. Never pass both:
+       // Plan mode only (3.5.0): the --plan reference, verbatim, instead of scope. Never pass both:
        // the workflow refuses the pair rather than merge free text into an approved plan.
        planPath: "<cycle ID or docs/cycles/<ID>/plan.md>",
        pluginRoot: "<PLUGIN_ROOT>",
@@ -160,149 +190,152 @@ script, not in your context.
      }
    })
    ```
-3. When it completes, report the returned summary: created task ids + slugs + dependencies, the
-   commit sha, and the doctor verdict. Also say that a bare `/go` will now run exactly these tasks
-   (the run returns `focus{}`): `/task` points this checkout's run focus at what it just created, so
-   the operator never has to name ids for the work they just planned. `/go --all` remains the way to
-   run the whole backlog. `models`/`agentsByTier` report which tier ran how many agents — counted
-   where an agent is charged, so a retried call shows up as the two agents it actually cost.
-   When the report has a `review` block, the tasks were reviewed by spec tools before they were
-   written: report it as described under "Task-stage spec review" below. A task in `review.held`
-   is **not** in the focus, and a bare `/go` will not run it. A task in `review.waiting` is in the
-   focus, but it depends on a held task, so `/go` will not run it until that task is released: do
-   not count it among the tasks a bare `/go` runs now.
-   If it returns `aborted: true`, surface the `defects` list and
-   **STOP** — do NOT hand-write task files to route around the validation gate. If it returns
-   `error`, **or the `Workflow` call is refused outright**, fall back to the legacy path below — a
-   denied tool call returns no value at all, so the `error` branch never sees it. Never retry with
-   `scriptPath` and never edit the user's settings.
-4. Do **not** also run the legacy steps — the workflow replaces them.
+3. When it completes, report the summary it returns: the created task ids with their slugs and
+   dependencies, the commit sha, and the doctor verdict. Say that a bare `/go` now runs exactly these
+   tasks (the run returns `focus{}`). `/task` points this checkout's run focus at what it just created,
+   so nobody has to name ids for the work they planned; `/go --all` still runs the whole backlog.
+   `models` and `agentsByTier` show how many agents each tier ran. They are counted where an agent is
+   charged, so a retried call shows up as the two agents it cost.
+   When the report has a `review` block, spec tools reviewed the tasks before they were written.
+   Report it as described under "Task-stage spec review" below. A task in `review.held` is **not** in
+   the focus, and a bare `/go` will not run it. A task in `review.waiting` is in the focus, but it
+   depends on a held task, so `/go` will not run it until that task is released:
+   do not count it among the tasks a bare `/go` runs now.
+   If it returns `aborted: true`, show the `defects` list and **stop**. Do not hand-write task files to
+   route around the validation gate. If it returns `error`, **or the `Workflow` call is refused
+   outright**, fall back to the legacy path below. A denied tool call returns no value at all, so the
+   `error` branch never sees it. Never retry with `scriptPath`, and never edit the user's settings.
+4. Do **not** also run the legacy steps. The workflow replaces them.
 
 ### Task-stage spec review
 
-A spec tool is a reviewer a project declares in `.acfwhip/spec-tools/<name>` (`/whip --tools add
-<name>` sets one up). One whose `at=` names `task` reviews every task `/task` authors, before it is
-written to the task store. Without such a tool, none of this happens.
+A spec tool is a reviewer a project declares in `.acfwhip/spec-tools/<name>`; `/whip --tools add <name>`
+sets one up. A tool whose `at=` names `task` reviews every task `/task` authors, before the task
+reaches the store. Without such a tool, none of this happens.
 
 What the run does when one exists:
 - Authors write every task document to `.acfwhip/run/staging/` first, on the `files` store too, so
   a bare `/go` never sees a task nobody reviewed.
 - One shell agent runs the review. The script checks that every verdict line arrived and asks once
-  more if some did not; finished tools come from the review cache, so that costs nothing.
-- A task a `policy=block` tool rejects with findings gets ONE repair round: a task-engineer reads the
-  findings and edits the body only. If the repair changed the title, the Metadata section or the
-  Transition Log, the original document is put back. Then the task is reviewed again.
-- A task a `policy=block` tool still rejects is **held in draft**. It is created (and, with `--plan`,
-  recorded as the cycle's task), but in `draft`, with a Transition Log row like
-  `| <time> | pending | draft | spec-review | held: no-tbd nogo n=2; /whip --review <stem> |`,
-  and it is **not** added to your focus.
+  more if some did not. Finished tools answer from the review cache, so the second ask re-runs none
+  of them.
+- A task that a `policy=block` tool rejects with findings gets one repair round: a task-engineer reads
+  the findings and edits the body only. If the repair changed the title, the Metadata section or the
+  Transition Log, the run puts the original document back. Then the tools review the task again.
+- A task a `policy=block` tool still rejects is **held in draft**. The run still creates it (and, with
+  `--plan`, records it as the cycle's task), but in `draft`, with a Transition Log row like
+  `| <time> | pending | draft | spec-review | held: no-tbd nogo n=2; /whip --review <stem> |`.
+  It is **not** added to your focus.
 - A tool that could not run (verdict `skip`) or failed (`error`) never holds a task. An `advisory`
-  tool never holds a task either; its findings are reported and nothing else happens.
-- A `block` tool with no result it can stand behind for those exact bytes reports `nogo`, so the
-  task is held: the tool is not trusted on this machine yet, its declaration has local edits, the
-  task document holds a credential literal, or the review ran out of time. Its `path` in the report
-  is then a `held.md` that says which, and no repair runs, because no edit to the task fixes it. If
-  the verdicts could not be read back, even after the second try, every `block` tool that has no
+  tool never holds a task either: its findings go in the report, and that is all.
+- A `block` tool that has no result it can stand behind for those exact bytes reports `nogo`, and the
+  task is held. That happens when the tool is not trusted on this machine yet, its declaration has
+  local edits, the task document holds a credential literal, or the review ran out of time. Its `path`
+  in the report is then a `held.md` that says which. No repair runs, because no edit to the task fixes
+  any of these.
+- If the run could not read the verdicts back, even after the second try, every `block` tool with no
   verdict for a task holds that task too. No tool gave a verdict there, so the entry is marked
   `unreviewed` and the row says `held: <tool> unreviewed (verdict not relayed)`. The run reads the
-  list of tools twice (once at the start, once with the verdicts). If neither list arrived whole
-  either, it cannot tell which tools block, so it holds each such task under the name `unknown`.
-- A task that depends on a held task is not held, and it goes into your focus, but `/go` will not
-  run it until the held task is released. It is listed in `review.waiting` with the held ids it
-  waits on.
+  list of tools twice, once at the start and once with the verdicts. If neither list arrived whole,
+  it cannot tell which tools block, so it holds each such task under the name `unknown`.
+- A task that depends on a held task is not held itself. It goes into your focus, but `/go` will not
+  run it until the held task is released. `review.waiting` lists it with the held ids it waits on.
 
-How to report `review`: say how many tasks were reviewed and by which tools (`review.tools`). If
-`review.verdicts` is 0, say that no tool actually reviewed anything (spec tools are switched off
-with `ACFW_SPEC=off`, or the declarations went away during the run). If `review.relay` starts with
-`short:`, say that the verdicts did not all arrive and that some tasks may be held for that reason
-alone. Name each repaired task, and say when `metaRestored` is true
-(the repair touched metadata, so it was thrown away). For each entry of `review.held`, print the id,
-each tool with its `n` (or `unreviewed` when the entry says so), and the `next` command. For each
-entry of `review.waiting`, say which held task it waits on. For `review.notes`, give one line per
-advisory finding, skip or error. Do not re-run the review yourself, and do not move a held task out
-of draft.
+How to report `review`:
+- Say how many tasks were reviewed, and by which tools (`review.tools`).
+- If `review.verdicts` is 0, say that no tool reviewed anything: either spec tools are switched off
+  with `ACFW_SPEC=off`, or the declarations went away during the run.
+- If `review.relay` starts with `short:`, say that some verdicts did not arrive, and that some tasks
+  may be held for that reason alone.
+- Name each repaired task. Say when `metaRestored` is true: the repair touched metadata, so the run
+  threw it away.
+- For each entry of `review.held`, print the id, each tool with its `n` (or `unreviewed` when the
+  entry says so), and the `next` command.
+- For each entry of `review.waiting`, say which held task it waits on.
+- For `review.notes`, give one line per advisory finding, skip or error.
 
-Releasing a held task is the user's call: `/whip --review <stem>` shows why it was held. After fixing
-the task, `/whip-move <stem> pending` releases it, and `/whip-focus add <stem>` (or `/go <stem>`)
+Do not re-run the review yourself, and do not move a held task out of draft.
+
+Releasing a held task is the user's call. `/whip --review <stem>` shows why it was held. Once the task
+is fixed, `/whip-move <stem> pending` releases it, and `/whip-focus add <stem>` (or `/go <stem>`)
 runs it.
 
 The legacy loop below runs no task-stage review. If `SPEC_TASK_TOOLS` was above 0 and you fall back
-to it, tell the user that the tasks it wrote were not reviewed by spec tools, and that
-`/whip --review <stem>` reviews one.
+to it, tell the user that no spec tool reviewed the tasks it wrote, and that `/whip --review <stem>`
+reviews one.
 
-**Launch by NAME, never by path.** `scriptPath` is checked against the readable set (the working
-directory plus any added directory); on a real marketplace install the plugin lives under
-`~/.claude/plugins/cache/`, which is neither, so a `scriptPath` launch is refused for every user who
-installed this plugin normally. The registry resolves `acf-whip:whip-task` without touching a path.
+**Launch by NAME, never by path.** The `Workflow` tool checks `scriptPath` against the readable set:
+the working directory plus any added directory. A real marketplace install puts the plugin under
+`~/.claude/plugins/cache/`, which is neither, so the tool refuses a `scriptPath` launch for every user
+who installed this plugin the normal way. The registry resolves `acf-whip:whip-task` without touching
+a path.
 
 **The legacy loop has no plan mode.** A `/task --plan` run never falls back to it (see Plan mode,
 rule 3).
 
-**The legacy loop is `files`-backend ONLY.** It writes and commits task documents directly into
+**The legacy loop is `files`-backend only.** It writes and commits task documents straight into
 `.backlog/pending/`. On `beads`, `multica`, `linear` or a third-party adapter there is no such
-directory, and files written there are invisible to the store — the tasks simply do not exist, while
-the run reports success. `/go` states the same fence for its own fallback.
+directory. Files written there are invisible to the store, so the tasks do not exist even though the
+run reports success. `/go` has the same fence on its own fallback.
 
-So **resolve the backend before falling back**: `bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" info`.
-That call is made inside the `Workflow` branch above, so on this path you may not have run it yet. If
-`store` is anything other than `files`, report the refusal and **STOP** — do not improvise, and do not
-write `.backlog/` files on a store that does not use them.
+**Resolve the backend before you fall back:** `bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" info`.
+Step 1 of the workflow path makes that call, so on this path you may not have run it yet. If `store`
+is anything other than `files`, report the refusal and **stop**. Do not improvise, and do not write
+`.backlog/` files on a store that does not use them.
 
-**Only if the `Workflow` tool is NOT available or cannot resolve the workflow** (dynamic workflows
-disabled, `CLAUDE_WORKFLOW_NAME_ONLY` set — which enumerates built-ins only, so no plugin workflow
-resolves under either form — or older Claude Code) **AND the resolved store is `files`**:
-run the legacy decomposition loop below (Steps 1–8). It produces the same task files — including the
-mandatory `Worktree:` / `PR Group:` / `Touches Globs:` slug fields — but as a single-context
-orchestration.
+Run the legacy decomposition loop below (Steps 1–8) **only when both of these hold**:
+- The `Workflow` tool is unavailable, cannot resolve the workflow, or workflow step 3 sent you here
+  (an `error` return or a refused call). The tool is out of reach when dynamic workflows are off, on older Claude
+  Code, or when `CLAUDE_WORKFLOW_NAME_ONLY` is set: that variable limits the tool to built-in
+  workflows, so no plugin workflow resolves by name or by path.
+- The resolved store is `files`.
+
+The loop writes the same task files, including the mandatory `Worktree:`, `PR Group:` and
+`Touches Globs:` slug fields, but runs the whole orchestration in your own context.
 
 ---
 
-## 🔥 MANDATORY: Style Enforcement
+## Style rules (mandatory)
 
-**Before creating ANY tasks, read and enforce**: `docs/acf/style/task-descriptions.md`
+Before you create any task, read `docs/acf/style/task-descriptions.md` and hold every task to it.
 
-### ABSOLUTE PROHIBITIONS
+### Never put in a task
 
-- Function/method implementations in task descriptions
+- Function or method implementations
 - Algorithm pseudocode
-- Step-by-step HOW instructions (specialists decide HOW)
-- Vague language: "comprehensive", "robust", "enhance", "optimize"
-- Code snippets beyond 2-3 lines (signatures/shapes only)
+- Step-by-step HOW instructions (the specialist decides HOW)
+- Vague words: "comprehensive", "robust", "enhance", "optimize"
+- Code snippets longer than 2-3 lines (signatures and shapes only)
 
-### REQUIRED
+### Always
 
-- Binary language: "API validates token" NOT "improve validation"
-- WHAT/WHY only: NEVER HOW
+- Binary language: "API validates token", not "improve validation"
+- WHAT and WHY only, never HOW
 - Testable criteria: "Returns 401 for missing token"
-- Specific outcomes: "Response < 200ms" NOT "fast"
+- Specific outcomes: "Response < 200ms", not "fast"
 
-**Validation Step** (MANDATORY before spawning task-engineer agents):
-1. Read `docs/acf/style/task-descriptions.md`
-2. Verify your task decomposition follows rules
-3. If any task violates rules, REVISE before agent spawning
+You read the guide in Step 1 and check every task against it in Step 4. Revise any task that breaks a
+rule before you spawn a task-engineer agent.
 
 ---
 
-## Command Flow
+## Command flow (legacy loop)
 
-### Step 1: Read Style Guide
+### Step 1: Read the style guide
 
-**MANDATORY FIRST STEP**:
+Do this first:
 ```markdown
 Read docs/acf/style/task-descriptions.md
 ```
 
-This guide defines ABSOLUTE requirements for task descriptions:
-- WHAT/WHY only (never HOW)
-- Binary, testable language
-- Max 2-3 line code snippets
-- Banned words and phrases
+Every rule in it binds every task. In short: WHAT and WHY only (never HOW), binary and testable
+language, code snippets of 2-3 lines at most, and none of the banned words.
 
-### Step 2: Minimal Research (Scope Understanding ONLY)
+### Step 2: Minimal research (scope only)
 
-#### Perplexity (MANDATORY)
+#### Perplexity (required)
 
-Use Perplexity for best practices, patterns, pitfalls:
+Search for best practices, patterns and pitfalls:
 
 ```markdown
 mcp__perplexity__perplexity_search:
@@ -312,13 +345,11 @@ mcp__perplexity__perplexity_search:
 - "testing strategies for {feature-type}"
 ```
 
-**Focus**: What to build, why, what constraints. NOT how to implement.
+You are after what to build, why, and under which constraints. Not how to implement it.
 
-#### Figma (MANDATORY if URL/node provided)
+#### Figma (required when the scope gives a Figma URL or node)
 
-If Figma URL or node ID mentioned:
-
-1. **Extract node ID** from URL:
+1. **Extract the node ID** from the URL:
    - Format: `https://figma.com/design/:fileKey/:fileName?node-id=1-2`
    - Extract: `1:2`
 
@@ -328,17 +359,17 @@ mcp__figma-dev-mode-mcp-server__get_code:
   nodeId: "1:2"
 ```
 
-3. **Extract UI requirements**:
+3. **Pull out the UI requirements**:
    - Component structure
    - Layout requirements
    - Interactive elements
    - Data bindings
 
-**Use for**: WHAT to build (component specs), NOT HOW to implement.
+Use them for WHAT to build (component specs), not HOW to implement it.
 
-#### Context7 (When Needed)
+#### Context7 (when needed)
 
-For library capabilities:
+To learn what a library can do (not how to use it):
 
 ```markdown
 mcp__context7__resolve-library-id:
@@ -349,11 +380,9 @@ mcp__context7__query-docs:
   topic: "{feature-relevant-topic}"
 ```
 
-**Use for**: What library can do, NOT how to use it.
+#### Project files
 
-#### File Analysis (Project Context)
-
-Quick scans for existing patterns:
+Scan for existing patterns:
 
 ```bash
 # Find related code
@@ -363,59 +392,52 @@ grep -r "similar-feature" --include="*.{go,py,ts,tsx}"
 glob "**/*{service,controller,handler}*"
 ```
 
-**Limit**: 5 minutes max. You're orchestrating, not researching deeply.
+Spend 5 minutes at most. You are orchestrating, not researching in depth.
 
-### Step 3: Decompose Scope Into Atomic Tasks
+### Step 3: Decompose the scope into atomic tasks
 
-#### Atomic Decomposition Strategy
+One logical feature is one task. Do not break it into micro-tasks.
 
-**One Logical Feature = One Task** (not micro-tasks):
+**Good:** one task, "User Authentication API", covering the API endpoint, validation, token
+generation, tests and docs.
 
-✅ **GOOD**: Single task "User Authentication API"
-- Includes: API endpoint, validation, token generation, tests, docs
-
-❌ **BAD**: 5 micro-tasks
+**Bad:** five micro-tasks:
 - "Create API endpoint"
 - "Add input validation"
 - "Implement JWT generation"
 - "Write tests"
 - "Update docs"
 
-**Mixed Stack Work = Single Task**:
-
-✅ **GOOD**: "User Profile Feature" (backend API + frontend component)
-❌ **BAD**: Separate "Backend API" and "Frontend Component" tasks
-
-#### Task Decomposition Rules
+Work that spans the stack is still one task:
+- **Good:** "User Profile Feature" (backend API + frontend component)
+- **Bad:** separate "Backend API" and "Frontend Component" tasks
 
 For each task, define:
-- **WHAT**: Binary outcome, testable
-- **WHY**: Business value, user impact
-- **CONSTRAINTS**: Performance, security, compatibility requirements
-- **OUT OF SCOPE**: What NOT to do (mandatory)
+- **WHAT**: a binary, testable outcome
+- **WHY**: the business value or user impact
+- **CONSTRAINTS**: performance, security, compatibility requirements
+- **OUT OF SCOPE**: what not to do (mandatory)
 
-**DO NOT define**:
-- HOW to implement
+Leave out:
+- HOW to implement it
 - Which libraries to use
 - Code structure
 - Implementation details
 
-### Step 4: Validate Against Style Guide
+### Step 4: Check every task against the style guide
 
-**Self-check BEFORE spawning agents**:
+Before you spawn any agent, check each task:
+- Binary, testable description?
+- WHAT and WHY only, no HOW?
+- Code snippets of 2-3 lines at most?
+- No banned words?
+- Specific, measurable criteria?
 
-For each task:
-- ✅ Binary, testable description?
-- ✅ WHAT/WHY only (no HOW)?
-- ✅ Max 2-3 line code snippets?
-- ✅ No banned words?
-- ✅ Specific, measurable criteria?
+Revise any task that fails before you go on.
 
-If ANY task fails, REVISE before proceeding.
+### Step 5: One TodoWrite call for all tasks
 
-### Step 5: TodoWrite (Single Call, All Tasks)
-
-Create todos for ALL tasks in single TodoWrite call:
+Create a todo for every task in a single TodoWrite call:
 
 ```javascript
 TodoWrite({
@@ -449,11 +471,11 @@ TodoWrite({
 - `status`: "pending"
 - `activeForm`: "Creating backlog task for {specific-component}"
 
-**Include final verification task**: Dependency validation
+End the list with one todo for the dependency check.
 
-### Step 6: Spawn task-engineer Agents (Parallel)
+### Step 6: Spawn task-engineer agents in parallel
 
-Launch ONE task-engineer agent per task in **SINGLE MESSAGE** with multiple Task calls:
+Launch one task-engineer agent per task, all in **one message** with several Task calls:
 
 ```markdown
 Task 1: task-engineer for User Authentication
@@ -462,7 +484,7 @@ Task 3: task-engineer for Password Reset Flow
 Task 4: task-engineer for Dependency Verification
 ```
 
-**Agent Instructions Template**:
+Prompt each agent with this template:
 
 ```markdown
 **Agent**: task-engineer
@@ -513,9 +535,9 @@ Task 4: task-engineer for Dependency Verification
 Task file in .backlog/pending/ following all requirements.
 ```
 
-### Step 7: Dependency Verification Agent (Final)
+### Step 7: Verify dependencies
 
-After all task-engineer agents complete, spawn ONE MORE agent to verify:
+When every task-engineer agent has finished, spawn one more to check the set:
 
 ```markdown
 **Agent**: task-engineer
@@ -537,87 +559,63 @@ Validation report confirming tasks are ready for execution.
 If issues found, fix them.
 ```
 
-### Step 8: Exit Immediately
+### Step 8: Report and exit
 
-**DO NOT**:
-- ❌ Implement any tasks
-- ❌ Start work on backlog
-- ❌ Review code
-- ❌ Run tests
-- ❌ Make commits beyond task file creation
+Report the task creation summary, then exit. Do not implement any task, start work on the backlog,
+review code, run tests, or make any commit other than the task files.
 
-**DO**:
-- ✅ Report task creation summary
-- ✅ Exit
-
-Tasks are now in `.backlog/pending/` ready for `/go` command.
+The tasks now wait in `.backlog/pending/` for `/go`.
 
 ---
 
-## Pre-Creation Validation
+## Pre-creation validation
 
-Before spawning task-engineer agents, validate:
+Before you spawn task-engineer agents, check four things.
 
-### A. Uniqueness Check
-
-Search pending tasks for similar work:
+**Uniqueness.** Search pending tasks for similar work:
 ```bash
 grep -r "authentication" .backlog/pending/
 ```
 
-If similar tasks exist, adjust scope to avoid duplication.
+If a similar task exists, adjust the scope so the work is not done twice.
 
-### B. Service Setup
+**Service setup.** For a new service, setup and config are one task. Do not split infrastructure from
+implementation.
 
-If creating new service:
-- Setup + config = ONE task (not separate)
-- Don't split infrastructure from implementation
+**Tech stack.** Name it: the language and framework, the key libraries, and the quality gate commands.
 
-### C. Tech Stack
-
-Specify tech stack clearly:
-- Language/framework
-- Key libraries
-- Quality gate commands
-
-### D. Scope Boundary
-
-Every task MUST include "Out of Scope" section:
-- What NOT to do
-- What to delegate
-- What's future work
+**Scope boundary.** Every task **must** have an "Out of Scope" section that says what not to do, what
+to delegate, and what is future work.
 
 ---
 
-## Atomic Decomposition Examples
+## Decomposition examples
 
-### ✅ GOOD: Proper Decomposition
+### Good: one task per feature
 
 **Scope**: "Implement user authentication system"
 
 **Tasks**:
 1. **User Authentication API** (backend-001-user-auth-api.md)
    - WHAT: JWT-based authentication with login/logout endpoints
-   - WHY: Enable secure user access
+   - WHY: Only signed-in users get access
    - Includes: API, validation, token generation, tests
 
 2. **User Profile Management** (backend-002-user-profile-mgmt.md)
    - WHAT: CRUD endpoints for user profile data
-   - WHY: Allow users to manage their information
+   - WHY: Users manage their own information
    - Includes: API, validation, database, tests
 
 3. **Password Reset Flow** (backend-003-password-reset-flow.md)
    - WHAT: Email-based password reset with secure tokens
-   - WHY: Account recovery mechanism
+   - WHY: Users who lose their password can recover the account
    - Includes: API, email service, token management, tests
 
-**Atomic**: Each task is complete, independent feature.
+Each task is a complete, independent feature.
 
-### ❌ BAD: Over-Decomposition
+### Bad: over-decomposition
 
-**Scope**: "Implement user authentication system"
-
-**Tasks**:
+The same scope, split into:
 1. Create database schema
 2. Create API endpoint structure
 3. Add input validation
@@ -627,15 +625,16 @@ Every task MUST include "Out of Scope" section:
 7. Update API documentation
 8. Add monitoring
 
-**Problem**: Micro-tasks that must be done together. No value delivered until all complete.
+These micro-tasks only make sense together, and none of them delivers anything until all eight are
+done.
 
 ---
 
-## Style Guide Violations (Common Mistakes)
+## Style guide violations
 
-### ❌ BAD: Implementation Details
+### Bad: implementation details
 
-```markdown
+````markdown
 ## Task Description
 Implement authentication using this approach:
 
@@ -649,11 +648,11 @@ function authenticateToken(req, res, next) {
 ```
 3. Use bcrypt for password hashing
 4. Configure JWT_SECRET in .env
-```
+````
 
-**Problem**: Telling specialist HOW to implement. 50+ lines of code.
+This tells the specialist how to build it, in 50+ lines of code.
 
-### ✅ GOOD: WHAT/WHY Only
+### Good: WHAT and WHY only
 
 ```markdown
 ## Task Description
@@ -675,78 +674,37 @@ API authenticates users and issues JWT tokens.
 - [ ] Tests cover all scenarios
 ```
 
-**Good**: Specialist knows WHAT and WHY. Decides HOW.
+The specialist knows what to build and why, and decides how.
 
 ---
 
-## Usage Examples
+## Done when (legacy loop)
 
-### Basic Usage
-
-```bash
-/task "Implement user authentication system with JWT tokens"
-```
-
-### With Context
-
-```bash
-/task "Add real-time notifications using WebSocket. Figma: https://figma.com/design/ABC123/App?node-id=1-2"
-```
-
-### Complex Scope
-
-```bash
-/task "Migrate user service from REST to GraphQL API. Maintain backward compatibility with v1 endpoints during transition."
-```
-
-### From an Approved Plan
-
-```bash
-/task --plan 20260928-owner-seat-notice
-/task --plan docs/cycles/20260928-owner-seat-notice/plan.md
-/task --plan        # the cycle /whip says is next
-```
+- You read the style guide.
+- Research is done: Perplexity, plus Figma and Context7 as needed.
+- The scope is split into atomic tasks.
+- Every task passed the style check.
+- TodoWrite was called once, with all tasks.
+- The task-engineer agents were spawned in parallel, in one message.
+- The dependency verification agent ran after the tasks were created.
+- The command exited without implementing anything.
 
 ---
 
-## Success Criteria
+## Anti-patterns
 
-✅ Style guide read and understood
-✅ Research completed (Perplexity, Figma, Context7 as needed)
-✅ Scope decomposed into atomic tasks
-✅ All tasks validated against style guide
-✅ TodoWrite called once with all tasks
-✅ task-engineer agents spawned in parallel (single message)
-✅ Dependency verification agent spawned after creation
-✅ Command exits without implementing
+| Don't | Do instead |
+|---|---|
+| Start coding, writing tests or running builds | Delegate to task-engineer agents and exit |
+| Spend hours researching implementation details | Spend 5-10 minutes on the scope; specialists work out the details |
+| Split one feature into database, API and test tasks | One logical feature, one task |
+| Tell specialists which libraries, patterns or approaches to use | Define what to build, why, and the constraints |
 
 ---
 
-## Anti-Patterns
+## Output format
 
-### ❌ Implementing Tasks
-
-**Never**: Start coding, writing tests, running builds
-**Always**: Delegate to task-engineer, exit immediately
-
-### ❌ Deep Research
-
-**Never**: Spend hours researching implementation details
-**Always**: 5-10 minutes for scope understanding, delegate details to specialists
-
-### ❌ Micro-Task Decomposition
-
-**Never**: Break into database/API/tests as separate tasks
-**Always**: One logical feature = one task
-
-### ❌ HOW Instructions
-
-**Never**: Tell specialists which libraries, patterns, approaches to use
-**Always**: Define WHAT needs to be built, WHY, and constraints
-
----
-
-## Output Format
+The legacy loop reports progress in this shape:
 
 ```
 🔥 Task Decomposition Started

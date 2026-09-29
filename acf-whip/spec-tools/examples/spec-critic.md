@@ -16,8 +16,8 @@ Check, in this order:
    command could say yes or no. "Works well", "is fast", "handles errors" are not binary.
 2. The Problem names an **Actor & trigger**: who does what, and what starts it.
 3. Non-scope says what will NOT be built where a reader would otherwise assume it.
-4. Every risk has an undo. Data, schema, auth, secrets, payments and anything irreversible need one
-   that actually works.
+4. Every risk has an undo. For data, schema, auth, secrets, payments and anything irreversible, the
+   undo must work if someone runs it; naming one is not enough.
 5. Words that hide a decision: "appropriate", "as needed", "etc.", "support", "handle", a number
    with no unit, a limit with no value.
 6. Edge cases a builder will hit on day one: empty input, duplicates, concurrency, retries,

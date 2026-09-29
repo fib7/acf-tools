@@ -1,6 +1,6 @@
 ---
 name: whip-add-agents
-description: Agent + Manifest Generator - Analyzes repository and creates missing specialist agents following ACF conventions
+description: Agent + Manifest Generator. Detects the repository's stack and writes each missing specialist agent (agent file plus Priority 1/2/3 manifest) following ACF conventions
 argument-hint: "[agent-types...]"
 allowed-tools:
   - Bash
@@ -15,31 +15,32 @@ allowed-tools:
 
 # /whip-add-agents - Agent + Manifest Generator
 
-**CRITICAL**: This command CREATES NEW AGENTS, not just installs them.
-
-Analyzes repository structure, detects missing specialist agents, and generates both agent implementation files AND comprehensive agent manifests following ACF agent subsystem conventions (58-74% token reduction pattern).
+This skill writes new agents; it does not install prebuilt ones. For each specialist the repository's
+stack needs and `.claude/agents/` lacks, it writes a short agent file and a manifest that tells the
+agent which docs to read for which kind of task. That split is the ACF agent-subsystem convention (the
+58-74% token-reduction pattern).
 
 ## Purpose
 
 For each missing specialist agent:
-1. **Create agent implementation**: `.claude/agents/{agent-name}.md` (small, core instructions)
-2. **Create agent manifest**: `docs/agents/{agent-name}.md` (comprehensive, Priority 1/2/3 docs)
-3. **Generate quality gates** (if missing): each specialist gets the gates of its own stack, its
+1. **Create agent implementation**: `.claude/agents/{agent-name}.md` (short: core instructions)
+2. **Create agent manifest**: `docs/agents/{agent-name}.md` (the full reference: Priority 1/2/3 docs)
+3. **Generate quality gates** (if missing): each specialist gets its own stack's gates at its
    `{gates_path}` (Step 2B). The backend specialist reads `docs/development/quality-gates-{gate_stack}.md`.
    A frontend specialist (React, Vue, Next.js) reads `docs/development/quality-gates-nodejs.md`, even
    when the backend is Go or Python. A stack with no shipped doc (Rust) gets
    `quality-gates-{stack}.md` from the Step 6 template.
 4. **Update configuration**: `.backlog/README.md`, `CLAUDE.md` (if exists)
 
-**User arguments take PRIORITY over auto-detection.**
+**User arguments take priority over auto-detection.**
 
 ---
 
 ## Execution Flow
 
-### Step 1: Parse User Arguments (PRIORITY)
+### Step 1: Parse User Arguments
 
-User arguments OVERRIDE auto-detection:
+Flags override auto-detection. For example:
 
 ```bash
 /whip-add-agents --backend=go --frontend=nextjs
@@ -56,15 +57,15 @@ User arguments OVERRIDE auto-detection:
 
 A flag decides its own slot outright, whatever the repository looks like: `--backend=python` makes a
 python-engineer with the Python gates in a repo whose only manifest is `package.json`. Auto-detection
-fills only the slots no flag names (see Mixed below). Keep the flags as `FLAGS` (for example
+fills only the slots no flag names (see Mixed below). Store the flags in `FLAGS` (for example
 `FLAGS='--backend=python --frontend=nextjs'`): the Step 2B, 6 and 7C blocks pass them to the detector,
 which applies `--backend=` and `--frontend=` and ignores the rest.
 
-### Step 2: Repository Analysis (if no user args OR to supplement)
+### Step 2: Repository Analysis (for the slots no flag names)
 
 #### A. Codebase Exploration
 
-Scan directory structure (depth 3-4 levels):
+Scan the directory tree, 3-4 levels deep:
 
 ```bash
 # Directory scan
@@ -161,11 +162,11 @@ if [ -f "CLAUDE.md" ]; then
 fi
 ```
 
-**Note**: Claude reads these files naturally to understand project structure and tech stack.
+Then read whichever of the two files exist, for the project's structure and stack.
 
 #### D. Existing Agent Check
 
-Scan `.claude/agents/` to avoid duplication:
+List `.claude/agents/` so you don't duplicate an agent that already exists:
 
 ```bash
 existing_agents=$(ls -1 .claude/agents/*.md 2>/dev/null | xargs -n1 basename | sed 's/\.md$//')
@@ -190,7 +191,7 @@ echo "Languages detected: $languages"
 
 #### F. Gap Analysis
 
-Compare detected needs vs installed agents:
+Compare what the repo needs with the agents already installed:
 
 ```bash
 needs=()
@@ -206,27 +207,27 @@ echo "Missing agents: ${needs[@]}"
 
 #### A. Study Agent Implementation Patterns
 
-Read existing agents in `.claude/agents/` (including universal agents from plugin):
+Read the agents already in `.claude/agents/`, including any universal ones `/whip-init` generated:
 
 ```bash
 # Extract patterns
 grep "^---" .claude/agents/*.md -A 10  # YAML frontmatter structure
 grep "## Core Responsibilities" .claude/agents/*.md -A 5
 grep "## Authority" .claude/agents/*.md -A 10
-grep "## MANDATORY" .claude/agents/*.md -A 3
+grep -E "^## .*(First Step|MANDATORY)" .claude/agents/*.md -A 3  # older agents say MANDATORY FIRST STEP
 ```
 
 **Extract Conventions**:
 - YAML frontmatter fields (name, role, tech_stack, scope)
 - Section headers and order
-- Mandatory reading section format
-- Scope boundaries format (IS/NOT Responsible For)
+- Format of the read-your-manifest section
+- Scope boundaries format (what the agent owns, and what it hands to another agent)
 - Quality gates section format
 - Common workflows format
 
 #### B. Study Agent Manifest Patterns
 
-Read existing manifests in `docs/agents/` (if any exist):
+Read the manifests in `docs/agents/`, if there are any:
 
 ```bash
 # Extract manifest structure
@@ -245,7 +246,7 @@ grep "## Anti-Patterns" docs/agents/*.md -A 15
 
 #### C. Extract Stack-Specific Patterns
 
-For target tech stack, research quality gate patterns:
+Research quality-gate practice for the target stack:
 
 ```bash
 # Use Perplexity for best practices
@@ -274,15 +275,15 @@ color: {color}
 
 # {Agent Display Name}
 
-## 🚨 MANDATORY FIRST STEP: Read Your Documentation
+## First Step: Read Your Manifest
 
-**CRITICAL**: Before executing ANY task, you MUST:
+Before any task:
 
 1. **Read your manifest**: `docs/agents/{agent-name}.md`
-2. **Load Priority 1 documents** (listed in manifest)
-3. **Follow navigation guidance** for task type
-4. **Implement following workflows** (in manifest)
-5. **Avoid anti-patterns** (in manifest)
+2. **Read the Priority 1 documents** it lists
+3. **Follow its navigation guidance** for the task type
+4. **Implement through its workflows**
+5. **Avoid its anti-patterns**
 
 ## Role & Responsibility
 
@@ -290,20 +291,20 @@ color: {color}
 
 ## Scope Boundaries
 
-**IS Responsible For**:
+**Yours**:
 - {capability 1}
 - {capability 2}
 - {capability 3}
 
-**NOT Responsible For**:
+**Not yours** (another agent owns it):
 - {out of scope 1} (delegate to {other-agent})
 - {out of scope 2}
 
 ## Quality Gates
 
-See manifest for complete quality gate requirements: `docs/agents/{agent-name}.md`
+The full requirements are in your manifest, `docs/agents/{agent-name}.md`.
 
-**Zero Bypass Tolerance**: All quality gates MUST pass before marking task complete.
+**Zero Bypass Tolerance**: every quality gate must pass before you mark the task complete.
 
 **Stack-Specific Commands**:
 ```bash
@@ -321,16 +322,16 @@ See manifest for complete quality gate requirements: `docs/agents/{agent-name}.m
 
 ## Workflow Protocol
 
-**Step 0 (MANDATORY before any edit)**: Invoke the `clean-checkout-before-task` skill. It resolves the task's `Worktree:` slug, lazy-creates `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and logs `clean-checkout: ok` to the task transition log. Without that token, quality-reviewer auto-rejects.
+**Step 0 (required before any edit)**: invoke the `clean-checkout-before-task` skill. The skill resolves the task's `Worktree:` slug, creates `.worktree/<slug>` on branch `worktree/<slug>` if it is missing, validates the branch, stashes unrelated changes, and logs `clean-checkout: ok` to the task's transition log. Without that token, quality-reviewer auto-rejects.
 
-After Step 0 succeeds, all reads, edits, state moves, and commits happen inside the worktree on `worktree/<slug>`. Never commit on `main`.
+Once Step 0 succeeds, every read, edit, state move and commit happens inside the worktree, on `worktree/<slug>`. Never commit on `main`.
 
-1. Read Priority 1 docs from manifest
-2. Load task-specific docs based on navigation guidance
-3. Implement following manifest workflows
-4. Run all quality gates
-5. Provide evidence of completion
-6. Update task status and commit (inside the worktree on `worktree/<slug>`)
+1. Read the Priority 1 docs your manifest lists.
+2. Read the task-specific docs its navigation guidance points to.
+3. Implement through the manifest's workflows.
+4. Run every quality gate.
+5. Write the evidence of completion.
+6. Update the task status and commit, inside the worktree on `worktree/<slug>`.
 ```
 
 #### Variable Replacement
@@ -402,9 +403,9 @@ The React and Next.js blocks are examples. On any `package.json` project the det
 
 For each missing agent, create `docs/agents/{agent-name}.md`:
 
-#### Template Structure (Comprehensive File, 58-74% Token Reduction)
+#### Template Structure (Full Reference, 58-74% Token Reduction)
 
-Use plugin's agent pattern templates from `content/agent-patterns/manifests/`:
+Build each manifest from the plugin's pattern for its kind, in `content/agent-patterns/manifests/`:
 - `backend-manifest-pattern.md`
 - `frontend-manifest-pattern.md`
 - `data-manifest-pattern.md`
@@ -433,12 +434,12 @@ Documents used in 80%+ of tasks:
    - When: Start of every task
 
 2. **`docs/acf/style/task-descriptions.md`**
-   - Why: Understanding task requirements (WHAT/WHY not HOW)
-   - When: After receiving task, before implementation
+   - Why: How task requirements are written (WHAT and WHY, not HOW)
+   - When: After you receive the task, before you implement it
 
 3. **`docs/acf/backlog/task-template.md`**
    - Why: Task file structure, transition log format
-   - When: Before marking complete, for evidence section
+   - When: Before marking the task complete, for the evidence section
 
 4. **`{gates_path}`** (this specialist's own gates, Step 2B)
    - Why: Quality gate commands, coverage thresholds
@@ -452,7 +453,7 @@ Documents used in 80%+ of tasks:
 
 ## Priority 2: SHOULD READ (40-80% of Tasks)
 
-Situational documents based on task type:
+Read the list for the task type you have:
 
 ### For {Task Type 1}
 - `{doc-path}` - {purpose}
@@ -466,7 +467,7 @@ Situational documents based on task type:
 
 ## Priority 3: REFERENCE (Situational, <40% of Tasks)
 
-Use when specific scenarios encountered:
+Read one only when its situation comes up:
 
 - `{doc-path}` - {when-to-use}
 - `{doc-path}` - {when-to-use}
@@ -540,7 +541,7 @@ Use when specific scenarios encountered:
 
 ### Zero Bypass Tolerance
 
-FORBIDDEN:
+None of these is allowed:
 - `git commit --no-verify`
 - `SKIP={hook-name}`
 - Lowering coverage thresholds
@@ -551,39 +552,39 @@ FORBIDDEN:
 ## Common Workflows
 
 ### Workflow 1: New Feature Implementation
-1. Read Priority 1 docs
-2. Read task requirements (WHAT/WHY)
-3. Decide HOW to implement
-4. Implement with tests
-5. Run quality gates
-6. Provide evidence, move to completed
+1. Read the Priority 1 docs
+2. Read the task requirements (WHAT and WHY)
+3. Decide HOW to implement it
+4. Implement it, with tests
+5. Run the quality gates
+6. Write the evidence and move the task to completed
 
 ### Workflow 2: Bug Fix
-1. Read Priority 1 docs
-2. Reproduce bug (write failing test)
-3. Identify root cause
-4. Implement fix
-5. Verify test passes
-6. Run quality gates, provide evidence
+1. Read the Priority 1 docs
+2. Reproduce the bug with a failing test
+3. Find the root cause
+4. Fix it
+5. Check that the test now passes
+6. Run the quality gates and write the evidence
 
 ### Workflow 3: Refactoring
-1. Read Priority 1 docs + testing strategy
-2. Ensure comprehensive test coverage FIRST
-3. Make incremental changes
-4. Run tests after each change
-5. Run quality gates, provide evidence
+1. Read the Priority 1 docs and the testing strategy
+2. Before you change anything, make sure tests cover the code you are about to change
+3. Change it in small steps
+4. Run the tests after each step
+5. Run the quality gates and write the evidence
 
 ### Workflow 4: Quality Gate Failure
-1. Attempt fix (max 10 attempts)
-2. If systemic issue: Call /retro
-3. If blocked: Move to blocked with report
-4. NEVER bypass quality gates
+1. Fix the failure (at most 10 attempts)
+2. If the issue is systemic, call /retro
+3. If you are blocked, move the task to blocked with a report
+4. Never bypass a quality gate
 
 ### Workflow 5: Task Handoff to quality-reviewer
-1. Complete all acceptance criteria
-2. Run ALL quality gates (capture output)
-3. Update evidence section with complete output
-4. Move to .backlog/completed/
+1. Meet every acceptance criterion
+2. Run every quality gate and capture the output
+3. Put the full output in the evidence section
+4. Move the task to .backlog/completed/
 5. Commit: `task: complete {task-id}`
 
 ---
@@ -593,7 +594,7 @@ FORBIDDEN:
 ### Receives Tasks From
 - **task-engineer**: Task specifications in `.backlog/pending/`
   - Handoff: Task file with acceptance criteria
-  - Expectations: WHAT/WHY specified, HOW is specialist's decision
+  - Expectations: the task states WHAT and WHY; the specialist decides HOW
 
 ### Delegates To
 - **quality-reviewer**: Completed tasks in `.backlog/completed/`
@@ -604,9 +605,9 @@ FORBIDDEN:
   - Handoff: Request for architectural guidance
   - Expectations: WHAT/WHY documented
 
-- **task-engineer**: When task too large or blocked
+- **task-engineer**: When the task is too large, or blocked
   - Handoff: Report in task notes
-  - Expectations: Clear blocker description
+  - Expectations: A clear description of the blocker
 
 ### Collaborates With
 - **{other-specialist-agents}**: Cross-stack features
@@ -616,55 +617,55 @@ FORBIDDEN:
 
 ## Anti-Patterns
 
-### 1. Implementing Without Reading Manifest
-**Problem**: Missing critical context
-**Why**: Leads to rework
-**Solution**: ALWAYS read manifest first
+### 1. Implementing Without Reading the Manifest
+**Problem**: The task starts without the context the manifest carries
+**Why**: Rework
+**Solution**: Read the manifest before every task
 
 ### 2. Bypassing Quality Gates
 **Problem**: Using `--no-verify`
 **Why**: Technical debt, bugs in production
-**Solution**: Fix actual issues
+**Solution**: Fix the failure the gate reports
 
 ### 3. Insufficient Test Coverage
 **Problem**: <80% coverage
 **Why**: Untested code breaks
-**Solution**: Write comprehensive tests
+**Solution**: Test every path the change touches
 
 ### 4. Vague Evidence
-**Problem**: "All tests pass" without output
-**Why**: quality-reviewer cannot verify
-**Solution**: Provide complete command output
+**Problem**: "All tests pass" with no output
+**Why**: quality-reviewer cannot verify it
+**Solution**: Paste the full command output
 
 ### 5. HOW Decisions in Task Descriptions
 **Problem**: Asking task-engineer for implementation details
-**Why**: Specialist decides HOW
-**Solution**: Make implementation decisions independently
+**Why**: The specialist decides HOW
+**Solution**: Make the implementation decisions yourself
 
-### 6. Working on Wrong Task State
-**Problem**: Implementing tasks not in in-progress
-**Why**: Breaks workflow tracking
-**Solution**: Move to in-progress before starting
+### 6. Working on a Task in the Wrong State
+**Problem**: Implementing a task that is not in in-progress
+**Why**: Workflow tracking loses the task
+**Solution**: Move it to in-progress before you start
 
 ### 7. Forgetting Task File Updates
-**Problem**: Not updating transition log
-**Why**: Audit trail broken
-**Solution**: Update log at every state change
+**Problem**: The transition log is not updated
+**Why**: The audit trail has gaps
+**Solution**: Add a log row at every state change
 
 ### 8. Partial Completion
-**Problem**: Some acceptance criteria unchecked
+**Problem**: Some acceptance criteria are unchecked
 **Why**: quality-reviewer auto-rejects
-**Solution**: ALL criteria checked before complete
+**Solution**: Check every criterion before you mark the task complete
 
 ### 9. Not Committing Task File
-**Problem**: Code committed but task file not included
-**Why**: Atomic commit violated
-**Solution**: Include task file in commits
+**Problem**: The code is committed without the task file
+**Why**: The commit is no longer atomic
+**Solution**: Commit the task file with the code
 
 ### 10. Ignoring "Out of Scope"
 **Problem**: Implementing out-of-scope features
 **Why**: Scope creep, duplicated work
-**Solution**: Strictly adhere to scope
+**Solution**: Stay inside the scope boundaries
 
 ---
 
@@ -734,8 +735,8 @@ mv .backlog/in-progress/{task}.md .backlog/blocked/
 
 ### Step 6: Generate Quality Gate Documentation (if missing)
 
-Copy the shipped doc for the backend and, when there is a frontend, the frontend's, each only when
-missing. Each matches its own stack: a plain Node.js project gets `nodejs.md`, not the
+Copy the shipped gates doc for the backend, and for the frontend if there is one. Leave any that
+already exists. Each copy matches its own stack: a plain Node.js project gets `nodejs.md`, not the
 Next.js/TypeScript one, and a React app next to a Python backend gets `quality-gates-nodejs.md` beside
 `quality-gates-python.md`. A flag names the stack outright, so `--backend=python` in a repo whose
 only manifest is `package.json` installs the Python gates.
@@ -759,15 +760,15 @@ true
 ```
 
 Only for a stack with no shipped doc (Rust, or any `--backend=` value other than go, python and
-nodejs), create `docs/development/quality-gates-{stack}.md` from this template, filling each command
-slot with a tool the project actually has and dropping the rest:
+nodejs), create `docs/development/quality-gates-{stack}.md` from this template. Fill each command slot
+with a tool the project has and drop the rest:
 
 ```markdown
 # Quality Gates - {Stack}
 
 ## Zero Bypass Tolerance
 
-**ABSOLUTE PROHIBITION**: The following bypasses are STRICTLY FORBIDDEN:
+**Never bypass a gate.** None of these is allowed:
 - `git commit --no-verify`
 - `SKIP={hook-name}` in environment
 - `git commit -n`
@@ -775,7 +776,7 @@ slot with a tool the project actually has and dropping the rest:
 - Lowering coverage thresholds to pass builds
 - Commenting out failing tests
 
-**Enforcement**: CI MUST re-run all quality gates. Any bypass detected results in immediate rejection.
+**Enforcement**: CI must re-run every quality gate, and a detected bypass is rejected outright.
 
 ## Quality Requirements
 
@@ -819,30 +820,30 @@ See `.pre-commit-config.yaml` for automated enforcement.
 ## Quality Gate Protocol
 
 **Failure Handling**:
-1. Attempts 1-10: Fix actual issues
-2. After 10 attempts: Move task to blocked with failure report
-3. If systemic issue (3+ similar failures): Run /retro
+1. Attempts 1-10: fix the failure the gate reports
+2. After 10 attempts: move the task to blocked with a failure report
+3. On a systemic issue (3+ similar failures): run /retro
 
 ## Continuous Integration
 
-CI MUST run all quality gates on every PR:
+CI must run every quality gate on every PR:
 - Linting
 - Type checking
 - Full test suite with coverage
 - Build verification
 
-**No PR merges without passing all gates.**
+A PR merges only when every gate passes.
 ```
 
 ### Step 7: Update Project Configuration
 
 #### A. Update `.backlog/README.md`
 
-Update the agent list **in place**. Do NOT re-render the template over an existing README:
-`.backlog/README.md` is a document the project owns and edits — its gate commands, coverage
-thresholds and evidence rules are the team's, not the sample's — and rewriting all of it to change
-one line silently replaced them with the generic defaults, reporting only "(agent list updated)".
-The placeholder is also gone after the first render, so re-rendering is not even idempotent.
+Update the agent list **in place**. Never re-render the template over an existing README.
+`.backlog/README.md` belongs to the project: its gate commands, coverage thresholds and evidence
+rules are the team's, not the sample's. An earlier version re-rendered the whole file to change one
+line, which replaced all of them with the generic defaults while the report said only "(agent list
+updated)". Re-rendering isn't idempotent either: the placeholder is gone after the first render.
 
 ```python
 # Scan .claude/agents/
@@ -869,7 +870,7 @@ else:
 
 #### B. Update `CLAUDE.md` (if exists)
 
-Add new agents to agent assignment section:
+Add the new agents to its agent-assignment section:
 
 ```markdown
 ## Agent Assignments
@@ -999,7 +1000,7 @@ Next Steps:
 /whip-add-agents
 ```
 
-Scans repo, detects Go + React + Kubernetes, creates:
+On a repo with Go, React and Kubernetes, creates:
 - go-engineer
 - react-engineer
 - k8s-engineer
@@ -1020,48 +1021,30 @@ Both slots are named, so detection decides neither. Creates:
 /whip-add-agents --backend=go
 ```
 
-Creates go-engineer per user request, then auto-detects other needs.
+Creates go-engineer from the flag and auto-detects the remaining slots.
 
 ---
 
 ## Success Criteria
 
-✅ Agent implementations created in `.claude/agents/`
-✅ Agent manifests created in `docs/agents/` with Priority 1/2/3 structure
-✅ Manifests include navigation guidance by task type
-✅ Manifests include 5-10 anti-patterns with explanations
-✅ Quality gate docs created for new stacks
-✅ `.backlog/README.md` updated with new agents
-✅ `CLAUDE.md` updated with agent assignments (if exists)
-✅ Pre-commit hooks installed for new stacks
-✅ All cross-references valid
-✅ Validation passed
+- An agent file for each new specialist in `.claude/agents/`
+- A manifest for each in `docs/agents/`, with the Priority 1/2/3 structure, navigation guidance by
+  task type, and 5-10 anti-patterns, each with its explanation
+- A quality-gates doc at every specialist's `{gates_path}`
+- `.backlog/README.md` lists the new agents
+- `CLAUDE.md` lists their assignments, when the file exists
+- A pre-commit config for the backend's stack, except where Step 7C skips it: the repo already has
+  one, none ships for the stack, or a Node.js stack has no root `package.json`
+- Every cross-reference resolves and every Step 8 check passes
 
 ---
 
 ## Anti-Patterns
 
-### ❌ Copying Without Customization
-
-**Never**: Copy existing agent without adapting to tech stack
-**Always**: Customize quality gates, tech stack, scope boundaries
-
-### ❌ Missing Manifest
-
-**Never**: Create agent implementation without manifest
-**Always**: Create BOTH implementation AND manifest
-
-### ❌ Generic Priority Docs
-
-**Never**: List generic docs in Priority 1/2/3
-**Always**: Specify actual project documentation paths
-
-### ❌ Incomplete Anti-Patterns
-
-**Never**: List anti-patterns without explanations
-**Always**: Include Problem/Why/Solution for each
-
-### ❌ Ignoring Existing Conventions
-
-**Never**: Create agents with different structure than existing
-**Always**: Study existing agents and follow conventions
+| Never | Always |
+|-------|--------|
+| Copy an existing agent without adapting it to the stack | Customize its quality gates, tech stack and scope boundaries |
+| Create an agent file without its manifest | Create both |
+| List generic docs in Priority 1/2/3 | Name the project's real documentation paths |
+| List anti-patterns without explanations | Give each one a Problem, Why and Solution |
+| Give a new agent a different structure from the existing ones | Study the existing agents and follow their conventions |

@@ -36,25 +36,30 @@ absent (an on-request tool still gates the approval it belongs to). It holds tas
 committed `at=` names `task`. A task-only block tool never gates a plan. The card, the hook run,
 `review --all` and the gate all use this one rule.
 
-**Policy and `at=` are read from HEAD.** A declaration that is uncommitted, edited, or whose driver
-or prompt is dirty against HEAD or was found via `$ACFW_SPEC_TOOL_PATH` or `$PATH` still runs, but
-advisory and with a WARN, and its result can never satisfy a block gate. A tool runs at a stage when
-either the committed or the working-tree `at=` names it: a local edit can add a stage, never remove
-one. A declaration deleted locally keeps running from HEAD until the deletion is committed. A
-committed declaration that fails to parse still gates when it could mean block: any `policy` line
-that is not plainly `advisory`, or a misspelled key set to `block`, counts as block. The gate then
-refuses naming the invalid declaration, and the override still works. A driver or prompt that is a
-symlink is judged by what runs: every link and the file it ends at must be inside the repo,
-committed and clean. Clean means byte-identical to HEAD, compared by content: index flags such as
-`assume-unchanged` or `skip-worktree` cannot make an edited driver look clean. A result satisfies a
-block gate only when it came from the committed declaration and the committed driver or prompt
-version. A GO from an older version (a teammate's fix pulled in since) is shown as stale and does
-not count.
+**Policy and `at=` are read from HEAD.** A local edit to a declaration, or to a driver or prompt it
+names under `.acfwhip/`, cannot loosen a gate:
 
-What a local edit cannot loosen is the declaration and a driver or prompt it names under
-`.acfwhip/`. A script that a `review=` command calls elsewhere in the repo is outside what the
-engine tracks. A block tool that runs repo code should be a driver committed under
-`.acfwhip/adapters/`, so that a local edit to it demotes the tool to advisory.
+- A declaration that is uncommitted or edited, or whose driver or prompt is dirty against HEAD or
+  was found via `$ACFW_SPEC_TOOL_PATH` or `$PATH`, still runs, but as advisory and with a WARN. Its
+  result can never satisfy a block gate.
+- A tool runs at a stage when either the committed or the working-tree `at=` names it: a local edit
+  can add a stage, never remove one. A declaration deleted locally keeps running from HEAD until
+  the deletion is committed.
+- A committed declaration that fails to parse still gates when it could mean block: any `policy`
+  line that is not plainly `advisory`, or a misspelled key set to `block`, counts as block. The
+  gate then refuses and names the invalid declaration. The override still works.
+- A driver or prompt that is a symlink is judged by what runs: every link, and the file it ends at,
+  must be inside the repo, committed and clean. Clean means byte-identical to HEAD, compared by
+  content, so index flags such as `assume-unchanged` or `skip-worktree` cannot make an edited
+  driver look clean.
+- A result satisfies a block gate only when it came from the committed declaration and the
+  committed version of the driver or prompt. A GO recorded against an older version (before you
+  pulled a teammate's fix, say) is shown as stale and does not count.
+
+A script that a `review=` command calls from elsewhere in the repo is not covered: it is outside
+what the engine tracks, so a local edit to it goes unnoticed. A block tool that runs repo code should
+therefore be a driver committed under `.acfwhip/adapters/`, where a local edit demotes the tool to
+advisory.
 
 **Driver discovery** (first executable wins): `$ACFW_SPEC_TOOL_PATH` (colon-separated dirs), then
 `<repo>/.acfwhip/adapters/`, then `<acf-whip>/spec-tools/<name>/`, then `$PATH`.
@@ -83,11 +88,13 @@ a driver lists in `NEEDS|` are also read from a gitignored, untracked `.env`.
 
 **Exit codes**: `0` GO · `1` NO-GO · `3` unavailable (unset credential, plan limit, quota, verb not
 supported; the first stderr line is the reason) · anything else is an error. The engine normalizes
-to `go | nogo | skip | error`. A timeout is an error. `skip` and `error` never block and never hold.
-A tool the engine never started, or cut short, because the shared review budget ran out is neither:
-it is no result. A block tool still needs GO or the override, a task is held, and the next review
-runs it again. The same holds when the engine refuses to run a tool (not trusted yet, or a
-credential literal in the task).
+these to `go | nogo | skip | error`, and a timeout is an error. `skip` and `error` never block and
+never hold.
+
+A tool that the engine never started, or cut short, because the shared review budget ran out is
+neither skip nor error: it has no result. A block tool still needs GO or the override, a task stays
+held, and the next review runs the tool again. The same holds when the engine refuses to run a tool
+(not trusted yet, or a credential literal in the task).
 
 ## Stdout records
 
@@ -106,8 +113,8 @@ One per line. Unknown lines are ignored (on NO-GO they feed the fallback below).
 `capabilities` prints `VERBS|review push pull from` (what it supports), `NEEDS|<ENV names>`,
 `EGRESS|<host>` and, if a run costs money or quota, `COST|<text>`. It must succeed without
 credentials. It is cached per driver hash, refreshed when a day old or before a verb is refused as
-not offered (so feature detection can light up a verb), and never called by `status`, `show`,
-`gate` or `list`.
+not offered (a driver may detect features, so a verb its service started offering since the last
+probe is not refused from a stale cache), and never called by `status`, `show`, `gate` or `list`.
 
 **Unstructured fallback**: on NO-GO with no `FINDING` records, the first 20 stdout lines become
 medium findings; a leading `file:line:` or `line:` becomes `L<line>`. Any linter works as-is.
@@ -167,7 +174,7 @@ was trusted, so a subagent is never handed text nobody saw.
 - **Secret lint**: `spec-tools/secret-patterns` (shape plus length). A match in a declaration, an
   agent prompt, a repo-local driver, a tracked `.mcp.json` or `.env`, or a plan, task or workbench
   text about to be sent stops everything with exit 20 (`review`, `trust`, `push`, `pull`, `from`,
-  and `prompt`, which hands the prompt to a subagent): delete the literal, commit, and ROTATE the
+  and `prompt`, which hands the prompt to a subagent). Delete the literal, commit, and rotate the
   key. A committed copy that differs from the working tree is checked as HEAD has it, so a literal
   removed only locally still refuses until the removal is committed. Patterns after a
   `#@scope config` line (the JSON `"...Key": "..."` pair) apply to committed configuration only,

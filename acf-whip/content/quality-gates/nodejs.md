@@ -1,19 +1,21 @@
 # Quality Gates - Node.js
 
 For every Node.js project that is not Next.js: a plain CLI or library, Express, Fastify, NestJS,
-React or Vue, in JavaScript or TypeScript. Next.js projects use the Next.js/TypeScript gates.
+React or Vue, in JavaScript or TypeScript. Next.js projects use the Next.js/TypeScript gates. A task
+is not done until the gates under Quality Requirements pass.
 
 ## Zero Bypass Tolerance
 
-**ABSOLUTELY FORBIDDEN**: Bypassing quality gates is STRICTLY PROHIBITED. **NO EXCEPTIONS.**
+Never bypass a quality gate, for any reason. Fix the code until the gate passes, or report the task
+blocked under the Quality Gate Protocol below.
 
 ## The Rule: Gates Are the Project's Own Scripts
 
 The gates are the scripts in `package.json`. Run the ones the project defines. A gate the project
 has not defined is skipped, never invented: a plain project has no build step, no linter and no
 TypeScript, and a gate that demands one fails every task for a reason no task can fix.
-`npm run <name> --if-present` does exactly this. It runs the script when it exists and exits 0 when
-it does not.
+`npm run <name> --if-present` handles this. It runs the script when it exists and exits 0 when it
+does not.
 
 Adding a tool the project does not use (ESLint, TypeScript, a bundler, a test framework) is a
 decision for a task that says so, never a side effect of passing the gates.
@@ -63,8 +65,8 @@ Measure it with the runner the project already uses:
 | vitest | `npx vitest run --coverage` (needs `@vitest/coverage-v8`; thresholds: `test.coverage.thresholds`) |
 | mocha | `npx c8 mocha` (needs `c8`) |
 
-A coverage tool the project does not have is not installed to pass a gate. Report the coverage the
-existing runner can measure and say which tool is missing.
+Passing a gate is no reason to install a coverage tool the project lacks. Report the coverage the
+existing runner can measure, and name the tool that is missing.
 
 ## Code Standards
 
@@ -81,26 +83,35 @@ existing runner can measure and say which tool is missing.
 
 ## Pre-commit Hooks
 
-The installed `.pre-commit-config.yaml` enforces the gates on commit. Its hooks run only what the
-project has: `npm run lint|typecheck|build --if-present` on a commit that stages source or JSON,
-`npm test --if-present` on push (skipped while the script is still npm init's placeholder), and the
-project's own prettier only when `package.json` declares it. It never touches `docs/cycles/` (cycle
-records), `docs/acf/` (plugin-managed docs), `.backlog/` (task state) or `.acfwhip/` (config and the
-LP-CAS ledger): acf-whip commits those itself, and a hook that rewrites one fails that commit.
+The installed `.pre-commit-config.yaml` enforces the gates on commit and push. Its hooks run only
+what the project has:
 
-A frontend next to a Go or Python backend reads this doc too, but the installed config is the
-backend's and runs none of the npm hooks. There, run the gates above yourself before a task is complete.
+- `npm run lint|typecheck|build --if-present` on a commit that stages source or JSON
+- `npm test --if-present` on push, skipped while the script is still npm init's placeholder
+- the project's own prettier, when `package.json` declares it
+
+None of them fire until someone runs `pre-commit install`, plus
+`pre-commit install --hook-type pre-push` for the test hook.
+
+The config never touches `docs/cycles/` (cycle records), `docs/acf/` (plugin-managed docs),
+`.backlog/` (task state) or `.acfwhip/` (config and the LP-CAS ledger). acf-whip commits those
+itself, and a hook that rewrites one fails that commit.
+
+To run every hook by hand:
 
 ```bash
 pre-commit run --all-files
 ```
 
+A frontend next to a Go or Python backend reads this doc too. Its repo gets the backend's config,
+which runs none of the npm hooks, so run the gates above yourself before you mark a task complete.
+
 ## Quality Gate Protocol
 
 ### When Checks Fail
 
-1. **Attempts 1-10**: Fix actual issues
-2. **After 10 attempts**: Move task to blocked with failure report
+1. **Attempts 1-10**: fix the underlying problem, not the check, and rerun.
+2. **After 10 attempts**: stop and report the task blocked, with this report.
 
 ### Failure Report Format
 
@@ -130,7 +141,7 @@ pre-commit run --all-files
 
 ## Forbidden Bypass Methods
 
-**NEVER use**:
+Never use any of these:
 
 - `git commit --no-verify`
 - `git push --no-verify`
@@ -156,4 +167,4 @@ jobs:
       - run: npm run build --if-present
 ```
 
-Failed CI blocks merge. NO exceptions.
+A failed CI run blocks the merge, with no exceptions.

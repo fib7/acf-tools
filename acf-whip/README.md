@@ -1,14 +1,18 @@
-# ACF Whip - Hostile Workflow Enforcer
+# ACF Whip
 
-**Zero tolerance backlog automation from decomposition to acceptance with aggressive quality gates.**
+acf-whip is a Claude Code plugin that breaks a goal into tasks and has agents build them. `/task`
+splits the goal into small tasks with explicit dependencies. `/go` builds them in isolated git
+worktrees, one per worktree slug, runs your quality gates and a review that accepts or rejects, and
+by default lands accepted work on your local trunk. `/retro` closes the cycle and, when something
+went wrong, looks for the root cause. A risky goal gets a written plan first, and nothing is built
+until you approve it.
 
-**ACF (Agentic Continuous Flow)** is software development where humans govern intelligent agent swarms rather than write code directly. Whip automates the complete task lifecycle with zero tolerance for incomplete work.
+It also enforces a task-writing style and generates the specialist agents your stack needs. It is
+the backlog engine of **ACF (Agentic Continuous Flow)**, in which humans govern agent swarms and the
+agents write the code. It needs no other ACF plugin.
 
-Standalone ACF plugin that implements the complete cycle: plan approval, task decomposition, continuous execution, quality review, deliverable coverage, and retrospectives. Enforces strict task description style and generates specialist agents on demand.
-
-## Overview
-
-ACF Whip is a hostile workflow enforcer that automates the entire task lifecycle:
+The one command to remember is `/whip`. With no argument it prints where you are, what needs you,
+and the one command to run next, worked out from git and the task store on every call.
 
 ```
 /whip "<goal>" → small work: /task; risky work: a plan you approve with one yes
@@ -24,10 +28,8 @@ review → binary accept/reject (no partial credit)
 /retro → close the cycle; when something went wrong: root causes, one-rule lessons, action items you approve
 ```
 
-**Philosophy**: Zero tolerance for incomplete work. Binary outcomes. Evidence required. No shortcuts.
-
-The one command to remember is `/whip`. With no argument it prints where you are, what needs you,
-and the one command to run next, derived from git and the task store on every call.
+The rules are strict on purpose. A review either accepts a task or rejects it; there is no partial
+credit, and acceptance needs evidence. Gates are never skipped (see [Quality Gates](#quality-gates)).
 
 ---
 
@@ -43,11 +45,11 @@ and the one command to run next, derived from git and the task store on every ca
 | RETRO | `/retro [<cycle>]` | clean: `Status: closed`, zero agents; triggered: `retro.md`, up to 3 `docs/acf/lessons/<slug>.md`, a retro-actions cycle | **you**: action items become work only through the same approval card |
 | SHIP | yours: push, PR, merge | nothing | **you**, always: `/go` never pushes |
 
-**Two routes.** `/whip "<goal>"` picks one and says why. Small work is the default: it prints
-`NEXT /task "<goal>"` and runs exactly as before 3.5.0, with no plan. A goal that touches data, a
-schema or a migration; auth, secrets, payments or personal data; a breaking change to a public
-contract; three or more modules; or a new user flow gets a plan first, and so does
-`/whip plan <goal>`. The rubric lives once, in [`skills/whip/SKILL.md`](skills/whip/SKILL.md).
+**Two routes.** `/whip "<goal>"` picks one and tells you why. Small work is the default: it prints
+`NEXT /task "<goal>"` and runs as it did before 3.5.0, with no plan. A goal gets a plan first when it
+touches data, a schema or a migration; auth, secrets, payments or personal data; a public contract,
+in a breaking way; three or more modules; or a new user flow. `/whip plan <goal>` asks for a plan
+outright. The rubric lives in one place, [`skills/whip/SKILL.md`](skills/whip/SKILL.md).
 
 What a plan's approval card looks like (real output):
 
@@ -64,11 +66,11 @@ NEED YOU
 NEXT yes: approve docs/cycles/20260929-owner-seat-notice/plan.md (content=64075a203d34)
 ```
 
-Rules the engine enforces, so you do not have to:
+The engine enforces these, so you do not have to:
 
 - **Approval binds bytes.** It holds only while `record.md`'s `Approved Content`, the newest
   `approved` row and the hash of `plan.md` agree at HEAD. Edit the plan after "yes" and `/whip`
-  says "amended since approval"; the approved text keeps building, the edit never builds unapproved.
+  says "amended since approval". The approved text keeps building; your edit waits for its own card.
 - **D-ids are permanent once a task names them.** New work takes the next number. To drop a
   deliverable, keep its heading and archive its tasks: it shows as cancelled.
 - **Imports are copies.** `/whip <file.md>` never writes the source file (superpowers, spec-kit,
@@ -93,16 +95,17 @@ Cards you may meet:
   reached trunk. On `files`, `/whip-move <stem> accepted --integrated-at <sha>` clears it. On other
   stores, write the ledger marker by hand ("Clearing accepted-branchless-unverified" in
   `docs/acf/backlog/recovery-runbook.md`), or `/whip-move <stem> pending` to build it again.
-- **A decomposition lock** is evidence that a `/task --plan` started, not proof it still runs. It
-  expires after 30 minutes, and the card prints its age and the one `rm` that clears it sooner.
+- **A decomposition lock** shows that a `/task --plan` started. It does not prove the run is still
+  alive. The lock expires after 30 minutes, and the card prints its age and the one `rm` that clears
+  it sooner.
 
 ---
 
 ## Spec tools (reviewers and workbenches)
 
 A spec tool reviews a plan before you approve it, reviews the tasks `/task` writes (free text or
-`--plan`), or lets you edit the plan somewhere else and merge it back. You plug one in with one committed file
-in `.acfwhip/spec-tools/`; acf-whip itself names no tool. The smallest is a grep:
+`--plan`), or lets you edit the plan somewhere else and merge it back. You add one with a single
+committed file in `.acfwhip/spec-tools/`; the engine itself names no tool. The smallest is a grep:
 
 ```
 # .acfwhip/spec-tools/no-tbd: refuse plans and tasks that still say TBD, TODO or FIXME
@@ -122,23 +125,32 @@ GapTrap (hosted spec gap analysis) is the worked example of a paid, remote tool
 2. `/whip --tools add gaptrap`: a free probe shows the verbs, egress host and cost, then commits it.
 3. `/whip "<goal>"`: the card shows GapTrap's verdict, findings F1..F8 and questions.
 
-Hook points: before every approval card (`at=plan`), inside `/task` (free text or `--plan`) before
-tasks are written (`at=task`; a task a `block` tool still rejects is held in draft), at approval
-(`policy=block` needs GO on those exact bytes, or your reply `yes, override <tool>`), and on
-`/whip --push` / `--pull` for a workbench. **Never in `/go`**: the spec is frozen at approval, and a false positive there would
-cost a task one of its three lives. A tool that cannot run never blocks. Full guide:
-[`spec-tools/README.md`](spec-tools/README.md); protocol: [`spec-tools/CONTRACT.md`](spec-tools/CONTRACT.md).
+Hook points: before every approval card (`at=plan`); inside `/task`, free text or `--plan`, before
+tasks are written (`at=task`; a task a `block` tool still rejects is held in draft); at approval
+(`policy=block` needs GO on those exact bytes, or your reply `yes, override <tool>`); and on
+`/whip --push` / `--pull` for a workbench. **Never in `/go`**: the spec is frozen at approval, and a
+false positive there would cost a task one of its three lives. A tool that cannot run never blocks.
+Full guide: [`spec-tools/README.md`](spec-tools/README.md); protocol:
+[`spec-tools/CONTRACT.md`](spec-tools/CONTRACT.md).
 
 ---
 
 ## Features
 
-### 🎯 A bare `/go` runs YOUR tasks (3.4.0)
+### Continuous execution
+
+`/go` loops until every task in its scope is accepted or blocked. Each iteration processes every
+state transition and runs independent tasks in parallel, one specialist per worktree slug. A task
+waits for its dependencies: a same-slug dependency must be accepted, a cross-slug one integrated.
+Accepted work is integrated into your local trunk, and a specialist resolves any conflict. You are
+not needed until the work is done or the loop stops making progress.
+
+### Scope: a bare `/go` runs your tasks (3.2.3, 3.4.0)
 
 `/task` points this checkout's **focus** at the tasks it just created, and a bare `/go` runs the
-focus. The ordinary path — plan → `/task` → `/go` — needs no arguments and still runs only your own
-work. `/whip-focus` manages the list by hand; it is gitignored per-checkout state, so two people on
-one board have two focuses.
+focus. The usual path (plan, then `/task`, then `/go`) takes no arguments and still runs only your
+own work. `/whip-focus` edits the focus by hand. It is gitignored, per-checkout state: two people
+on one board have two focuses.
 
 ```
 /go                              your focus
@@ -148,130 +160,17 @@ one board have two focuses.
 /whip-move <task> draft          pause it   (archive = cancel) — on every backend
 ```
 
-With no focus set, a bare `/go` drains the backlog on the `files` store (unchanged) and **refuses**
-on a shared API-backed board, naming the three ways forward. One person's bare `/go` should never be
-everyone's.
+Named tasks run with their unmet dependencies, and nothing outside the scope is dispatched,
+transitioned or integrated, so `/go` is usable on a backlog a whole team shares. With no focus set,
+a bare `/go` drains the backlog on the `files` store and **refuses** on a shared API-backed board:
+one person's bare `/go` should never run everyone's work. Details are under `/go` in the
+[Commands Reference](#commands-reference).
 
-### 📦 The snapshot is narrowed in the store, and verified on arrival (3.4.0)
+### Integration: local by default, PR-per-task if you pin it
 
-`/go`'s scan agent relays the store walk into the orchestrator. On a large board that relay could come
-back short — valid JSON, fewer tasks — and the run would report the ids it was given as nonexistent.
-Now `--only` emits just the **closure** of the named tasks (seeds plus their unmet dependencies), a
-real `--digest` collapses finished work on **every** backend rather than only `files`, and every
-snapshot carries a `relay` header the orchestrator recomputes. A short relay stops the run as
-`relay-truncated` with the honest remedy; it is never reported as a missing id.
-
-### 🩹 One malformed card no longer blocks the team (3.4.0)
-
-An integrity FATAL used to stop the run. Now only **repo-scoped** ones do (detached HEAD, a worktree
-on the wrong branch, an unreadable store). A **task-scoped** finding holds out that one task — never
-dispatched, never integrated, still gating its dependents — and the rest of the board runs. The run
-reports `partial`, never `complete`, and `heldOut[]` names what it refused to touch and why.
-
-### 💸 Agents route by tier, and the run says what it spent (3.4.0)
-
-Fixed-command shell runners (scan, writers, integrate, doctor) run on a cheap model; specialists and
-reviewers run on the model the project declared in `.claude/agents/<name>.md`; the architect and the
-conflict resolver stay on the session model. Pin it once per repo (`ACFW_MODEL_SHELL`, `_JUDGE`,
-`_AUTHOR`). Every run reports `models` and `agentsByTier`.
-
-### 🔥 Hostile Task Style Enforcement
-
-**MANDATORY compliance** with `docs/acf/style/task-descriptions.md`:
-- Binary language only ("API validates token" NOT "improve validation")
-- WHAT/WHY specification, NEVER HOW (specialists decide implementation)
-- Max 2-3 line code snippets (signatures only, NO implementations)
-- Banned words: comprehensive, robust, elegant, enhance, optimize
-
-**Violations = Immediate rejection**
-
-### ⚡ Workflow-native orchestration (2.0.0)
-
-When dynamic workflows are available (Claude Code ≥ 2.1.154), `/task` and `/go` run as **dynamic workflows** (`workflows/whip-task.workflow.js`, `workflows/whip-go.workflow.js`):
-
-- **Flat context**: the loop, slug partition, dependency gate, and topological integration order run inside a deterministic script — intermediate state lives in script variables, not Claude's context — so context stays flat no matter how many tasks/iterations. (This is the fix for the old "stop work to dump history" problem.)
-- **Schema-enforced worktree slugs**: `/task`'s planner cannot omit a slug; a JS validation gate (kebab-case, slug ≠ id, acyclic deps, unique ids) runs before any file is written; the doctor REPAIRS a missing slug on an active task by deriving one from the id, and FATALs only when two ids derive the same slug (`duplicate-derived-slug`) or there is no id to derive one from.
-- **Integrity-gated**: the doctor runs as a hard gate at startup and a recheck every iteration.
-- **Automatic fallback**: if dynamic workflows are off, both commands fall back to the legacy single-context loop (same behavior, byte-compatible).
-
-### 🔌 Pluggable task stores (3.1.0)
-
-Task state lives behind an **executable adapter contract** (`adapters/CONTRACT.md`, contract v1).
-The `acfw-store` dispatcher resolves the configured backend and routes every read/write —
-`snapshot`, `transition`, `read`, `create`, `doctor` — to its adapter:
-
-| Backend | State lives in | Select with |
-|---|---|---|
-| `files` (default) | `.backlog/<state>/*.md` committed on trunk | nothing — zero-config default |
-| `beads` | [beads](https://github.com/gastownhall/beads) (`bd`, embedded Dolt) | `ACFW_STORE=beads` in `.acfwhip/config` |
-| `multica` | [multica](https://github.com/multica-ai/multica) server | `ACFW_STORE=multica` + `MULTICA_*` env |
-| `linear` | [Linear](https://linear.app) issues (attachment metadata) | `ACFW_STORE=linear` + `LINEAR_API_KEY`/`ACFW_LINEAR_TEAM` env |
-
-- **Zero migration**: existing `.backlog/` projects run unchanged; `files` behavior is byte-identical to 3.0.x.
-- **Third-party backends without forking**: drop one executable at `.acfwhip/adapters/acfw-store-<name>`, set `ACFW_STORE=<name>`, pass the conformance test (`ADAPTER=<path> bash tests/phase9-store-conformance.test.sh`). Contract, discovery order, JSON shapes and exit codes: `adapters/CONTRACT.md`; architecture, dispatcher mechanics, and an authoring walkthrough: `adapters/README.md`.
-- **What never moves into a backend**: the LP-CAS integration ledger (`.acfwhip/integrated/` in the git tree) — integration truth stays git-native on every store.
-
-### 🧬 Per-task child workflows (3.2.0)
-
-Every dispatched unit runs as its **own nested workflow**, not a single `agent()` call. A
-**workflow-architect** authors that harness for the specific task by filling four marked regions of a
-locked, byte-diffed skeleton (`skills/lib/child-skeleton.js.tmpl`); a 20-check validator rejects a
-defective harness *before* any child agent spawns. The default harness is deliberately shallow —
-checkout → implement → bounded gate loop → adversarial diff review → verify — holding the only three
-mechanisms a script structurally buys over one strong agent: a schema-*observed* advance condition, a
-fresh-context reviewer of the diff, and a durable stage ledger that survives the script throwing.
-
-- **Escalation is a policy, not a guarantee**: the runtime caps total agents per run, so `/go`
-  degrades FULL → LEAN → DIRECT → CLOSE back to verbatim 3.1.0 single-agent dispatch, and the report
-  says which one you got (`escalation{}`, `agentsUsed`/`agentCap`).
-- **Tunable**: `escalate` (default on — set false to revert to 3.1.0 dispatch; reach for this first
-  if a run looks hung), `escalateReview` (default **off**, the only subtractive seam), `maxAmend`,
-  `agentBudget`, `agentCap`, `shellModel`.
-
-### 🎯 Scoped runs (3.2.3)
-
-`/go` is no longer all-or-nothing. `/go api-014-token-refresh ui-021-login-form` runs exactly those tasks plus their
-unmet dependencies; `/go frontend tasks only` or `/go bugfixes` resolves a natural-language filter
-against the backlog once, before launch, and confirms the matched list with you. Nothing outside the
-scope is dispatched, transitioned or integrated — which is what makes `/go` usable on a backlog a
-whole team shares. See `/go` under Commands Reference.
-
-### 🧪 Every backend under the contract suite, offline (3.3.0)
-
-`tests/phase9-store-conformance.test.sh` is the contract's executable spec, and it used to run only
-against the default `files` adapter — the three others skipped unless a live server was reachable, and
-the runner counted a skip as a pass. So the API backends were green by absence, and a whole class of
-defect was invisible until a user hit it: a snapshot field answered for one task state, an inert card
-raised to a gate FATAL, a network timeout written into a rejection counter.
-
-The multica suite now drives the real adapter through an offline fake of its CLI — injected at the
-`ACFW_MULTICA_BIN` seam every call already funnels through — and runs the frozen spec with no server,
-no credentials and no skip, with fault injection so the transient paths are exercised deliberately.
-Writing an adapter for your own backend? `ADAPTER=<path> bash tests/phase9-store-conformance.test.sh`
-is the whole acceptance criterion, and `tests/phase9-adapter-multica.test.sh` is a worked example of
-testing one without a backend to talk to.
-
-### 🔁 Installed docs that stay current (3.3.0)
-
-The plugin installs a few documents into your project (`docs/acf/backlog/workflow.md` and friends).
-Those used to be copied once and never touched again, so a correction made here never reached a
-project that already had the file. Now an **unedited** copy refreshes itself — recognised by content,
-so it works on projects that predate the mechanism — and an **edited** one is never overwritten: the
-session tells you it is behind and leaves the merge to you.
-
-### 🔄 Continuous Backlog Execution
-
-`/go` loops until 100% complete — or, when scoped, until every task in the scope is terminal:
-- Processes ALL state transitions each iteration
-- Parallel agent spawning for independent tasks (one specialist per worktree slug)
-- Dependency-gated dispatch (same-slug needs accepted; cross-slug needs integrated)
-- Autonomous integration into local trunk with specialist-driven conflict resolution
-- Exits only when all tasks in terminal states (accepted/blocked)
-- No manual intervention needed
-
-**Protected trunk / PR-per-task teams**: integration is automatic and **local** by default — accepted
-work is cherry-picked onto your local trunk, nothing is pushed and no PR is opened. If merges must go
-through review, pin the mode so it never depends on a per-run judgement:
+Integration is automatic and **local** by default: accepted work is cherry-picked onto your local
+trunk, nothing is pushed, and no PR is opened. If merges must go through review (a protected trunk,
+or a team that works PR by PR), pin the mode so it never depends on a per-run judgement.
 
 Set it in the config file your repo already has, and change the existing line if there is one
 (`/whip-init` pins `default` in new projects): `.backlog/.acfw-config` on the files store,
@@ -283,34 +182,139 @@ file.
 ACFW_INTEGRATION_MODE=override    # committed; travels with the repo
 ```
 
-`/go` then stops at `accepted`, writes no ledger marker, and keeps each `worktree/<slug>` branch alive
-for you to push and open PRs from; dependency ordering becomes yours. It does not push or call `gh` —
-that stays your call. Left unpinned, `/go` decides each run by reading `CLAUDE.md`. Note `.backlog/`
-state transitions are committed on trunk in **both** modes; use a non-files task store (below) if
-trunk must stay free of bookkeeping commits. Details: `skills/go/SKILL.md` § Integration mode.
+`/go` then stops at `accepted`, writes no ledger marker, and keeps each `worktree/<slug>` branch
+alive for you to push and open PRs from. Dependency ordering becomes your job. `/go` still never
+pushes or calls `gh`. Left unpinned, `/go` decides the mode on each run by reading `CLAUDE.md`.
 
-### 🩺 Backlog Integrity Doctor
+`.backlog/` state transitions are committed on trunk in **both** modes. If trunk must stay free of
+bookkeeping commits, use a non-files task store (below). Details: `skills/go/SKILL.md` §
+Integration mode.
 
-`/whip-doctor [--fix]` is the integrity battery (~20 invariants across FATAL/REPAIRABLE/WARN): status-vs-folder mismatch, missing/empty worktree slug, unknown agent, dangling/cyclic deps, cross-slug dependent dispatched before integration, orphaned worktrees, stale in-progress, and more. It runs automatically as a `/go` startup gate and per-iteration recheck, and at `/task` create-time.
+### Per-task child workflows (3.2.0)
 
-### 📦 Worktree Env Hydration
+Each dispatched task runs as its **own nested workflow**, not a single `agent()` call. A
+**workflow-architect** agent writes the harness for that task by filling four marked regions of a
+locked, byte-diffed skeleton (`skills/lib/child-skeleton.js.tmpl`), and a 20-check validator rejects
+a defective harness *before* any child agent starts.
 
-A committed `.worktreeinclude` manifest lists git-ignored files (`.env`, `node_modules`, `.venv`, local config) to copy/symlink into each fresh `.worktree/<slug>` so specialists run a full dev/test sandbox. Allowlist-only with a hard secret denylist (refuses to symlink `.env*`/`*.pem`/`*.key`/`id_*`/`credentials*`/`*.p12`, requires every entry to be git-ignored, treats a tracked path as an error).
+The default harness is shallow on purpose: checkout, implement, a bounded gate loop, an adversarial
+review of the diff, verify. It keeps the three things a script gives you that one strong agent
+cannot: an advance condition the script checks against a schema instead of taking an agent's word
+for it, a reviewer who reads the diff with fresh context, and a stage ledger that survives the
+script throwing.
 
-### 🤖 Agent + Manifest Generator
+- **Escalation is best effort.** The runtime caps the number of agents per run, so `/go` steps down
+  FULL → LEAN → DIRECT → CLOSE as the budget runs out, falling back to unchanged 3.1.0 single-agent
+  dispatch at the lower levels. The report says which level you got (`escalation{}`,
+  `agentsUsed`/`agentCap`).
+- **Tunable**: `escalate` (default on; set it false to go back to 3.1.0 dispatch, and try this first
+  if a run looks hung), `escalateReview` (default **off**; it turns on the multi-lens review panel,
+  the one escalation that can reject work that would otherwise ship), `maxAmend`, `agentBudget`,
+  `agentCap`, `shellModel`.
 
-`/whip-add-agents` creates specialist agents on demand:
-- **Analyzes repository**: Tech stack detection, complexity assessment
-- **Creates TWO files per agent**:
-  - `.claude/agents/{agent}.md` (implementation, core instructions)
-  - `docs/agents/{agent}.md` (manifest with Priority 1/2/3 docs, 58-74% token reduction)
-- **Generates quality gates**: Stack-specific documentation if missing
-- **Updates configuration**: `.backlog/README.md`, `CLAUDE.md`
-- **User args override auto-detection**: `--backend=go --frontend=react`
+### Workflow-native orchestration (2.0.0)
 
-### 📋 State Machine
+When dynamic workflows are available (Claude Code ≥ 2.1.154), `/task` and `/go` run as **dynamic
+workflows** (`workflows/whip-task.workflow.js`, `workflows/whip-go.workflow.js`):
 
-User-specified custom flow:
+- **Flat context.** The loop, slug partition, dependency gate and topological integration order run
+  in a deterministic script. Intermediate state lives in script variables rather than in Claude's
+  context, so the context stays flat however many tasks and iterations a run takes. This is what
+  ended the old "stop work to dump history" problem.
+- **Slugs enforced by schema.** `/task`'s planner cannot omit a worktree slug, and a JS validation
+  gate (kebab-case, slug ≠ id, acyclic deps, unique ids) runs before any file is written. The doctor
+  repairs a missing slug on an active task by deriving one from the id. It raises a FATAL only when
+  two ids derive the same slug (`duplicate-derived-slug`) or there is no id to derive one from.
+- **Integrity gate.** The doctor gates startup and rechecks every iteration.
+- **Fallback.** If dynamic workflows are off, both commands fall back to the legacy single-context
+  loop (same behavior, byte-compatible).
+
+### Integrity doctor, and one bad card holds out one task (3.4.0)
+
+`/whip-doctor [--fix]` checks about 20 invariants (listed under `/whip-doctor` below) and reports
+each finding as FATAL, REPAIRABLE or WARN. It runs as `/go`'s startup gate and per-iteration
+recheck, and when `/task` creates tasks.
+
+Only a **repo-scoped** FATAL stops the run: a detached HEAD, a worktree on the wrong branch, an
+unreadable store. A **task-scoped** finding holds out that one task and lets the rest of the board
+run; before 3.4.0, one malformed card could block a whole team. The held task is never dispatched
+and never integrated, and it still gates its dependents. A run that held something out reports
+`partial`, never `complete`, and `heldOut[]` names each task it refused to touch and why.
+
+### The snapshot is narrowed in the store and verified on arrival (3.4.0)
+
+`/go`'s scan agent relays the store walk to the orchestrator. On a large board that relay could come
+back short, as valid JSON with fewer tasks, and the run then reported the ids it was given as
+nonexistent. Now `--only` emits only the **closure** of the named tasks (the seeds plus their unmet
+dependencies), a real `--digest` collapses finished work on **every** backend instead of only
+`files`, and every snapshot carries a `relay` header that the orchestrator recomputes. A short relay
+stops the run as `relay-truncated`, with the actual remedy. It is never reported as a missing id.
+
+### Agents route by tier, and the run says what it spent (3.4.0)
+
+Agents run on the model their job needs:
+
+| Agents | Model |
+|---|---|
+| Shell runners that run a fixed command and copy its output (scan, writers, integrate, doctor) | a cheap model (`ACFW_MODEL_SHELL`, default `haiku`) |
+| `/task` planners, the judge, the critic | the session model, unless `ACFW_MODEL_JUDGE` pins one |
+| `/task` task-document authors | the session model, unless `ACFW_MODEL_AUTHOR` pins one |
+| Specialists and reviewers | the `model:` the project declared in `.claude/agents/<name>.md` |
+| The architect and the conflict resolver | always the session model |
+
+Pin the tiers once per repo (`ACFW_MODEL_SHELL`, `_JUDGE`, `_AUTHOR`) in the config file your repo
+already has, as under Integration above: `.backlog/.acfw-config` on the files store,
+`.acfwhip/config` on the others. Every run reports `models` and `agentsByTier`.
+
+### Pluggable task stores (3.1.0)
+
+Task state lives behind an **executable adapter contract** (`adapters/CONTRACT.md`, contract v1).
+The `acfw-store` dispatcher resolves the configured backend and routes every read and write
+(`snapshot`, `transition`, `read`, `create`, `doctor`) to its adapter:
+
+| Backend | State lives in | Select with |
+|---|---|---|
+| `files` (default) | `.backlog/<state>/*.md` committed on trunk | nothing: it is the zero-config default |
+| `beads` | [beads](https://github.com/gastownhall/beads) (`bd`, embedded Dolt) | `ACFW_STORE=beads` in `.acfwhip/config` |
+| `multica` | [multica](https://github.com/multica-ai/multica) server | `ACFW_STORE=multica` + `MULTICA_*` env |
+| `linear` | [Linear](https://linear.app) issues (attachment metadata) | `ACFW_STORE=linear` + `LINEAR_API_KEY`/`ACFW_LINEAR_TEAM` env |
+
+- **No migration.** Existing `.backlog/` projects run unchanged; `files` behaves byte for byte as it
+  did in 3.0.x.
+- **Your own backend, no fork.** Drop one executable at `.acfwhip/adapters/acfw-store-<name>`, set
+  `ACFW_STORE=<name>`, and pass the conformance test
+  (`ADAPTER=<path> bash tests/phase9-store-conformance.test.sh`). The contract, discovery order,
+  JSON shapes and exit codes are in `adapters/CONTRACT.md`; the architecture, dispatcher mechanics
+  and an authoring walkthrough are in `adapters/README.md`.
+- **What never moves into a backend**: the LP-CAS integration ledger (`.acfwhip/integrated/` in the
+  git tree). Integration truth stays in git on every store.
+
+### Every backend under the contract suite, offline (3.3.0)
+
+`tests/phase9-store-conformance.test.sh` is the contract's executable spec. Before 3.3.0 only
+`files` ran it: the other three skipped without a live server, and the runner counted a skip as a
+pass. The API backends were green by absence, and their defects stayed hidden until a user hit
+one: a snapshot field answered for one task state, an inert card raised to a gate FATAL, a network
+timeout written into a rejection counter.
+
+The multica suite now drives the real adapter through an offline fake of its CLI, injected at the
+`ACFW_MULTICA_BIN` seam that every call already goes through. It runs the frozen spec with no
+server, credentials or skip. Fault injection covers the transient paths.
+
+To accept an adapter for your own backend, run
+`ADAPTER=<path> bash tests/phase9-store-conformance.test.sh`; that is the whole test.
+`tests/phase9-adapter-multica.test.sh` shows how to test an adapter with no backend to talk to.
+
+### Worktree env hydration
+
+A committed `.worktreeinclude` manifest lists the git-ignored files (`.env`, `node_modules`,
+`.venv`, local config) to copy or symlink into each fresh `.worktree/<slug>`, so a specialist can
+run the full dev and test setup. Nothing outside the list is touched. Every entry must be
+git-ignored, and a tracked path is an error. A secret-shaped path (`.env*`, `*.pem`, `*.key`,
+`id_*`, `credentials*`, `*.p12`) is never symlinked: a link entry for one becomes a copy with group
+and other permissions removed.
+
+### State machine
 
 ```
 pending → in-progress → completed → in-review → [accepted | rejected]
@@ -318,53 +322,75 @@ pending → in-progress → completed → in-review → [accepted | rejected]
          blocked                                    pending (retry)
 ```
 
-**Terminal states**: `accepted` (success), `blocked` (failure after 3 retries or unresolvable)
+**Terminal states**: `accepted` (success) and `blocked` (failed after 3 retries, or cannot be
+resolved). `draft` (paused) and `archive` (cancelled) sit outside the loop; `/whip-move` puts a task
+there.
 
-### 🪝 SessionStart Hook
+### Task style enforcement
 
-**Passive documentation setup** (runs automatically on every session):
-- Installs the plugin-owned documents it does not find: `task-descriptions.md` into
+Every task must follow `docs/acf/style/task-descriptions.md`:
+
+- binary, testable statements ("API validates token", not "improve validation")
+- what and why, never how: the specialist decides the implementation
+- code snippets of 2-3 lines at most, signatures only, never implementations
+- none of the banned words (comprehensive, robust, elegant, enhance, optimize and others)
+
+`/task` checks every task against the guide and revises any that fail before it writes them. The
+rules are summarized under [Task Description Style Guide](#task-description-style-guide).
+
+### Agent and manifest generator
+
+`/whip-add-agents` creates the specialist agents your project is missing:
+
+- **Reads the repository**: detects the tech stack and assesses its complexity.
+- **Writes two files per agent**: `.claude/agents/{agent}.md` with the agent's core instructions,
+  and `docs/agents/{agent}.md`, a manifest that ranks the docs the agent should read (Priority
+  1/2/3).
+- **Writes a quality-gate doc** for the stack if there is none.
+- **Updates** `.backlog/README.md`, and `CLAUDE.md` if the project has one.
+- **Takes flags over detection**: `--backend=go --frontend=react`.
+
+### SessionStart hook and installed docs (3.3.0)
+
+On every session start the hook:
+
+- installs any plugin-owned document it does not find: `task-descriptions.md` into
   `docs/acf/style/`, and `task-template.md`, `workflow.md` and `recovery-runbook.md` into
   `docs/acf/backlog/`
-- **Refreshes** a copy it already installed when that copy is unedited — recognised by content
-  digest (`content/.digests.json`), not by a version stamp the copy may predate. An edited copy is
-  never overwritten; it is reported as behind so you can merge what you want
-- Injects style guide into session context for enforcement
+- **refreshes** a copy it installed earlier when that copy is unedited. It recognizes an unedited
+  copy by content digest (`content/.digests.json`), not by a version stamp the copy may predate, so
+  this works on projects older than the mechanism. An edited copy is never overwritten; the hook
+  reports it as behind so you can merge what you want
+- injects the style guide into the session context
 
-⚠️ **SessionStart hook does NOT create `.backlog/` structure or install agents.** Run `/whip-init` for complete initialization.
+⚠️ **The hook does not create the `.backlog/` structure or install agents.** Run `/whip-init` for
+that.
 
-### 🚀 Pure Delegation Enforcement
+### CLAUDE.md delegation section
 
-`/whip-init` adds **Pure Delegation Architecture** section to `CLAUDE.md` (if exists):
-- **CRITICAL RULE**: General-purpose agent CANNOT modify code directly
-- **Orchestration ONLY**: Task decomposition, coordination, quality gates
-- **Agent Matrix**: Up-to-date table of all agents with specializations
-- **Delegation Protocol**: 5-step process ensuring specialists handle implementation
-- **Enforcement**: Pre-tool-use hook validates (conceptual - not yet implemented)
-- **Result**: 3x+ speedup through parallel specialist execution
+`/whip-init` adds a **Pure Delegation Architecture** section to `CLAUDE.md`, and creates a minimal
+`CLAUDE.md` first if the project has none. The rule it states: the general-purpose agent never
+modifies code. It decomposes, coordinates and enforces gates; specialists implement. The section
+also carries an up-to-date matrix of your agents and a 5-step delegation protocol. It mentions a
+pre-tool-use hook that validates who edits code, which is not implemented yet, and claims a 3x+
+speedup from running specialists in parallel, which nothing in the plugin measures.
 
-**Matrix Example**:
+The matrix looks like this:
+
 | Domain | Agent | Responsibilities |
 |--------|-------|------------------|
 | Core | task-engineer | Task decomposition (WHAT/WHY only) |
 | Backend | go-engineer | Go implementation |
 | Infrastructure | devops | Docker, K8s, CI/CD, monitoring |
 
-### 📚 docs/README.md Support
+### docs/README.md as a documentation index
 
-If your project has a `docs/README.md` file, acf-whip agents will read it to discover documentation instead of blind directory scanning.
+When `/whip-init` and `/whip-add-agents` build agent manifests, they read `docs/README.md`, if you
+have one, to find your documentation. Without it they scan the standard directories
+(`docs/architecture/`, `docs/operations/`, and so on). An index lets them find docs outside those
+directories, and lets you decide what is listed and what comes first. It needs no special format.
 
-**How it works**:
-- `/whip-init` checks for `docs/README.md`
-- If exists: Agents read it to understand what documentation is available
-- If missing: Agents scan standard directories (`docs/architecture/`, `docs/operations/`, etc.)
-
-**Benefits**:
-- Agents discover ALL documentation (not just standard directories)
-- You control what's documented and prioritized
-- Natural language index (no special format required)
-
-**Simple example** `docs/README.md`:
+A simple `docs/README.md`:
 ```markdown
 # Project Documentation
 
@@ -376,15 +402,13 @@ If your project has a `docs/README.md` file, acf-whip agents will read it to dis
 - [API Development](./guides/api-development.md) - Building APIs
 ```
 
-**Template**: See `content/templates/docs-readme-template.md` for a starting point.
+A starting point is in `content/templates/docs-readme-template.md`.
 
-### 🔍 Gap Analysis on Re-Init
+### Gap analysis on re-init
 
-Running `/whip-init` on existing project performs **non-destructive gap detection**:
-- **Checks**: Universal agents, manifests, core docs, quality gates, CLAUDE.md sections
-- **Reports**: Missing artifacts with actionable recommendations
-- **Never overwrites**: Existing files preserved, gaps highlighted
-- **Example output**:
+Run `/whip-init` again on a project that already has acf-whip and it reports what is missing
+(universal agents, manifests, core docs, quality gates, CLAUDE.md sections) with a fix for each. It
+never overwrites an existing file. Example output:
 ```
 ⚠️  Gap Analysis: Missing ACF Artifacts
 
@@ -433,14 +457,15 @@ Running `/whip-init` on existing project performs **non-destructive gap detectio
 # Start a session in your project
 # You should see:
 ```
+```
 # ACF Task Description Style Guide (Enforcement Active)
 
 The following style guide is MANDATORY for all task descriptions...
 ```
 
-This confirms SessionStart hook is active.
+That confirms the SessionStart hook is active.
 
-**Debug if not working:**
+**If it does not appear:**
 ```bash
 # Enable debug mode to see plugin loading
 claude --debug
@@ -454,7 +479,9 @@ claude plugin validate .
 
 ## Quick Start
 
-⚠️ **REQUIRED FIRST STEP**: You MUST run `/whip-init` after plugin installation to create the `.backlog/` structure, install agents, and configure quality gates. The SessionStart hook alone does NOT perform complete initialization.
+⚠️ **Run `/whip-init` first**, right after installing. It creates the task store (`.backlog/` on
+the default `files` store), installs the agents and configures quality gates. The SessionStart hook
+does none of that.
 
 ### 1. Initialize Backlog Workflow
 
@@ -463,15 +490,16 @@ claude plugin validate .
 ```
 
 **What it does**:
-- Detects tech stack (Go, Python, Node.js, React, Next.js, K8s, Docker, CI/CD, etc.)
-- Detects infrastructure (Docker, Kubernetes, GitHub Actions, monitoring)
-- Creates `.backlog/` structure (9 state folders)
-- **Generates 6-7 universal agents** to `.claude/agents/` (customized from patterns, devops optional)
+- Detects the tech stack (Go, Python, Node.js, React, Next.js, K8s, Docker, CI/CD and others) and
+  the infrastructure (Docker, Kubernetes, GitHub Actions, monitoring)
+- Creates the `.backlog/` structure, 9 state folders (on the `files` store)
+- **Generates 7 universal agents** into `.claude/agents/`, customized from patterns, plus `devops`
+  when it finds infrastructure and you accept it
 - Configures quality gates (`.pre-commit-config.yaml`)
 - Generates `.backlog/README.md`
-- **Deep manifest customization**: Analyzes existing `docs/` for Priority 1/2/3 references
-- **CLAUDE.md Pure Delegation enforcement**: Adds delegation rules + agent matrix (if CLAUDE.md exists)
-- **Gap analysis**: Non-destructive detection of missing artifacts on re-init
+- **Builds agent manifests** from your existing `docs/` (Priority 1/2/3 references)
+- **Adds delegation rules and an agent matrix to `CLAUDE.md`**, creating the file if needed
+- **On a re-run**, reports missing artifacts and overwrites nothing
 
 **Output**:
 ```
@@ -517,12 +545,11 @@ Next Steps: Run /whip-add-agents
 ```
 
 **What it does**:
-- Analyzes repository structure
-- Detects missing specialist agents
-- Creates `.claude/agents/{agent}.md` (implementation)
-- Creates `docs/agents/{agent}.md` (manifest with Priority 1/2/3 docs)
-- Generates quality gate docs (if missing)
-- Updates `.backlog/README.md` with new agents
+- Reads the repository structure and finds the specialist agents you are missing
+- Creates `.claude/agents/{agent}.md` (implementation) and `docs/agents/{agent}.md` (manifest with
+  Priority 1/2/3 docs) for each
+- Generates quality gate docs if you have none
+- Adds the new agents to `.backlog/README.md`
 
 **Output**:
 ```
@@ -550,12 +577,13 @@ Not sure whether the work needs a plan? Run `/whip "<goal>"` instead. For small 
 approval card, and your "yes" starts `/task --plan` itself. See [The cycle](#the-cycle-350).
 
 **What it does**:
-- Reads `docs/acf/style/task-descriptions.md` (style enforcement)
-- Minimal research (Perplexity, Context7, Figma if applicable)
-- Decomposes scope into atomic tasks (WHAT/WHY only)
-- Validates against style guide
+- Reads `docs/acf/style/task-descriptions.md`
+- Does light research, only to understand the scope (Perplexity, plus Context7 and Figma when they
+  apply)
+- Decomposes the scope into atomic tasks (WHAT/WHY only)
+- Checks each task against the style guide
 - Spawns task-engineer agents in parallel
-- Creates tasks in `.backlog/pending/`
+- Creates the tasks as pending (`.backlog/pending/` on `files`)
 
 **Output**:
 ```
@@ -580,15 +608,10 @@ Next step: Run /go
 /go
 ```
 
-**What it does**:
-- Loops until 100% tasks in terminal states
-- Each iteration:
-  1. Quality gate auto-fix
-  2. Scan ALL states
-  3. Process ALL transitions
-  4. Spawn agents in parallel
-  5. Check completion
-- Exits when all tasks accepted/blocked OR intervention needed
+**What it does**: loops until every task in the run is accepted or blocked. Each iteration scans
+every state, processes the transitions, dispatches agents in parallel (one per free worktree slug),
+integrates newly accepted work and checks for completion. It stops when everything is terminal, or
+when it stalls and needs you.
 
 **Output**:
 ```
@@ -622,14 +645,10 @@ Next step: Run /go
 /retro     # the cycle /whip names
 ```
 
-**What it does**:
-- A clean cycle closes with one script call and zero agents
-- When a task was reworked or stuck, or a deliverable is not met, the retro agent finds root causes (Five Whys) and writes docs/cycles/<ID>/retro.md, at most 3 one-rule lessons in docs/acf/lessons/, and a retro-actions cycle you approve like any plan
-- It never creates tasks, edits agent files, or deletes a lesson itself
-
-Work done without a plan has no cycle to close: `/retro --force <task>...` analyzes it (name no
-tasks and it reads your `/go` focus) and writes `docs/retrospectives/YYYYMMDD-<slug>.md` and its
-lessons for you to commit.
+A clean cycle closes with one script call. If a task was reworked or stuck, or a deliverable was
+missed, the retro agent writes the root causes, up to 3 lessons and a retro-actions cycle for you
+to approve; `/retro` in the Commands Reference has the details. Work done without a plan has no
+cycle to close: use `/retro --force <task>...`.
 
 ---
 
@@ -642,8 +661,8 @@ and `whip-go` / `whip-task` are the workflow engines behind `/go` and `/task`.
 
 ### /whip - Where you are, and the one command to run next
 
-**Purpose**: the front door of the cycle. It prints `acfw-cycle` output verbatim and never derives
-a stage in prose.
+**Purpose**: shows where the cycle stands and what to run next. It prints `acfw-cycle` output
+verbatim and never works out a stage on its own.
 
 **Usage**:
 ```bash
@@ -668,11 +687,13 @@ yes                          # after a card: approve those exact bytes, then sta
 
 ---
 
-### /task - Pure Orchestration
+### /task - Decompose a scope
 
-**Purpose**: Decompose scope into atomic tasks (NEVER implements)
+**Purpose**: split a scope into atomic tasks. It never implements anything.
 
-**Execution**: runs as the `whip-task` dynamic workflow when available (schema-enforced slugs + JS validation gate + create-time doctor, before any file is written); otherwise the legacy single-context decomposition.
+**Execution**: runs as the `whip-task` dynamic workflow when available, which enforces slugs by
+schema and runs a JS validation gate and the create-time doctor before any file is written.
+Otherwise it runs the legacy single-context decomposition.
 
 **Usage**:
 ```bash
@@ -689,29 +710,33 @@ task exists, and your `/go` focus is set to the cycle's unfinished tasks. Free t
 `--plan` is refused: extra work goes into the plan, or into a separate `/task "<scope>"`.
 
 **Behavior**:
-1. Reads style guide (mandatory)
-2. Minimal research (Perplexity, Context7, Figma)
+1. Reads the style guide (required)
+2. Does light research, only to understand the scope (Perplexity, Context7, Figma)
 3. Decomposes into atomic tasks (WHAT/WHY only)
-4. Validates against style guide
-5. Spawns task-engineer agents (parallel)
-6. Exits immediately
+4. Checks each task against the style guide
+5. Spawns task-engineer agents in parallel
+6. Exits without starting any of the work
 
-**Style Enforcement**:
+**Style rules it checks**:
 - ✅ Binary language ("API validates token")
 - ✅ WHAT/WHY only (no HOW)
-- ✅ Max 2-3 line code snippets
-- ❌ NO implementation details
-- ❌ NO banned words
+- ✅ Code snippets of 2-3 lines at most
+- ❌ Implementation details
+- ❌ Banned words
 
-**Output**: Tasks created in `.backlog/pending/`
+**Output**: pending tasks in the task store (`.backlog/pending/` on `files`)
 
 ---
 
 ### /go - Continuous Execution
 
-**Purpose**: Execute entire backlog until 100% complete
+**Purpose**: run the tasks in scope until every one is accepted or blocked
 
-**Execution**: runs as the `whip-go` dynamic workflow when available (the loop/partition/dependency-gate/integration live in a script, so Claude's context stays flat across iterations); otherwise the legacy single-context loop. Both refuse to dispatch against a FATAL-failing backlog (doctor startup gate).
+**Execution**: runs as the `whip-go` dynamic workflow when available. The loop, partition,
+dependency gate and integration live in a script, so Claude's context stays flat across iterations.
+Otherwise it runs the legacy single-context loop. A repo-scoped FATAL from the doctor's startup
+gate stops both. On a task-scoped FATAL the workflow holds out that task and runs the rest, while
+the legacy loop still refuses to dispatch at all.
 
 **Usage**:
 ```bash
@@ -723,31 +748,35 @@ task exists, and your `/go` focus is set to the cycle's unfinished tasks. Free t
 /go bugfixes                                 # the fix/bug tasks
 ```
 
-**Run scope (3.2.3, focus-driven since 3.4.0)**: with no arguments `/go` runs your **focus** — the
-per-checkout list `/task` sets to the tasks it just created, or that you set with `/whip-focus`. With
-no focus, `files` drains the whole backlog as before while every shared API-backed store refuses and
-names the three ways forward; `/go --all` is the explicit "yes, everything". With arguments it runs
-**only** what you name. Task ids, stems and native backend ids pass straight through; a
-natural-language filter is resolved **once, before launch** — matched against the fields the snapshot projects on every backend
-(`agent`, `slug`, `priority`, `stem`, `touchesGlobs`), shown to you, and confirmed — so the
-orchestrator always receives a concrete task list and stays deterministic. Unmet transitive
-dependencies are pulled in and named in the log; already-accepted ones are left alone. Nothing
-outside the scope is dispatched, transitioned or integrated, including by the post-loop drain, which
-is what makes a scoped run safe against a backlog other people are working in. Completion is
-measured over your scope, and an id matching no task aborts the run rather than quietly running
+**Run scope (3.2.3, focus-driven since 3.4.0)**: with no arguments `/go` runs your **focus**, the
+per-checkout list `/task` sets to the tasks it just created, or that you set with `/whip-focus`.
+With no focus, `files` drains the whole backlog as before, and every shared API-backed store refuses
+and names the three ways forward. `/go --all` is the explicit "yes, everything".
+
+With arguments it runs **only** what you name. Task ids, stems and native backend ids pass straight
+through. A natural-language filter is resolved **once, before launch**: it is matched against the
+fields the snapshot carries on every backend (`agent`, `slug`, `priority`, `stem`, `touchesGlobs`),
+shown to you and confirmed, so the orchestrator always receives a concrete task list and stays
+deterministic.
+
+Unmet transitive dependencies are pulled in and named in the log; already-accepted ones are left
+alone. Nothing outside the scope is dispatched, transitioned or integrated, not even by the
+post-loop drain, so a scoped run is safe on a backlog other people are working in. Completion is
+measured over your scope. An id that matches no task aborts the run, rather than quietly running
 less than you asked for. The run report echoes `scopeFilter`, `scopedTo` and `scopeResolved`.
 
 **Behavior**:
-- Loops until ALL tasks in terminal states (or, when scoped, all tasks in the scope)
+- Loops until every task is terminal (or, when scoped, every task in the scope)
 - Each iteration:
-  - Scan ALL states (pending, in-progress, completed, in-review, rejected, blocked)
-  - Integrity re-check (`whip-doctor --active-only`)
-  - Process ALL transitions through the single writer
-  - Spawn agents in parallel, one per free worktree slug
-  - Integrate newly-accepted work into trunk (LP-CAS), then check completion
-- Exits: 100% complete, OR 3 consecutive iterations doing no work at all (genuinely stuck — e.g.
-  unsatisfiable dependencies), OR 15 iterations with no *terminal* gain (the perpetual-retry guard)
-- Quality gate auto-fix runs on the **legacy** single-context loop; the workflow orchestrator relies
+  - Scans every state (pending, in-progress, completed, in-review, rejected, blocked)
+  - Re-checks integrity (`whip-doctor --active-only`)
+  - Processes every transition through the single writer
+  - Spawns agents in parallel, one per free worktree slug
+  - Integrates newly accepted work into trunk (LP-CAS), then checks completion
+- Exits: 100% complete; or 3 consecutive iterations doing no work at all (stuck, for example on
+  dependencies that can never be met); or 15 iterations with no *terminal* gain (the
+  perpetual-retry guard)
+- Quality gate auto-fix runs on the **legacy** single-context loop. The workflow orchestrator relies
   on the per-task harness's own bounded gate loop instead
 
 **State Transitions Processed**:
@@ -757,13 +786,13 @@ less than you asked for. The run report echoes `scopeFilter`, `scopedTo` and `sc
 - `completed` → `in-review` → `accepted|rejected` (quality-reviewer)
 - `in-progress` → `blocked` (stale dispatch; default 8h, set `ACFW_INPROGRESS_TIMEOUT_HOURS` to change)
 
-**Output**: Continuous progress until completion
+**Output**: progress while it runs, then a run report
 
 ---
 
 ### /whip-focus - What a bare `/go` runs
 
-**Purpose**: manage the run focus — the small, per-checkout list of tasks a bare `/go` runs
+**Purpose**: manage the run focus, the short per-checkout list of tasks a bare `/go` runs
 
 ```bash
 /whip-focus                    # show it, with each task's live state and who set it when
@@ -775,16 +804,16 @@ less than you asked for. The run report echoes `scopeFilter`, `scopedTo` and `sc
 
 Tasks may be named by stem, id, native backend id (`MUL-4821`) or a unique stem prefix. `set` and
 `add` resolve every token through the store first and **refuse the whole operation** if any is
-unknown or ambiguous — a focus holding raw arguments would inherit every ambiguity of the thing
-typed, and a selection that silently changes meaning is worse than no selection.
+unknown or ambiguous. A focus that stored raw arguments would inherit every ambiguity in what you
+typed, and a selection that quietly changes meaning is worse than none.
 
-It lives at `.acfwhip/run/focus`, which is gitignored, and that is not an implementation detail: a
-focus is one person's current selection, never a fact about the project. Two people on one board
-have two focuses, and neither one's `/go` becomes everyone's.
+It lives at `.acfwhip/run/focus`, which is gitignored on purpose: a focus is one person's current
+selection, not a fact about the project. Two people on one board have two focuses, and neither
+one's `/go` becomes everyone's.
 
-**Dropping is not pausing.** A scoped run pulls in the unmet dependencies of everything in its
-scope, so a task you drop that something else needs comes straight back — correctly, since otherwise
-that dependent could never run. To actually park a task, use `/whip-move` below.
+**Dropping a task does not pause it.** A scoped run pulls in the unmet dependencies of everything in
+its scope, so a dropped task that something else needs comes straight back. That is correct:
+otherwise the dependent could never run. To park a task, use `/whip-move` below.
 
 ---
 
@@ -798,15 +827,15 @@ that dependent could never run. To actually park a task, use `/whip-move` below.
 
 States: `pending in-progress completed in-review accepted rejected blocked draft archive`.
 
-**`draft` pauses and `archive` cancels**, on every backend (3.4.0). Both are inert to the scheduler
-and excluded from the completion denominator, while staying resolvable as dependencies — so a task
-that depends on a paused one is reported as *gated, and here is why*, not as a dangling reference.
-A parked task's worktree and branch are never reaped by `/whip-doctor --fix`; they are reported as
-`parked-task-worktree` and left for you.
+**`draft` pauses and `archive` cancels**, on every backend (3.4.0). The scheduler ignores both and
+neither counts toward completion. Both still resolve as dependencies, so a task that depends on a
+paused one is reported as gated, with the reason, rather than as a dangling reference.
+`/whip-doctor --fix` never reaps a parked task's worktree or branch: it reports them as
+`parked-task-worktree` and leaves them for you.
 
-Setting a native `blocked`/`cancelled` status on an API-backed board does **not** pause a task —
-whip reads its own metadata, not the native status. The doctor reports that as `WARN|native-hold`
-and leaves the native status alone rather than repairing it.
+Setting a native `blocked`/`cancelled` status on an API-backed board does **not** pause a task,
+because acf-whip reads its own metadata and ignores the native status. The doctor reports that as
+`WARN|native-hold` and leaves the native status alone.
 
 It runs the validated writer, so the folder move, the `Status:` sync, the transition-log row and the
 commit stay atomic. Run `/whip-doctor` after.
@@ -815,7 +844,7 @@ commit stay atomic. Run `/whip-doctor` after.
 
 ### /whip-doctor - Backlog Integrity
 
-**Purpose**: Diagnose (and optionally repair) backlog + worktree health
+**Purpose**: diagnose, and optionally repair, backlog and worktree health
 
 **Usage**:
 ```bash
@@ -823,15 +852,20 @@ commit stay atomic. Run `/whip-doctor` after.
 /whip-doctor --fix    # apply the REPAIRABLE class, then re-scan
 ```
 
-**Checks** (FATAL / REPAIRABLE / WARN): status-vs-folder mismatch, missing/empty worktree slug on a code task, unknown Assigned Agent, duplicate IDs, dangling/cyclic dependencies, cross-slug dependent dispatched before integration, worktree on the wrong branch, detached HEAD; missing worktree slug derivable from the id, out-of-range Rejection Count, dup-folder, orphaned worktree; missing clean-checkout token, lingering in-review, stale in-progress, cross-slug glob overlap.
+**Checks** (FATAL / REPAIRABLE / WARN): status-vs-folder mismatch, missing/empty worktree slug on a
+code task, unknown Assigned Agent, duplicate IDs, dangling/cyclic dependencies, cross-slug dependent
+dispatched before integration, worktree on the wrong branch, detached HEAD; missing worktree slug
+derivable from the id, out-of-range Rejection Count, dup-folder, orphaned worktree; missing
+clean-checkout token, lingering in-review, stale in-progress, cross-slug glob overlap.
 
-**Output**: `SEVERITY|CODE|TASK_ID|DETAIL` lines + a `SUMMARY|fatal=N|repairable=N|warn=N|ok=…` line; exit 0 iff no FATAL. Runs automatically as a `/go` startup gate and per-iteration recheck.
+**Output**: `SEVERITY|CODE|TASK_ID|DETAIL` lines + a `SUMMARY|fatal=N|repairable=N|warn=N|ok=…`
+line; exit 0 iff no FATAL. Runs automatically as a `/go` startup gate and per-iteration recheck.
 
 ---
 
 ### /retro - Close a Cycle, and Learn from It
 
-**Purpose**: Close a planned cycle, and learn from it when something went wrong
+**Purpose**: close a planned cycle, and learn from it when something went wrong
 
 **Usage**:
 ```bash
@@ -844,7 +878,9 @@ commit stay atomic. Run `/whip-doctor` after.
 
 **Behavior**:
 - A clean cycle closes with one script call and zero agents
-- When a task was reworked or stuck, or a deliverable is not met, the retro agent finds root causes (Five Whys) and writes docs/cycles/<ID>/retro.md, at most 3 one-rule lessons in docs/acf/lessons/, and a retro-actions cycle you approve like any plan
+- When a task was reworked or stuck, or a deliverable is not met, the retro agent finds root causes
+  (Five Whys) and writes docs/cycles/<ID>/retro.md, at most 3 one-rule lessons in
+  docs/acf/lessons/, and a retro-actions cycle you approve like any plan
 - It never creates tasks, edits agent files, or deletes a lesson itself
 - `/retro --force <task>...` (or a bare `/retro --force` with no cycle waiting, over your `/go`
   focus) analyzes work done without a plan, and writes `docs/retrospectives/YYYYMMDD-<slug>.md`
@@ -861,7 +897,8 @@ commit stay atomic. Run `/whip-doctor` after.
 
 ### /research - Research Workflow
 
-**Purpose**: Conduct structured research using MCP tools, create temporal documentation, generate backlog task
+**Purpose**: research a topic with MCP tools, write a dated research document, and file a follow-up
+task
 
 **Usage**:
 ```bash
@@ -871,36 +908,38 @@ commit stay atomic. Run `/whip-doctor` after.
 ```
 
 **Behavior**:
-1. Verifies prerequisites (`.backlog/`, `docs/acf/research-protocol.md`, `docs/acf/organization.md`)
-2. Generates temporal filename: `docs/research/YYYYMMDD-{topic}.md`
-3. Launches research-agent for comprehensive research
-4. **MCP Tool Selection** (from research-protocol.md):
-   - **Figma MCP**: MANDATORY when Figma URL/node provided
-   - **Context7**: Library documentation, API references
-   - **Perplexity**: Best practices, architecture, security, performance
-5. Creates research document with evidence-based analysis
-6. **Automatically generates backlog task** from findings
+1. Checks the task store can take the follow-up task (on `files`, that `.backlog/` exists), and
+   warns but continues when `docs/acf/research-protocol.md` or `docs/acf/organization.md` is missing
+2. Names the document by date: `docs/research/YYYYMMDD-{topic}.md`
+3. Hands the topic to research-agent
+4. **MCP tool selection** (from research-protocol.md):
+   - **Figma MCP**: required when you give a Figma URL or node
+   - **Context7**: library documentation, API references
+   - **Perplexity**: best practices, architecture, security, performance
+5. Writes the research document, with a source for each claim
+6. **Files a pending task** from the findings (`.backlog/pending/` on `files`, `acfw-store create`
+   on other stores)
 
-**Temporal Naming (MANDATORY)**:
+**Naming (required)**:
 - Format: `docs/research/YYYYMMDD-description.md`
-- Date: Current date in YYYYMMDD (NO hyphens)
+- Date: the current date as YYYYMMDD, with no hyphens
 - Description: lowercase, hyphen-separated
-- Reference: `docs/acf/organization.md`
+- Reference: `docs/acf/organization.md` (installed by the optional acf-librarian plugin)
 
-**Style Requirements** (from `docs/acf/style/research-documents.md`):
+**Style requirements** (from `docs/acf/style/research-documents.md`):
 - Direct, factual analysis (no promotional language)
-- Evidence-based claims with source attribution
+- A source for every claim
 - Quantified comparisons (not "faster", use "3x faster")
 - Tables for comparisons (not prose)
 - Code snippets ≤3 lines
 
-**Output**: Research document (`docs/research/YYYYMMDD-topic.md`) + backlog task (`.backlog/pending/`)
+**Output**: Research document (`docs/research/YYYYMMDD-topic.md`) + a pending task in the task store
 
 ---
 
 ### /whip-init - Initialize Workflow
 
-**Purpose**: Explicit project initialization
+**Purpose**: set up acf-whip in a project
 
 **Usage**:
 ```bash
@@ -909,25 +948,29 @@ commit stay atomic. Run `/whip-doctor` after.
 ```
 
 **Behavior**:
-1. Detects tech stack (package files scan)
-2. Asks user for customization (priority system, coverage thresholds)
-3. Analyzes repository for agent customization data
-4. Creates `.backlog/` structure (9 folders)
-5. Installs quality gate config (`.pre-commit-config.yaml`), with every hook kept out of `docs/cycles/`
-6. **Generates 6 universal agents** from patterns to `.claude/agents/` (customized for project)
+1. Detects the tech stack (scans package files)
+2. Asks you for preferences (priority system, coverage thresholds)
+3. Analyzes the repository to customize the agents
+4. Creates the `.backlog/` structure (9 folders, `files` store only)
+5. Installs quality gate config (`.pre-commit-config.yaml`), with a top-level exclude that keeps
+   every hook out of `docs/cycles/`, `docs/acf/`, `.backlog/` and `.acfwhip/`
+6. **Generates the 7 universal agents** from patterns into `.claude/agents/`, customized for the
+   project, plus `devops` if you accept it
 7. Generates agent manifests in `docs/agents/` (Priority 1/2/3 structure)
-8. Triggers SessionStart hook behavior (copies docs, generates README)
-9. Adds CLAUDE.md section (if exists), naming `/whip` as the place to start
-10. In a **new** project only, pins `ACFW_INTEGRATION_MODE=default`; adds `docs/cycles/` to an
-    existing `.prettierignore` or `.markdownlintignore`, because approval hashes those bytes
+8. Installs the core docs the SessionStart hook would, and generates `.backlog/README.md`
+9. Adds its sections to `CLAUDE.md`, creating a minimal one if there is none, and names `/whip` as
+   the place to start
+10. In a **new** project only, pins `ACFW_INTEGRATION_MODE=default`. It also adds `docs/cycles/`,
+    `docs/acf/`, `.backlog/` and `.acfwhip/` to an existing `.prettierignore` or
+    `.markdownlintignore`, so no formatter rewrites the bytes approval hashes or `/go` commits
 
-**Output**: Complete backlog workflow initialized
+**Output**: an initialized backlog workflow
 
 ---
 
 ### /whip-add-agents - Agent + Manifest Generator
 
-**Purpose**: Create missing specialist agents
+**Purpose**: create the specialist agents a project is missing
 
 **Usage**:
 ```bash
@@ -940,67 +983,67 @@ commit stay atomic. Run `/whip-doctor` after.
 ```
 
 **Behavior**:
-1. **Parse user args** (override auto-detection)
-2. **Repository analysis**:
-   - Scan directory structure
-   - Detect tech stack indicators
-   - Analyze CLAUDE.md for mentions
-   - Check existing agents (avoid duplication)
-   - Assess complexity (LOC, polyglot, microservices)
-3. **Study existing conventions**:
-   - Read existing agent implementations
-   - Read existing manifests
-   - Extract patterns (structure, sections, formats)
-4. **Generate agent files**:
-   - **Implementation**: `.claude/agents/{agent}.md` (small, core instructions)
-   - **Manifest**: `docs/agents/{agent}.md` (Priority 1/2/3 docs, navigation guidance, 10 anti-patterns)
-5. **Generate quality gates**: `docs/development/quality-gates-{stack}.md` (if missing)
-6. **Update configuration**:
-   - Regenerate `.backlog/README.md` with new agents
-   - Update `CLAUDE.md` agent assignments (if exists)
-   - Install pre-commit hooks (if missing)
+1. **Parses your flags**, which override auto-detection
+2. **Analyzes the repository**:
+   - Scans the directory structure
+   - Detects tech stack indicators
+   - Reads CLAUDE.md for mentions
+   - Checks existing agents, so none is duplicated
+   - Assesses complexity (LOC, polyglot, microservices)
+3. **Studies existing conventions**:
+   - Reads existing agent implementations and manifests
+   - Extracts their patterns (structure, sections, formats)
+4. **Generates agent files**:
+   - **Implementation**: `.claude/agents/{agent}.md` (short, core instructions)
+   - **Manifest**: `docs/agents/{agent}.md` (Priority 1/2/3 docs, navigation guidance, 5-10
+     anti-patterns)
+5. **Generates quality gates**: `docs/development/quality-gates-{stack}.md` (if missing)
+6. **Updates configuration**:
+   - Adds the new agents to `.backlog/README.md`
+   - Updates the agent assignments in `CLAUDE.md`, if the project has one
+   - Installs pre-commit hooks (if missing)
 
-**Tech Stack Detection**:
-- **Backend**: `go.mod` → go-engineer, `requirements.txt` → python-engineer, `package.json` + express/fastify → nodejs-backend-engineer
+**Tech stack detection**:
+- **Backend**: `go.mod` → go-engineer, `requirements.txt` → python-engineer, `package.json` +
+  express/fastify → nodejs-engineer
 - **Frontend**: `package.json` + next → nextjs-engineer, + react → react-engineer
-- **Data**: Dagster/BentoML files → data-engineer/ml-ops-engineer
-- **Infrastructure**: `k8s/` → k8s-engineer, `docker-compose.yml` → devops
+- **Data**: Dagster or Airflow → data-engineer
+- **Infrastructure**: `k8s/` → k8s-engineer, `docker-compose.yml` → docker-engineer, `terraform/` →
+  terraform-engineer
 
-**Output**: Agent implementations + manifests + quality gates + updated config
+**Output**: agent implementations, manifests, quality gates and updated config
 
 ---
 
 ## Universal Agents
 
-All projects get **6-7 universal agents** (devops optional) **GENERATED FROM PATTERNS** and customized for the project's tech stack:
-
-**Key Change**: Universal agents are no longer generic files copied verbatim. They're **generated** from patterns and customized with:
-- Stack-specific examples (Go/Python/Node.js syntax)
-- Quality gate tool references matching your `.pre-commit-config.yaml`
-- Coverage thresholds from your initialization choices
-- Priority system (3-level vs 5-level SLA-based)
-- Agent assignment matrices reflecting your actual agents
-- **Infrastructure detection** (Docker, K8s, CI/CD, monitoring)
-
-**The 6 core universal agents**:
+`/whip-init` generates seven universal agents in every project, plus `devops` when it detects
+infrastructure and you accept it. They are **generated** from patterns, not copied, and customized
+with:
+- stack-specific examples (Go/Python/Node.js syntax)
+- the gate tools in your `.pre-commit-config.yaml`
+- the coverage thresholds you chose at initialization
+- your priority system (3-level, or 5-level SLA-based)
+- a matrix of the agents the project has
+- the infrastructure it detected (Docker, K8s, CI/CD, monitoring)
 
 ### task-engineer
 - **Role**: Task decomposition (WHAT/WHY only, no HOW)
 - **Authority**: Create tasks, set priorities, assign agents
-- **Prohibition**: ZERO implementation code
+- **Prohibition**: writes no implementation code
 - **Style**: Enforces `task-descriptions.md` style guide
 
 ### quality-reviewer
 - **Role**: Binary accept/reject decisions
 - **Authority**: Accept completed work, reject with reasons
-- **Prohibition**: NEVER fixes code, only identifies issues
-- **Critical**: MUST move tasks to terminal state (accepted/rejected)
+- **Prohibition**: never fixes code; it only identifies issues
+- **Required**: every review ends in `accepted` or `rejected`, and the orchestrator makes the move
 
 ### lean-architect
 - **Role**: System architecture design (WHAT/WHY not HOW)
 - **Authority**: Design architectures, define contracts, document decisions
-- **Prohibition**: NO implementation code
-- **Style**: Max 2-3 line code snippets (interfaces only)
+- **Prohibition**: No implementation code
+- **Style**: Code snippets of 2-3 lines at most (interfaces only)
 
 ### retro
 - **Role**: Root cause analysis when a cycle's work went wrong (dispatched by `/retro`)
@@ -1010,21 +1053,27 @@ All projects get **6-7 universal agents** (devops optional) **GENERATED FROM PAT
 
 ### precommit
 - **Role**: Pre-commit hook configuration
-- **Authority**: Configure hooks, select repositories, optimize execution
+- **Authority**: Configure hooks, choose hook repositories, tune how fast hooks run
 - **Prohibition**: Cannot modify quality standards (a /retro action item, approved by a human)
 
 ### research-agent
 - **Role**: Evidence-based research
-- **Authority**: Conduct research, create comprehensive reports
-- **Tools**: **MANDATORY Perplexity usage** for all research
+- **Authority**: Run research and write reports in `docs/research/`
+- **Tools**: Perplexity for every query (required)
 
-### devops (Optional, Infrastructure-Aware)
+### workflow-architect
+- **Role**: Writes the per-task child-workflow harness for each `/go` unit: fills the four marked
+  regions of the locked skeleton, then stops
+- **Prohibition**: Does not implement the task
+- **Model**: none pinned; `/go` runs it on the session model
+
+### devops (optional, infrastructure-aware)
 - **Role**: Infrastructure, CI/CD, and deployment operations
-- **Authority**: Configure Docker/K8s, setup monitoring, CI/CD pipelines, troubleshooting
-- **Created When**: Docker, Kubernetes, or CI/CD platform detected (user can skip)
+- **Authority**: Configure Docker/K8s, set up monitoring and CI/CD pipelines, troubleshoot
+- **Created when**: Docker, Kubernetes, or a CI/CD platform is detected (you can skip it)
 - **Customization**: Generated with detected orchestration (docker-compose/kubernetes), CI tool (github-actions/gitlab-ci), monitoring stack (prometheus-grafana/datadog), cloud provider (gke/eks/aks)
 - **Prohibition**: Cannot design K8s manifests (delegates to k8s-engineer if exists)
-- **Manifest**: Deeply customized analyzing `docs/operations/` for Priority 1/2/3 docs
+- **Manifest**: built from what it finds in `docs/operations/` (Priority 1/2/3 docs)
 
 ---
 
@@ -1032,7 +1081,9 @@ All projects get **6-7 universal agents** (devops optional) **GENERATED FROM PAT
 
 ### Purpose
 
-Achieve **58-74% token reduction** through priority-ordered documentation.
+A manifest (`docs/agents/{agent}.md`) tells an agent which docs to read first, so it reads the few
+that matter for a task instead of everything. The patterns cite a **58-74% token reduction**;
+nothing in the plugin measures it.
 
 ### Structure
 
@@ -1047,7 +1098,8 @@ Every manifest has:
 7. **Quality Gates**: Stack-specific commands
 8. **Common Workflows**: 5 standard patterns
 9. **Integration Points**: Handoffs to/from other agents
-10. **Anti-Patterns**: 10 common mistakes with explanations
+10. **Anti-Patterns**: 5-10 common mistakes, each with the reason (the backend, frontend, data and
+    infrastructure patterns ship 10)
 11. **Quick Reference**: Copy-paste commands, evidence templates
 12. **Success Metrics**: First-pass acceptance rate, doc usage
 
@@ -1077,15 +1129,17 @@ Every manifest has:
 
 ## Quality Gates
 
-### Zero Bypass Tolerance
+### No bypasses
 
-**ABSOLUTE PROHIBITIONS**:
+Never:
 - ❌ `git commit --no-verify`
 - ❌ `SKIP={hook-name}`
 - ❌ Lowering coverage thresholds
 - ❌ Commenting out failing tests
 
-**Enforcement**: CI re-runs all quality gates. Bypasses = immediate rejection.
+A local hook can be skipped, so have your CI re-run every gate. Inside `/go`, the per-task harness
+tells the implementer to fix the cause without weakening or deleting a test, and its diff reviewer
+looks for removed or weakened tests.
 
 ### Stack-Specific Commands
 
@@ -1123,17 +1177,20 @@ npm run build
 | Utilities | 85% |
 | UI components | 80% |
 
+These rows match the default answer (80%) to `/whip-init`'s coverage question. Answering 60% or 95%
+moves them down or up.
+
 ### Failure Protocol
 
 - **Red gate inside a worktree**: the default per-task harness runs your gates at most twice, with
   one fix round after each failure, then sends the diff to a fresh reviewer. Fix causes; never
-  weaken or delete a test. This never pages you.
+  weaken or delete a test. None of this needs you.
 - **Rejected in review**: the task goes back to pending with its rejection counted. The third
   rejection blocks it, and a task its own specialist blocks a third time stays blocked (`/go` args
   `maxReject` / `maxBlock`, default 3). The counters are lifetime counters on every store.
-- **Blocked at the cap**: parked work, which does page you. In a planned cycle `/whip` shows a card
-  with the exact reply. `/whip-move <task> pending` buys exactly one more attempt; the usual fix is
-  to archive the task and plan the work again.
+- **Blocked at the cap**: this is parked work, and it does need you. In a planned cycle `/whip`
+  shows a card with the exact reply. `/whip-move <task> pending` buys exactly one more attempt; the
+  usual fix is to archive the task and plan the work again.
 - **Learning from it**: when a planned cycle ends with a reworked or stuck task, or an unmet
   deliverable, `/retro` finds the root cause and proposes the fix as an action item you approve.
   For work done without a plan: `/retro --force <task>...`.
@@ -1142,27 +1199,27 @@ npm run build
 
 ## Task Description Style Guide
 
-### MANDATORY Rules
+The full guide is `docs/acf/style/task-descriptions.md`. The rules in short:
 
-**Binary Language**:
+**Binary language**:
 - ✅ "API validates token" NOT "improve validation"
 - ✅ "Returns 401 for invalid credentials"
 - ❌ "Enhance authentication system"
 
-**WHAT/WHY Only** (NO HOW):
+**WHAT/WHY only, never HOW**:
 - ✅ WHAT: "POST /api/v1/auth/login endpoint"
-- ✅ WHY: "Enable user authentication"
+- ✅ WHY: "Users need to authenticate"
 - ✅ CONSTRAINTS: "Response < 200ms"
 - ❌ HOW: "Use bcrypt for hashing, JWT for tokens"
 
-**Code Snippet Limits**:
+**Code snippet limits**:
 - ✅ ALLOWED (2-3 lines): `POST /api/v1/auth`, `{"token": "jwt"}`, `Returns 400 for missing fields`
 - ❌ PROHIBITED: Function implementations, algorithms, config files
 
-**Banned Words**:
-- comprehensive, systematic, significant, substantial
-- robust, elegant, achievement
-- enhance, optimize, streamline (unless specific: "optimize query from 2s to 200ms")
+**Banned words**:
+- comprehensive, systematic, significant, substantial, robust, elegant
+- achievement, progress, improvement (unless the work is 100% complete)
+- enhance, optimize, streamline: say what changes instead ("query drops from 2s to 200ms")
 
 ### Golden Rule
 
@@ -1195,7 +1252,7 @@ Values are read literally: surrounding quotes and trailing whitespace are stripp
 
 ### SessionStart Hook
 
-Automatically initializes on every session:
+What the hook does on every session start:
 
 ```python
 # Location: hooks/handlers/session-start.py
@@ -1214,10 +1271,10 @@ def main():
     return hookSpecificOutput with style guide enforcement
 ```
 
-`.backlog/README.md` is created once by `/whip-init` and is never rewritten wholesale
-afterwards — not by the SessionStart hook, and not by `/whip-add-agents`, which updates
-only its agent-roster line in place. Your gate commands, coverage thresholds and evidence
-rules are yours, and they survive every re-run.
+`.backlog/README.md` is created once by `/whip-init` and never rewritten wholesale afterwards: not
+by the SessionStart hook, and not by `/whip-add-agents`, which updates only its agent-roster line in
+place. Your gate commands, coverage thresholds and evidence rules are yours, and they survive every
+re-run.
 
 ### What it writes in your repo
 
@@ -1235,7 +1292,7 @@ rules are yours, and they survive every re-run.
 | `docs/retrospectives/YYYYMMDD-<slug>.md` | `/retro --force [<task>...]` (no plan) | you commit it |
 | `docs/acf/style/`, `docs/acf/backlog/` | SessionStart hook | you commit them; unedited copies refresh themselves |
 | `.claude/agents/`, `docs/agents/`, `.backlog/README.md`, a `CLAUDE.md` section | `/whip-init`, `/whip-add-agents` | you commit them |
-| `.gitignore`, `.pre-commit-config.yaml`, `.prettierignore`, `.markdownlintignore` entries | `/whip-init` (keeps formatters out of `docs/cycles/`, whose bytes approval hashes) | you commit them |
+| `.gitignore`, `.pre-commit-config.yaml`, `.prettierignore`, `.markdownlintignore` entries | `/whip-init` (keeps formatters out of `docs/cycles/`, whose bytes approval hashes, and out of `docs/acf/`, `.backlog/` and `.acfwhip/`) | you commit them |
 
 `/go` never pushes. What leaves your machine: task state, to a `multica` server or to Linear when
 you use those stores, and plan text, to the host a committed spec-tool declaration names.
@@ -1318,9 +1375,9 @@ yes          # approves those exact bytes and starts /task --plan in the backgro
 
 ### Tasks Stuck in in-review
 
-**Problem**: quality-reviewer didn't move tasks to terminal state
+**Problem**: a task stays in `in-review` after its review ran
 
-**Solution**:
+**Solution** (the `ls` applies to the `files` store):
 ```bash
 # Manually check in-review tasks
 ls .backlog/in-review/
@@ -1330,11 +1387,11 @@ ls .backlog/in-review/
 /go
 ```
 
-**Prevention**: quality-reviewer agent enforces terminal state movement
+**Prevention**: `/whip-doctor` reports a task that lingers in review
 
 ### No Progress for 3 Iterations
 
-**Problem**: Tasks blocked or circular dependencies
+**Problem**: tasks are blocked, or dependencies form a cycle
 
 **Solution**:
 ```bash
@@ -1353,16 +1410,17 @@ cat .backlog/blocked/*.md
 
 ### Style Guide Violations
 
-**Problem**: task-engineer creates tasks with implementation details
+**Problem**: task-engineer writes tasks with implementation details
 
 **Solution**:
-- SessionStart hook injects style guide enforcement
-- `/task` command validates before spawning agents
-- If violations persist, run /retro --force <task>...: it proposes a [guide] action item for the task-engineer file, which you approve
+- The SessionStart hook puts the style guide in every session's context
+- `/task` checks every task against the guide before spawning agents
+- If violations continue, run `/retro --force <task>...`: it proposes a [guide] action item for the
+  task-engineer file, which you approve
 
 ### Agent Generation Errors
 
-**Problem**: `/whip-add-agents` can't detect tech stack
+**Problem**: `/whip-add-agents` can't detect the tech stack
 
 **Solution**:
 ```bash
@@ -1487,24 +1545,25 @@ Update CLAUDE.md (if exists)
 
 ### Pattern Extraction
 
-To contribute new patterns:
+To contribute a pattern:
 
-1. Identify universal pattern in production
-2. Strip project-specific details
-3. Add PARAMETERIZE markers
-4. Create multi-stack examples
-5. Test template clarity
-6. Submit PR with comprehensive documentation
+1. Start from an agent or manifest that has worked in production
+2. Strip the project-specific details
+3. Replace them with template variables (`{backend_stack}`, `{project_name}`), as the existing
+   patterns do
+4. Add examples for more than one stack
+5. Check that the template reads clearly
+6. Open a PR with the pattern and a usage example
 
 ### Agent Templates
 
-To add new agent patterns:
+To add an agent pattern:
 
 1. Create `{type}-agent-pattern.md` in `content/agent-patterns/`
 2. Create `{type}-manifest-pattern.md` with Priority 1/2/3 structure
-3. Update `/whip-add-agents` command to recognize new type
-4. Test agent generation with pattern
-5. Submit PR with usage examples
+3. Teach `/whip-add-agents` to recognize the new type
+4. Generate an agent from the pattern to test it
+5. Open a PR with usage examples
 
 ---
 
@@ -1516,7 +1575,7 @@ Proprietary License - Copyright 2025 Fibonacci Seven, LLC. See LICENSE file in r
 
 ## Acknowledgments
 
-Distilled from production ACF implementations.
+Extracted from production ACF implementations.
 
 ---
 
@@ -1530,5 +1589,3 @@ Documentation: https://github.com/fib7/acf-tools/tree/main/docs
 
 **Version**: see `.claude-plugin/plugin.json`; what changed in each release: `CHANGELOG.md`
 **Last Updated**: 2026-09-29
-
-Zero tolerance. Binary outcomes. Evidence required. No shortcuts.

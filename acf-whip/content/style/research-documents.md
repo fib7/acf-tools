@@ -1,76 +1,81 @@
 # Research Documentation Style
 
-## For: research-agent when creating research documents in docs/research/
+The research-agent follows these rules for every document it writes in `docs/research/`. Someone on
+the project should be able to decide from the document, check each claim against its source, and
+read the numbers in a table instead of digging them out of paragraphs.
 
 ## Core Principles
 
-- **Tone**: Direct, factual analysis (no promotional language)
-- **Evidence**: Every claim backed by source attribution
-- **Objectivity**: Balanced assessment with tradeoffs
-- **Recency**: Sources from last 6 months for fast-moving tech
-- **Density**: Token-optimized (tables > prose)
+- **Tone**: direct and factual, with no promotional language
+- **Evidence**: every claim names its source
+- **Objectivity**: every option comes with its tradeoffs
+- **Recency**: for fast-moving tech, sources from the last 6 months
+- **Density**: tables over prose, to save tokens
 
----
+## Temporal Naming (mandatory)
 
-## Temporal Naming (MANDATORY)
+Every research document must be named this way:
 
-**ALL research documents MUST follow**:
 - **Format**: `docs/research/YYYYMMDD-description.md`
-- **Date**: Current date in YYYYMMDD (NO hyphens in date)
-- **Description**: lowercase, hyphen-separated
-- **Reference**: See `docs/acf/organization.md`
+- **Date**: today's date as YYYYMMDD, with no hyphens inside the date
+- **Description**: lowercase words joined by hyphens
+- **Reference**: `docs/acf/organization.md`
 
-**Examples**:
-- ✅ `20251117-postgresql-query-optimization.md`
-- ✅ `20251030-react-server-components-patterns.md`
-- ❌ `2025-11-17-research.md` (hyphens in date)
-- ❌ `research-findings.md` (missing date)
+Right:
 
----
+- `20251117-postgresql-query-optimization.md`
+- `20251030-react-server-components-patterns.md`
+
+Wrong:
+
+- `2025-11-17-research.md` (hyphens in the date)
+- `research-findings.md` (no date)
 
 ## Banned Language (Marketing Speak)
 
-**NEVER use these words**:
-- "comprehensive", "systematic", "significant", "substantial", "robust", "elegant", "seamless"
-- "achievement", "progress", "improvement" (unless quantified with metrics)
-- "enhance", "optimize", "streamline" (be specific: "Reduce latency from 500ms to 200ms")
-- "leverage", "utilize" (use "use")
-- "facilitate", "enable" (be direct about what happens)
-- "cutting-edge", "state-of-the-art", "best-in-class"
+Never use these words:
 
----
+- "comprehensive", "systematic", "significant", "substantial", "robust", "elegant", "seamless"
+- "achievement", "progress", "improvement", unless a metric quantifies them
+- "enhance", "optimize", "streamline": say what changed instead ("Reduce latency from 500ms to 200ms")
+- "leverage", "utilize": write "use"
+- "facilitate", "enable": say what happens
+- "cutting-edge", "state-of-the-art", "best-in-class"
 
 ## Required Language (Precise, Testable)
 
-**ALWAYS use**:
-- **Quantified**: "Reduces query time from 500ms to 200ms" NOT "improves performance"
-- **Specific**: "PostgreSQL JSONB indexes" NOT "database optimization"
-- **Testable**: "Handles 1000 concurrent connections" NOT "scales well"
-- **Comparative**: "15% faster than Approach A" NOT "very fast"
-- **Sourced**: "Per Next.js docs (2025-11-15)" NOT "common practice"
+Write claims a reader can check:
 
----
+| Kind | Write | Instead of |
+|------|-------|------------|
+| Quantified | "Reduces query time from 500ms to 200ms" | "improves performance" |
+| Specific | "PostgreSQL JSONB indexes" | "database optimization" |
+| Testable | "Handles 1000 concurrent connections" | "scales well" |
+| Comparative | "15% faster than Approach A" | "very fast" |
+| Sourced | "Per Next.js docs (2025-11-15)" | "common practice" |
 
 ## Code Snippet Policy
 
-**ABSOLUTE PROHIBITIONS**:
-- ❌ Function/method implementations
-- ❌ Algorithm pseudocode (use natural language description)
-- ❌ Configuration file contents >3 lines (describe what, not exact content)
-- ❌ Database queries (specify data requirements)
-- ❌ API call sequences (describe workflow outcomes)
-- ❌ Multi-file code examples (show pattern, not full implementation)
+Research documents carry no implementation code. Never include:
 
-**ALLOWED** (sparingly, 2-3 lines maximum):
-- ✅ API endpoint signatures: `POST /api/v1/resource`
-- ✅ Response shape: `{"id": "uuid", "status": "pending"}`
-- ✅ Error codes: `Returns 400 for invalid input`
-- ✅ Type signatures: `func Process(input []byte) (*Result, error)`
-- ✅ CLI commands: `npm install library@latest`
+- Function or method implementations
+- Algorithm pseudocode: describe the algorithm in plain language
+- Configuration file contents over 3 lines: describe what the config sets, not its exact content
+- Database queries: state what data is needed
+- API call sequences: describe what the workflow produces
+- Multi-file code examples: show the pattern, not the full implementation
 
-**Example compression**:
+Allowed sparingly, 2-3 lines at most:
 
-❌ **Wrong** (10 lines of implementation):
+- API endpoint signatures: `POST /api/v1/resource`
+- Response shapes: `{"id": "uuid", "status": "pending"}`
+- Error codes: `Returns 400 for invalid input`
+- Type signatures: `func Process(input []byte) (*Result, error)`
+- CLI commands: `npm install library@latest`
+
+An example of compressing code into prose:
+
+Wrong (nine lines of implementation):
 ```javascript
 function optimizeQuery(query) {
   const cached = cache.get(query.hash);
@@ -83,22 +88,20 @@ function optimizeQuery(query) {
 }
 ```
 
-✅ **Correct** (natural language):
+Right (plain language):
 > Query optimization uses two-tier caching: in-memory (5min TTL) and Redis (1hr TTL). Cache key is query hash. Returns cached result if valid, otherwise executes query and updates cache.
-
----
 
 ## Source Attribution Requirements
 
-**Every claim needs attribution**:
+Every claim needs a source.
 
-✅ **Correct**:
+Right:
 > React Server Components reduce client bundle by 30-40% (Next.js docs, 2025-11-15).
 
-❌ **Wrong**:
+Wrong:
 > React Server Components significantly reduce bundle size.
 
-**Source format**:
+List sources in this format:
 ```markdown
 ## Sources
 
@@ -107,20 +110,18 @@ function optimizeQuery(query) {
 3. [React RFC: Server Components](https://github.com/react/rfcs) (Published: 2024-12-01, Type: Official)
 ```
 
-**Credibility hierarchy**:
+**Credibility**, most trusted first:
 1. **Official documentation** (highest trust)
 2. **Framework maintainer blogs** (high trust)
 3. **Peer-reviewed articles** (high trust)
-4. **Technical blogs** (medium trust, verify claims)
-5. **Forum posts** (low trust, verify with official sources)
+4. **Technical blogs** (medium trust; verify their claims)
+5. **Forum posts** (low trust; verify against official sources)
 
-**Recency requirements**:
+**Recency**, the maximum age of a source:
 - Fast-moving tech (frameworks, libraries): <6 months
 - Architecture patterns: <12 months
 - Security vulnerabilities: <1 month
-- Performance benchmarks: <6 months (specify environment)
-
----
+- Performance benchmarks: <6 months, and name the environment
 
 ## Document Structure Requirements
 
@@ -133,53 +134,52 @@ function optimizeQuery(query) {
 
 2. **Context** (1-2 paragraphs)
    - Problem statement
-   - Why research was needed
-   - Scope (what's covered, what's not)
+   - Why the research was needed
+   - Scope: what it covers and what it leaves out
 
-3. **Findings** (structured by topic)
-   - Evidence-based analysis
-   - Source attribution for each claim
+3. **Findings** (grouped by topic)
+   - Analysis grounded in evidence
+   - A source for each claim
    - Quantified comparisons
    - Tradeoffs
 
-4. **Comparison** (table format)
-   - Side-by-side analysis
-   - Pros/cons
-   - Fit for project
+4. **Comparison** (a table)
+   - Options side by side
+   - Pros and cons
+   - Fit for this project
 
-5. **Recommendations** (prioritized)
+5. **Recommendations** (in priority order)
    - Immediate (this sprint)
    - Short-term (next month)
    - Long-term (quarterly)
 
-6. **Sources** (numbered list)
+6. **Sources** (a numbered list)
    - Title, URL, publish date, type
 
 ### Optional Sections
 
-- **Risk Assessment** (if architectural change)
-- **Cost Analysis** (if infrastructure/licensing)
-- **Migration Path** (if replacing existing)
-
----
+- **Risk Assessment**, for an architectural change
+- **Cost Analysis**, for infrastructure or licensing
+- **Migration Path**, when the recommendation replaces something that exists
 
 ## Format Optimization Requirements
 
 ### Tables Over Prose
 
-✅ **Correct** (table, 60% token reduction):
+Right (a table):
+
 | Approach | Latency | Throughput | Complexity |
 |----------|---------|------------|------------|
 | Current | 500ms | 100 req/s | Low |
 | Option A | 200ms | 500 req/s | Medium |
 | Option B | 150ms | 800 req/s | High |
 
-❌ **Wrong** (prose, verbose):
+Wrong (the same data as prose):
 > The current approach has a latency of 500ms and throughput of 100 requests per second with low complexity. Option A reduces latency to 200ms and increases throughput to 500 requests per second but has medium complexity. Option B achieves the best performance with 150ms latency and 800 requests per second but has high complexity.
 
 ### Compressed Examples
 
-✅ **Correct** (pattern with ellipsis):
+Right (the pattern, with an ellipsis):
 ```javascript
 const config = {
   api: { timeout: 5000, retries: 3 },
@@ -187,7 +187,7 @@ const config = {
 }
 ```
 
-❌ **Wrong** (full 15-line config):
+Wrong (the full 15-line config):
 ```javascript
 const config = {
   api: {
@@ -200,109 +200,86 @@ const config = {
 
 ### Inline Lists for Simple Enumerations
 
-✅ **Correct**: **Supported databases**: PostgreSQL, MySQL, MongoDB, Redis
-❌ **Wrong**: Supported databases: • PostgreSQL • MySQL • MongoDB • Redis (each on new line)
+Right: **Supported databases**: PostgreSQL, MySQL, MongoDB, Redis
 
----
+Wrong: Supported databases: • PostgreSQL • MySQL • MongoDB • Redis (each on its own line)
 
 ## Objectivity Requirements
 
 ### Balanced Assessment
 
-**ALWAYS include tradeoffs**:
+Always include the tradeoffs.
 
-✅ **Correct**:
+Right:
 > GraphQL reduces over-fetching (fetch only needed fields) but increases backend complexity (schema design, resolver implementation, N+1 queries). Query performance depends on resolver optimization.
 
-❌ **Wrong**:
+Wrong:
 > GraphQL is the best solution for API design. It eliminates over-fetching and provides a great developer experience.
 
 ### Comparative Analysis
 
-**Show evidence, not opinions**:
+Show evidence, not opinions.
 
-✅ **Correct**:
+Right:
 > Benchmark (Go 1.21, 16 cores): JSON parsing 450MB/s vs MessagePack 680MB/s (51% faster). MessagePack saves 30% bandwidth but requires schema coordination.
 
-❌ **Wrong**:
+Wrong:
 > MessagePack is much faster than JSON and should be used for all APIs.
-
----
 
 ## Evidence Requirements
 
 ### Primary Sources Preferred
 
-✅ **Correct**:
+Right:
 > PostgreSQL 16 introduces parallel hash joins for partitioned tables (PostgreSQL 16 Release Notes, 2023-09-14). Benchmark: 3.2x faster for >10M rows (Postgres documentation).
 
-❌ **Wrong**:
+Wrong:
 > I heard PostgreSQL 16 is faster for large datasets.
 
 ### Quantify Everything
 
-**Performance**:
-- NOT "faster" → USE "3.2x faster (500ms to 156ms)"
-- NOT "scales well" → USE "handles 10K concurrent connections"
-- NOT "low latency" → USE "p95 latency <50ms"
-
-**Cost**:
-- NOT "expensive" → USE "$2000/month at 1M API calls"
-- NOT "cheap" → USE "30% cost reduction vs current ($500 → $350/month)"
-
-**Complexity**:
-- NOT "complex" → USE "requires 3 new services, 2-week migration"
-- NOT "simple" → USE "single config change, zero downtime"
-
----
+| Area | Write | Instead of |
+|------|-------|------------|
+| Performance | "3.2x faster (500ms to 156ms)" | "faster" |
+| Performance | "handles 10K concurrent connections" | "scales well" |
+| Performance | "p95 latency <50ms" | "low latency" |
+| Cost | "$2000/month at 1M API calls" | "expensive" |
+| Cost | "30% cost reduction vs current ($500 → $350/month)" | "cheap" |
+| Complexity | "requires 3 new services, 2-week migration" | "complex" |
+| Complexity | "single config change, zero downtime" | "simple" |
 
 ## Anti-Patterns
 
-❌ **Don't**: Promotional language ("revolutionary", "game-changing")
-✅ **Do**: Factual assessment with evidence
-
-❌ **Don't**: Include full implementation code
-✅ **Do**: Show signatures, shapes, patterns (2-3 lines max)
-
-❌ **Don't**: Subjective claims without attribution
-✅ **Do**: Every claim backed by source
-
-❌ **Don't**: Outdated sources (>6 months for fast-moving tech)
-✅ **Do**: Recent, credible sources with publish dates
-
-❌ **Don't**: One-sided analysis (only pros, no cons)
-✅ **Do**: Balanced assessment with tradeoffs
-
-❌ **Don't**: Vague recommendations ("consider using X")
-✅ **Do**: Specific, actionable recommendations with priority
-
-❌ **Don't**: Missing temporal naming (`research-findings.md`)
-✅ **Do**: Always YYYYMMDD prefix (`20251117-topic.md`)
-
----
+| Don't | Do |
+|-------|----|
+| Promotional language ("revolutionary", "game-changing") | A factual assessment with evidence |
+| Full implementation code | Signatures, shapes and patterns, 2-3 lines at most |
+| Subjective claims without attribution | A source behind every claim |
+| Outdated sources (>6 months for fast-moving tech) | Recent, credible sources with publish dates |
+| One-sided analysis (only pros, no cons) | A balanced assessment with tradeoffs |
+| Vague recommendations ("consider using X") | Specific, actionable recommendations, each with a priority |
+| No temporal naming (`research-findings.md`) | A YYYYMMDD prefix, always (`20251117-topic.md`) |
 
 ## Validation Checklist
 
-Before finalizing research document:
+Before you finish a research document, check:
 
 - [ ] Temporal naming: `YYYYMMDD-description.md`
-- [ ] Summary (2-3 sentences, specific)
-- [ ] All claims have source attribution
-- [ ] Sources include publish dates
-- [ ] No marketing language (check banned words)
-- [ ] Quantified comparisons (not "faster", use "3x faster")
-- [ ] Tables used for comparisons (not prose)
-- [ ] Code snippets ≤3 lines (or natural language description)
-- [ ] Balanced tradeoffs (pros AND cons)
-- [ ] Recommendations prioritized (immediate/short/long-term)
-- [ ] Sources section with credibility indicators
+- [ ] Summary of 2-3 specific sentences
+- [ ] A source for every claim
+- [ ] A publish date for every source
+- [ ] No marketing language (check the banned words)
+- [ ] Quantified comparisons ("3x faster", not "faster")
+- [ ] Comparisons in tables, not prose
+- [ ] Code snippets of 3 lines or fewer, or a plain-language description instead
+- [ ] Tradeoffs on both sides: pros and cons
+- [ ] Recommendations in priority order (immediate, short-term, long-term)
+- [ ] A Sources section with credibility indicators
 - [ ] Token-optimized (40-70% reduction vs verbose)
-
----
 
 ## Examples
 
-### ✅ GOOD Research Document Excerpt
+### A Good Excerpt
 
 ```markdown
 # Research: PostgreSQL vs MongoDB for Time-Series Data
@@ -337,7 +314,7 @@ PostgreSQL 14+ with TimescaleDB extension outperforms MongoDB for time-series wo
 2. [PostgreSQL 14 Release Notes](https://postgresql.org) (Published: 2023-09-30, Type: Official)
 ```
 
-### ❌ BAD Research Document Excerpt
+### A Bad Excerpt
 
 ```markdown
 # Research: Database Options
@@ -357,16 +334,16 @@ MongoDB is also a fantastic choice with its elegant document model and seamless 
 We should leverage the best database to optimize our data layer and enhance system performance.
 ```
 
-**Problems**:
-- ❌ No temporal naming
-- ❌ Marketing language ("comprehensive", "robust", "significant", "fantastic", "elegant", "seamless")
-- ❌ No source attribution
-- ❌ Vague claims ("very powerful", "many developers")
-- ❌ No quantified comparisons
-- ❌ No tradeoffs
-- ❌ Vague recommendation
+What is wrong with it:
+- No temporal naming
+- Marketing language ("comprehensive", "robust", "significant", "fantastic", "elegant", "seamless")
+- No source attribution
+- Vague claims ("very powerful", "many developers")
+- No quantified comparisons
+- No tradeoffs
+- A vague recommendation
 
 ---
 
-**Last Updated**: Auto-maintained during /whip-init
-**Reference**: See `docs/acf/organization.md` for full conventions
+`/whip-init` installs this file and skips it when a copy already exists; nothing refreshes it after
+that. The full conventions are in `docs/acf/organization.md`.

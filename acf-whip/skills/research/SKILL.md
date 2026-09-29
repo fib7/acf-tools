@@ -1,6 +1,6 @@
 ---
 name: research
-description: Conduct research using MCP tools, create temporal documentation, generate backlog task
+description: Research a topic with MCP tools (Perplexity, Context7, Figma), write a temporal (YYYYMMDD-dated) research document, and generate a backlog task from the findings
 argument-hint: "[topic]"
 allowed-tools:
   - Bash
@@ -19,39 +19,35 @@ allowed-tools:
 
 # /research - Research Workflow
 
-Research command. Delegates to research-agent for structured research using MCP tools (Perplexity, Context7, Figma).
+`/research <topic>` hands the topic to research-agent. It researches with MCP tools (Perplexity,
+Context7, Figma), writes one dated document under `docs/research/`, and files a follow-up task in
+the backlog based on what it found.
 
-> **Task store**: Step 1 prints the active store as a `Task store: <name>` line and Step 5 hands that
-> name to research-agent. On the default `files` store the follow-up task is written into
-> `.backlog/pending/` directly. On any other store it is staged under the gitignored
-> `.acfwhip/run/staging/` (a system temp dir if that is not ignored) and ingested with
-> `acfw-store create --file <path> --folder pending`; nothing creates or tests a `.backlog/`
-> directory there, because on those stores it does not exist and a task written into it is invisible.
+> **Task store**: Step 1 prints the active store as a `Task store: <name>` line, and Step 5 passes
+> that name to research-agent. On the default `files` store the follow-up task goes straight into
+> `.backlog/pending/`. On any other store research-agent stages it under the gitignored
+> `.acfwhip/run/staging/` (or a system temp dir when that path is not ignored) and ingests it with
+> `acfw-store create --file <path> --folder pending`. It never creates or tests `.backlog/` there:
+> those stores have no such directory, and a task written into one is invisible to them.
 
-## Purpose
+## Temporal Naming (required)
 
-Single-phase research workflow:
-1. Launch research-agent for comprehensive research
-2. Create temporal documentation (`docs/research/YYYYMMDD-topic.md`)
-3. Automatically generate backlog task from findings
+Every research document is named `docs/research/YYYYMMDD-description.md`:
 
-## Temporal Naming (MANDATORY)
+- **Date**: the current date as YYYYMMDD, with no hyphens inside the date
+- **Description**: the topic, lowercase and hyphen-separated
+- **Reference**: `docs/acf/organization.md` (Section 2: Temporal vs Timeless) covers the wider
+  convention. The optional acf-librarian plugin installs it; the rules here are complete without it.
 
-**ALL research documents MUST follow temporal naming convention**:
+**Right**:
+- `docs/research/20251117-postgresql-performance-tuning.md`
+- `docs/research/20251030-figma-component-extraction.md`
+- `docs/research/20251115-nextjs-server-components.md`
 
-- **Format**: `docs/research/YYYYMMDD-description.md`
-- **Date**: Current date in YYYYMMDD format (NO hyphens in date portion)
-- **Description**: lowercase, hyphen-separated topic
-- **Reference**: See `docs/acf/organization.md` (Section 2: Temporal vs Timeless), installed by the
-  optional acf-librarian plugin; the rules above are complete without it
-
-**Examples**:
-- ✅ `docs/research/20251117-postgresql-performance-tuning.md`
-- ✅ `docs/research/20251030-figma-component-extraction.md`
-- ✅ `docs/research/20251115-nextjs-server-components.md`
-- ❌ `docs/research/database-research.md` (missing date)
-- ❌ `docs/research/2025-11-17-performance.md` (hyphens in date)
-- ❌ `docs/research/PostgreSQL-Performance.md` (not lowercase)
+**Wrong**:
+- `docs/research/database-research.md` (no date)
+- `docs/research/2025-11-17-performance.md` (hyphens in the date)
+- `docs/research/PostgreSQL-Performance.md` (not lowercase)
 
 ## Execution Flow
 
@@ -137,19 +133,19 @@ fi
 ```
 
 Step 1 always prints a `Task store: <name>` line. Copy that `<name>` verbatim into Step 5's
-**Task store** line: it decides where research-agent files the follow-up task. If the line is missing,
-Step 1 did not run as written; re-run it. Never assume `files`: on any other store that files the task
-where the board never looks.
+**Task store** line, because it decides where research-agent files the follow-up task. No line means
+Step 1 did not run as written, so run it again. Never assume `files`: on any other store that puts the
+task where the board never looks.
 
 If a Warning named `docs/acf/organization.md` or the research protocol
-(`docs/acf/research-protocol.md`), list the absent file(s) in Step 5's **Absent references** line;
-otherwise drop that line. research-agent then applies the Temporal Filename rules in place of
-`organization.md` and the Tool Selection rules inlined in Step 5 in place of `research-protocol.md`,
-rather than stalling on a reference that does not exist.
+(`docs/acf/research-protocol.md`), list the missing file(s) in Step 5's **Absent references** line.
+Otherwise drop that line. research-agent then uses the Temporal Filename rules in place of
+`organization.md`, and the Tool Selection rules written into Step 5 in place of
+`research-protocol.md`, instead of stalling on a file that does not exist.
 
 ### Step 2: Parse Research Scope
 
-Extract topic from user input:
+Take the topic from the user's input:
 ```bash
 # User provides: /research "Next.js 15 server components best practices"
 topic="Next.js 15 server components best practices"
@@ -183,7 +179,7 @@ TodoWrite: Single todo for research task
 
 ### Step 5: Launch research-agent
 
-Use Task tool to delegate to research-agent:
+Delegate to research-agent with the Task tool:
 
 ```markdown
 **Task**: Conduct comprehensive research on: {topic}
@@ -267,11 +263,8 @@ file was reported missing.
 
 ### Step 6: Exit
 
-Research-agent handles:
-- MCP tool usage
-- Research synthesis
-- Documentation creation (temporal naming enforced)
-- Backlog task generation
+The skill's part ends here. research-agent runs the MCP tools, writes the document under its
+temporal name, and files the backlog task.
 
 ## Usage Examples
 
@@ -285,45 +278,38 @@ Output: `docs/research/20251117-nextjs-15-server-components-best-practices-for-v
 ```bash
 /research "Prisma query optimization patterns for PostgreSQL time-series data"
 ```
-Uses Context7 for Prisma docs, creates: `docs/research/20251117-prisma-query-optimization-patterns-for-postgresql-time-series-data.md`
+Uses Context7 for the Prisma docs and creates `docs/research/20251117-prisma-query-optimization-patterns-for-postgresql-time-series-data.md`
 
 ### Figma Component Research
 ```bash
 /research "UI component from Figma: https://figma.com/design/ABC123/node-id=1-2"
 ```
-Uses Figma MCP (MANDATORY), creates: `docs/research/20251117-ui-component-from-figma.md`
+Uses Figma MCP, which a Figma URL makes required, and creates `docs/research/20251117-ui-component-from-figma.md`
 
 ### Architecture Research
 ```bash
 /research "Compare event-driven vs request-response for microservices communication"
 ```
-Uses Perplexity with architecture focus, creates: `docs/research/20251117-compare-event-driven-vs-request-response-for-microservices-communication.md`
+Uses Perplexity, focused on architecture, and creates `docs/research/20251117-compare-event-driven-vs-request-response-for-microservices-communication.md`
 
 ## Success Criteria
 
-✅ Research document created with temporal naming: `YYYYMMDD-topic.md`
-✅ MCP tools used appropriately (Figma/Context7/Perplexity)
-✅ Evidence-based analysis with sources
-✅ Backlog task created in the active store's `pending` state (`.backlog/pending/` on `files`)
-✅ Task references research document
-✅ Recommendations are specific and actionable
+- The research document has a temporal name: `YYYYMMDD-topic.md`
+- The MCP tools used fit the topic (Figma/Context7/Perplexity)
+- The analysis cites a source for its evidence
+- A backlog task exists in the active store's `pending` state (`.backlog/pending/` on `files`)
+- The task references the research document
+- The recommendations are specific enough to act on
 
 ## Anti-Patterns
 
-❌ **Don't**: Create research docs without dates
-✅ **Do**: Always use `YYYYMMDD-description.md` format
-
-❌ **Don't**: Skip Figma MCP when Figma URL provided
-✅ **Do**: MANDATORY Figma usage for design research
-
-❌ **Don't**: Use generic filenames like "research-findings.md"
-✅ **Do**: Descriptive topic: "20251117-nextjs-server-components.md"
-
-❌ **Don't**: Include implementation code in research docs
-✅ **Do**: Show signatures, shapes, patterns only (2-3 lines max)
-
-❌ **Don't**: Skip backlog task creation
-✅ **Do**: Always create task from research findings
+| Don't | Do instead |
+|---|---|
+| Create a research doc without a date | Name it `YYYYMMDD-description.md` |
+| Skip Figma MCP when the topic has a Figma URL | Use Figma MCP whenever a Figma URL or node is given |
+| Use a generic filename like "research-findings.md" | Name the topic: "20251117-nextjs-server-components.md" |
+| Put implementation code in a research doc | Show signatures, shapes and patterns only (2-3 lines max) |
+| Skip the backlog task | Always create a task from the findings |
 
 ## Output Format
 
@@ -358,11 +344,12 @@ Phase 4: Task Creation
 ## Integration with ACF Workflow
 
 **Research → Task → Implementation**:
-1. `/research "topic"` → Creates research doc + task
-2. `/task` reads research doc → Decomposes into subtasks
-3. `/go` executes tasks → Implements findings
+1. `/research "topic"` writes the research doc and a task
+2. `/task` reads the research doc and decomposes it into subtasks
+3. `/go` runs the tasks, which implement the findings
 
 **Documentation Conventions**:
-- Research docs are TEMPORAL (YYYYMMDD prefix)
-- Architecture docs are TIMELESS (update in place)
-- See `docs/acf/organization.md` (optional, acf-librarian) for full conventions
+- Research docs are temporal: a YYYYMMDD prefix, and a new file for each snapshot rather than an
+  edit in place
+- Architecture docs are timeless: you update them in place
+- `docs/acf/organization.md` (optional, from acf-librarian) has the full conventions

@@ -1,8 +1,13 @@
 # Quality Gates - Next.js/TypeScript
 
+The gates for Next.js projects. They assume the App Router and TypeScript; every other Node.js project
+uses the Node.js gates. A Next.js task is not done until every command under Quality Requirements
+passes.
+
 ## Zero Bypass Tolerance
 
-**ABSOLUTELY FORBIDDEN**: Bypassing quality gates is STRICTLY PROHIBITED. **NO EXCEPTIONS.**
+Never bypass a quality gate, for any reason. Fix the code until the gate passes, or report the task
+blocked under the Quality Gate Protocol below.
 
 ## Quality Requirements
 
@@ -18,10 +23,12 @@ pnpm test --coverage # Jest/Vitest with coverage
 
 ### Test Coverage
 
-- **Routes**: 80% minimum coverage
-- **Core Logic**: 90% minimum coverage
-- **Utilities**: 85% minimum coverage
-- **Components**: 80% minimum coverage
+| Code Type | Minimum Coverage |
+|-----------|------------------|
+| Routes | 80% |
+| Core logic | 90% |
+| Utilities | 85% |
+| Components | 80% |
 
 ### Code Quality Standards
 
@@ -64,7 +71,8 @@ pnpm test --coverage # Jest/Vitest with coverage
 
 ### Pre-commit Hooks
 
-**MANDATORY**: All hooks must pass. NO --no-verify allowed.
+Every hook must pass, and `--no-verify` is never allowed. A Husky and lint-staged setup looks like
+this:
 
 ```yaml
 # .husky/pre-commit
@@ -86,13 +94,15 @@ pnpm lint-staged
 
 ### App Router Standards
 
-- **Server Components**: Default for all pages
-- **Client Components**: Only when necessary, marked with 'use client'
-- **Metadata**: Proper SEO metadata exports
-- **Loading States**: loading.tsx for each route group
-- **Error Boundaries**: error.tsx for each route group
+- **Server Components**: every page is one by default
+- **Client Components**: only where a component needs the browser, marked with `'use client'`
+- **Metadata**: routes export their SEO metadata
+- **Loading States**: a `loading.tsx` in each route group
+- **Error Boundaries**: an `error.tsx` in each route group
 
 ### API Route Standards
+
+Every API route returns the same response shape, on success and on failure:
 
 ```typescript
 // Standardized response format
@@ -130,8 +140,8 @@ try {
 
 ### When Checks Fail
 
-1. **Attempts 1-10**: Fix actual issues
-2. **After 10 attempts**: Move task to blocked with failure report
+1. **Attempts 1-10**: fix the underlying problem, not the check, and rerun.
+2. **After 10 attempts**: stop and report the task blocked, with a failure report in the format below.
 
 ### Failure Report Format
 
@@ -162,7 +172,7 @@ try {
 
 ## Forbidden Bypass Methods
 
-**NEVER use**:
+Never use any of these:
 
 - `git commit --no-verify`
 - `git push --no-verify`
@@ -174,7 +184,7 @@ try {
 
 ## Continuous Integration
 
-All CI pipelines must include:
+Every CI pipeline must run at least these steps:
 
 ```yaml
 # GitHub Actions example
@@ -188,4 +198,4 @@ jobs:
       - run: pnpm build
 ```
 
-Failed CI blocks merge. NO exceptions.
+A failed CI run blocks the merge, with no exceptions.

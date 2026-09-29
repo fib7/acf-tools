@@ -1,8 +1,8 @@
 # Spec tools: reviewers and workbenches
 
 A spec tool checks a plan before you approve it, checks the tasks `/task` writes from it, or lets
-you edit the plan somewhere else and merge it back. You plug one in with a single committed file.
-No acf-whip code changes, no wrapper for most tools.
+you edit the plan somewhere else and merge it back. You plug one in with a single committed file:
+acf-whip needs no code change, and most tools need no wrapper.
 
 - **Reviewer**: its findings appear on the approval card. `advisory` findings inform you; a `block`
   tool must say GO on the exact bytes you approve, or you override it by name.
@@ -21,12 +21,14 @@ The protocol is `spec-tools/CONTRACT.md`. This page is how to use it.
 | STATUS | bare `/whip` | one line listing tools; cards for broken, misnamed or untrusted declarations and credential literals; plans OUT in a workbench |
 | RETRO | `/retro` | the committed `reviewed` and `overridden` rows are an input |
 
-Never in `/go`. A false positive there costs one of a task's three lives, and the spec is frozen at
-approval. A tool that cannot run (skip) or fails (error) never blocks anything. A block tool the
-engine never started, or cut short, because the 540 s budget ran out is not a pass: review again,
-and finished tools come from the cache. At the task stage a `block` tool also holds a task when its
-result cannot stand for those bytes: a locally edited declaration, a dirty driver, a tool not yet
-trusted, or the budget.
+No tool runs in `/go`: the spec is frozen at approval, and a false positive there would cost one of
+a task's three lives.
+
+A tool that cannot run (skip) or fails (error) never blocks anything. But if the shared 540 s
+review budget runs out before a block tool starts, or while it runs, the tool has not passed:
+review again, and the tools that finished come from the cache. At the task stage a `block` tool
+also holds a task when its result cannot stand for those bytes: a locally edited declaration, a
+dirty driver, a tool not yet trusted, or the budget.
 
 ## One-line reviewers
 
@@ -101,26 +103,29 @@ this machine, and commits it. Shipped examples:
 | `rerun=every` or `ask` | `ask` runs on the first card that gets a GO or NO-GO, then only when you reply "review"; the card shows the last result as "stale since your edit". Default: `ask` for a driver whose capabilities print `COST|` or were never probed, else `every`. Agent tools default to `every`; set `rerun=ask` for a paid critic |
 | `timeout=<seconds>` | 5 to 540, default 120 |
 
-Exactly one of `review=`, `driver=`, `agent=`. The file is read line by line and never executed as
-shell, so an unknown key or a comment after a value is an error rather than a silent default. The
-file name must be lowercase letters, digits and dashes with no extension. A file like `no_tbd` or a
-copied `no-tbd.example` is ignored, and `/whip` shows a card saying so.
+A declaration has exactly one of `review=`, `driver=`, `agent=`. `acfw-spec` reads it line by line
+and never runs it as shell, so an unknown key or a comment after a value is an error, not a silent
+default. The file name must be lowercase letters, digits and dashes with no extension. A file like
+`no_tbd` or a copied `no-tbd.example` is ignored, and `/whip` shows a card saying so.
 
 **Where a block tool gates.** A `block` tool whose committed `at=` names `plan`, or has no `at=`,
 gates plan approval. One whose committed `at=` names `task` holds tasks in draft. A task-only block
 tool never gates a plan.
 
 **Policy and `at=` come from the committed file.** An uncommitted or edited declaration still runs,
-but advisory, and its result cannot satisfy a block gate until you commit it. The same holds for a
-driver in `.acfwhip/adapters/` with uncommitted edits (or a committed symlink whose target has
-them), and for a driver found through `$ACFW_SPEC_TOOL_PATH` or `$PATH`. A local edit can add a
-stage to `at=`, never remove one. A committed declaration that no longer parses still gates if it
-could mean `block`. So editing the declaration, or a driver or prompt under `.acfwhip/`, never
-loosens a gate. "Clean" is checked by content against HEAD, so `git update-index
---assume-unchanged` or `--skip-worktree` does not hide an edit. A GO counts at approval only when
-the committed declaration and the committed driver or prompt produced it: after a teammate's fix to
-a driver lands, the old GO is shown as stale until the tool reviews again. Files a `review=`
-command calls elsewhere in the repo are not covered: see `house-rules` above.
+but as advisory, and its result cannot satisfy a block gate until you commit it. The same holds for
+a driver in `.acfwhip/adapters/` with uncommitted edits (or a committed symlink whose target has
+them), and for a driver found through `$ACFW_SPEC_TOOL_PATH` or `$PATH`.
+
+Editing the declaration, or a driver or prompt under `.acfwhip/`, never loosens a gate. A local
+edit can add a stage to `at=` but not remove one, and a committed declaration that no longer parses
+still gates if it could mean `block`. `acfw-spec` compares content against HEAD to decide what is
+clean, so `git update-index --assume-unchanged` or `--skip-worktree` does not hide an edit. A GO
+counts at approval only when the committed declaration and the committed driver or prompt produced
+it: after a teammate's fix to a driver lands, the old GO shows as stale until the tool reviews
+again.
+
+Files a `review=` command calls elsewhere in the repo are not covered: see `house-rules` above.
 
 ## The card
 
@@ -133,9 +138,10 @@ REVIEW spec tools at content=3f9c2a71b0de
   replies: yes · ignore F<n>: <reason> · review · yes, override no-tbd
 ```
 
-Findings are numbered F1 to F8, critical and high first and never cut. Questions are Q1 to Q5.
-From the second round on, each finding is labeled `new` or `persisting`, and resolved ones are
-counted. Your replies:
+The card numbers findings F1, F2 and so on, critical and high first. It shows every critical and
+high finding, then fills up to eight with lower ones. Questions are Q1 to Q5. From the second round
+on, each finding is labeled `new` or `persisting`, and the card counts the resolved ones. Your
+replies:
 
 | Reply | Effect |
 |---|---|
@@ -180,12 +186,12 @@ export ACFW_WORKBENCH_DIR="$HOME/Notes/plans"     # in your shell or a gitignore
   goes through.
 
 Push and pull events go into the plan's Plan Log with the approval, as `ref=<id> base=<content>`.
-
-Push and pull take a cycle's plan, not a task. A task a `block` tool held in draft is fixed where it
-lives: the file under `.backlog/draft/` on the `files` store, the backend's own editor on the others.
-Then `/whip --review <task>` reviews it again, and `/whip-move <task> pending` plus
-`/whip-focus add <task>` release it.
 Links stay in `.acfwhip/run/` (gitignored) and never reach git.
+
+Push and pull take a cycle's plan, not a task. To fix a task a `block` tool held in draft, edit it
+where it lives: the file under `.backlog/draft/` on the `files` store, the backend's own editor on
+the others. Then `/whip --review <task>` reviews it again, and `/whip-move <task> pending` plus
+`/whip-focus add <task>` release it.
 
 ## Writing a driver
 
@@ -207,7 +213,7 @@ esac
 
 Try it by hand: `ACFW_SPEC_VERB=review ACFW_SPEC_FILE=docs/cycles/<id>/plan.md ./acfw-spec-mine`.
 
-Rules that matter:
+Rules for a driver:
 - Make `fp` stable across runs: hash the finding's pattern and text, never a per-run id. That is
   what lets the card say `persisting` and lets a decision stick.
 - A paid or remote tool should write its job id into `$ACFW_SPEC_STATE` before it starts waiting,
@@ -226,7 +232,7 @@ Rules that matter:
 `agent=<prompt.md>` runs a prompt as a subagent in your Claude Code session. Use it for tools that
 only work there: an MCP server behind OAuth, a slash-command analyzer, or an LLM critic that uses
 your session. The prompt file has one section per verb (`## review`, `## push`, `## pull`); see
-`examples/spec-critic.md`. acfw-spec prints `AGENT|...` work orders and exits 21, the session
+`examples/spec-critic.md`. `acfw-spec` prints `AGENT|...` work orders and exits 21, the session
 dispatches the subagents, and the next run collects their results. The subagent must end its
 review with `SUMMARY|verdict=go` or `SUMMARY|verdict=nogo`. Agent tools never run at the task stage.
 They default to `rerun=every`; a critic that costs real tokens should say `rerun=ask`.
@@ -257,20 +263,22 @@ Details, cost and what leaves your machine: `spec-tools/gaptrap/README.md`.
   does not remove it from git history. Until the deletion is committed, the refusal stays, because
   the next push would still carry the key. A JSON `"X-Api-Key": "..."` pair counts only in
   committed configuration such as `.mcp.json` (a `${VAR}` reference is fine there). In a plan or a
-  task, JSON examples with fields like `"partitionKey"` or `"nextPageToken"` are just text.
+  task, JSON examples with fields like `"partitionKey"` or `"nextPageToken"` are not flagged.
   Nothing the engine prints repeats the value: warnings, cards, status lines, push and pull output
   and the REVIEW block show `<redacted>` in its place, including a token inside a workbench link.
-- **Trust on first use.** A new or changed declaration is printed in full with a version key and
-  skipped until you reply "run tools" on this machine. A teammate's commit cannot run a new command
-  on your machine without you seeing all of it first. "run tools" trusts the version you were
-  shown in full. The status card is only a pointer: it cuts long commands at 160 characters, so a
-  "run tools" after the card prints the whole declaration and asks you to reply "run tools" again.
-  If the declaration changed after the notice (a `git pull` in between), it is shown again instead
-  of trusted. A declaration holding a control character (a carriage return mid-line, an escape
-  sequence, a bidi override) is refused as an error, so the notice always shows what runs.
-  `acfw-spec trust <name>=<key>` trusts exactly one version. Trust covers the declaration and any
-  driver or prompt it names under `.acfwhip/`. A `review=` command that calls a script elsewhere
-  in the repo runs whatever that script contains at the time, the same as your test suite does.
+- **Trust on first use.** A teammate's commit cannot run a new command on your machine until you
+  have seen all of it. A new or changed declaration is printed in full with a version key and
+  skipped until you reply "run tools" on this machine, and "run tools" trusts the version you were
+  shown in full. `acfw-spec trust <name>=<key>` trusts exactly one version.
+  - The status card is only a pointer. It cuts long commands at 160 characters, so a "run tools"
+    after the card prints the whole declaration and asks you to reply "run tools" again.
+  - If the declaration changed after the notice (a `git pull` in between), it is shown again
+    instead of trusted.
+  - A declaration holding a control character (a carriage return mid-line, an escape sequence, a
+    bidi override) is refused as an error, so the notice always shows what runs.
+  - Trust covers the declaration and any driver or prompt it names under `.acfwhip/`. A `review=`
+    command that calls a script elsewhere in the repo runs whatever that script contains at the
+    time, the same as your test suite does.
 - **Egress is consent.** Committing a declaration is the team's consent to send plans where it
   says. `add` and every REVIEW line show the egress.
 - **Kill switch.** `ACFW_SPEC=off` runs nothing. A block tool then still needs your override at

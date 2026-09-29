@@ -1,14 +1,17 @@
 # Quality Gates - Python/FastAPI
 
+A Python task is not done until every command under Quality Requirements passes.
+
 ## Zero Bypass Tolerance
 
-**ABSOLUTELY FORBIDDEN**: Bypassing quality gates is STRICTLY PROHIBITED. **NO EXCEPTIONS.**
+Never bypass a quality gate, for any reason. Fix the code until the gate passes, or report the task
+blocked under the Quality Gate Protocol below.
 
 ## Python Environment Requirements
 
 ### Package Management
 
-**Recommended**: UV for fast, reliable package management
+**Recommended**: uv. A plain virtualenv is acceptable.
 
 ```bash
 # ✅ RECOMMENDED
@@ -35,10 +38,12 @@ pytest --cov=src             # Tests with coverage (or: uv run pytest --cov=src)
 
 ### Test Coverage
 
-- **Core Logic**: 90% minimum
-- **API Endpoints**: 95% minimum
-- **Services**: 90% minimum
-- **Utilities**: 85% minimum
+| Code Type | Minimum Coverage |
+|-----------|------------------|
+| Core logic | 90% |
+| API endpoints | 95% |
+| Services | 90% |
+| Utilities | 85% |
 
 ## Code Standards
 
@@ -139,10 +144,10 @@ async def analyze(request: AnalysisRequest) -> ApiResponse:
 
 ### Async Requirements
 
-- ALL database operations must be async
-- ALL external API calls must be async
-- Use `httpx` for HTTP requests (not `requests`)
-- Use `asyncio` for concurrent operations
+- Every database operation must be async.
+- Every call to an external API must be async.
+- Make HTTP requests with `httpx`, not `requests`.
+- Run concurrent operations with `asyncio`.
 
 ### Type Safety
 
@@ -165,14 +170,28 @@ async def process_data(input, metadata, timestamp):
 
 ## Pre-commit Hooks
 
-The installed `.pre-commit-config.yaml` enforces these gates on commit: ruff and ruff format always,
-mypy once the project configures it (`[tool.mypy]` in pyproject.toml, `mypy.ini`, or `[mypy]` in
-setup.cfg), and pytest on push once the project declares it. mypy and pytest run in the project's
-own environment: uv, poetry, `.venv`, or PATH. Set `strict = true` under `[tool.mypy]` so the hook
-enforces the `--strict` gate above. The config never touches `docs/cycles/` (cycle records),
-`docs/acf/` (plugin-managed docs), `.backlog/` (task state) or `.acfwhip/` (config and the LP-CAS
-ledger): acf-whip commits those itself, and a hook that rewrites one fails that commit. ruff runs at
-the version the config pins and reads your `[tool.ruff]`; keep that pin at or above the ruff you use.
+The installed `.pre-commit-config.yaml` enforces these gates:
+
+- ruff and ruff format, always, on commit
+- mypy, on commit, once the project configures it (`[tool.mypy]` in pyproject.toml, `mypy.ini`, or
+  `[mypy]` in setup.cfg)
+- pytest, on push, once the project declares it
+
+None of them fire until someone runs `pre-commit install`, plus
+`pre-commit install --hook-type pre-push` for the pytest hook.
+
+mypy and pytest run in the project's own environment: uv, poetry, `.venv`, or PATH. The mypy hook
+uses whatever strictness your config sets, so set `strict = true` under `[tool.mypy]` or the hook
+will not enforce the `--strict` gate above.
+
+ruff runs at the version the config pins and reads your `[tool.ruff]`. Keep that pin at or above the
+ruff you use: a setting the pinned ruff does not know yet fails every commit.
+
+The config never touches `docs/cycles/` (cycle records), `docs/acf/` (plugin-managed docs),
+`.backlog/` (task state) or `.acfwhip/` (config and the LP-CAS ledger). acf-whip commits those
+itself, and a hook that rewrites one fails that commit.
+
+To run every hook by hand:
 
 ```bash
 pre-commit run --all-files
@@ -182,8 +201,8 @@ pre-commit run --all-files
 
 ### When Checks Fail
 
-1. **Attempts 1-10**: Fix actual issues
-2. **After 10 attempts**: Move task to blocked with report
+1. **Attempts 1-10**: fix the underlying problem, not the check, and rerun.
+2. **After 10 attempts**: stop and report the task blocked, with this report.
 
 ### Failure Report Format
 
@@ -214,7 +233,7 @@ pre-commit run --all-files
 
 ## Forbidden Bypass Methods
 
-**NEVER use**:
+Never use any of these:
 
 - `# type: ignore`
 - `# noqa`
@@ -224,7 +243,9 @@ pre-commit run --all-files
 - Disabling mypy strict mode
 - Using `Any` type unnecessarily
 
-## Performance Requirements (Optional - Customize)
+## Performance Requirements (Optional)
+
+These are examples. Replace them with your project's own targets, or delete the section.
 
 ### Example for API Services
 
@@ -235,10 +256,10 @@ pre-commit run --all-files
 
 ### Optimization Patterns
 
-- Use `asyncio.gather()` for parallel operations
-- Implement connection pooling for database
-- Cache frequently accessed data
-- Stream large files instead of loading to memory
+- Run independent operations in parallel with `asyncio.gather()`
+- Pool database connections
+- Cache data that is read often
+- Stream large files instead of loading them into memory
 
 ## Dependencies Management
 
@@ -303,4 +324,4 @@ jobs:
         run: pytest --cov=src --cov-fail-under=90
 ```
 
-Failed CI blocks merge. NO exceptions.
+A failed CI run blocks the merge, with no exceptions.

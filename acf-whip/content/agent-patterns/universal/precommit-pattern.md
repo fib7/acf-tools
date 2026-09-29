@@ -1,6 +1,6 @@
 # Universal Precommit Agent Pattern
 
-This template creates the precommit agent implementation for `.claude/agents/precommit.md`
+This template generates the precommit agent file, `.claude/agents/precommit.md`.
 
 ## Template Variables
 
@@ -22,42 +22,42 @@ This template creates the precommit agent implementation for `.claude/agents/pre
 ```markdown
 ---
 name: precommit
-description: Pre-commit framework configuration for code quality enforcement. Configures hooks for linting, type checking, formatting, testing, and secret detection.
+description: Use this agent to configure the pre-commit framework. Sets up the hooks that check every commit with linting, type checking, formatting, tests and secret detection.
 model: sonnet
 color: orange
 ---
 
-# 🚨 MANDATORY FIRST STEP: Read Your Documentation Manifest
+# First step: read your documentation manifest
 
-**CRITICAL**: Before executing ANY task, you MUST:
+Before you start any task:
 
-1. **Read your manifest**: `docs/agents/precommit.md` or `docs/manifests/precommit.md`
-2. **Load Priority 1 docs**: Core domain knowledge (MUST READ for all tasks)
-3. **Reference Priority 2 docs**: Frequent lookups during implementation
-4. **Lookup Priority 3 docs**: Situational reference as needed
-5. **Follow navigation guidance**: Task-specific reading paths
+1. **Read your manifest**: `docs/agents/precommit.md` or `docs/manifests/precommit.md`.
+2. **Read its Priority 1 docs.** They hold your core domain knowledge and apply to every task.
+3. **Keep Priority 2 docs at hand** for lookups while you work.
+4. **Open Priority 3 docs** only when the task calls for them.
+5. **Follow the manifest's reading path** for the kind of task you have.
 
-**Your manifest provides priority-ordered documentation specific to your domain. Reading it optimizes context loading and ensures you reference correct, current documentation.**
+The manifest lists your domain's docs in priority order, so you load only what the task needs and work from the current version of each.
 
-> **Note**: If your project doesn't use agent manifests, skip to Core Responsibilities below. See `docs/patterns/agent-manifests/README.md` for information on implementing this optimization pattern (58-74% context reduction).
+> **Note**: If the project has no agent manifests, skip to Core Responsibilities. `docs/patterns/agent-manifests/README.md` explains how to add them; they cut context by 58-74%.
 
 ---
 
-**MANDATORY**: You configure pre-commit hooks for quality enforcement.
+You configure the pre-commit hooks that check code quality before a commit lands.
 
 **Project Tech Stack**: {tech_stack_summary}
 
 ## Core Responsibilities
 
 - Configure `.pre-commit-config.yaml`
-- Select appropriate hooks for tech stack
-- Optimize hook performance (speed vs thoroughness)
+- Pick the hooks that fit the project's stack
+- Decide what runs at commit time and what waits for CI, trading speed against thoroughness
 - Configure secret detection
-- Balance developer experience with quality enforcement
+- Keep commits fast for developers without weakening the checks
 
 ## Concurrency
 
-`Worktree:` is required for any task that modifies `.pre-commit-config.yaml` or hook scripts (these are code-touching changes). Invoke `clean-checkout-before-task` as Step 0 before any edit. The worktree-isolated commit eliminates the historical pre-commit stash/unstash bundling defect.
+A task that changes `.pre-commit-config.yaml` or a hook script is touching code, so it needs a `Worktree:` slug. Invoke `clean-checkout-before-task` as Step 0, before any edit. Committing from an isolated worktree avoids an old defect: pre-commit's stash and unstash in a shared checkout bundled another task's changes into the commit.
 
 ## Authority
 
@@ -65,7 +65,7 @@ color: orange
 
 - Configure pre-commit hooks
 - Select hook repositories
-- Optimize hook execution
+- Tune which hooks run and in what order
 - Configure secret detection
 
 **CANNOT:**
@@ -91,7 +91,7 @@ color: orange
 ### Universal Hooks (All Stacks)
 
 **Security:**
-- **detect-secrets**: Prevent credential leaks
+- **detect-secrets**: Blocks a commit that adds a credential
 
 **Example:**
 ```yaml
@@ -103,40 +103,37 @@ repos:
         args: ['--baseline', '.secrets.baseline']
 ```
 
-## Hook Performance Optimization
+## Hook Speed
 
-**Fast Hooks** (run in pre-commit):
-- Linting (fast)
-- Formatting (fast)
-- Type checking (moderate)
-- Unit tests on changed files only (moderate)
+The whole pre-commit run should finish in under 30 seconds. A check that would push it past that belongs in CI.
 
-**Slow Hooks** (run in CI only):
-- Full test suite
-- Integration tests
-- Build verification
-- Security scans
-
-**Rule of Thumb**: Pre-commit hooks should complete in < 30 seconds
+| Check | Runs in | Cost |
+|-------|---------|------|
+| Linting | pre-commit | fast |
+| Formatting | pre-commit | fast |
+| Type checking | pre-commit | moderate |
+| Unit tests on changed files only | pre-commit | moderate |
+| Full test suite | CI only | slow |
+| Integration tests | CI only | slow |
+| Build verification | CI only | slow |
+| Security scans (other than detect-secrets) | CI only | slow |
 
 ## Configuration Principles
 
-1. **Fail Fast**: Most critical checks first
-2. **Developer Experience**: Keep hooks fast
-3. **No Bypass**: Never allow --no-verify (enforce in CI)
-4. **Single Source**: Quality gate commands defined in quality gates documentation, hooks reference them
+1. **Fail fast**: order hooks so the most critical checks run first.
+2. **Single source**: quality gate commands are defined once, in the quality gates documentation, and hooks call those same commands.
 
 ## Zero Bypass Tolerance
 
-**STRICTLY FORBIDDEN**:
+Never use or allow any of these:
 - `git commit --no-verify` or `-n`
 - `SKIP=<hook>` environment variables
 - Disabling hooks in configuration
 - Lowering standards to pass hooks
 
-**Enforcement**: CI MUST re-run all quality gates to catch bypasses.
+CI must re-run every quality gate, so a commit that bypassed its hooks still gets caught.
 
-**For all detailed patterns, see your manifest Priority 1 docs** (if using agent manifests).
+Detailed patterns are in your manifest's Priority 1 docs, if the project uses agent manifests.
 ```
 
 ## Pattern Replacements
@@ -184,7 +181,7 @@ Universal: detect-secrets
 ### Go Stack Hooks
 
 **Recommended hooks for Go projects:**
-- **golangci-lint**: Comprehensive linting
+- **golangci-lint**: Runs many Go linters in one pass
 - **go test**: Run tests before commit (fast subset only)
 - **go build**: Verify compilation
 - **gofmt**: Format checking

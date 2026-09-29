@@ -1,6 +1,7 @@
 # DevOps Agent Manifest Pattern
 
-Pattern for `docs/agents/devops.md` with Priority 1/2/3 structure and project-specific doc references.
+Pattern for `docs/agents/devops.md`. Unlike the specialist patterns, its Priority 1 and 2 lists are
+not fixed: build them from the docs that exist in the project, as described below the template.
 
 ## Template Variables
 
@@ -57,7 +58,10 @@ Pattern for `docs/agents/devops.md` with Priority 1/2/3 structure and project-sp
 ---
 
 ## Concurrency
-**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. All commits land on `worktree/<slug>`, never on `main`, and hold code only: never the task file, never task state. Token `clean-checkout: ok` must appear in the task transition log.
+**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. Commit on
+`worktree/<slug>`, never on `main`, and commit code only: never the task file, never task state. The
+token `clean-checkout: ok` must be in the task's transition log. The skill writes it, and review
+auto-rejects a task without it.
 
 ## Common Workflows
 
@@ -111,8 +115,9 @@ fi
 # ... continue for other docs
 ```
 
-**If NO operations docs exist** (true of every new project). Do not tell the agent to create them:
-a MUST READ entry that is a to-do turns every devops task into a documentation task.
+**If no operations docs exist** (true of every new project), do not tell the agent to create them.
+A MUST READ entry that is a to-do turns every devops task into a documentation task. Write this
+instead:
 ```markdown
 ## Priority 1: MUST READ
 
@@ -238,7 +243,10 @@ ops/scripts/health_check.sh
 ---
 
 ## Concurrency
-**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. All commits land on `worktree/<slug>`, never on `main`, and hold code only: never the task file, never task state. Token `clean-checkout: ok` must appear in the task transition log.
+**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. Commit on
+`worktree/<slug>`, never on `main`, and commit code only: never the task file, never task state. The
+token `clean-checkout: ok` must be in the task's transition log. The skill writes it, and review
+auto-rejects a task without it.
 
 ## Common Workflows
 

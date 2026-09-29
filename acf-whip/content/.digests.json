@@ -2,10 +2,12 @@
   "_comment": "sha256 of every version of each managed artifact this plugin has shipped. A consumer copy matching any of these is unedited-and-stale, so it is safe to refresh; one matching none was edited by hand and is never overwritten. Regenerate with skills/lib/bin/acfw-gen-digests.sh.",
   "artifacts": {
     "content/style/task-descriptions.md": [
+      "d47d0f1c7587d3cd54feb96028164ed521ea48ee729b8f87fd51e0f69297992b",
       "05b261d474525d0210fb5c59469d70a5a0bef35dbd85a9e177c3dce41b3ba2b5",
       "0c4b92a40d193c235b1a138fe9e22d8a9e9b95576203d11235d2c0f9836ef67d"
     ],
     "content/backlog/task-template.md": [
+      "f8d5fba067cefb98a4144e211b8064ce0db2b9908298b002dcb944014a472f7f",
       "928fa84efdf4f5cab2df817780c751154472f502b1ca2dfba6317c251ebd76d4",
       "ca4b3605783e036fa428a5101731f55b619467b43ca602be924235f35eec52ed",
       "8f4c665a5f5a839866020d92d56ed83adc554b2163707dc84cff117fcc172e06",
@@ -19,6 +21,7 @@
       "088b535a6dc93a76ac5b243a0ebea130241f497d7cddf07e06a62207f9b05a03"
     ],
     "content/backlog/workflow.md": [
+      "19d4d8d3d2c6002f3e4345aa39a853fdd578aba66a499f80853d0bc8c9fcf515",
       "1f8d49875f881c2d261fd43f2d43644d063799f2c6717753dd76be535a1eb2c3",
       "f830ff217ce4ab3e280192fa9ce3f4e17fec06713aaa135f47f31a988c76ab36",
       "98ba3b6a4dc3dee7d7a94068d1d3cce98c0055e87cac0a32288fa86c3283c000",
@@ -41,6 +44,7 @@
       "19c4056408e7ee83e4515582738df0c55ecf8b8af30e8818342435fa256e6cab"
     ],
     "content/backlog/recovery-runbook.md": [
+      "c5de7fc8c0f36375d4c4ad5f009ee4da45a27e80b3c970a3ecfd9895af0777e3",
       "515fd4d8f450cbc97794d3b7b7127beb252edddc36376a55322653bdd7af8dac",
       "2d61385ac54f7cb69ff727045a4936eb8f25f34a9ee4b517ea33a9ff60146fb2",
       "015be83aaf3f4fda82dab41641423d3c5355c3ad301ecaea5b37a2ac751eca0a",
