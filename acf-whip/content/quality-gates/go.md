@@ -267,21 +267,14 @@ func BenchmarkProcessRequest(b *testing.B) {
 
 ## Pre-commit Hooks
 
-```yaml
-# .pre-commit-config.yaml (if using pre-commit)
-repos:
-  - repo: https://github.com/golangci/golangci-lint
-    rev: v1.50.0
-    hooks:
-      - id: golangci-lint
+The installed `.pre-commit-config.yaml` enforces these gates on commit: gofmt, `go vet ./...`,
+`go mod tidy` when go.mod or go.sum changes, `go test ./...` on push, and golangci-lint when it is
+installed (required once a `.golangci.yml` exists). It never touches `docs/cycles/` (cycle records),
+`docs/acf/` (plugin-managed docs), `.backlog/` (task state) or `.acfwhip/` (config and the LP-CAS
+ledger): acf-whip commits those itself, and a hook that rewrites one fails that commit.
 
-  - repo: https://github.com/dnephin/pre-commit-golang
-    rev: v0.5.1
-    hooks:
-      - id: go-fmt
-      - id: go-vet
-      - id: go-imports
-      - id: go-mod-tidy
+```bash
+pre-commit run --all-files
 ```
 
 ## Quality Gate Protocol

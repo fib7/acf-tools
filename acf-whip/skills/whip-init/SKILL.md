@@ -27,9 +27,11 @@ Initialize ACF Whip backlog workflow in the current project:
 - Initialize core documentation (via SessionStart hook)
 - Add CLAUDE.md section for backlog workflow
 - Pin `ACFW_INTEGRATION_MODE=default` for a **new** project only (an existing pin, or an existing
-  project's choice to stay unpinned, is never changed), and keep formatters away from
-  `docs/cycles/`, where `/whip` keeps planned cycles: the pre-commit config this skill installs
-  gets a top-level exclude, and existing ignore files get a line
+  project's choice to stay unpinned, is never changed), and keep formatters away from the paths
+  acf-whip writes and commits itself: `docs/cycles/` (planned cycles), `docs/acf/` (managed docs,
+  refreshed by content digest), `.backlog/` (task state) and `.acfwhip/` (config and the LP-CAS
+  ledger). The pre-commit config this skill installs gets a top-level exclude, and existing ignore
+  files get a line
 
 **Key Changes**:
 - Universal agents are now **GENERATED** from patterns and customized for each project's tech stack, not copied verbatim
@@ -45,11 +47,48 @@ The `${CLAUDE_PLUGIN_ROOT}` variable is automatically resolved by Claude Code an
 
 ### Step 1: Detect Tech Stack
 
-Scan project for tech stack indicators:
+Detect the language stack with the plugin's detector (the same one `/whip-add-agents` runs, so the
+two skills never disagree). Run it from the project root. A `--backend=` or `--frontend=` flag the
+user passed overrides detection for that slot; set `FLAGS` to those flags verbatim, or leave it empty:
 
 ```bash
-# Backend: go.mod → "go" | requirements.txt/pyproject.toml → "python" | package.json + (fastify|express|@nestjs) → "nodejs"
-# Frontend: package.json + "next" → "nextjs" | + "react" → "react" | + "vue" → "vue"
+FLAGS=''   # e.g. FLAGS='--backend=python'. Only --backend= and --frontend= matter to the detector.
+bash "${CLAUDE_PLUGIN_ROOT}/content/quality-gates/detect-stack.sh" "$FLAGS"
+```
+
+It prints one `key='value'` line per fact, every value from a fixed vocabulary or a validated flag.
+Keep them for the later steps; Step 4 re-runs the detector itself with the same `FLAGS`, because shell
+variables do not survive between steps.
+
+| Key | Values | Used by |
+|-----|--------|---------|
+| `backend` | `go`, `python`, `nodejs`, empty | Step 6.5 backend specialist |
+| `frontend` | `nextjs`, `react`, `vue`, empty | Step 6.5 frontend specialist |
+| `node_framework` | `express`, `fastify`, `nestjs`, `none` (plain Node.js) | Step 6.5 `{framework}` |
+| `node_test_runner` | `vitest`, `jest`, `mocha`, `node --test`, `npm test`, `none` | Step 6.5 `{test-runner}` |
+| `node_typescript` | `true` only with `tsconfig.json` or a `typescript` dependency | Step 6.5 `{type-checker}` |
+| `node_linter` | `eslint` only with an eslint config or dependency, `npm run lint`, `none` | Step 6.5 `{linter}` |
+| `node_formatter` | `prettier` only with a prettier config or dependency, `none` | Step 6.5 `{formatter}` |
+| `node_test_cmd`, `node_lint_cmd`, `node_typecheck_cmd`, `node_format_cmd`, `node_build_cmd` | the gate command for that slot (`npm test`, `npm run lint`, `npx tsc --noEmit`, ...), or empty when the project has no such gate | Steps 6 and 6.5: the command slots |
+| `gate_stack` | `go`, `python`, `nodejs`, empty | Step 4: which pre-commit config, and the backend's `docs/development/quality-gates-<gate_stack>.md` |
+| `gates_doc` | `go.md`, `python-fastapi.md`, `nextjs-typescript.md`, `nodejs.md` | Step 4: the backend's gates doc source |
+| `frontend_gate_stack` | `nodejs` whenever `frontend` is set, else empty | Step 4: the frontend's own `docs/development/quality-gates-nodejs.md` |
+| `frontend_gates_doc` | `nextjs-typescript.md`, `nodejs.md`, empty | Step 4: the frontend's gates doc source |
+
+A `package.json` with no Express/Fastify/NestJS/Next/React/Vue is still a Node.js project:
+`backend='nodejs'`, `node_framework='none'`, the test runner read from its `"test"` script. Never
+fill a `node_*` value the detector did not report: a plain project has no ESLint, no TypeScript and
+no build step, and an agent told it does fails every gate.
+
+**Each specialist reads its own gates.** One `gate_stack` cannot serve a polyglot repo: a React app
+next to a FastAPI backend would be sent to ruff, mypy and pytest. So the backend specialist reads
+`docs/development/quality-gates-<gate_stack>.md` and a frontend specialist reads
+`docs/development/quality-gates-<frontend_gate_stack>.md`, which is always `quality-gates-nodejs.md`.
+When the backend is Node.js too, the two are the same file.
+
+Infrastructure is still read by hand:
+
+```bash
 # Infrastructure flags: has_docker, has_k8s, has_ci, detected_ci_tool, detected_orchestration, has_monitoring
 # Docker: Dockerfile|docker-compose.yml → has_docker=true, detected_orchestration="docker-compose"
 # K8s: k8s/|kubernetes/|skaffold.yaml|helm/|charts/ → has_k8s=true, detected_orchestration="kubernetes"
@@ -172,9 +211,9 @@ Directory").
 ```bash
 WT_DIR="${ACFW_WORKTREE_DIR:-.worktree}"   # honor a custom dir if .acfw-config sets one
 ensure_gitignore() { # <pattern> <comment>
-  if [ -f .gitignore ] && grep -qxF "$1" .gitignore; then return; fi
-  printf '\n# %s\n%s\n' "$2" "$1" >> .gitignore
-  echo "✓ Added $1 to .gitignore"
+  if [ -f .gitignore ] && grep -qxF "${1}" .gitignore; then return; fi
+  printf '\n# %s\n%s\n' "${2}" "${1}" >> .gitignore
+  echo "✓ Added ${1} to .gitignore"
 }
 ensure_gitignore "${WT_DIR%/}/" 'ACF Whip per-task worktrees (clean-checkout-before-task)'
 ensure_gitignore '.backlog/.acfw-run.json' 'ACF Whip /go run heartbeat'
@@ -318,73 +357,141 @@ done
 
 ### Step 4: Install Quality Gate Configuration
 
-**Install pre-commit configuration** (skip if `.pre-commit-config.yaml` exists):
+Install the pre-commit config and the quality-gates docs that Step 1's detector selected. Nothing
+here overwrites an existing file: an existing `.pre-commit-config.yaml` is the operator's (Step 4.5
+covers it), and an existing gates doc is the team's.
 
-| Stack | Pre-commit Config Source | Quality Gates Doc Source | Destination |
-|-------|-------------------------|-------------------------|-------------|
-| **Go** | `${CLAUDE_PLUGIN_ROOT}/content/pre-commit-configs/.pre-commit-config-go.yaml` | `${CLAUDE_PLUGIN_ROOT}/content/quality-gates/go.md` | `.pre-commit-config.yaml`, `docs/development/quality-gates-go.md` |
-| **Python** | `${CLAUDE_PLUGIN_ROOT}/content/pre-commit-configs/.pre-commit-config-python.yaml` | `${CLAUDE_PLUGIN_ROOT}/content/quality-gates/python-fastapi.md` | `.pre-commit-config.yaml`, `docs/development/quality-gates-python.md` |
-| **Node.js** | `${CLAUDE_PLUGIN_ROOT}/content/pre-commit-configs/.pre-commit-config-nodejs.yaml` | `${CLAUDE_PLUGIN_ROOT}/content/quality-gates/nextjs-typescript.md` | `.pre-commit-config.yaml`, `docs/development/quality-gates-nodejs.md` |
+| `gate_stack` | Pre-commit config source | Quality gates doc source (`gates_doc`) | Destination |
+|--------------|--------------------------|----------------------------------------|-------------|
+| **go** | `${CLAUDE_PLUGIN_ROOT}/content/pre-commit-configs/.pre-commit-config-go.yaml` | `${CLAUDE_PLUGIN_ROOT}/content/quality-gates/go.md` | `.pre-commit-config.yaml`, `docs/development/quality-gates-go.md` |
+| **python** | `${CLAUDE_PLUGIN_ROOT}/content/pre-commit-configs/.pre-commit-config-python.yaml` | `${CLAUDE_PLUGIN_ROOT}/content/quality-gates/python-fastapi.md` | `.pre-commit-config.yaml`, `docs/development/quality-gates-python.md` |
+| **nodejs** | `${CLAUDE_PLUGIN_ROOT}/content/pre-commit-configs/.pre-commit-config-nodejs.yaml` | `${CLAUDE_PLUGIN_ROOT}/content/quality-gates/nodejs.md` (plain Node, Express, Fastify, NestJS, React, Vue), `${CLAUDE_PLUGIN_ROOT}/content/quality-gates/nextjs-typescript.md` (Next.js) | `.pre-commit-config.yaml`, `docs/development/quality-gates-nodejs.md` |
 
-Use Read/Write tool sequence for each file. Create `docs/development/` directory if missing (bash mkdir -p).
+A frontend next to a Go or Python backend also gets `docs/development/quality-gates-nodejs.md`, from
+`frontend_gates_doc`. The pre-commit config stays the backend's: only one `.pre-commit-config.yaml`
+exists, and the Node.js hooks run npm scripts from the root.
 
-**If you wrote `.pre-commit-config.yaml` in this step, keep its hooks out of `docs/cycles/`.**
-`/whip` keeps each planned cycle in `docs/cycles/<ID>/`, and `acfw-cycle` hashes `plan.md` and
-`record.md` and commits them itself. A hook that rewrites either file fails that commit. The Node.js
-config runs prettier with `--write` on markdown, and prettier re-aligns `record.md`'s tables on every
-commit, so on a fresh Node.js project no plan could ever be approved. The whitespace fixers every
-stack ships cost one failed approval each time they fire. So the file this step installs carries a
-top-level `exclude`, which pre-commit applies to every hook. The shipped configs already have it, and
-the block below says so; it adds the line only to a copy that lacks it. Run this only when the file
-is the one you just wrote; an existing `.pre-commit-config.yaml` is the operator's (Step 4.5 covers
-it):
+The shipped configs run only tools the project already has. The Node.js one runs
+`npm run lint|typecheck|build --if-present` when a commit stages source or JSON, the project's own
+prettier only when `package.json` declares it, and `npm test` on push unless the script is still npm
+init's placeholder, so a plain `"test": "node --test"` project commits and pushes clean. The Python
+one runs mypy and pytest only once the project configures them; the Go one runs golangci-lint only
+when it is installed.
+
+**The installed config keeps every hook out of the paths acf-whip writes and commits itself.**
+- `docs/cycles/`: `/whip` keeps each planned cycle there, and `acfw-cycle` hashes `plan.md` and
+  `record.md` and commits them itself, so a hook that rewrites either file fails that commit. prettier
+  re-aligns `record.md`'s tables, so on a Node.js project with prettier no plan could be approved.
+- `docs/acf/`: plugin-managed docs the SessionStart hook refreshes by content digest. A formatter's
+  rewrite makes a copy match no shipped version, so it counts as edited and is never refreshed again.
+- `.backlog/`: task state. `/go` commits every transition at the repo root with hooks active, and
+  prettier re-aligns a task's Transition Log table, so every transition would hit the writer's
+  "commit failed" FATAL.
+- `.acfwhip/`: config and the LP-CAS ledger. Every integration commits a one-line JSON marker with
+  hooks active, and a JSON formatter that reflows it fails the integration.
+
+The shipped configs carry a top-level `exclude: '^(docs/(cycles|acf)/|\.backlog/|\.acfwhip/)'`, which
+pre-commit applies to every hook. The block below says so, and adds the line only to a freshly
+written copy that lacks it:
 
 ```bash
+FLAGS=''   # the same flags as Step 1
+eval "$(bash "${CLAUDE_PLUGIN_ROOT}/content/quality-gates/detect-stack.sh" "$FLAGS")"
 f=.pre-commit-config.yaml
-if grep -q 'docs/cycles' "$f"; then
-  echo "✓ $f already keeps its hooks out of docs/cycles/"
-elif grep -qE '^exclude:' "$f"; then
-  # A second top-level key would be invalid YAML, and merging two regexes by script is a guess.
-  echo "NOTE: $f has its own top-level exclude. Add docs/cycles/ to it by hand, or /whip approvals fail to commit."
-else
-  T=$(mktemp "${TMPDIR:-/tmp}/acfw-precommit.XXXXXX") || exit 1
-  # Insert before the first top-level `repos:` key. awk exits 0 only when it inserted, so a file
-  # without that key is never rewritten. `cat >` keeps the file's own mode (mktemp files are 0600).
-  if awk '
-       !done && /^repos:/ {
-         print "# acf-whip: acfw-cycle hashes docs/cycles/ and commits it itself, so no hook may rewrite it."
-         print "exclude: '"'"'^docs/cycles/'"'"'"
-         print ""
-         done = 1
-       }
-       { print }
-       END { exit done ? 0 : 1 }' "$f" > "$T"; then
-    cat "$T" > "$f" && echo "✓ $f: every hook skips docs/cycles/"
-  else
-    echo "NOTE: $f has no top-level repos: key. Add  exclude: '^docs/cycles/'  at its top level by hand."
+wrote=0
+if [ -z "$gate_stack$frontend_gate_stack" ]; then
+  echo "NOTE: no stack detected: no pre-commit config or quality-gates doc installed (see Error Handling)"
+fi
+if [ -f "$f" ]; then
+  echo "✓ $f exists: it is the operator's, left alone (Step 4.5 checks it)"
+elif [ -z "$gate_stack" ]; then
+  [ -n "$backend" ] && echo "NOTE: no shipped pre-commit config for ${backend}: none installed"
+elif [ "$gate_stack" = nodejs ] && [ ! -f package.json ]; then
+  echo "NOTE: no package.json at the repo root. The Node.js config runs npm scripts from the root, so it was not installed."
+elif cp "${CLAUDE_PLUGIN_ROOT}/content/pre-commit-configs/.pre-commit-config-${gate_stack}.yaml" "$f"; then
+  wrote=1
+  echo "✓ Installed $f (${gate_stack})"
+fi
+# The backend's gates doc, then the frontend's. They are one file when the backend is Node.js too.
+last_d=''
+for pair in "${gate_stack}:${gates_doc}" "${frontend_gate_stack}:${frontend_gates_doc}"; do
+  stack=${pair%%:*}; doc=${pair#*:}
+  [ -n "$stack" ] && [ -n "$doc" ] || continue
+  d="docs/development/quality-gates-${stack}.md"
+  [ "$d" = "${last_d:-}" ] && continue   # backend and frontend share the Node.js doc
+  last_d=$d
+  mkdir -p docs/development
+  if [ -f "$d" ]; then
+    echo "✓ $d exists, left as is"
+  elif cp "${CLAUDE_PLUGIN_ROOT}/content/quality-gates/${doc}" "$d"; then
+    echo "✓ Installed $d (from ${doc})"
   fi
-  rm -f "$T"
+done
+if [ -n "$frontend_gate_stack" ] && [ -n "$gate_stack" ] && [ "$frontend_gate_stack" != "$gate_stack" ]; then
+  echo "NOTE: $f runs the ${gate_stack} hooks only. The ${frontend} app's gates are in docs/development/quality-gates-${frontend_gate_stack}.md, which its specialist runs."
+fi
+# Only the copy written just now. An existing config is the operator's, never edited here.
+if [ "$wrote" = 1 ]; then
+  ex=$(grep -E '^exclude:' "$f")
+  if printf '%s' "$ex" | grep -q cycles && printf '%s' "$ex" | grep -qE 'acf[)/|]' \
+     && printf '%s' "$ex" | grep -q backlog && printf '%s' "$ex" | grep -q acfwhip; then
+    echo "✓ $f keeps its hooks out of docs/cycles/, docs/acf/, .backlog/ and .acfwhip/"
+  elif [ -n "$ex" ]; then
+    # A second top-level key would be invalid YAML, and merging two regexes by script is a guess.
+    echo "NOTE: $f has its own top-level exclude. Make it cover ^(docs/(cycles|acf)/|\\.backlog/|\\.acfwhip/) by hand, or /whip approvals, /go transitions and integrations fail to commit, and managed docs stop refreshing."
+  else
+    T=$(mktemp "${TMPDIR:-/tmp}/acfw-precommit.XXXXXX") || exit 1
+    # Insert before the first top-level `repos:` key. awk exits 0 only when it inserted, so a file
+    # without that key is never rewritten. `cat >` keeps the file's own mode (mktemp files are 0600).
+    if awk '
+         !done && /^repos:/ {
+           print "# acf-whip: no hook may rewrite docs/cycles/ (acfw-cycle hashes and commits it), docs/acf/ (managed docs, refreshed by digest),"
+           print "# .backlog/ (task state /go commits) or .acfwhip/ (config and the LP-CAS ledger)."
+           print "exclude: '"'"'^(docs/(cycles|acf)/|\\.backlog/|\\.acfwhip/)'"'"'"
+           print ""
+           done = 1
+         }
+         { print }
+         END { exit done ? 0 : 1 }' "$f" > "$T"; then
+      cat "$T" > "$f" && echo "✓ $f: every hook skips docs/cycles/, docs/acf/, .backlog/ and .acfwhip/"
+    else
+      echo "NOTE: $f has no top-level repos: key. Add  exclude: '^(docs/(cycles|acf)/|\\.backlog/|\\.acfwhip/)'  at its top level by hand."
+    fi
+    rm -f "$T"
+  fi
 fi
 ```
 
-### Step 4.5: Keep formatters out of `docs/cycles/`
+### Step 4.5: Keep formatters out of acf-whip's own paths
 
 This runs **after** Step 4, so it sees the pre-commit config whether the operator had one or Step 4
-just installed it. Add the folder to the formatter ignore files the project **already has**; never
-create one:
+just installed it. Add `docs/cycles/`, `docs/acf/`, `.backlog/` and `.acfwhip/` to the formatter
+ignore files the project **already has**; never create one:
 
 ```bash
 for f in .prettierignore .markdownlintignore; do
   [ -f "$f" ] || continue
-  if grep -qE '^/?docs/cycles/?$' "$f"; then echo "✓ $f already ignores docs/cycles/"; continue; fi
-  printf '\n# acf-whip cycle records: acfw-cycle hashes these bytes, so a formatter must not rewrite them\ndocs/cycles/\n' >> "$f"
-  echo "✓ Added docs/cycles/ to $f"
+  for d in docs/cycles docs/acf .backlog .acfwhip; do
+    if grep -qxF -e "$d" -e "$d/" -e "/$d" -e "/$d/" "$f"; then echo "✓ $f already ignores ${d}/"; continue; fi
+    case "$d" in
+      docs/cycles) why='acf-whip cycle records: acfw-cycle hashes these bytes, so a formatter must not rewrite them' ;;
+      docs/acf) why='acf-whip managed docs: refreshed by content digest, so a formatter rewrite freezes them' ;;
+      .backlog) why='acf-whip task state: /go commits every transition, so a formatter rewrite fails the run' ;;
+      .acfwhip) why='acf-whip config and LP-CAS ledger: a formatter rewrite of a ledger marker fails the integration' ;;
+    esac
+    printf '\n# %s\n%s/\n' "$why" "$d" >> "$f"
+    echo "✓ Added ${d}/ to $f"
+  done
 done
 # A formatter wired straight into the OPERATOR's pre-commit config: say what to add, never edit it.
 # The config Step 4 installed already carries the exclude, so it never reaches this NOTE.
-if [ -f .pre-commit-config.yaml ] && grep -qiE 'prettier|markdownlint' .pre-commit-config.yaml \
-   && ! grep -q 'docs/cycles' .pre-commit-config.yaml; then
-  echo "NOTE: .pre-commit-config.yaml runs a markdown formatter. If it does not read .prettierignore or .markdownlintignore, add  exclude: ^docs/cycles/  to that hook, or /whip approvals will fail to commit."
+f=.pre-commit-config.yaml
+if [ -f "$f" ] && grep -qiE 'prettier|markdownlint|mdformat' "$f"; then
+  ex=$(grep -E '^[[:space:]]*exclude:' "$f")
+  if ! { printf '%s' "$ex" | grep -q cycles && printf '%s' "$ex" | grep -qE 'acf[)/|]' \
+         && printf '%s' "$ex" | grep -q backlog && printf '%s' "$ex" | grep -q acfwhip; }; then
+    echo "NOTE: $f runs a formatter. If it does not read .prettierignore or .markdownlintignore, add  exclude: ^(docs/(cycles|acf)/|\\.backlog/|\\.acfwhip/)  to that hook, or /whip approvals, /go transitions and integrations fail to commit, and managed docs stop refreshing."
+  fi
 fi
 ```
 
@@ -411,10 +518,13 @@ Collect project data before generating agents:
 # Tech stack: From Step 1 (backend, frontend, frameworks)
 # Project: project_name=$(basename $(pwd))
 # Structure: services/|packages/ → is_monorepo=true | services/ + multiple → has_microservices=true | kafka|rabbitmq|pulsar|nats → has_event_driven=true
-# Quality tools: Extract from .pre-commit-config.yaml → quality_tools list
+# Quality tools: Extract from .pre-commit-config.yaml → quality_tools list. A hook named "(when ...)" runs
+#   only when the project has that tool, so list it only if the project does (Node.js: its node_*_cmd is
+#   non-empty; Python: mypy or pytest is configured; Go: golangci-lint is installed)
 # Coverage/Priority: From Step 2 user selection
 # Database: postgres|psycopg|pg → "postgresql" | mongo → "mongodb"
-# Doc paths: docs/acf/backlog/task-template.md, docs/development/quality-gates-{stack}.md, docs/acf/backlog/workflow.md
+# Doc paths: docs/acf/backlog/task-template.md, docs/acf/backlog/workflow.md, and the gates docs Step 4 wrote:
+#   docs/development/quality-gates-{gate_stack}.md (backend), docs/development/quality-gates-{frontend_gate_stack}.md (frontend)
 
 # DevOps-specific (if create_devops=true):
 # Monitoring: prometheus.yml|docker-compose.yml → "prometheus-grafana" | datadog → "datadog" | newrelic → "newrelic" | has_k8s → "prometheus-grafana"
@@ -446,6 +556,11 @@ Create `.claude/agents/` directory if missing. **Generate** 7-8 agents from patt
 | **devops** | `{LOCAL_ORCHESTRATION}`, `{DEPLOYMENT_TARGET}`, `{CI_TOOL}`, `{MONITORING_STACK}`, `{CLOUD_PROVIDER}`, `{HAS_K8S}`, `{PROJECT_NAME}`, `{ORCHESTRATION_RESPONSIBILITY}`, `{K8S_DELEGATION_SECTION}` | docker-compose, github-actions, prometheus-grafana, gke |
 
 **Coverage threshold logic**: 95% → api 95-98%, core 95% | 80% → api 90-95%, core 90% | 60% → api 75-80%, core 70%
+
+**Tool variables on a Node.js project** (`{backend_linter}`, `{backend_formatter}`,
+`{backend_test_runner}`, `{frontend_linter}`) come from Step 1's `node_*` values, never from a
+default: `node_lint_cmd`, `node_format_cmd`, `node_test_cmd`. An empty one means the project has no
+such tool; write "none" there, never `eslint` or `tsc`.
 
 Write generated agents to `.claude/agents/{agent}.md`.
 
@@ -495,23 +610,33 @@ fi
 - `{framework}` → framework examples:
   - Python: "FastAPI, Django, Flask"
   - Go: "Gin, Echo, Chi"
-  - Node.js: "Express, Fastify, NestJS"
+  - Node.js: `node_framework`: "Express", "Fastify", "NestJS", or for `none` "none (plain Node.js,
+    standard library)"
 - `{linter}` → linter tools:
   - Python: "ruff" (or "pylint" if .pre-commit-config has pylint)
   - Go: "golangci-lint"
-  - Node.js: "eslint"
+  - Node.js: `node_lint_cmd`
 - `{formatter}` → formatter tools:
   - Python: "ruff format" (or "black")
   - Go: "gofmt"
-  - Node.js: "prettier"
+  - Node.js: `node_format_cmd`
 - `{test-runner}` → test frameworks:
   - Python: "pytest"
   - Go: "go test"
-  - Node.js: "jest" (or "vitest")
+  - Node.js: `node_test_cmd` (runner: `node_test_runner`, e.g. `npm test` running `node --test`)
 - `{type-checker}` → type checking tools:
   - Python: "mypy"
   - Go: "built-in"
-  - Node.js: "tsc" (TypeScript)
+  - Node.js: `node_typecheck_cmd` (TypeScript projects only)
+- `{build}` → build step:
+  - Python: "python -m build" (packages only)
+  - Go: "go build ./..."
+  - Node.js: `node_build_cmd`
+
+**Node.js: an empty `node_*_cmd` drops that slot.** Remove its line from the command block and its
+term from the one-liner. A plain Node.js project (`node_framework='none'`, `"test": "node --test"`)
+ends up with `npm test` alone. Never write `eslint`, `prettier` or `tsc` into a project that does not
+have them: the agent can then only fail that gate or skip it.
 
 **For frontend agents** (nextjs/react/vue):
 - `{stack}` → detected frontend value ("nextjs", "react", "vue")
@@ -520,9 +645,9 @@ fi
   - Next.js: "next build"
   - React: "vite" (or "webpack")
   - Vue: "vite" (or "vue-cli")
-- `{linter}` → "eslint"
-- `{formatter}` → "prettier"
-- `{test-runner}` → "vitest" (or "jest")
+- `{linter}` → `node_lint_cmd` (empty: drop the slot)
+- `{formatter}` → `node_format_cmd` (empty: drop the slot)
+- `{test-runner}` → `node_test_cmd` (empty: drop the slot)
 
 **For infrastructure agent**:
 - `{orchestration}` → detected_orchestration ("docker-compose", "kubernetes", "docker-swarm")
@@ -600,7 +725,7 @@ Create `docs/agents/` directory. **Generate** manifests from patterns with Prior
 
 | Manifest | Customizations |
 |----------|----------------|
-| **All** | Replace `{stack}` with detected stacks, update quality gates paths: `docs/development/quality-gates-{backend_stack}.md` |
+| **All** | Replace `{stack}` with detected stacks, update quality gates paths to the files Step 4 wrote: `docs/development/quality-gates-{gate_stack}.md`, plus `docs/development/quality-gates-{frontend_gate_stack}.md` when a frontend exists and it is a different file (quality-reviewer and precommit check both sides) |
 | **task-engineer** | Update Priority 1 docs, match project structure |
 | **quality-reviewer** | Coverage thresholds from Step 2, quality gates for detected stacks, backend/frontend sections |
 | **lean-architect** | Priority 2 docs from project, add microservices/event-driven if detected |
@@ -627,14 +752,18 @@ Create `docs/agents/` directory. **Generate** manifests from patterns with Prior
 |-----------|----------|-------------------|
 | **python-engineer** | backend-manifest-pattern.md | `{stack}=python`, `{language}=Python`, `{framework}=FastAPI/Django/Flask`, `{linter}=ruff`, `{test_runner}=pytest`, `{type_checker}=mypy`, quality gates path |
 | **go-engineer** | backend-manifest-pattern.md | `{stack}=go`, `{language}=Go`, `{framework}=Gin/Echo/Chi`, `{linter}=golangci-lint`, `{test_runner}=go test`, `{type_checker}=built-in`, quality gates path |
-| **nodejs-engineer** | backend-manifest-pattern.md | `{stack}=nodejs`, `{language}=Node.js`, `{framework}=Express/Fastify/NestJS`, `{linter}=eslint`, `{test_runner}=jest`, `{type_checker}=tsc`, quality gates path |
-| **nextjs-engineer** | frontend-manifest-pattern.md | `{stack}=nextjs`, `{framework}=Next.js`, `{build_tool}=next build`, `{linter}=eslint`, `{formatter}=prettier`, `{test_runner}=vitest`, quality gates path |
-| **react-engineer** | frontend-manifest-pattern.md | `{stack}=react`, `{framework}=React`, `{build_tool}=vite`, `{linter}=eslint`, `{formatter}=prettier`, `{test_runner}=vitest`, quality gates path |
-| **vue-engineer** | frontend-manifest-pattern.md | `{stack}=vue`, `{framework}=Vue.js`, `{build_tool}=vite`, `{linter}=eslint`, `{formatter}=prettier`, `{test_runner}=vitest`, quality gates path |
+| **nodejs-engineer** | backend-manifest-pattern.md | `{stack}=nodejs`, `{language}=Node.js`, `{framework}`=`node_framework` (`none`: plain Node.js), `{linter}`=`node_lint_cmd`, `{test_runner}`=`node_test_cmd`, `{type_checker}`=`node_typecheck_cmd`, `{build}`=`node_build_cmd` (an empty one drops that slot), quality gates path |
+| **nextjs-engineer** | frontend-manifest-pattern.md | `{stack}=nextjs`, `{framework}=Next.js`, `{build_tool}=next build`, `{linter}`, `{formatter}`, `{test_runner}` from the `node_*_cmd` values (an empty one drops that slot), quality gates path |
+| **react-engineer** | frontend-manifest-pattern.md | `{stack}=react`, `{framework}=React`, `{build_tool}=vite`, `{linter}`, `{formatter}`, `{test_runner}` from the `node_*_cmd` values (an empty one drops that slot), quality gates path |
+| **vue-engineer** | frontend-manifest-pattern.md | `{stack}=vue`, `{framework}=Vue.js`, `{build_tool}=vite`, `{linter}`, `{formatter}`, `{test_runner}` from the `node_*_cmd` values (an empty one drops that slot), quality gates path |
 | **infrastructure-engineer** | infrastructure-manifest-pattern.md | `{orchestration}`, `{deployment_target}`, `{cloud_provider}`, `{ci_tool}`, `{monitoring_stack}` from Step 5.5, quality gates path |
 
 **Additional customizations for all specialist manifests**:
-- Priority 1 docs: Link to quality gates (`docs/development/quality-gates-{stack}.md`)
+- Priority 1 docs: Link to that specialist's own quality gates, the file Step 4 wrote. A backend
+  specialist reads `docs/development/quality-gates-{gate_stack}.md`. A frontend specialist reads
+  `docs/development/quality-gates-{frontend_gate_stack}.md` (`quality-gates-nodejs.md`), even when the
+  backend is Go or Python: a react-engineer sent to ruff, mypy and pytest can pass none of them. The
+  infrastructure specialist reads the backend's.
 - Priority 2 docs: Link to architecture docs if they exist
 - Replace project-specific paths discovered via docs/README.md scan
 
@@ -801,7 +930,7 @@ ACF Whip active. State machine: `pending → in-progress → completed → in-re
 
 **Universal Agents**: task-engineer (WHAT/WHY only), quality-reviewer (accept/reject), lean-architect (design, max 2-3 line snippets), retro (root cause analysis; proposes, never edits), precommit, research-agent (Perplexity/Context7), workflow-architect (authors the per-task child-workflow harness)
 
-**Quality Gates**: `docs/development/quality-gates-{stack}.md` | **Zero Bypass Tolerance**: No `--no-verify`, no skipping.
+**Quality Gates**: `docs/development/quality-gates-{gate_stack}.md`{IF frontend_gate_stack differs}, frontend: `docs/development/quality-gates-{frontend_gate_stack}.md`{ENDIF} | **Zero Bypass Tolerance**: No `--no-verify`, no skipping.
 
 **Next Steps**: `/whip` shows where you are and the one command to run next (`/whip "<goal>"` → `/task` → `/go` → `/retro`). `/retro` records one-rule lessons in `docs/acf/lessons/`, relevant when changing an area a lesson names.
 ```
@@ -821,8 +950,8 @@ if [ -f CLAUDE.md ]; then
   # awk exits 0 only when it replaced something, so an unchanged file is never rewritten.
   # `cat >` rather than `mv` keeps CLAUDE.md's own mode and inode (mktemp files are 0600).
   if awk -v old="$OLD" -v new="$NEW" '
-       $0 == old      { print new;      hit = 1; next }
-       $0 == old "\r" { print new "\r"; hit = 1; next }
+       $(0) == old      { print new;      hit = 1; next }
+       $(0) == old "\r" { print new "\r"; hit = 1; next }
                       { print }
        END { exit hit ? 0 : 1 }' CLAUDE.md > "$T"; then
     cat "$T" > CLAUDE.md && echo "✓ Replaced the old Next Steps line in CLAUDE.md"
@@ -839,7 +968,7 @@ Compare expected state (Steps 1-9) with actual state on disk:
 # 1. Check Universal Agents: expected_agents=(task-engineer quality-reviewer lean-architect precommit retro research-agent workflow-architect [+devops]) → missing_agents=[]
 # 2. Check Manifests: docs/agents/{agent}.md → missing_manifests=[]
 # 3. Check Core Docs: docs/acf/style/task-descriptions.md, docs/acf/backlog/task-template.md, docs/acf/backlog/workflow.md, docs/acf/backlog/recovery-runbook.md → missing_docs=[]
-# 4. Check Quality Gates: .pre-commit-config.yaml, docs/development/quality-gates-{stack}.md → missing_quality_gates=[]
+# 4. Check Quality Gates: .pre-commit-config.yaml, docs/development/quality-gates-{gate_stack}.md, docs/development/quality-gates-{frontend_gate_stack}.md (when a frontend exists) → missing_quality_gates=[]
 # 5. Check CLAUDE.md Sections (if exists): "## Pure Delegation Architecture", "## Backlog Workflow", devops in matrix (if create_devops=true) → missing_claude_sections=[], outdated_claude_sections=[]
 ```
 
@@ -882,7 +1011,7 @@ Compare expected state (Steps 1-9) with actual state on disk:
 {IF has_docs_index}📋 Documentation Hub: docs/README.md found → Agents will use it for discovery. Keep it updated.
 {IF NOT has_docs_index}📂 Documentation: Scanning standard directories. 💡 Create docs/README.md to help agents discover ALL docs.
 
-🎯 Quality Gates: ✓ .pre-commit-config.yaml ({stack}), ✓ docs/development/quality-gates-{stack}.md | Coverage: {threshold}%, Max retries: {attempts}
+🎯 Quality Gates: ✓ .pre-commit-config.yaml ({gate_stack}), ✓ docs/development/quality-gates-{gate_stack}.md ({gates_doc}){IF frontend_gate_stack differs}, ✓ docs/development/quality-gates-{frontend_gate_stack}.md ({frontend_gates_doc}, frontend){ENDIF} | Coverage: {threshold}%, Max retries: {attempts}
 
 {IF new_project}🔀 Integration mode: pinned ACFW_INTEGRATION_MODE=default (new project; accepted work lands on your local trunk, never pushed)
 {IF NOT new_project}🔀 Integration mode: left as found ({pinned value, or "unpinned: /whip will ask you to pin it"})
@@ -920,6 +1049,7 @@ Allow optional flags for automation:
 - `--strict` - Use aggressive quality gates (5 retry attempts)
 - `--standard` - Use standard quality gates (10 retry attempts)
 - `--with-specialists` - Auto-generate specialized agents based on tech stack detection (backend/frontend/infrastructure)
+- `--backend=go|python|nodejs|<stack>`, `--frontend=nextjs|react|vue|<stack>` - Override detection for that slot (Steps 1 and 4 pass them to the detector as `FLAGS`). A stack with no shipped gates doc gets no pre-commit config and no gates doc; `/whip-add-agents` writes its doc from a template
 
 ## Validation
 

@@ -1,11 +1,25 @@
-# Pre-commit hooks for Node.js/TypeScript projects
+# Pre-commit hooks for Node.js projects: plain Node, Express/Fastify/NestJS, React/Vue/Next.js,
+# JavaScript or TypeScript.
 # Install: https://pre-commit.com/
-# Usage: pre-commit install
+# Usage: pre-commit install                       (commit-stage hooks)
+#        pre-commit install --hook-type pre-push  (adds the test hook)
+#
+# Every hook runs only what the project already has. package.json scripts run through
+# `npm run <name> --if-present`, so a project without a lint, typecheck or build script skips that
+# hook instead of failing every commit. prettier runs from the project's own install and only when
+# package.json declares it. Nothing here installs a linter, a formatter or TypeScript the project
+# never chose: a plain `"test": "node --test"` project commits clean out of the box.
 
-# acf-whip: acfw-cycle hashes docs/cycles/ and commits it itself, so no hook may rewrite it.
-# plan.md is bound to the exact bytes you approved and record.md is verified after each commit:
-# a whitespace fixer or a markdown formatter that touches either one fails that commit.
-exclude: '^docs/cycles/'
+# acf-whip: four paths no hook may touch.
+#   docs/cycles/  acfw-cycle hashes plan.md and record.md and commits them itself. A whitespace fixer
+#                 or formatter that touches either one fails that commit.
+#   docs/acf/     plugin-managed docs, refreshed by content digest. A rewritten copy no longer matches
+#                 any shipped version, counts as edited, and is never refreshed again.
+#   .backlog/     task state. /go commits every transition at the repo root with hooks active, so a
+#                 hook that rewrites a task file fails that commit and stops the run.
+#   .acfwhip/     acf-whip config and the LP-CAS ledger. Every integration commits a one-line JSON
+#                 marker with hooks active, and a JSON formatter that reflows it fails the integration.
+exclude: '^(docs/(cycles|acf)/|\.backlog/|\.acfwhip/)'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -14,57 +28,74 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        args: ['--allow-multiple-documents']
       - id: check-json
+        # JSONC, not JSON: tsconfig/jsconfig, .eslintrc.json and editor settings allow comments.
+        exclude: '(^|/)((tsconfig|jsconfig)[^/]*|\.eslintrc|devcontainer)\.json$|^\.vscode/'
       - id: check-added-large-files
         args: ['--maxkb=500']
       - id: check-merge-conflict
       - id: mixed-line-ending
 
-  - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: v3.1.0
-    hooks:
-      - id: prettier
-        args: ['--write']
-        types_or: [javascript, jsx, ts, tsx, json, css, scss, markdown]
-
-  - repo: https://github.com/pre-commit/mirrors-eslint
-    rev: v8.55.0
-    hooks:
-      - id: eslint
-        args: ['--fix']
-        types_or: [javascript, jsx, ts, tsx]
-        additional_dependencies:
-          - eslint
-          - '@typescript-eslint/parser'
-          - '@typescript-eslint/eslint-plugin'
-
   - repo: local
     hooks:
-      - id: npm-build
-        name: npm build (typecheck)
-        entry: npm run build
+      # The project's own prettier, on staged files. It runs only when package.json declares prettier:
+      # npm links a bin for every transitive dependency, so node_modules/.bin/prettier alone proves
+      # nothing. The bin is found the way `npm run` finds one, in node_modules/.bin here or in any
+      # parent directory, so an acf-whip task worktree nested in the repo uses the root install.
+      # Declared but installed nowhere up the tree: fails and says so, never skips silently.
+      - id: prettier
+        name: prettier (when package.json declares it)
+        entry: >-
+          sh -c 'grep -Eqs "\"prettier\"[[:space:]]*:" package.json || exit 0;
+          d=$(pwd); while :; do
+          if [ -x "$d/node_modules/.bin/prettier" ]; then exec "$d/node_modules/.bin/prettier" --write --ignore-unknown "$@"; fi;
+          [ "$d" = / ] && break; d=$(dirname "$d"); done;
+          echo "prettier is in package.json but not installed here: run npm install" >&2; exit 1' --
         language: system
-        pass_filenames: false
-        always_run: true
+        types_or: [javascript, jsx, ts, tsx, json, css, scss, markdown]
 
+      # The script hooks run when the commit stages a source or JSON file, not on every commit.
+      # acf-whip commits task state (.backlog/) and cycle records (docs/cycles/) with hooks active,
+      # and a lint and a full build on each of those commits costs minutes and fails them for
+      # breakage they did not cause.
+      - id: npm-lint
+        name: npm run lint (when package.json defines it)
+        entry: npm run lint --if-present
+        language: system
+        types_or: [javascript, jsx, ts, tsx, vue, svelte, json]
+        pass_filenames: false
+
+      - id: npm-typecheck
+        name: npm run typecheck (when package.json defines it)
+        entry: npm run typecheck --if-present
+        language: system
+        types_or: [javascript, jsx, ts, tsx, vue, svelte, json]
+        pass_filenames: false
+
+      - id: npm-build
+        name: npm run build (when package.json defines it)
+        entry: npm run build --if-present
+        language: system
+        types_or: [javascript, jsx, ts, tsx, vue, svelte, json]
+        pass_filenames: false
+
+      # npm init writes a placeholder test script that exits 1. The stack detector and the gates doc
+      # both read it as "no tests yet", so it must not fail every push of a new project either.
       - id: npm-test
-        name: npm test
-        entry: npm test
+        name: npm test (when package.json defines it)
+        entry: >-
+          sh -c 'if grep -qs "Error: no test specified" package.json; then
+          echo "npm test is still the npm init placeholder: skipped. Add a real test script to run tests on push.";
+          exit 0; fi; exec npm run test --if-present' --
         language: system
         pass_filenames: false
         always_run: true
         stages: [pre-push]
 
-      - id: npm-lint
-        name: npm lint
-        entry: npm run lint
-        language: system
-        pass_filenames: false
-        always_run: true
-
-# PARAMETERIZE: Customize based on your Node.js/TypeScript project needs
-# - Replace 'npm' with 'pnpm' or 'yarn' as needed
-# - Adjust build/test/lint scripts to match package.json
-# - Add specific TypeScript checking (tsc --noEmit)
+# PARAMETERIZE: Customize based on your Node.js project needs
+# - Replace 'npm run' with 'pnpm run' or 'yarn run' as needed (Yarn PnP has no node_modules/.bin:
+#   point the prettier entry at 'yarn prettier')
+# - Add an eslint hook on staged files if you want lint feedback narrower than 'npm run lint'
 # - Add security auditing (npm audit)
 # - Consider adding commitlint for commit message validation

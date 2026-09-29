@@ -24,7 +24,11 @@ Analyzes repository structure, detects missing specialist agents, and generates 
 For each missing specialist agent:
 1. **Create agent implementation**: `.claude/agents/{agent-name}.md` (small, core instructions)
 2. **Create agent manifest**: `docs/agents/{agent-name}.md` (comprehensive, Priority 1/2/3 docs)
-3. **Generate quality gates**: `docs/development/quality-gates-{stack}.md` (if missing)
+3. **Generate quality gates** (if missing): each specialist gets the gates of its own stack, its
+   `{gates_path}` (Step 2B). The backend specialist reads `docs/development/quality-gates-{gate_stack}.md`.
+   A frontend specialist (React, Vue, Next.js) reads `docs/development/quality-gates-nodejs.md`, even
+   when the backend is Go or Python. A stack with no shipped doc (Rust) gets
+   `quality-gates-{stack}.md` from the Step 6 template.
 4. **Update configuration**: `.backlog/README.md`, `CLAUDE.md` (if exists)
 
 **User arguments take PRIORITY over auto-detection.**
@@ -50,7 +54,11 @@ User arguments OVERRIDE auto-detection:
 - `--infrastructure=k8s|docker|terraform`
 - `--specialized=temporal|event-bus|graphql`
 
-If user provides flags, SKIP auto-detection and create those agents.
+A flag decides its own slot outright, whatever the repository looks like: `--backend=python` makes a
+python-engineer with the Python gates in a repo whose only manifest is `package.json`. Auto-detection
+fills only the slots no flag names (see Mixed below). Keep the flags as `FLAGS` (for example
+`FLAGS='--backend=python --frontend=nextjs'`): the Step 2B, 6 and 7C blocks pass them to the detector,
+which applies `--backend=` and `--frontend=` and ignores the rest.
 
 ### Step 2: Repository Analysis (if no user args OR to supplement)
 
@@ -70,38 +78,47 @@ find . -type f -name "*.ts" -o -name "*.tsx" | wc -l
 
 #### B. Tech Stack Indicators
 
-**Backend Detection**:
+**Backend and Frontend Detection**: the same detector `/whip-init` runs, so the two skills never
+disagree about a stack. It prints `key='value'` lines from a fixed vocabulary (the key table is in
+`/whip-init` Step 1 and in the script's header):
+
 ```bash
-# Go
-if [ -f "go.mod" ]; then
-  backend="go"
-  # Check frameworks
+FLAGS=''   # Step 1's flags, verbatim; empty when the user gave none
+eval "$(bash "${CLAUDE_PLUGIN_ROOT}/content/quality-gates/detect-stack.sh" "$FLAGS")"
+echo "backend=${backend:-none} (gates: ${gate_stack:-none}, ${gates_doc:-none})"
+echo "frontend=${frontend:-none} (gates: ${frontend_gate_stack:-none}, ${frontend_gates_doc:-none})"
+[ -n "$node_framework" ] && echo "node: framework=$node_framework test=$node_test_runner typescript=$node_typescript linter=$node_linter formatter=$node_formatter"
+
+# Framework hints the detector does not report (Go/Python only):
+if [ "$backend" = go ] && [ -f go.mod ]; then
   grep -q "github.com/gin-gonic/gin" go.mod && framework="gin"
   grep -q "github.com/labstack/echo" go.mod && framework="echo"
 fi
-
-# Python
-if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
-  backend="python"
-  grep -q "fastapi" requirements.txt && framework="fastapi"
-  grep -q "django" requirements.txt && framework="django"
-  grep -q "langchain\|langgraph" requirements.txt && ml="true"
-fi
-
-# Node.js
-if [ -f "package.json" ]; then
-  grep -q '"fastify"\|"express"\|"@nestjs"' package.json && backend="nodejs"
+if [ "$backend" = python ]; then
+  for m in requirements.txt requirements-dev.txt pyproject.toml setup.py setup.cfg Pipfile; do
+    [ -f "$m" ] || continue
+    grep -qi "fastapi" "$m" && framework="fastapi"
+    grep -qi "django" "$m" && framework="django"
+    grep -qi "langchain\|langgraph" "$m" && ml="true"
+  done
 fi
 ```
 
-**Frontend Detection**:
-```bash
-if [ -f "package.json" ]; then
-  grep -q '"next"' package.json && frontend="nextjs"
-  grep -q '"react"' package.json && frontend="react"
-  grep -q '"vue"' package.json && frontend="vue"
-fi
-```
+A `package.json` with no Express/Fastify/NestJS/Next/React/Vue is a plain Node.js project:
+`backend=nodejs`, `node_framework=none`, the test runner read from its `"test"` script. It gets a
+`nodejs-engineer`, and its gates are only the ones `node_*_cmd` reports (often `npm test` alone).
+The backend is first match (`go.mod`, then a Python manifest, then Node.js), and Next.js wins over
+React because it ships React.
+
+**Each specialist's `{gates_path}`**, used by its manifest (Step 5), CLAUDE.md entry (Step 7B) and
+checks (Step 8). One `gate_stack` cannot serve a polyglot repo: on FastAPI plus React it is `python`,
+and a react-engineer sent to ruff, mypy and pytest can pass none of them.
+
+| Specialist | `{gates_path}` |
+|------------|----------------|
+| backend (`{backend}-engineer`) | `docs/development/quality-gates-{gate_stack}.md`. With no shipped doc (`gate_stack` empty, e.g. `--backend=rust`): `docs/development/quality-gates-{backend}.md`, written in Step 6 |
+| frontend (`{frontend}-engineer`) | `docs/development/quality-gates-{frontend_gate_stack}.md`, which is always `quality-gates-nodejs.md` |
+| data, infrastructure, specialized | the backend's |
 
 **Data/ML Detection**:
 ```bash
@@ -159,7 +176,7 @@ existing_agents=$(ls -1 .claude/agents/*.md 2>/dev/null | xargs -n1 basename | s
 ```bash
 # Project size
 total_files=$(find . -type f -name "*.go" -o -name "*.py" -o -name "*.ts" | wc -l)
-total_loc=$(find . -type f \( -name "*.go" -o -name "*.py" -o -name "*.ts" \) -exec wc -l {} + | tail -1 | awk '{print $1}')
+total_loc=$(find . -type f \( -name "*.go" -o -name "*.py" -o -name "*.ts" \) -exec wc -l {} + | tail -1 | awk '{print $(1)}')
 
 # Polyglot detection
 languages=0
@@ -352,12 +369,14 @@ mypy . --strict
 pytest --cov --cov-report=term
 ```
 
-**Node.js/TypeScript**:
+**Node.js** (plain Node, Express, Fastify, NestJS; JavaScript or TypeScript). Use the detector's
+`node_*_cmd` values and drop any that are empty. A plain project with `"test": "node --test"` has
+`npm test` and nothing else; never add `eslint`, `tsc` or a build step it does not have:
 ```bash
-npm run lint
-npm run typecheck
-npm test --coverage
-npm run build
+npm test                          # node_test_cmd
+npm run lint                      # node_lint_cmd, when the project has a linter
+npx tsc --noEmit                  # node_typecheck_cmd, TypeScript projects only
+npm run build                     # node_build_cmd, when package.json defines build
 ```
 
 **React**:
@@ -375,6 +394,9 @@ pnpm typecheck
 pnpm test --coverage
 pnpm build
 ```
+
+The React and Next.js blocks are examples. On any `package.json` project the detector's
+`node_*_cmd` values win: a React app with no `typecheck` script gets no typecheck line.
 
 ### Step 5: Generate Agent Manifest Files
 
@@ -418,7 +440,7 @@ Documents used in 80%+ of tasks:
    - Why: Task file structure, transition log format
    - When: Before marking complete, for evidence section
 
-4. **`docs/development/quality-gates-{stack}.md`**
+4. **`{gates_path}`** (this specialist's own gates, Step 2B)
    - Why: Quality gate commands, coverage thresholds
    - When: Before marking complete, during evidence collection
 
@@ -712,9 +734,33 @@ mv .backlog/in-progress/{task}.md .backlog/blocked/
 
 ### Step 6: Generate Quality Gate Documentation (if missing)
 
-If stack-specific quality gates don't exist:
+Copy the shipped doc for the backend and, when there is a frontend, the frontend's, each only when
+missing. Each matches its own stack: a plain Node.js project gets `nodejs.md`, not the
+Next.js/TypeScript one, and a React app next to a Python backend gets `quality-gates-nodejs.md` beside
+`quality-gates-python.md`. A flag names the stack outright, so `--backend=python` in a repo whose
+only manifest is `package.json` installs the Python gates.
 
-Create `docs/development/quality-gates-{stack}.md`:
+```bash
+FLAGS=''   # Step 1's flags, verbatim; empty when the user gave none
+eval "$(bash "${CLAUDE_PLUGIN_ROOT}/content/quality-gates/detect-stack.sh" "$FLAGS")"
+last_d=''
+for pair in "${gate_stack}:${gates_doc}" "${frontend_gate_stack}:${frontend_gates_doc}"; do
+  stack=${pair%%:*}; doc=${pair#*:}
+  [ -n "$stack" ] && [ -n "$doc" ] || continue
+  d="docs/development/quality-gates-${stack}.md"
+  [ "$d" = "${last_d:-}" ] && continue   # backend and frontend share the Node.js doc
+  last_d=$d
+  if [ -f "$d" ]; then echo "✓ $d exists, left as is"; continue; fi
+  mkdir -p docs/development
+  cp "${CLAUDE_PLUGIN_ROOT}/content/quality-gates/${doc}" "$d" && echo "✓ Installed $d (from ${doc})"
+done
+[ -n "$backend" ] && [ -z "$gate_stack" ] && echo "NOTE: no shipped gates doc for ${backend}: write docs/development/quality-gates-${backend}.md from the template below"
+true
+```
+
+Only for a stack with no shipped doc (Rust, or any `--backend=` value other than go, python and
+nodejs), create `docs/development/quality-gates-{stack}.md` from this template, filling each command
+slot with a tool the project actually has and dropping the rest:
 
 ```markdown
 # Quality Gates - {Stack}
@@ -832,15 +878,31 @@ Add new agents to agent assignment section:
 
 - **{agent-name}**: {scope-description}
   - Manifest: `docs/agents/{agent-name}.md`
-  - Quality Gates: `docs/development/quality-gates-{stack}.md`
+  - Quality Gates: `{gates_path}`
   - Tech Stack: {technologies}
 ```
 
 #### C. Install Pre-commit Hooks (if not present)
 
+The shipped configs run only tools the project has, and keep every hook out of the paths acf-whip
+commits itself: `docs/cycles/`, `docs/acf/`, `.backlog/` and `.acfwhip/`. An existing
+`.pre-commit-config.yaml` is the operator's and is never replaced. There is one config per repo, so
+it is the backend's; a frontend next to a Go or Python backend keeps its gates in
+`quality-gates-nodejs.md`, which its specialist runs.
+
 ```bash
-if [ ! -f ".pre-commit-config.yaml" ]; then
-  cp "${CLAUDE_PLUGIN_ROOT}/content/pre-commit-configs/.pre-commit-config-{stack}.yaml" .pre-commit-config.yaml
+FLAGS=''   # Step 1's flags, verbatim; empty when the user gave none
+eval "$(bash "${CLAUDE_PLUGIN_ROOT}/content/quality-gates/detect-stack.sh" "$FLAGS")"
+f=.pre-commit-config.yaml
+if [ -f "$f" ]; then
+  echo "✓ $f exists: it is the operator's, left alone"
+elif [ -z "$gate_stack" ]; then
+  echo "NOTE: no shipped pre-commit config for ${backend:-this repo}: none installed"
+elif [ "$gate_stack" = nodejs ] && [ ! -f package.json ]; then
+  echo "NOTE: no package.json at the repo root. The Node.js config runs npm scripts from the root, so it was not installed."
+else
+  cp "${CLAUDE_PLUGIN_ROOT}/content/pre-commit-configs/.pre-commit-config-${gate_stack}.yaml" "$f" \
+    && echo "✓ Installed $f (${gate_stack})"
 fi
 ```
 
@@ -864,13 +926,19 @@ grep "## Priority 1:" docs/agents/{agent}.md
 grep "## Priority 2:" docs/agents/{agent}.md
 grep "## Priority 3:" docs/agents/{agent}.md
 
-# Anti-patterns section has 5-10 examples
-grep -c "^### [0-9]\\." docs/agents/{agent}.md
+# Anti-patterns section has 5-10 entries. The manifest templates write them as a numbered list
+# ("1. Skip manifest reading → Rework"); a "### 1." heading also counts. Only lines inside the
+# "## Anti-Patterns" section are counted, so numbered lists elsewhere in the manifest do not inflate it.
+n=$(awk '
+  /^## / { in_ap = ($(0) ~ /^## Anti-Patterns/); next }
+  in_ap && /^(### )?[0-9]+\. / { n++ }
+  END { print n + 0 }' docs/agents/{agent}.md)
+if [ "$n" -ge 5 ] && [ "$n" -le 10 ]; then echo "✓ $n anti-patterns"; else echo "FAIL: $n anti-patterns in docs/agents/{agent}.md (want 5-10)"; fi
 ```
 
-3. **Quality gate docs created**:
+3. **Quality gate docs created**, one per specialist's `{gates_path}`:
 ```bash
-[ -f "docs/development/quality-gates-{stack}.md" ]
+[ -f "{gates_path}" ]
 ```
 
 4. **Cross-references valid**:
@@ -878,8 +946,8 @@ grep -c "^### [0-9]\\." docs/agents/{agent}.md
 # Agent references manifest
 grep -q "docs/agents/{agent}.md" .claude/agents/{agent}.md
 
-# Manifest references quality gates
-grep -q "docs/development/quality-gates-{stack}.md" docs/agents/{agent}.md
+# Manifest references ITS OWN gates (a frontend manifest pointing at the backend's gates is a FAIL)
+grep -q "{gates_path}" docs/agents/{agent}.md
 
 # README lists agent
 grep -q "{agent}" .backlog/README.md
@@ -900,7 +968,7 @@ grep -q "{agent}" .backlog/README.md
      ├── Priority 3: {N} docs (REFERENCE)
      ├── Navigation Guidance: {N} task types
      └── Anti-Patterns: {N} examples
-   - Quality Gates: docs/development/quality-gates-{stack}.md
+   - Quality Gates: {gates_path}
      ├── Linting: {linter-command}
      ├── Type Checking: {type-checker-command}
      ├── Testing: {test-command} (coverage: {threshold}%)
@@ -911,7 +979,7 @@ grep -q "{agent}" .backlog/README.md
 Updated Configuration:
   ✓ .backlog/README.md (agent list updated)
   ✓ CLAUDE.md (agent assignments added)
-  ✓ .pre-commit-config.yaml ({stack})
+  ✓ .pre-commit-config.yaml ({gate_stack}; an existing one is left alone)
 
 Next Steps:
   1. Review generated agents in .claude/agents/
@@ -942,9 +1010,9 @@ Scans repo, detects Go + React + Kubernetes, creates:
 /whip-add-agents --backend=python --frontend=nextjs
 ```
 
-Skips detection, creates:
-- python-engineer
-- nextjs-engineer
+Both slots are named, so detection decides neither. Creates:
+- python-engineer, reading `docs/development/quality-gates-python.md`
+- nextjs-engineer, reading `docs/development/quality-gates-nodejs.md` (from `nextjs-typescript.md`)
 
 ### Mixed
 

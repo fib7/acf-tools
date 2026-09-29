@@ -10,10 +10,36 @@ Universal zero-bypass quality enforcement patterns across tech stacks.
 
 | Tech Stack | File | Status |
 |------------|------|--------|
+| **Node.js** (plain Node, Express, Fastify, NestJS, React, Vue) | [nodejs.md](nodejs.md) | Ready to use |
 | **Next.js/TypeScript** | [nextjs-typescript.md](nextjs-typescript.md) | Ready to use |
 | **Python/FastAPI** | [python-fastapi.md](python-fastapi.md) | Ready to use |
 | **Go** | [go.md](go.md) | Ready to use |
 | **Custom** | [template.md](template.md) | Template for your stack |
+
+## Which Doc a Project Gets
+
+`/whip-init` and `/whip-add-agents` pick the doc with [detect-stack.sh](detect-stack.sh), run from the
+project root. It prints `gate_stack` (which `.pre-commit-config-<gate_stack>.yaml` to install and the
+backend's `docs/development/quality-gates-<gate_stack>.md` destination) and `gates_doc` (the source
+file here):
+
+| Detected | gate_stack | gates_doc |
+|----------|------------|-----------|
+| `go.mod` | go | go.md |
+| `requirements.txt`, `pyproject.toml`, `setup.py`, `setup.cfg` or `Pipfile` | python | python-fastapi.md |
+| `package.json` with `next` | nodejs | nextjs-typescript.md |
+| any other `package.json`, including one with no framework at all | nodejs | nodejs.md |
+
+First match wins, top to bottom: a Go module with a `package.json` for tooling gets the Go gates.
+
+A frontend gets gates of its own. Whenever `package.json` has `next`, `react` or `vue`, the detector
+also prints `frontend_gate_stack=nodejs` and `frontend_gates_doc` (`nextjs-typescript.md` for Next.js,
+`nodejs.md` otherwise), installed as `docs/development/quality-gates-nodejs.md`. So in a FastAPI plus
+React repo the python-engineer reads the Python gates and the react-engineer reads the Node.js gates.
+When the backend is Node.js too, both are the same file.
+
+`--backend=<stack>` and `--frontend=<stack>` override detection for that slot, so a skill's flags
+pick the gates. A stack with no shipped doc (`--backend=rust`) gets an empty `gate_stack`.
 
 ## Universal Structure
 
@@ -29,6 +55,14 @@ All quality gates follow this pattern:
 8. **Continuous Integration** - CI pipeline requirements
 
 ## Quick Reference
+
+### Node.js
+```bash
+npm test                          # the project's own runner (node --test, jest, vitest)
+npm run lint --if-present         # only when package.json defines it
+npm run typecheck --if-present    # TypeScript projects
+npm run build --if-present        # projects with a build step
+```
 
 ### Next.js/TypeScript
 ```bash

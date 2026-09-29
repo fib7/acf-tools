@@ -165,21 +165,17 @@ async def process_data(input, metadata, timestamp):
 
 ## Pre-commit Hooks
 
-```yaml
-# .pre-commit-config.yaml
-repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.1.0
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
+The installed `.pre-commit-config.yaml` enforces these gates on commit: ruff and ruff format always,
+mypy once the project configures it (`[tool.mypy]` in pyproject.toml, `mypy.ini`, or `[mypy]` in
+setup.cfg), and pytest on push once the project declares it. mypy and pytest run in the project's
+own environment: uv, poetry, `.venv`, or PATH. Set `strict = true` under `[tool.mypy]` so the hook
+enforces the `--strict` gate above. The config never touches `docs/cycles/` (cycle records),
+`docs/acf/` (plugin-managed docs), `.backlog/` (task state) or `.acfwhip/` (config and the LP-CAS
+ledger): acf-whip commits those itself, and a hook that rewrites one fails that commit. ruff runs at
+the version the config pins and reads your `[tool.ruff]`; keep that pin at or above the ruff you use.
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.0.0
-    hooks:
-      - id: mypy
-        args: [--strict]
+```bash
+pre-commit run --all-files
 ```
 
 ## Quality Gate Protocol

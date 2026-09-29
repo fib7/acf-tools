@@ -1,11 +1,22 @@
 # Pre-commit hooks for Go projects
 # Install: https://pre-commit.com/
-# Usage: pre-commit install
+# Usage: pre-commit install                       (commit-stage hooks)
+#        pre-commit install --hook-type pre-push  (adds the test hook)
+#
+# Every hook runs only what the project already has. gofmt and go vet ship with Go. golangci-lint
+# runs the binary the developer installed, so its version matches the project's .golangci config;
+# not installed and not configured, it is skipped.
 
-# acf-whip: acfw-cycle hashes docs/cycles/ and commits it itself, so no hook may rewrite it.
-# plan.md is bound to the exact bytes you approved and record.md is verified after each commit:
-# a whitespace fixer or a markdown formatter that touches either one fails that commit.
-exclude: '^docs/cycles/'
+# acf-whip: four paths no hook may touch.
+#   docs/cycles/  acfw-cycle hashes plan.md and record.md and commits them itself. A whitespace fixer
+#                 or formatter that touches either one fails that commit.
+#   docs/acf/     plugin-managed docs, refreshed by content digest. A rewritten copy no longer matches
+#                 any shipped version, counts as edited, and is never refreshed again.
+#   .backlog/     task state. /go commits every transition at the repo root with hooks active, so a
+#                 hook that rewrites a task file fails that commit and stops the run.
+#   .acfwhip/     acf-whip config and the LP-CAS ledger. Every integration commits a one-line JSON
+#                 marker with hooks active, and a JSON formatter that reflows it fails the integration.
+exclude: '^(docs/(cycles|acf)/|\.backlog/|\.acfwhip/)'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -14,19 +25,32 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        args: ['--allow-multiple-documents']
       - id: check-added-large-files
         args: ['--maxkb=500']
       - id: check-merge-conflict
       - id: mixed-line-ending
 
-  - repo: https://github.com/golangci/golangci-lint
-    rev: v1.55.2
-    hooks:
-      - id: golangci-lint
-        args: ['run', '--fix']
-
   - repo: local
     hooks:
+      # Replaces the golangci-lint repo hook, whose entry is already `golangci-lint run ...`: the
+      # `args: ['run', '--fix']` it carried became a package pattern named "run", which fails to load.
+      # Lints only what changed since HEAD, as that hook did, so existing lint debt does not block
+      # every commit. A .golangci config without the binary fails and says so.
+      - id: golangci-lint
+        name: golangci-lint (when installed)
+        entry: >-
+          sh -c 'if command -v golangci-lint >/dev/null 2>&1; then
+          if git rev-parse -q --verify HEAD >/dev/null; then exec golangci-lint run --new-from-rev HEAD --fix; fi;
+          exec golangci-lint run --fix; fi;
+          for c in .golangci.yml .golangci.yaml .golangci.toml .golangci.json; do if [ -f "$c" ]; then
+          echo "$c exists but golangci-lint is not installed: https://golangci-lint.run/welcome/install/" >&2;
+          exit 1; fi; done' --
+        language: system
+        types: [go]
+        pass_filenames: false
+        require_serial: true
+
       - id: go-fmt
         name: go fmt
         entry: gofmt
@@ -35,9 +59,11 @@ repos:
         types: [go]
         pass_filenames: true
 
+      # ./... and not bare `go vet`: bare vet checks only the root package, and a module whose code
+      # lives under cmd/ or internal/ has none ("no Go files"), which failed every commit.
       - id: go-vet
         name: go vet
-        entry: go vet
+        entry: go vet ./...
         language: system
         types: [go]
         pass_filenames: false
@@ -58,7 +84,7 @@ repos:
         stages: [pre-push]
 
 # PARAMETERIZE: Customize based on your Go project needs
-# - Add custom linters to golangci-lint args
+# - Add a .golangci.yml to choose linters (golangci-lint then becomes required)
 # - Add security scanning (gosec)
 # - Add vulnerability checking (govulncheck)
 # - Adjust go test args for your test suite

@@ -1,11 +1,26 @@
 # Pre-commit hooks for Python projects
 # Install: https://pre-commit.com/
-# Usage: pre-commit install
+# Usage: pre-commit install                       (commit-stage hooks)
+#        pre-commit install --hook-type pre-push  (adds the test hook)
+#
+# Every hook runs only what the project already has. ruff installs itself at the rev pinned below and
+# reads the project's own [tool.ruff] or ruff.toml. A config newer than that rev (a target-version or
+# a rule it does not know yet) fails every commit, so keep the rev at or above the ruff the project
+# uses: `pre-commit autoupdate --repo https://github.com/astral-sh/ruff-pre-commit`.
+# mypy and pytest run in the project's own environment (uv, poetry, .venv, or PATH) and only when the
+# project configures them: `mypy --strict` on a project that never opted into type checking fails
+# every commit, and a hook that assumes uv fails on a pip or poetry project.
 
-# acf-whip: acfw-cycle hashes docs/cycles/ and commits it itself, so no hook may rewrite it.
-# plan.md is bound to the exact bytes you approved and record.md is verified after each commit:
-# a whitespace fixer or a markdown formatter that touches either one fails that commit.
-exclude: '^docs/cycles/'
+# acf-whip: four paths no hook may touch.
+#   docs/cycles/  acfw-cycle hashes plan.md and record.md and commits them itself. A whitespace fixer
+#                 or formatter that touches either one fails that commit.
+#   docs/acf/     plugin-managed docs, refreshed by content digest. A rewritten copy no longer matches
+#                 any shipped version, counts as edited, and is never refreshed again.
+#   .backlog/     task state. /go commits every transition at the repo root with hooks active, so a
+#                 hook that rewrites a task file fails that commit and stops the run.
+#   .acfwhip/     acf-whip config and the LP-CAS ledger. Every integration commits a one-line JSON
+#                 marker with hooks active, and a JSON formatter that reflows it fails the integration.
+exclude: '^(docs/(cycles|acf)/|\.backlog/|\.acfwhip/)'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -14,32 +29,55 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        args: ['--allow-multiple-documents']
       - id: check-added-large-files
         args: ['--maxkb=500']
       - id: check-merge-conflict
       - id: mixed-line-ending
       - id: check-toml
       - id: check-json
+        # JSONC, not JSON: editor and devcontainer settings allow comments.
+        exclude: '(^|/)devcontainer\.json$|^\.vscode/'
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.1.6
+    rev: v0.16.9
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: ['--fix', '--exit-non-zero-on-fix']
+      # Python files only. ruff format also rewrites the Python blocks inside markdown files by
+      # default, which would reformat every doc and agent manifest that shows a code sample.
       - id: ruff-format
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.7.1
-    hooks:
-      - id: mypy
-        args: ['--strict', '--ignore-missing-imports']
-        additional_dependencies: [types-all]
+        types_or: [python, pyi, jupyter]
 
   - repo: local
     hooks:
+      # Runs only when mypy is configured (mypy.ini, .mypy.ini, [mypy] in setup.cfg, [tool.mypy] in
+      # pyproject.toml), with that config's strictness. The mirrors-mypy hook this replaces pulled
+      # `types-all`, which no longer installs (it depends on the yanked types-pkg-resources), so it
+      # failed every commit on every project.
+      - id: mypy
+        name: mypy (when the project configures it)
+        entry: >-
+          sh -c 'if [ ! -f mypy.ini ] && [ ! -f .mypy.ini ]
+          && ! grep -Eqs "^\[(mypy|tool\.mypy)" setup.cfg pyproject.toml; then exit 0; fi;
+          if [ -f uv.lock ]; then exec uv run mypy "$@"; fi;
+          if [ -f poetry.lock ]; then exec poetry run mypy "$@"; fi;
+          if [ -x .venv/bin/mypy ]; then exec .venv/bin/mypy "$@"; fi;
+          exec mypy "$@"' --
+        language: system
+        types: [python]
+        require_serial: true
+
+      # Runs only when the project declares pytest. "No tests collected" (exit 5) passes: a new
+      # project with no tests yet must still be able to push.
       - id: pytest
-        name: pytest
-        entry: uv run pytest
+        name: pytest (when the project declares it)
+        entry: >-
+          sh -c 'grep -qs pytest pyproject.toml setup.cfg tox.ini pytest.ini Pipfile requirements*.txt requirements/*.txt
+          || [ -f conftest.py ] || exit 0;
+          if [ -f uv.lock ]; then set -- uv run pytest; elif [ -f poetry.lock ]; then set -- poetry run pytest;
+          elif [ -x .venv/bin/pytest ]; then set -- .venv/bin/pytest; else set -- pytest; fi;
+          "$@"; rc=$?; if [ "$rc" = 5 ]; then echo "pytest collected no tests"; exit 0; fi; exit "$rc"' --
         language: system
         pass_filenames: false
         always_run: true
@@ -47,15 +85,17 @@ repos:
 
       - id: pytest-cov
         name: pytest with coverage
-        entry: uv run pytest --cov=src --cov-fail-under=80
+        entry: >-
+          sh -c 'if [ -f uv.lock ]; then set -- uv run pytest; elif [ -f poetry.lock ]; then set -- poetry run pytest;
+          elif [ -x .venv/bin/pytest ]; then set -- .venv/bin/pytest; else set -- pytest; fi;
+          exec "$@" --cov=src --cov-fail-under=80' --
         language: system
         pass_filenames: false
         always_run: true
         stages: [manual]
 
 # PARAMETERIZE: Customize based on your Python project needs
-# - Replace 'uv run' with 'poetry run' or 'python -m' as needed
-# - Adjust mypy args for your type checking needs
-# - Adjust pytest args for your test suite
+# - Adjust pytest-cov's --cov=src to your package directory (flat layouts have no src/)
+# - Configure mypy (e.g. [tool.mypy] strict = true) to turn the mypy hook on
 # - Add bandit for security scanning
 # - Add safety for dependency vulnerability checking
