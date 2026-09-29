@@ -1,0 +1,1489 @@
+#!/usr/bin/env bash
+# acfw-cycle — the ACF cycle engine (acf-whip 3.5.0): PLAN -> DECOMPOSE -> BUILD -> VERIFY -> RETRO.
+#
+# WHY ONE SCRIPT. The stage of a cycle is NEVER STORED. It is re-derived on every call from git, the
+# task store and the cycle folder, because every stored stage is a second copy of the truth that
+# drifts the first time a run dies between two writes. A model deriving it in prose is worse: it
+# recommends commands that do not exist. So the derivation lives here, once, and the skills print
+# this script's output verbatim.
+#
+# THE CYCLE FOLDER IS THE RECORD. docs/cycles/<YYYYMMDD-slug>/ holds plan.md (the human's), record.md
+# (ours: stamp, task map, newest-first Plan Log) and retro.md. Human edits and tool writes never share
+# a file, so a tool commit can never sweep an uncommitted plan edit, and every event is its own
+# PATHSPEC commit (`git commit -o -- <exact paths>`), never `git add -A`. One exception, and it cannot
+# change what was approved: approve rewrites plan.md to its normalized bytes (the ones the content hash
+# covers) so a whitespace pre-commit hook has nothing to fix; close and note do the same to the files
+# the retro agent just wrote; see norm_in_place.
+#
+# APPROVAL BINDS BYTES, NOT INTENT. Valid only when three things agree at HEAD: record.md's Approved
+# Content, the newest `approved` row, and the normalized hash of plan.md. `--expect` must prefix-match
+# the hash the card showed (rule 11), so an approval can only ever bind the text a human saw. Trailers
+# (ACFW-Plan-Event) are audit only: squash merges and shallow clones drop them, so their absence WARNs
+# and never refuses. /task --plan builds from a frozen HEAD copy, never the live file.
+#
+# A LOCK IS EVIDENCE, NOT LIVENESS. The decompose lock records that a /task started; it expires in 30
+# minutes and every refusal prints its age plus the one `rm` that overrides it. The same shape guards
+# the trunk: a cycle's events commit only on a pinned ACFW_TRUNK_BRANCH or, unpinned, on the branch the
+# cycle was created on (recorded in its gitignored run state; `rm` of that file moves the cycle).
+#
+# ONE WRITER PER CYCLE, LOCKED BEFORE IT READS. Every verb that writes (approve, record, close, note,
+# abandon) and `check` takes the cycle's mkdir lock before it reads HEAD:record.md, because each one
+# rebuilds the record from HEAD: a writer that read first and waited second erased the rows of the
+# writer it waited on. Commits verify that HEAD holds exactly the bytes and exactly the paths written.
+#
+# SIZE, ON PURPOSE. The design budget was about 500 lines; 3.5.0 ships near 1,500 here plus ~770 in
+# acfw-plan.sh. The growth is premortem hardening, each piece pinned by phase20: the per-cycle write
+# lock, finding our own commit among concurrent writers, CRLF, race retries, the retro-actions
+# auto-close. The verbs past the plan's list (triggers, retro-begin, note, close --if-done, record
+# --drop) are called by /retro and whip-task, so none can be cut. The next cut is a move, not a
+# rewrite: status rendering (render, card, blocker_cards, state_cards, approval_card, cmd_status)
+# into a sourced acfw-cycle-status.sh next to acfw-plan.sh.
+#
+# STATE: <repo>/.acfwhip/run/cycle/<ID>/ (pending.log, <c12>.md frozen copies, retro-baseline, branch,
+# settled (per-seed store verdicts), .lock/) and <repo>/.acfwhip/run/cycle-<ID>.decomposing. All
+# gitignored; none of it is the truth. ACFW_CYCLE_LOCK_WAIT: seconds to wait on a busy cycle (20).
+#
+# Verbs:  status [<plan>] [--if-cycle] [--after-run <stopReason> --mode <m>]  ·  check <plan>
+#         approve <plan> --expect <hex> [--override <tool>]... [--by <email>]
+#         init <slug|ID> [--from-file <src>] --kind feature|retro-actions --source <text> [--title <H1>]
+#         record <plan> <stem>=<D1,D2|->... [--drop <stem>]...  ·  lessons  ·  triggers <plan>
+#         retro-begin <plan>  ·  close <plan> none|retro.md [--lesson <path>]... [--actions <ID>]
+#         close <plan> none --if-done   (retro-actions only; approve/record/close/note run it for you)
+#         note <plan> retro.md [--lesson <path>]...  ·  abandon <plan> [--reason <text>]
+# Exit:   0 ok · 2 usage · 3 not a cycle/not found/bad slug · 4 store unreachable or jq missing ·
+#         5 git state refuses · 6 not approved · 7 lock held · 8 rule 10 · 9 rule 11 · 10 commit
+#         failed (record.md restored) · 11 post-commit hash mismatch · 12 Format too new ·
+#         22/26 propagated from `acfw-spec gate`
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$LIB_DIR/acfw-plan.sh"
+
+VERB="${1:-}"; [ $# -gt 0 ] && shift
+REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+TAB=$(printf '\t')
+
+die() { local c="$1"; shift; printf '%s\n' "$*" >&2; exit "$c"; }
+# shq <string>: one shell word. A REPLY or remedy is pasted verbatim, and under a repo at "sp ace/"
+# an unquoted `rm <path>` removed split words while `>> <path>` wrote a stray file. Quoted only when
+# needed, so an ordinary path prints exactly as before.
+shq() {
+  case "$1" in
+    ""|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:@%+=,-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# ---- lessons: read-only, and deliberately BEFORE any store library is sourced ---------------------
+# Planners and critics run this; it must never touch store config, the network, or git state.
+if [ "$VERB" = "lessons" ]; then
+  LD="${REPO_ROOT:+$REPO_ROOT/}docs/acf/lessons"
+  [ -n "$REPO_ROOT" ] && [ -d "$LD" ] || exit 0
+  set -- "$LD"/*.md; [ -e "$1" ] || exit 0
+  n=0; out=""
+  for f in "$@"; do
+    s=$(basename "$f" .md); [ "$s" = "README" ] && continue
+    n=$((n + 1))
+    acfw_lesson_slug_ok "$s" || echo "WARN: lesson slug '$s' is not timeless (^[a-z][a-z0-9-]*$, no 8-digit run, no -v<digits> anywhere, no leading v<digits>); rename it so an update keeps one file" >&2
+    r=$(grep -m1 '^\*\*Rule\*\*:' "$f" 2>/dev/null | sed 's/^\*\*Rule\*\*:[[:space:]]*//; s/[[:space:]]*$//')
+    if [ -z "$r" ]; then echo "WARN: $f has no '**Rule**: <one sentence>' line, so no planner ever sees it" >&2; continue; fi
+    out="$out$s: $r
+"
+  done
+  [ -n "$out" ] && printf '%s' "$out" | LC_ALL=C sort
+  [ "$n" -gt 30 ] && echo "WARN: $n lessons. Retire lessons a test or gate now enforces: git rm docs/acf/lessons/<slug>.md. Git is the archive. Never retire on age." >&2
+  exit 0
+fi
+
+. "$LIB_DIR/acfw-git.sh"
+STORE_BIN="$SCRIPT_DIR/acfw-store"
+SPEC_BIN="$SCRIPT_DIR/acfw-spec"
+PLUGIN_ROOT=$(acfw_plugin_root)
+CAP_R=3; CAP_B=3          # mirror MAX_REJECT_RETRY / MAX_BLOCK_RETRY in whip-go.workflow.js
+LOCK_FRESH_MIN=30
+
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/acfw-cycle.XXXXXX") || die 2 "FATAL: mktemp failed"
+HAVE_LOCK=""
+cleanup() { [ -n "$HAVE_LOCK" ] && rm -rf "$HAVE_LOCK"; rm -rf "$TMPD"; }
+trap cleanup EXIT
+
+now() { date -u +"%Y-%m-%d %H:%M:%S"; }
+who() { local w; w=$(git -C "${REPO_ROOT:-.}" config user.email 2>/dev/null); [ -n "$w" ] || w=$(git -C "${REPO_ROOT:-.}" config user.name 2>/dev/null); printf '%s' "${w:-unknown}"; }
+g() { git -C "$REPO_ROOT" "$@"; }
+need_repo() { [ -n "$REPO_ROOT" ] || die 3 "FATAL: not inside a git repository (and ACFW_TRUNK_ROOT is unset)"; ROOT_P=$(cd "$REPO_ROOT" && pwd -P); }
+
+# Human reason (stderr), then exit with the pinned code. Only `check` also prints a machine line (its
+# CHECK|refuse line is what /task --plan relays and parses). Refusals print no copyable command for the
+# verb they refuse: a context-absent model pastes whatever it is handed.
+refuse() { # <VERB> <code> <reason>
+  [ "$1" = CHECK ] && printf 'CHECK|refuse|cycle=%s|code=%s|reason=%s\n' "${ID:--}" "$2" "$(printf '%s' "$3" | tr '\n|' '  ')"
+  printf 'REFUSED (%s): %s\n' "$2" "$3" >&2
+  exit "$2"
+}
+
+# ---- run state (gitignored) ---------------------------------------------------------------------
+ensure_run_ignored() {
+  mkdir -p "$REPO_ROOT/.acfwhip/run" 2>/dev/null || true
+  g check-ignore -q ".acfwhip/run/" 2>/dev/null && return 0
+  grep -qxF '.acfwhip/run/' "$REPO_ROOT/.gitignore" 2>/dev/null \
+    || printf '\n# ACF Whip run state (cycle locks, frozen plan copies, pending plan events)\n.acfwhip/run/\n' >> "$REPO_ROOT/.gitignore"
+  g check-ignore -q ".acfwhip/run/" 2>/dev/null
+}
+run_dir() { printf '%s/.acfwhip/run/cycle/%s' "$REPO_ROOT" "$1"; }
+dlock_path() { printf '%s/.acfwhip/run/cycle-%s.decomposing' "$REPO_ROOT" "$1"; }
+run_lock_fresh() { # mirrors whip-go: the run lock touched within 30 minutes
+  local rl; rl=$(acfw_run_lock_path "$REPO_ROOT")
+  [ -n "$(find "$(dirname "$rl")" -maxdepth 1 -name "$(basename "$rl")" -mmin -$LOCK_FRESH_MIN 2>/dev/null)" ]
+}
+
+# ---- plan argument -> cycle identity ----------------------------------------------------------------
+# Accepts an ID, docs/cycles/<ID>[/], or .../plan.md|record.md|retro.md, relative or absolute. Anything
+# that does not land exactly on <root>/docs/cycles/<ID> is refused: mutating verbs never write outside
+# a valid cycle folder (adoption imports a foreign file first).
+resolve_plan() {
+  local a="${1:-}" p abs parent id
+  REASON=""
+  [ -n "$a" ] || { REASON="no cycle named"; return 3; }
+  p="${a%/}"
+  case "$p" in */plan.md|*/record.md|*/retro.md|plan.md|record.md|retro.md) p=$(dirname "$p") ;; esac
+  if acfw_cycle_id_ok "$p"; then id="$p"
+  else
+    case "$p" in /*) abs="$p" ;; *) if [ -d "$p" ]; then abs="$(cd "$p" && pwd -P)"; else abs="$REPO_ROOT/$p"; fi ;; esac
+    [ -d "$abs" ] && abs=$(cd "$abs" && pwd -P)
+    id="${abs##*/}"; parent="${abs%/*}"
+    [ -d "$parent" ] && parent=$(cd "$parent" && pwd -P)
+    [ "$parent" = "$ROOT_P/docs/cycles" ] || { REASON="'$a' is not a cycle folder: cycles live at docs/cycles/<YYYYMMDD-slug>/"; return 3; }
+  fi
+  acfw_cycle_id_ok "$id" || { REASON="'$id' is not a cycle id (YYYYMMDD-slug, lowercase)"; return 3; }
+  ID="$id"; REL="docs/cycles/$id"; DIR="$REPO_ROOT/$REL"; RUN=$(run_dir "$id")
+}
+
+# Loads everything a verb needs about one cycle. TRACKED = record.md exists at HEAD (approval is the
+# first commit, so an untracked folder is a draft). MREC is the record whose Metadata is the truth:
+# HEAD's for a tracked cycle, the working copy for a draft.
+load_cycle() {
+  local fmt rid
+  WREC="$DIR/record.md"; WPLAN="$DIR/plan.md"; HREC=""; HPLAN=""; TRACKED=0
+  if g cat-file -e "HEAD:$REL/record.md" 2>/dev/null; then g show "HEAD:$REL/record.md" > "$TMPD/h-record.md" && HREC="$TMPD/h-record.md" && TRACKED=1; fi
+  if g cat-file -e "HEAD:$REL/plan.md" 2>/dev/null; then g show "HEAD:$REL/plan.md" > "$TMPD/h-plan.md" && HPLAN="$TMPD/h-plan.md"; fi
+  if [ "$TRACKED" = 1 ]; then MREC="$HREC"; elif [ -f "$WREC" ]; then MREC="$WREC"; else REASON="$REL has no record.md: not an acf-whip cycle"; return 3; fi
+  fmt=$(acfw_plan_meta "$MREC" Format); rid=$(acfw_plan_meta "$MREC" ID)
+  if [ -z "$fmt" ] || [ "$rid" != "$ID" ]; then REASON="$REL/record.md has no Format/ID stamp for $ID: not an acf-whip cycle"; return 3; fi
+  case "$fmt" in *[!0-9]*) REASON="$REL/record.md Format '$fmt' is not a number"; return 12 ;; esac
+  [ "$fmt" -le 1 ] || { REASON="$REL/record.md is Format $fmt; this acf-whip understands Format 1. Update the plugin: /plugin marketplace update acf-tools"; return 12; }
+  CSTATUS=$(acfw_plan_meta "$MREC" Status); KIND=$(acfw_plan_meta "$MREC" Kind); [ -n "$KIND" ] || KIND=feature
+  TITLE=$(sed -n 's/^# Cycle Record:[[:space:]]*//p' "$MREC" | head -1 | tr -d '\r')
+  TASKS=$(acfw_plan_tasks "$MREC")
+  approval_state
+}
+# cycle_or_refuse <VERB> <plan-arg> [lock]. With "lock" the per-cycle write lock is taken BEFORE
+# record.md is read: every writer rebuilds record.md from HEAD, so one that read HEAD and then waited
+# on the lock committed a record built from the commit BEFORE the lock holder's, and silently erased
+# its rows (two concurrent `record`s kept one mapping; a lost D row re-decomposes into duplicates).
+cycle_or_refuse() {
+  need_repo; resolve_plan "$2" || refuse "$1" 3 "$REASON"
+  [ -d "$DIR" ] || g cat-file -e "HEAD:$REL/record.md" 2>/dev/null || refuse "$1" 3 "$REL does not exist"
+  if [ "${3:-}" = lock ]; then cycle_lock || refuse "$1" 7 "another acfw-cycle is writing $REL/record.md right now"; fi
+  local rc; load_cycle; rc=$?; [ $rc -eq 0 ] || refuse "$1" "$rc" "$REASON"
+}
+
+# APPROVAL = none | valid | row-mismatch | stale.  A_C12 = Approved Content (12 hex).
+approval_state() {
+  local rowc
+  APPROVAL=none; A_C12=""; HP_C12=""
+  [ -n "$HPLAN" ] && HP_C12=$(acfw_plan_c12 "$(acfw_plan_content "$HPLAN")")
+  [ -n "$HREC" ] || return 0
+  A_C12=$(acfw_plan_c12 "$(acfw_plan_meta "$HREC" "Approved Content")")
+  [ -n "$A_C12" ] || return 0
+  rowc=$(acfw_plan_c12 "$(acfw_plan_log_latest "$HREC" approved | cut -f4)")
+  if [ "$A_C12" != "$rowc" ]; then APPROVAL=row-mismatch
+  elif [ "$A_C12" != "$HP_C12" ]; then APPROVAL=stale
+  else APPROVAL=valid; fi
+}
+# Ds known to the cycle: HEAD plan when approved there, else the working plan. COV=on|off.
+known_ds() { # <plan-file>
+  local out rc
+  out=$(acfw_plan_dids "$1" 2>/dev/null); rc=$?
+  KNOWN="$out"; COV=on
+  if [ $rc -ne 0 ] || [ -z "$out" ]; then COV=off; KNOWN=""; fi
+}
+dup_ds() { acfw_plan_dids "$WPLAN" 2>/dev/null | cut -f1 | LC_ALL=C sort | uniq -d | paste -sd, - ; }
+recorded_ds() { printf '%s\n' "$TASKS" | awk -F'\t' '$1 ~ /^D[0-9]+$/ && $2 != "" {print $1}' | sort -u; }
+uncovered_ds() { # KNOWN minus recorded; coverage off -> "-" when the Tasks table is empty
+  if [ "$COV" = off ]; then [ -z "$(printf '%s' "$TASKS" | awk -F'\t' '$2!=""')" ] && echo "-"; return 0; fi
+  local rec; rec=$(recorded_ds)
+  printf '%s\n' "$KNOWN" | cut -f1 | grep -v '^$' | while IFS= read -r d; do printf '%s\n' "$rec" | grep -qxF "$d" || echo "$d"; done
+}
+csv() { grep -v '^$' | paste -sd, - ; }
+# The lookup walks up to 200 commits of the folder's log, on every status and check of an approved
+# cycle; the verdict is cached per (HEAD, approval) in gitignored run state, so it is paid once per
+# commit, never once per bare /whip.
+trailer_warn() {
+  local h v="" c="$RUN/trailer"
+  h=$(g rev-parse -q --verify HEAD 2>/dev/null)
+  [ -n "$h" ] && [ -f "$c" ] && v=$(awk -v k="$h $A_C12" 'index($0, k " ") == 1 {print $3; exit}' "$c" 2>/dev/null)
+  if [ -z "$v" ]; then
+    v=0; acfw_plan_trailer_seen "$REPO_ROOT" "$REL" approved "$A_C12" "$ID" && v=1
+    [ -n "$h" ] && g check-ignore -q ".acfwhip/run/" 2>/dev/null && mkdir -p "$RUN" 2>/dev/null \
+      && printf '%s %s %s\n' "$h" "$A_C12" "$v" > "$c.$$" 2>/dev/null && mv -f "$c.$$" "$c"
+  fi
+  [ "$v" = 1 ] && return 0
+  local why="a squash merge or rebase that rewrote messages drops it"
+  [ "$(g rev-parse --is-shallow-repository 2>/dev/null)" = true ] && why="this is a shallow clone"
+  printf 'WARN no ACFW-Plan-Event trailer found for approval %s (%s); the content check still holds' "$A_C12" "$why"
+}
+
+# ---- git state refusals (exit 5) ------------------------------------------------------------------
+git_refusal() {
+  local gp br tb f
+  for f in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+    gp=$(g rev-parse --git-path "$f" 2>/dev/null); case "$gp" in /*) ;; *) gp="$REPO_ROOT/$gp" ;; esac
+    [ -e "$gp" ] && { printf 'a merge, rebase, cherry-pick or revert is in progress (%s): finish or abort it first' "$f"; return 5; }
+  done
+  br=$(g symbolic-ref --short -q HEAD 2>/dev/null)
+  [ -n "$br" ] || { printf 'HEAD is detached: plan events must land on the trunk branch'; return 5; }
+  # Trunk = a pinned ACFW_TRUNK_BRANCH (env, then config); unpinned, the branch this cycle was created
+  # on, recorded in its run state. Plan events committed on a side branch vanish from trunk's view.
+  tb="${ACFW_TRUNK_BRANCH:-$(acfw_config_get "$REPO_ROOT" ACFW_TRUNK_BRANCH)}"
+  if [ -n "$tb" ]; then [ "$br" = "$tb" ] || { printf "on '%s', not the trunk branch '%s'" "$br" "$tb"; return 5; }
+  elif [ -n "${RUN:-}" ] && [ -s "$RUN/branch" ] && [ "$(cat "$RUN/branch")" != "$br" ]; then
+    printf "on '%s', but this cycle lives on '%s': git switch %s (to move the cycle to '%s' instead: rm %s)" "$br" "$(cat "$RUN/branch")" "$(cat "$RUN/branch")" "$br" "$(shq "$RUN/branch")"; return 5
+  fi
+  acfw_load_namespace "$REPO_ROOT"
+  case "$br" in "$ACFW_BRANCH_PREFIX"/*) printf "on the acf-whip task branch '%s', not the trunk" "$br"; return 5 ;; esac
+  for f in "$@"; do g check-ignore -q -- "$f" 2>/dev/null && { printf '%s is gitignored, so it can never be committed' "$f"; return 5; }; done
+  return 0
+}
+
+# ---- per-cycle write lock (record.md is read-modify-rename; two writers would lose a row) ---------
+# ACFW_CYCLE_LOCK_WAIT seconds of waiting (20) before refusing 7; autoclose passes 0 so a best-effort
+# close of another cycle skips a busy one instead of stalling the verb the user ran.
+old_lock() { [ -n "$(find "$1" -maxdepth 0 -mmin +"$2" 2>/dev/null)" ]; }
+cycle_lock() {
+  local d="$RUN/.lock" i=0 wait="${ACFW_CYCLE_LOCK_WAIT:-20}"
+  mkdir -p "$RUN" || return 7
+  until mkdir "$d" 2>/dev/null; do
+    # Held across a commit, and a consumer pre-commit hook may run a test suite: 10 minutes before a
+    # lock left by a killed process is presumed dead. Reaping is serialized by a second mkdir and the
+    # age re-checked inside it: two waiters that both saw a stale lock would otherwise both rm it, and
+    # the second rm would delete the lock the first had just taken. A reaper killed mid-reap leaves
+    # $d.reap behind; reaping takes milliseconds, so one a minute old is dead too.
+    if old_lock "$d" 10; then
+      old_lock "$d.reap" 1 && rmdir "$d.reap" 2>/dev/null
+      if mkdir "$d.reap" 2>/dev/null; then old_lock "$d" 10 && rm -rf "$d"; rmdir "$d.reap"; continue; fi
+    fi
+    i=$((i + 1)); [ $i -ge "$wait" ] && return 7
+    sleep 1
+  done
+  HAVE_LOCK="$d"
+}
+cycle_unlock() { [ -n "$HAVE_LOCK" ] && rm -rf "$HAVE_LOCK"; HAVE_LOCK=""; }
+
+# ---- transactional record writes + pathspec commit ----------------------------------------------
+# rec_begin: working copy of the BASE record (HEAD's for a tracked cycle: an approved row or edit that
+# exists only in the working tree is never honoured or committed) and a byte snapshot to restore.
+rec_begin() {
+  mkdir -p "$DIR" && WORK=$(mktemp "$DIR/.acfw-rec.XXXXXX") || return 10
+  # Always LF, and CRs ignored when comparing: a core.autocrlf checkout holds CRLF while git stores
+  # LF, and a line ending must never make HEAD's own record look like "local edits".
+  if [ "$TRACKED" = 1 ]; then tr -d '\r' < "$HREC" > "$WORK"
+    [ -f "$WREC" ] && ! tr -d '\r' < "$WREC" | cmp -s - "$WORK" && { cp "$WREC" "$RUN/record.local-$(date -u +%Y%m%d%H%M%S).md" 2>/dev/null; echo "WARN: $REL/record.md had local edits; they were set aside in $RUN/ and never committed" >&2; }
+  else tr -d '\r' < "$WREC" > "$WORK"; fi
+  PRE=""; if [ -f "$WREC" ]; then PRE="$RUN/record.pre.$$"; cp "$WREC" "$PRE" || { rm -f "$WORK"; return 10; }; fi
+  chmod a+r,u+w "$WORK" 2>/dev/null || true
+}
+rec_set() { acfw_plan_record_set "$WORK" "$@" > "$WORK.n" && mv -f "$WORK.n" "$WORK"; }
+rec_row() { # <event> <by> <c12|-> <details> [ts]
+  append_log_row "$WORK" "| ${5:-$(now)} | $(acfw_plan_cell "$1") | $(acfw_plan_cell "$2") | $(acfw_plan_cell "${3:--}") | $(acfw_plan_cell "$4") |" "Plan Log" none
+}
+rec_install() { mv -f "$WORK" "$WREC"; }
+rec_restore() {
+  rm -f "$WORK" "$WORK.n" 2>/dev/null
+  if [ -n "$PRE" ]; then cp "$PRE" "$DIR/.acfw-restore.$$" && mv -f "$DIR/.acfw-restore.$$" "$WREC"; rm -f "$PRE"
+  else rm -f "$WREC"; fi   # it did not exist before this write: restore that
+}
+# commit_paths <subject-event> <trailer-event> <c12> <repo-relative paths...>
+# Sets COMMIT (12 hex) and COMMIT_FULL to THIS verb's commit, which need not be HEAD: a /go transition,
+# an LP-CAS land() or another cycle's approve can commit on top of it before the checks below run, and
+# checking HEAD then failed every such plan commit with 11 and told the user to `reset --soft HEAD~1`
+# the OTHER writer's commit.
+commit_paths() {
+  local se="$1" te="$2" c="$3" p h out rc tries=0 added="" lost extra pre subj undo; shift 3
+  subj=$(acfw_plan_subject "$se" "$ID")
+  { printf '%s' "$subj"; printf '\n\nACFW-Plan-Event: %s %s %s\n' "$te" "${c:--}" "$ID"; } > "$TMPD/msg"
+  : > "$TMPD/intended"
+  for p in "$@"; do printf '%s\t%s\n' "$p" "$(g hash-object -- "$p")" >> "$TMPD/intended"; done
+  while :; do
+    pre=$(g rev-parse -q --verify HEAD 2>/dev/null)
+    # Re-marked on every attempt: land()'s `reset --mixed` drops intent-to-add entries, so a /go
+    # integrating concurrently can make a pathspec that was known a moment ago "match nothing". Under
+    # the lock backoff too: that same land() holds .git/index.lock while it resets.
+    for p in "$@"; do g ls-files --error-unmatch -- "$p" >/dev/null 2>&1 || { git_with_lock_backoff -C "$REPO_ROOT" add -N -- "$p" && added="$added $p"; }; done
+    out=$(git_with_lock_backoff -C "$REPO_ROOT" commit -q -o -F "$TMPD/msg" -- "$@" 2>&1); rc=$?
+    [ $rc -eq 0 ] && break
+    # Retry only on a race, asked of git itself rather than of its (localized) messages: a path LOST
+    # its index entry during the attempt (de_DE: "stimmt mit keinen Git bekannten Dateien überein"), or
+    # HEAD moved under the commit ("cannot lock ref 'HEAD': is at X but expected Y"; git rolls the
+    # index back, so a retry is clean). Bounded, and a beat apart, so a racing writer can finish.
+    lost=""; for p in "$@"; do g ls-files --error-unmatch -- "$p" >/dev/null 2>&1 || lost=1; done
+    [ "$(g rev-parse -q --verify HEAD 2>/dev/null)" = "$pre" ] || lost=1
+    if [ $tries -lt 3 ] && [ -n "$lost" ]; then tries=$((tries + 1)); sleep 1; continue; fi
+    printf '%s\n' "$out" >&2
+    for p in $added; do g cat-file -e "HEAD:$p" 2>/dev/null || g reset -q -- "$p" 2>/dev/null; done
+    return 10
+  done
+  # Our commit = the newest commit since `pre` that touches our paths and carries our subject (the only
+  # one that touches them, when a commit-msg hook reworded it). The per-cycle lock means no other
+  # writer touches this cycle's files, and tasks never land docs/cycles/.
+  h=HEAD; [ -n "$pre" ] && h="$pre..HEAD"
+  g log --format='%H%x09%s' "$h" -- "$@" 2>/dev/null > "$TMPD/ours"
+  COMMIT_FULL=$(awk -F'\t' -v s="$subj" '$2 == s {print $1; exit}' "$TMPD/ours")
+  [ -n "$COMMIT_FULL" ] || [ "$(grep -c . "$TMPD/ours")" != 1 ] || COMMIT_FULL=$(cut -f1 "$TMPD/ours")
+  [ -n "$COMMIT_FULL" ] || { echo "FATAL: git reported the $se commit for $ID, but it cannot be told apart on this branch (did something reset HEAD?). Check git log -- $REL, then re-run the step." >&2; COMMIT=unknown; return 11; }
+  COMMIT=$(printf '%s' "$COMMIT_FULL" | cut -c1-12)
+  [ -s "$RUN/branch" ] || g symbolic-ref --short -q HEAD > "$RUN/branch" 2>/dev/null || true
+  undo="git reset --soft HEAD~1"; [ "$(g rev-parse HEAD)" = "$COMMIT_FULL" ] || undo="git revert $COMMIT (other commits already sit on top of it)"
+  # A formatter hook (prettier, markdownlint --fix) can rewrite a staged file. The approval would then
+  # bind bytes nobody saw, so a mismatch fails loudly instead of being trusted.
+  while IFS="$TAB" read -r p h; do
+    [ "$(g rev-parse "$COMMIT_FULL:$p" 2>/dev/null)" = "$h" ] || { echo "FATAL: a commit hook rewrote $p in $COMMIT: the committed bytes are not the ones acfw-cycle wrote. Add docs/cycles/ to .prettierignore and .markdownlintignore, then re-run the step (re-approve with /whip $ID)." >&2; return 11; }
+  done < "$TMPD/intended"
+  # A hook that STAGES (`git add -u`, lint-staged) runs against `commit -o`'s temporary index, so what
+  # it adds rides into the plan commit: an unrelated edit of the user's, committed under a
+  # docs(plan) subject. Hard rule 8 is "only these paths", so anything else fails as loudly.
+  extra=$(g diff-tree --no-commit-id --name-only -r --root "$COMMIT_FULL" | LC_ALL=C sort -u \
+          | LC_ALL=C comm -23 - <(printf '%s\n' "$@" | LC_ALL=C sort -u) | paste -sd' ' -)
+  [ -z "$extra" ] || { echo "FATAL: a commit hook added paths acfw-cycle did not write to $COMMIT: $extra. A plan commit carries only its own files: undo it with $undo, stop the hook staging files, then re-run the step." >&2; return 11; }
+  return 0
+}
+# norm_in_place <abs path>...: rewrite each file to its normalized bytes (CRLF->LF, trailing
+# whitespace, exactly one final newline) just before a commit. approve runs it on plan.md; close and
+# note run it on the retro's outputs (retro.md, the lessons, the actions folder).
+# WHY: every pre-commit config whip-init ships runs trailing-whitespace, end-of-file-fixer and
+# mixed-line-ending. They rewrite a staged file and FAIL the commit, so a plan or a lesson with a
+# markdown hard break or no final newline exited 10 once and passed on the retry. The configs exclude
+# docs/cycles/, but not docs/acf/lessons/, and an older installed config excludes nothing. For
+# plan.md this is hash-neutral by definition: the content hash is taken over exactly these bytes, so
+# no approval, card or spec-tool result changes. (A hard break is lost; the hook strips it anyway,
+# and the hash never counted it.) Writes only when something changes, never through a symlink,
+# keeps the file's mode, and renames only if the file still holds the bytes it read, so an edit
+# landing meanwhile is never overwritten (for plan.md, rule 11 then refuses it).
+NORM_N=0; NORMED=""
+norm_in_place() {
+  local f i t
+  for f in "$@"; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    NORM_N=$((NORM_N + 1)); i="$TMPD/norm.$NORM_N"
+    cp -p "$f" "$i.orig" 2>/dev/null && acfw_plan_normalize "$i.orig" > "$i.norm" || continue
+    cmp -s "$i.orig" "$i.norm" && continue
+    t=$(mktemp "$(dirname "$f")/.acfw-norm.XXXXXX") || continue
+    cp -p "$i.orig" "$t" 2>/dev/null && cat "$i.norm" > "$t" || { rm -f "$t"; continue; }
+    if cmp -s "$f" "$i.orig" && mv -f "$t" "$f"; then NORMED="$NORMED$i$TAB$f
+"; else rm -f "$t"; fi
+  done
+  return 0
+}
+# norm_gov: norm_in_place over every path in $GOV (repo-relative, one per line). One call per path,
+# not one word-split list, so a repo under a path with a space still resolves.
+norm_gov() {
+  local p
+  while IFS= read -r p; do [ -n "$p" ] && norm_in_place "$REPO_ROOT/$p"; done <<NORMGOV
+$GOV
+NORMGOV
+  return 0
+}
+# norm_restore: a commit that failed changed nothing, so each rewritten file goes back to the bytes it
+# had, unless it was edited after the rewrite (then that edit stands).
+norm_restore() {
+  local i f r
+  while IFS="$TAB" read -r i f; do
+    [ -n "$i" ] || continue
+    r="$(dirname "$f")/.acfw-norm-restore.$$"
+    cmp -s "$f" "$i.norm" && cp -p "$i.orig" "$r" && mv -f "$r" "$f"
+    rm -f "$r" 2>/dev/null
+  done <<NORMLIST
+$NORMED
+NORMLIST
+  NORMED=""
+  return 0
+}
+# Runs the full transaction for a record change. $@ = extra paths committed with record.md.
+# The caller has already called rec_begin and edited $WORK.
+rec_commit() { # <subject-event> <trailer-event> <c12> [extra paths...]
+  local rc
+  rec_install
+  commit_paths "$1" "$2" "$3" "$REL/record.md" "${@:4}"; rc=$?
+  if [ $rc -eq 10 ]; then rec_restore; return 10; fi
+  rm -f "$PRE" 2>/dev/null
+  return $rc
+}
+
+# ---- store access (jq only here) ------------------------------------------------------------------
+flatten() {
+  jq -r '
+    def c: tostring | gsub("[\t\n\r]"; " ");
+    def b: if . == true then "1" else "0" end;
+    ( ((.tasks // []) + (.inactive // []))[]
+      | ["T", (.stem // "" | c), (.id // "" | c), (.folder // "" | c), (.slug // "" | c),
+         ((.rejectionCount // 0) | c), ((.blockCount // 0) | c),
+         ((.hasIntegratedAt // false) | b), ((.hasWorktreeBranch // false) | b),
+         ((.deps // []) | map(c) | join(",")), (.integratedAt // "" | c)] | join("\t") ),
+    ( (.satisfiedDeps // [])[] | ["S", (.stem // .id // "" | c), (.id // "" | c)] | join("\t") ),
+    ( (.scope.resolved // {}) | to_entries[] | ["R", (.key | c), (.value | c)] | join("\t") ),
+    ( (.scope.unresolved // [])[] | ["U", c] | join("\t") ),
+    ( (.scope.ambiguous // [])[] | ["A", (.tok // "" | c), ((.candidates // []) | map(c) | join(","))] | join("\t") ),
+    ( (.scope.inactiveSeeds // [])[] | ["I", (.stem // "" | c), (.folder // "" | c)] | join("\t") )'
+}
+# snap <stems...> -> appends to $TMPD/snap.tsv. rc 4 on any failure (never guess a stage).
+snap() {
+  local a=(snapshot --mode "$MODE") s out
+  for s in "$@"; do a[${#a[@]}]="--only"; a[${#a[@]}]="$s"; done
+  out=$(bash "$STORE_BIN" "${a[@]}" 2>"$TMPD/snap.err") || { SNAP_ERR="acfw-store snapshot exited $?: $(head -c 300 "$TMPD/snap.err")"; return 4; }
+  printf '%s' "$out" | flatten >> "$TMPD/snap.tsv" 2>"$TMPD/snap.err" || { SNAP_ERR="the snapshot was not valid JSON"; return 4; }
+}
+# reads <stems...>: one `acfw-store read` per accepted-terminal seed the closure dropped, so its
+# lifetime counters (rework/stuck triggers) are real rather than zero. Integration and branch are
+# git's, recomputed on every use (xline). Every read of an ACCEPTED task is remembered per cycle in
+# $RUN/settled (gitignored run state only): its folder, slug and id cannot change while it stays
+# accepted, so the one question a status asks of it (is it code at all?) costs one read per seed for
+# the life of the cycle, not one per bare /whip on an API-billed board.
+xline() { # <stem> <folder> <slug> <rc> <bc> <id>
+  local hi=0 hb=0
+  acfw_is_integrated "$REPO_ROOT" HEAD "$1" && hi=1
+  [ -n "$3" ] && [ "$3" != none ] && g show-ref --verify --quiet "refs/heads/$ACFW_BRANCH_PREFIX/$3" && hb=1
+  printf 'X\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t\t\n' "$1" "$6" "$2" "$3" "$4" "$5" "$hi" "$hb" >> "$TMPD/snap.tsv"
+}
+# The tuple is "|"-separated on purpose: tab is IFS whitespace to `read`, which collapses an empty
+# field (a task with no Worktree) and shifts every column after it.
+# rc 4 (SNAP_ERR set) when the store could not answer. Only "not found" (3) skips a seed: an outage
+# (5, 6, 99) or an unparseable answer that also skipped it left an accepted seed without counters,
+# so `triggers` said TRIGGERS|none and the cycle closed clean with its rework and stuck lost for good.
+reads() {
+  local s out f sl r b i rc
+  acfw_load_namespace "$REPO_ROOT"
+  for s in "$@"; do
+    out=$(bash "$STORE_BIN" read "$s" 2>"$TMPD/read.err"); rc=$?
+    [ $rc -eq 3 ] && continue
+    [ $rc -eq 0 ] || { SNAP_ERR="acfw-store read $s exited $rc: $(head -c 300 "$TMPD/read.err")"; return 4; }
+    out=$(printf '%s' "$out" | jq -r --arg s "$s" 'def c: tostring | gsub("[|\t\n\r ]"; ""); select(.stem == $s) | [$s, (.folder // "" | c), (.fields.worktree // "" | c), ((.fields.rejection_count // 0) | c), ((.fields.block_count // 0) | c), (.fields.id // "" | c)] | join("|")' 2>/dev/null) \
+      || { SNAP_ERR="acfw-store read $s did not answer valid JSON"; return 4; }
+    [ -n "$out" ] || continue
+    IFS='|' read -r s f sl r b i <<EOF
+$out
+EOF
+    xline "$s" "$f" "$sl" "$r" "$b" "$i"
+    [ "$f" = accepted ] && [ -n "${CACHE_OK:-}" ] && printf '%s\n' "$out" >> "$RUN/settled"
+  done
+  # Newest line per stem wins: a fresh read (row 11, --after-run) refreshes the counters it holds.
+  [ -f "$RUN/settled" ] && awk -F'|' '!($1 in l) { k[++n] = $1 } { l[$1] = $0 } END { for (i = 1; i <= n; i++) print l[k[i]] }' "$RUN/settled" > "$RUN/settled.$$" && mv -f "$RUN/settled.$$" "$RUN/settled"
+  return 0
+}
+# settle_absent [fresh]: a raw adapter's closure drops every seed it calls accepted-terminal, and that
+# includes branchless-UNVERIFIED code tasks (the scheduler must never wait on them), so absence alone
+# cannot say ✓. The ledger answers for free, from git; a seed with no marker is answered from
+# $RUN/settled, else costs one `acfw-store read`. "fresh" skips the cache for the CLOSE stage and
+# --after-run, where hard rule 1 wants live counters. Default mode only: in override mode every
+# accepted task is done. CACHED lists the seeds answered from the cache (row 11 re-reads them).
+settle_absent() {
+  local a s k need="" f sl r b i
+  CACHED=""
+  [ "$MODE" = default ] && [ -n "${ID:-}" ] || return 0
+  CACHE_OK=""; g check-ignore -q ".acfwhip/run/" 2>/dev/null && mkdir -p "$RUN" 2>/dev/null && CACHE_OK=1
+  acfw_load_namespace "$REPO_ROOT"
+  a=$(cycle_facts | classify | awk -F'\t' '$1=="SM"'); a=$(sm "$a" absent)
+  for s in $(printf '%s' "$a" | tr ',' ' '); do
+    if acfw_is_integrated "$REPO_ROOT" HEAD "$s"; then printf 'G\t%s\n' "$s" >> "$TMPD/snap.tsv"; continue; fi
+    k=""
+    if [ "${1:-}" != fresh ] && [ -f "$RUN/settled" ]; then
+      IFS='|' read -r k f sl r b i <<EOF
+$(awk -F'|' -v s="$s" '$1 == s { l = $0 } END { print l }' "$RUN/settled")
+EOF
+    fi
+    if [ "$k" = "$s" ]; then xline "$s" "$f" "$sl" "$r" "$b" "$i"; CACHED="$CACHED $s"; else need="$need $s"; fi
+  done
+  # shellcheck disable=SC2086
+  [ -z "$need" ] || reads $need
+}
+# store_down: row 2's fail-closed render, for a store that stops answering AFTER the snapshot did.
+store_down() {
+  PIN=""
+  fact "stage unknown: run /whip-doctor"
+  card store "the '$STORE' task store did not answer" "${SNAP_ERR:-no detail}" "/whip-doctor"
+  NEXT=/whip-doctor; render "${1:-${ID:-(no active cycle)}}"; exit 4
+}
+classify() { # <extra tagged lines on stdin are appended to the snapshot facts>
+  { cat "$TMPD/snap.tsv" 2>/dev/null; cat; } | ACFW_CL_MODE="$MODE" ACFW_CL_STORE="$STORE" ACFW_CL_RCAP=$CAP_R ACFW_CL_BCAP=$CAP_B \
+    ACFW_CL_CREATING="${CREATING:-0}" acfw_plan_classify
+}
+# derive: CL = the classifier's verdict for the loaded cycle. files keeps an Integrated-At ack in the
+# task file and the scanner's slim accepted records omit it, so the one file that can hold it is read
+# before anything is called unverified (else the ? card's own REPLY could never clear it).
+derive() {
+  local a b
+  CL=$(cycle_facts | classify)
+  [ "$STORE" = files ] && [ -n "$(sm "$CL" unverified)" ] || return 0
+  for a in $(sm "$CL" unverified | tr ',' ' '); do
+    b=$(sed -n 's/^- \*\*Integrated-At\*\*:[[:space:]]*//p' "$REPO_ROOT/.backlog/accepted/$a.md" 2>/dev/null | head -1 | tr -d '[:space:]')
+    [ -n "$b" ] && awk -F'\t' -v OFS='\t' -v s="$a" -v v="$b" '$1=="T" && $2==s {$11=v} {print}' "$TMPD/snap.tsv" > "$TMPD/snap.n" && mv -f "$TMPD/snap.n" "$TMPD/snap.tsv"
+  done
+  CL=$(cycle_facts | classify)
+}
+# dlock_fresh <ID>: a /task --plan for that cycle took the decompose lock under 30 minutes ago.
+dlock_fresh() { local a; a=$(acfw_plan_lock_age "$(dlock_path "$1")"); [ -n "$a" ] && [ "$a" -lt $LOCK_FRESH_MIN ]; }
+cycle_facts() { # K and D lines for the loaded cycle
+  printf '%s\n' "$KNOWN" | awk -F'\t' 'NF && $1!="" {print "K\t" $1 "\t" $2}'
+  printf '%s\n' "$TASKS" | awk -F'\t' 'NF && $1!="" {print "D\t" $1 "\t" $2}'
+}
+stems_of() { printf '%s\n' "$1" | cut -f2 | tr ',' '\n' | grep -v '^$' | sort -u; }
+
+scan_cycles() { acfw_plan_scan "$REPO_ROOT"; }       # id status kind approvedBy createdBy stems
+# follow_through [<actions-id>]: the PREVIOUS retro's items. Two retro-actions cycles are left out,
+# both this retro's own. The --actions one this close commits: it is the newest by ID, so grading it
+# would grade this retro against itself. And an uncommitted draft an earlier attempt of THIS retro
+# made, known by its Source "retro <ID>" (the init command /retro runs). Every other draft is graded,
+# untracked or not: a plan-less retro's actions stay an untracked draft until someone approves them
+# (Source "retro docs/retrospectives/<file>"), and they are exactly the previous retro's items.
+# /retro's gather (the same function, run before its agent creates anything) grades them too.
+follow_through() {
+  local x="${1:-}" a
+  for a in $(scan_cycles | awk -F'\t' '$3=="retro-actions" {print $1}'); do
+    g cat-file -e "HEAD:docs/cycles/$a/record.md" 2>/dev/null && continue
+    case "$(acfw_plan_meta "$REPO_ROOT/docs/cycles/$a/record.md" Source)" in
+      "retro $ID"|"retro $ID (blob "*) x="$x $a" ;;
+    esac
+  done
+  # shellcheck disable=SC2086
+  acfw_plan_follow "$REPO_ROOT" "$ID" $x
+}
+
+# ================================ status: STATUS / NEED YOU / NEXT ================================
+# The derivation (first match wins, exactly one NEXT): 1 setup · 2 store unreachable · 3 run lock /
+# decompose lock · 4 plan-less focus in flight · 5 idle · 6 plan missing · 7 approval card ·
+# 8 uncovered D -> /task --plan · 9 runnable -> /go · 10 gated -> root-blocker card · 11 all terminal
+# -> /retro · 12 closed -> /whip "<next goal>". NEXT is set once (setnext ignores later rows), so the
+# row order below IS the priority order.
+FACTS=(); CARDS=(); NEXT=""; COVTXT=""; CARDED=" "; PIN=""; CAND_NEXT=""; WAIT3=""; TASKS=""
+CACHED=""; CACHE_OK=""; CREATING=0; STATE1=""; BLOCK1=""; UV1=""
+fact() { FACTS[${#FACTS[@]}]="$1"; }
+# ship_fact: the SHIP gate's one info line. Shipping is the human's, and the moment it is next is right
+# after a close, when a bare /whip is idle and `status <closed ID>` is row 12: so every status that can
+# say it does, not only a live approved cycle. One git call when there is no upstream, zero store calls.
+ship_fact() {
+  local u n
+  u=$(g rev-parse --abbrev-ref '@{u}' 2>/dev/null) || return 0
+  n=$(g rev-list --count "@{u}..HEAD" 2>/dev/null || echo 0)
+  [ "${n:-0}" -gt 0 ] && fact "$n commit(s) not pushed to $u (shipping is yours)"
+  return 0
+}
+setnext() { [ -n "$NEXT" ] || NEXT="$1"; }
+card() { # <key> <what> <risk> <reply> [extra lines]
+  case "$CARDED" in *" $1 "*) return 0 ;; esac
+  CARDED="$CARDED$1 "
+  local c="  WHAT $2
+  RISK $3
+  REPLY $4"
+  [ -n "${5:-}" ] && c="$c
+$5"
+  CARDS[${#CARDS[@]}]="$c"
+}
+render() { # <header>
+  local i n=${#FACTS[@]} shown=0 lim=5 pass f
+  printf 'STATUS %s\n' "$1"
+  # PIN is a machine-read fact (/go step 3a greps it), so it is printed first and outside the cap.
+  [ -n "$PIN" ] && printf '  %s\n' "$PIN"
+  [ "$n" -gt 5 ] && lim=4
+  for pass in 1 2; do
+    i=0; while [ $i -lt "$n" ]; do
+      f="${FACTS[$i]}"; i=$((i + 1))
+      case "$f" in WARN*) [ $pass = 1 ] || continue ;; *) [ $pass = 2 ] || continue ;; esac
+      [ $shown -lt $lim ] && printf '  %s\n' "$f"; shown=$((shown + 1))
+    done
+  done
+  [ "$n" -gt 5 ] && printf '  (+%d more)\n' $((n - 4))
+  [ -n "$COVTXT" ] && printf '%s\n' "$COVTXT"
+  echo
+  if [ ${#CARDS[@]} -eq 0 ]; then echo "NEED YOU: nothing"
+  else echo "NEED YOU"; i=0; while [ $i -lt ${#CARDS[@]} ]; do [ $i -gt 0 ] && echo; printf '%s\n' "${CARDS[$i]}"; i=$((i + 1)); done; fi
+  echo
+  printf 'NEXT %s\n' "${NEXT:-/whip}"
+}
+focus_stems() { local f; f=$(acfw_focus_path "$REPO_ROOT"); [ -r "$f" ] || return 0; grep -v '^[[:space:]]*#' "$f" | grep -v '^[[:space:]]*$' || true; }
+intersects() { local s; for s in $(printf '%s' "$1" | tr ',' ' '); do printf '%s\n' "$2" | grep -qxF "$s" && return 0; done; return 1; }
+sm() { printf '%s\n' "$1" | awk -F'\t' -v k="$2" '$1=="SM"{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]==k){print a[2];exit}}}'; }
+old_body() { # the last approved body, by content (HEAD's plan when it is still the approved one)
+  if [ -n "$HPLAN" ] && [ -n "$A_C12" ] && [ "$HP_C12" = "$A_C12" ]; then printf '%s' "$HPLAN"; return 0; fi
+  acfw_plan_old_body "$REPO_ROOT" "$REL/plan.md" "$A_C12" "$TMPD/old.md" && printf '%s' "$TMPD/old.md"
+}
+# r10_scope: what rule 10 holds a new plan body against. R10_OLD = the last approved body, R10_REC =
+# the D-ids a task names. rc 0 check · 1 nothing to check · 2 the approved body is not in history.
+# A /task --plan decomposing THIS cycle right now records its tasks only when its writer starts, so
+# ## Tasks is still empty while its planners already build every D of the frozen copy: those count as
+# named. Without that, renumbering under a running decomposition passed, and the writer then recorded
+# the password-reset task against a D2 that now said "audit log" while D3 went uncovered.
+r10_scope() {
+  local fz=""
+  R10_OLD=""; R10_REC=$(recorded_ds | csv)
+  [ "$TRACKED" = 1 ] && [ -n "$A_C12" ] || return 1
+  if dlock_fresh "$ID"; then
+    if [ -f "$RUN/$A_C12.md" ]; then fz="$RUN/$A_C12.md"; else fz=$(old_body) || fz=""; fi
+    [ -n "$fz" ] && { R10_OLD="$fz"; R10_REC=$( { printf '%s\n' "$R10_REC" | tr ',' '\n'; acfw_plan_dids "$fz" 2>/dev/null | cut -f1; } | grep -v '^$' | LC_ALL=C sort -u | csv); }
+  fi
+  [ -n "$R10_REC" ] || return 1
+  [ -n "$R10_OLD" ] || R10_OLD=$(old_body) || return 2
+}
+spec_decls() {
+  g ls-tree --name-only "HEAD:.acfwhip/spec-tools" 2>/dev/null | grep -v '\.' | grep -q . && return 0
+  local f; for f in "$REPO_ROOT"/.acfwhip/spec-tools/*; do [ -f "$f" ] || continue; case "${f##*/}" in *.*) ;; *) return 0 ;; esac; done
+  return 1
+}
+approval_card() {
+  local a c12 r old rec what dl as rv n rt s
+  c12=$(acfw_plan_c12 "$(acfw_plan_content "$WPLAN")")
+  if acfw_plan_has_conflict "$WPLAN"; then
+    card conflict "$REL/plan.md has git conflict markers" "approving would bind a half-merged plan" "resolve the markers in $REL/plan.md, then /whip $ID"; setnext "/whip $ID"; return
+  fi
+  a=$(dup_ds); [ -n "$a" ] && { card dup "$a appear(s) more than once under ## Deliverables" "coverage cannot tell those deliverables apart, so approve refuses" "renumber the duplicate to the next unused D in $REL/plan.md, then /whip $ID"; setnext "/whip $ID"; return; }
+  if [ "$c12" != "$A_C12" ] && r10_scope; then
+    r=$(acfw_plan_rule10 "$R10_OLD" "$WPLAN" "$R10_REC") || { card rule10 "$r" "approve refuses this edit: tasks already name these D-ids" "restore the heading in $REL/plan.md, then /whip $ID"; setnext "/whip $ID"; return; }
+  fi
+  dl=$(acfw_plan_dids "$WPLAN" 2>/dev/null | awk -F'\t' '{print "  " $1 ": " $2}')
+  n=$(printf '%s' "$dl" | grep -c 'D[0-9]')
+  as=$(acfw_plan_section "$WPLAN" Assumptions | sed -n 's/^[[:space:]]*[-*][[:space:]]\{1,\}/  ASSUME /p')
+  # A retro-actions plan lists under ## Retire the lessons a test or gate now enforces. Retiring one
+  # loosens a control, so a human runs the git rm, and the "yes" is only informed if the card shows
+  # it: without these lines the approver approved the D headings and never saw what would be deleted.
+  # Feature plans are skipped: their "## Retire" (an old endpoint, say) is not about lessons.
+  rt=""
+  if [ "$KIND" = retro-actions ]; then
+    for s in $(acfw_plan_retire_slugs "$WPLAN"); do
+      if [ -f "$REPO_ROOT/docs/acf/lessons/$s.md" ]; then r="  RETIRE (yours, after yes): git rm docs/acf/lessons/$s.md"
+      else r="  RETIRE $s: docs/acf/lessons/$s.md does not exist, so there is nothing to remove"; fi
+      rt="$rt${rt:+
+}$r"
+    done
+  fi
+  rv=""; [ -x "$SPEC_BIN" ] && rv=$(bash "$SPEC_BIN" show "$REL/plan.md" --blob "$c12" 2>/dev/null | sed 's/^/  /')
+  if [ "$n" -gt 0 ]; then what="approve $REL/plan.md \"$(acfw_plan_h1 "$WPLAN")\" ($n deliverable$( [ "$n" = 1 ] || echo s))"
+  else what="approve $REL/plan.md \"$(acfw_plan_h1 "$WPLAN")\" (coverage off: no ## Deliverables with ### D<n> headings, so it is decomposed whole)"; fi
+  card approve "$what" "nothing is built until you approve, and the approval binds exactly content=$c12: any later edit needs a new card. Undo: /whip --abandon $ID" \
+    "yes: approve, then start /task --plan in the background (sets your /go focus)" \
+    "  content=$c12${dl:+
+$dl}${as:+
+$as}${rt:+
+$rt}${rv:+
+$rv}"
+  setnext "yes: approve $REL/plan.md (content=$c12)"
+}
+blocker_cards() { # [gate] RB lines on stdin. With "gate", the first root's REPLY becomes BLOCK1 (row 10's NEXT).
+  local tag root kind dep det t w k y m
+  while IFS="$TAB" read -r tag root kind dep det; do
+    [ "$tag" = RB ] || continue
+    [ "$dep" = - ] && dep=""; [ "$det" = - ] && det=""
+    # How ## Tasks holds the root (acfw_plan_blocker's <in-cycle>): only a parked card uses it.
+    m=$(printf '%s\n' "$TASKS" | awk -F'\t' -v s="$root" '{ n = split($2, a, ","); hit = 0; for (i = 1; i <= n; i++) if (a[i] == s) hit = 1
+          if (hit) { ds = ds (ds == "" ? "" : ",") $1; if (n > 1) sh = 1 } } END { if (ds != "") print (sh ? "shared:" : "sole:") ds }')
+    # The dependent's state, from the snapshot this status already took: a REPLY that edits its
+    # Dependencies must name it (whip-move reads a bare flag after the stem as a missing state).
+    w=""; [ -n "$dep" ] && w=$(awk -F'\t' -v s="$dep" '$1=="T" && $2==s {print $4; exit}' "$TMPD/snap.tsv" 2>/dev/null)
+    t=$(acfw_plan_blocker "$kind" "$root" "$dep" "$det" "$ID" "$REL/plan.md" "$SCRIPT_DIR/acfw-cycle" "$m" "$w") || continue
+    w=${t%%"$TAB"*}; t=${t#*"$TAB"}; k=${t%%"$TAB"*}; y=${t#*"$TAB"}
+    card "$root" "$w" "$k" "$y"
+    [ "${1:-}" = gate ] && BLOCK1="${BLOCK1:-$y}"
+    STATE1="${STATE1:-$y}"
+  done
+}
+state_cards() { # ST lines on stdin: parked, paused and unverified work is a gate even when something else can run
+  local tag s c f rc bc a w k r
+  while IFS="$TAB" read -r tag s c f rc bc a w; do
+    [ "$tag" = ST ] || continue
+    case "$c" in
+      parked|draft|phantom) k=$c; [ "$c" = draft ] && k=paused
+        blocker_cards <<EOF
+RB${TAB}$s${TAB}$k${TAB}-${TAB}rc=$rc bc=$bc
+EOF
+        ;;
+      unverified)
+        # The ack is files-only: every other adapter refuses --integrated-at (no backend maps the field
+        # and the in-tree ledger is the sole oracle), so a card handing it out would hand out a failure.
+        if [ "$STORE" = files ]; then r="/whip-move $s accepted --integrated-at <sha of the commit that holds it>"
+        else r="if it is on trunk, write its ledger marker ('Clearing accepted-branchless-unverified' in docs/acf/backlog/recovery-runbook.md); if not: /whip-move $s pending"; fi
+        card "$s" "$s is accepted, but no branch or ledger marker proves it reached trunk" "its deliverable shows ? until someone checks; if the change is not on trunk, re-run the task" "$r"
+        STATE1="${STATE1:-$r}"; UV1="${UV1:-$r}" ;;
+    esac
+  done
+}
+
+cmd_status() {
+  local plan_arg="" if_cycle=0 after="" mode_arg="" hits cands="" OLDER="" PLANLESS="" QS="" rc a b ME via_if=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --if-cycle) if_cycle=1; shift ;;
+      --after-run) [ $# -ge 2 ] || die 2 "usage: status --after-run <stopReason> --mode <default|override>"; after="$2"; shift 2 ;;
+      --mode) [ $# -ge 2 ] || die 2 "usage: --mode <default|override>"; mode_arg="$2"; shift 2 ;;
+      -*) die 2 "FATAL: unknown status flag '$1'" ;;
+      *) plan_arg="$1"; shift ;;
+    esac
+  done
+  if [ -z "$REPO_ROOT" ]; then
+    [ $if_cycle = 1 ] && exit 0
+    card setup "this folder is not a git repository" "acf-whip keeps plans, tasks and integration in git, so nothing can run here" "git init, then /whip-init --with-specialists"
+    NEXT="/whip-init --with-specialists"; render "(no repository)"; exit 0
+  fi
+  need_repo
+  FOC=$(focus_stems); SCAN=$(scan_cycles)
+  # --if-cycle: /go's completion tail. Outside a planned cycle it must be byte-identical to 3.4.x
+  # (print nothing) and cost nothing on an API-backed board, so it decides from disk alone.
+  if [ $if_cycle = 1 ]; then
+    hits=$(printf '%s\n' "$SCAN" | awk -F'\t' '$1!="" && $2!="closed" && $2!="abandoned" && $6!="-"' | while IFS="$TAB" read -r a b c d e f; do intersects "$f" "$FOC" && echo "$a"; done)
+    [ -n "$hits" ] || exit 0
+    # One hit is resolved THROUGH the focus, not named: it must behave like a bare /whip that found it.
+    [ -z "$plan_arg" ] && [ "$(printf '%s\n' "$hits" | grep -c .)" = 1 ] && { plan_arg="$hits"; via_if=focus; }
+  fi
+  STORE=$(acfw_resolve_store "$REPO_ROOT")
+  PINNED=$(acfw_resolve_integration_mode "$REPO_ROOT" 2>"$TMPD/mode.err") || { card mode "ACFW_INTEGRATION_MODE has a value acf-whip does not recognise" "$(head -1 "$TMPD/mode.err")" "fix it in $(acfw_resolve_config_file "$REPO_ROOT" || echo .acfwhip/config)"; fact "stage unknown: run /whip-doctor"; NEXT=/whip-doctor; render "(configuration)"; exit 4; }
+  case "$mode_arg" in override|default) MODE="$mode_arg" ;; "") MODE="${PINNED:-default}" ;; *) die 2 "FATAL: --mode must be default or override" ;; esac
+
+  # Row 1: setup.
+  SETUP=""
+  if [ "$STORE" = files ]; then [ -d "$REPO_ROOT/.backlog" ] || SETUP="no task store yet (.backlog/ is missing)"
+  else acfw_locate_adapter "$STORE" "$REPO_ROOT" >/dev/null 2>&1 || SETUP="no adapter found for the '$STORE' store"; fi
+  if [ -z "$SETUP" ]; then
+    local uni spec=0 f
+    uni=$(ls "$PLUGIN_ROOT/content/agent-patterns/universal/" 2>/dev/null | sed -n 's/-pattern\.md$//p')
+    for f in "$REPO_ROOT"/.claude/agents/*.md; do [ -e "$f" ] || continue; printf '%s\n' "$uni" | grep -qxF "$(basename "$f" .md)" || spec=$((spec + 1)); done
+    [ $spec -gt 0 ] || SETUP="no specialist agents in .claude/agents/ (none, or only the universal ones)"
+  fi
+  if [ -n "$SETUP" ]; then
+    card setup "set up acf-whip here: $SETUP" "nothing can be decomposed or built until the store and specialists exist" "/whip-init --with-specialists"
+    NEXT="/whip-init --with-specialists"; render "(setup)"; exit 0
+  fi
+
+  # Resolution without a pointer file: focus -> my approved-but-undecomposed -> my single draft.
+  ME=$(g config user.email 2>/dev/null); ID=""; VIA=""
+  if [ -n "$plan_arg" ]; then resolve_plan "$plan_arg" || die 3 "$REASON"; VIA="${via_if:-explicit}"
+  else
+    cands=$(printf '%s\n' "$SCAN" | awk -F'\t' '$1!="" && $2!="closed" && $2!="abandoned" && $6!="-"' | while IFS="$TAB" read -r a b c d e f; do intersects "$f" "$FOC" && echo "$a"; done)
+    [ -n "$cands" ] && VIA=focus
+    [ -n "$cands" ] || { [ -n "$ME" ] && cands=$(printf '%s\n' "$SCAN" | awk -F'\t' -v me="$ME" '$2=="approved" && $4==me && $6=="-" {print $1}'); [ -n "$cands" ] && VIA=approved; }
+    # A draft is an UNTRACKED folder (approval is its first commit). A tracked draft is a retro's
+    # action items, committed by `close --actions`: they show as the standing ra- card, and taking
+    # them here would hijack NEXT from /whip "<next goal>" and point it at an approval.
+    [ -n "$cands" ] || { [ -n "$ME" ] && cands=$(printf '%s\n' "$SCAN" | awk -F'\t' -v me="$ME" '$2=="draft" && $5==me {print $1}' \
+      | while IFS= read -r a; do g cat-file -e "HEAD:docs/cycles/$a/record.md" 2>/dev/null || echo "$a"; done); [ -n "$cands" ] && VIA=draft; }
+    if [ "$(printf '%s\n' "$cands" | grep -c .)" = 1 ]; then resolve_plan "$cands" || die 3 "$REASON"
+    elif [ -n "$cands" ]; then
+      # A tie lists every candidate and picks none. Its NEXT is held back until rows 2-4 had their say
+      # (first match wins): set here, it beat a live /go run lock and a decomposition in flight.
+      for a in $cands; do card "cand-$a" "cycle $a matches too, so none was picked" "none: this only chooses what /whip reports on" "/whip $a"; done
+      CAND_NEXT="/whip $(printf '%s\n' "$cands" | head -1)"
+    fi
+  fi
+  if [ -n "$ID" ]; then
+    [ -d "$DIR" ] || g cat-file -e "HEAD:$REL/record.md" 2>/dev/null || die 3 "$REL does not exist"
+    load_cycle; rc=$?; [ $rc -eq 0 ] || die $rc "$REASON"
+    if [ "$APPROVAL" = valid ]; then known_ds "$HPLAN"; else known_ds "$WPLAN"; fi
+    QS=$(stems_of "$TASKS")
+    CREATING=0; dlock_fresh "$ID" && CREATING=1
+  fi
+  # Older unclosed feature cycles: one info line if finished but not retro'd; they never take NEXT.
+  OLDER=$(printf '%s\n' "$SCAN" | awk -F'\t' -v me="$ID" '$1!="" && $1!=me && $2!="closed" && $2!="abandoned" && $2!="draft" && $3!="retro-actions" && $6!="-" {print $1 "\t" $6}')
+  QS=$(printf '%s\n%s\n' "$QS" "$(printf '%s\n' "$OLDER" | cut -f2 | tr ',' '\n')" | grep -v '^$' | sort -u)
+  # Row 4's subjects: focus stems no cycle owns. A focus that reached the cycle can still hold a
+  # hotfix (`/task --plan` sets it, a free-text `/task` adds to it), and that work was never seen. A
+  # stem a CLOSED or abandoned cycle recorded is not plan-less: its retro already ran, so it is left
+  # out rather than re-reported as a fresh "plan-less trigger" on every bare /whip.
+  if [ "$VIA" != explicit ] && [ -n "$FOC" ]; then
+    b=$( { stems_of "$TASKS"; [ "$VIA" = focus ] && [ -z "$ID" ] && for a in $cands; do printf '%s\n' "$SCAN" | awk -F'\t' -v c="$a" '$1==c {print $6}' | tr ',' '\n'; done
+           printf '%s\n' "$SCAN" | awk -F'\t' '($2=="closed" || $2=="abandoned") && $6!="-" {print $6}' | tr ',' '\n'; } | grep -v '^$' | sort -u)
+    PLANLESS=$(printf '%s\n' "$FOC" | grep -v '^$' | grep -vxF -f <(printf '%s\n' "${b:-/}") || true)
+    [ -n "$PLANLESS" ] && QS=$(printf '%s\n%s\n' "$QS" "$PLANLESS" | grep -v '^$' | sort -u)
+  fi
+
+  # Row 2: the store. One narrowed snapshot (no --digest: hard rule 1), only when there is something to ask.
+  : > "$TMPD/snap.tsv"
+  if [ -n "$QS" ]; then
+    command -v jq >/dev/null 2>&1 || { card jq "jq is required to read the task store for this cycle" "without it the stage cannot be derived, and a guessed stage is worse than none" "install jq (brew install jq), then /whip"; fact "jq required"; NEXT="install jq, then /whip"; render "${ID:-(no active cycle)}"; exit 4; }
+    # shellcheck disable=SC2086
+    snap $QS || store_down
+    # files keeps every active task in view, so an unresolved dependency is either paused/cancelled
+    # (outside the scan) or truly missing. One more seeded call tells which, instead of guessing.
+    if [ "$STORE" = files ]; then
+      a=$( { [ -n "$ID" ] && cycle_facts; printf '%s\n' "$PLANLESS" | awk 'NF{print "F\t" $0}'; } | classify | awk -F'\t' '$1=="RB" && $3=="missing" {print $2}' | sort -u)
+      # shellcheck disable=SC2086
+      [ -n "$a" ] && { snap $a || true; }
+    fi
+    if [ -n "$after" ]; then settle_absent fresh || store_down; else settle_absent || store_down; fi
+  fi
+
+  # Row 3: locks. Evidence that work started, never proof it is still running.
+  run_lock_fresh && { fact "wait: /go is running (its run lock was touched in the last $LOCK_FRESH_MIN minutes)"; setnext "wait: /go is running"; WAIT3=1; }
+  find "$REPO_ROOT/.acfwhip/run" -maxdepth 1 -name 'cycle-*.decomposing' -mmin -$LOCK_FRESH_MIN 2>/dev/null > "$TMPD/locks"
+  while IFS= read -r a; do
+    local lid="${a##*/cycle-}"; lid="${lid%.decomposing}"; local age; age=$(acfw_plan_lock_age "$a")
+    if [ -z "$ID" ] || [ "$lid" = "$ID" ]; then
+      card "lock-$lid" "a decomposition of docs/cycles/$lid/plan.md started ${age}m ago in this checkout" "a second /task --plan would decompose the same deliverables twice" "if that /task is no longer running: rm $(shq "$a")"
+      setnext "wait: /task --plan is decomposing $lid (started ${age}m ago)"; WAIT3=1
+    else fact "a /task --plan for $lid started ${age}m ago"; fi
+  done < "$TMPD/locks"
+
+  # Row 4: plan-less focus in flight.
+  if [ -n "$PLANLESS" ]; then
+    CL=$(printf '%s\n' "$PLANLESS" | awk 'NF{print "F\t" $0}' | classify)
+    if [ "$(sm "$CL" adv)" -gt 0 ]; then fact "focus: $(printf '%s\n' "$PLANLESS" | grep -c .) task(s) without a plan; $(sm "$CL" adv) can move"; setnext /go; fi
+    printf '%s\n' "$CL" | awk -F'\t' '$1=="TR"{printf "%s %s %s\n", $2, $3, $4}' | head -3 | while IFS= read -r a; do echo "plan-less trigger: $a"; done > "$TMPD/pl"
+    while IFS= read -r a; do fact "$a"; done < "$TMPD/pl"
+  fi
+
+  # Standing cards: retro action items nobody has approved yet.
+  for a in $(printf '%s\n' "$SCAN" | awk -F'\t' -v me="$ID" '$1!="" && $1!=me && $3=="retro-actions" && $2=="draft" {print $1}'); do
+    card "ra-$a" "retro action items in docs/cycles/$a/ wait for your approval" "nothing from that retro is built until you approve it" "/whip $a"
+  done
+  # Older cycles: finished but not retro'd.
+  if [ -n "$OLDER" ] && [ -s "$TMPD/snap.tsv" ]; then
+    hits=""
+    while IFS="$TAB" read -r a b; do
+      [ -n "$a" ] || continue
+      CL=$(printf '%s\n' "$b" | tr ',' '\n' | awk 'NF{print "F\t" $0}' | classify)
+      [ "$(sm "$CL" adv)" = 0 ] && [ "$(sm "$CL" wait)" = 0 ] && hits="$hits /retro $a,"
+    done <<EOF
+$OLDER
+EOF
+    [ -n "$hits" ] && fact "finished but not retro'd:${hits%,}"
+  fi
+
+  # Spec tools: facts and cards, zero network (acfw-spec owns what they say).
+  if [ -x "$SPEC_BIN" ]; then
+    bash "$SPEC_BIN" status ${ID:+"$REL/plan.md"} --machine 2>/dev/null > "$TMPD/spec" || true
+    while IFS='|' read -r a b c d; do case "$a" in FACT) fact "$b" ;; CARD) card "spec-$b" "$b" "$c" "$d" ;; esac; done < "$TMPD/spec"
+  fi
+  if [ -z "$ID" ]; then
+    # Row 5: idle, unless candidates tied: then nothing is idle, the user picks one.
+    if [ -n "$CAND_NEXT" ]; then setnext "$CAND_NEXT"; a="several cycles match"
+    else fact "idle: name the next goal; small work can go straight to /task \"<goal>\""; setnext '/whip "<goal>"'; a="no active cycle"; fi
+    ship_fact
+    [ -n "$after" ] && [ "$after" != complete ] && NEXT="act on the /go report above"
+    render "$a"; exit 0
+  fi
+
+  [ -f "$WPLAN" ] && a=$(acfw_plan_h1 "$WPLAN") && [ -n "$a" ] && TITLE="$a"
+  HDR="$ID · $CSTATUS · $KIND${TITLE:+ · \"$TITLE\"}"
+  case "$CSTATUS" in closed|abandoned)
+    # Row 12.
+    fact "this cycle is $CSTATUS$( [ "$CSTATUS" = closed ] && printf ' (retro: %s)' "$(acfw_plan_meta "$MREC" Retro)")"
+    ship_fact
+    setnext '/whip "<next goal>"'; render "$HDR"; exit 0 ;;
+  esac
+
+  # Row 6: plan missing.
+  if [ ! -f "$WPLAN" ]; then
+    # The card carries its own restore command: an earlier row (a lock, a /go run) may already own
+    # NEXT, and the exact `git mv` must still be printed somewhere.
+    local blob src="" fix
+    if [ -n "$HPLAN" ]; then
+      blob=$(g rev-parse "HEAD:$REL/plan.md" 2>/dev/null)
+      src=$(g ls-files -s 2>/dev/null | awk -v b="$blob" -v me="$REL/plan.md" '$2==b && $4!=me {print $4; exit}')
+      if [ -n "$src" ]; then fix="git mv $(shq "$src") $REL/plan.md"; else fix="git checkout HEAD -- $REL/plan.md"; fi
+    else
+      local n=0; for a in "$DIR"/*.md; do case "${a##*/}" in record.md|retro.md) continue ;; esac; [ -f "$a" ] && { src="$a"; n=$((n + 1)); }; done
+      if [ "$n" = 1 ]; then fix="mv $(shq "$src") $(shq "$DIR/plan.md")"; else fix="/whip --abandon $ID"; fi
+    fi
+    card planmissing "$REL/plan.md is missing" "the folder name is the cycle id and plan.md is its spec; without it nothing can be approved or checked" "$fix"
+    setnext "$fix"
+    render "$HDR"; exit 0
+  fi
+
+  # Approval facts.
+  [ "$APPROVAL" = row-mismatch ] && card rowmismatch "record.md's Approved Content ($A_C12) does not match its newest approved row" "a hand-edited record cannot prove what was approved, so the approval is void" "/whip $ID"
+  if [ "$APPROVAL" = valid ]; then
+    a=$(trailer_warn) && [ -n "$a" ] && fact "$a"
+    [ -f "$WREC" ] && [ "$(acfw_plan_c12 "$(acfw_plan_log_latest "$WREC" approved | cut -f4)")" != "$A_C12" ] \
+      && fact "WARN record.md has an approved row that exists only in the working tree; it is never honoured"
+    [ "$(acfw_plan_c12 "$(acfw_plan_content "$WPLAN")")" != "$A_C12" ] && fact "amended since approval: re-approve with /whip $ID"
+    a=$(g rev-parse --abbrev-ref '@{u}' 2>/dev/null) && {
+      rc=$(g rev-list --count "@{u}..HEAD" -- "$REL" 2>/dev/null || echo 0)
+      [ "${rc:-0}" -gt 0 ] && fact "WARN $rc plan commit(s) for $ID are not on $a: push them, or teammates re-decompose"
+      ship_fact
+    }
+  elif [ "$APPROVAL" = stale ]; then fact "WARN plan.md at HEAD is not the approved content $A_C12: the build follows the approved text; re-approve with /whip $ID"; fi
+
+  UNC=$(uncovered_ds | csv)
+  derive
+  COVTXT=$(printf '%s\n' "$CL" | acfw_plan_coverage_text "$MODE")
+  # Row 7: the approval card. Explicitly named (/whip <id>) with unapproved bytes, or no valid
+  # approval while deliverables are uncovered. Amending an approved plan never blocks building it.
+  local wc12; wc12=$(acfw_plan_c12 "$(acfw_plan_content "$WPLAN")")
+  # An explicit request with a void approval (a hand-edited row, a stale HEAD plan) always gets the
+  # card, even when the bytes did not change: it is the only way out the row-mismatch card offers.
+  if { [ "$VIA" = explicit ] && { [ "$wc12" != "$A_C12" ] || [ "$APPROVAL" != valid ]; }; } || { [ "$APPROVAL" != valid ] && [ -n "$UNC" ]; } \
+     || { [ "$APPROVAL" = valid ] && [ -z "$UNC" ] && [ "$wc12" != "$A_C12" ] && [ -n "$(acfw_plan_dids "$WPLAN" 2>/dev/null | cut -f1 | while IFS= read -r a; do printf '%s\n' "$TASKS" | cut -f1 | grep -qxF "$a" || echo "$a"; done)" ]; }; then
+    approval_card
+  fi
+  # Row 8: approved, deliverables not yet decomposed.
+  [ "$APPROVAL" = valid ] && [ -n "$UNC" ] && setnext "/task --plan $REL/plan.md"
+
+  state_cards <<EOF
+$CL
+EOF
+  SM_ADV=$(sm "$CL" adv); SM_WAIT=$(sm "$CL" wait)
+  # Hard rule 6: accepted but not integrated covers both a live branch /go still has to land (integ)
+  # and a branchless one with no marker (unverified). Unpinned, either one can stall the cycle: an
+  # inferred override never integrates (NEXT /go loops), and work merged by hand shows ? forever.
+  a=$(sm "$CL" unverified); a=$(( $(sm "$CL" integ) + $(printf '%s' "$a" | tr ',' '\n' | grep -c .) ))
+  if [ -z "$PINNED" ] && [ -z "$mode_arg" ] && [ "$a" -gt 0 ]; then
+    # A config whose last line has no newline would glue the pin onto that line
+    # (`KEY=valACFW_INTEGRATION_MODE=default`): the pin is not read and the other key is corrupted.
+    # The REPLY adds the missing newline first, and makes the directory for a first config file.
+    card pin "ACFW_INTEGRATION_MODE is not pinned, and $a accepted task(s) of this cycle have no ledger marker" "unpinned, /go infers the mode from project instructions: inferred override never integrates, so /go loops and the cycle never finishes. Pin override instead if people merge by hand" \
+      "f=$(shq "$(acfw_resolve_config_file "$REPO_ROOT" || echo "$REPO_ROOT/.acfwhip/config")"); mkdir -p \"\$(dirname \"\$f\")\"; [ -s \"\$f\" ] && [ -n \"\$(tail -c1 \"\$f\")\" ] && echo >> \"\$f\"; printf 'ACFW_INTEGRATION_MODE=default\\n' >> \"\$f\""
+  fi
+  # /go step 3a: a focus that IS this approved cycle's unfinished work needs no second confirmation
+  # (the approval card was the yes). Exactly: every focus stem is recorded here, every unfinished
+  # recorded stem is in the focus, the approval is valid at HEAD, and something can run. A recorded
+  # stem the store does not answer for (phantom) voids it: the line means "launch without asking",
+  # and a /go launched over a stem that resolves to nothing stops on it, so that run is worth a
+  # confirmation. (A phantom is always unfinished, so it is either in the focus or fails the check.)
+  if [ "$VIA" = focus ] && [ "$APPROVAL" = valid ] && [ "${SM_ADV:-0}" -gt 0 ] && [ -z "$(sm "$CL" phantom)" ]; then
+    a=$(stems_of "$TASKS"); b=$(printf '%s\n' "$CL" | awk -F'\t' '$1=="ST" && ($7=="1" || $8=="1") {print $2}' | sort -u)
+    if [ -z "$(printf '%s\n' "$FOC" | grep -v '^$' | grep -vxF -f <(printf '%s\n' "$a") )" ] \
+       && [ -z "$(printf '%s\n' "$b" | grep -v '^$' | grep -vxF -f <(printf '%s\n' "$FOC") )" ]; then
+      PIN="focus = the $(printf '%s\n' "$b" | grep -c .) runnable task(s) of approved cycle $ID"
+    fi
+  fi
+  if [ -n "$(stems_of "$TASKS")" ]; then
+    # Row 9: something can advance.
+    [ "${SM_ADV:-0}" -gt 0 ] && setnext /go
+    # Row 10: gated. Name the ROOT blocker, never the task that merely waits on it.
+    if [ "${SM_WAIT:-0}" -gt 0 ]; then blocker_cards gate <<EOF
+$CL
+EOF
+      setnext "${BLOCK1:-/whip-doctor}"; fi
+    # Row 11: all terminal, not closed.
+    if [ "${SM_ADV:-0}" = 0 ] && [ "${SM_WAIT:-0}" = 0 ] && [ -n "$TASKS" ] && [ -z "$UNC" ]; then
+      if [ "$KIND" = retro-actions ] && [ "$(sm "$CL" clean)" = 1 ]; then
+        fact "retro actions are done: this cycle closes itself (the next approve, record or /retro stamps it)"; setnext '/whip "<next goal>"'
+      elif [ "$KIND" = retro-actions ]; then
+        # Parked (✗) and unverified (?) work is final to the scheduler, never done: the cycle stays
+        # open and the gate card's REPLY is the next step, or the gate is buried in a closed cycle.
+        fact "retro actions are not done: $(printf '%s\n' "$CL" | awk -F'\t' '$1=="CV" && $3!="\342\234\223" && $3!="cancelled" {printf "%s%s %s", s, $2, $3; s=", "}') need you"
+        setnext "${STATE1:-/whip $ID}"
+      else
+        a=$(sm "$CL" absent)
+        # The CLOSE stage reads live counters (hard rule 1), including seeds the cache answered.
+        # shellcheck disable=SC2046
+        if [ -n "$a$CACHED" ]; then reads $(printf '%s' "$a" | tr ',' ' ') $CACHED || store_down "$HDR"; derive; fi
+        a=$(printf '%s\n' "$CL" | awk -F'\t' '$1=="TR"{ if ($2=="gap") s=s ", gap (" $3 ")"; else s=s ", " $2 " (" $3 " " $4 ")" } END{print substr(s,3)}')
+        b=$(sm "$CL" unverified)
+        if [ -n "$b" ]; then
+          # A ? deliverable fires no trigger, so /retro would close "clean" over work nothing shows
+          # reached trunk, and its card would be buried in a closed cycle. The ? card's REPLY goes first;
+          # once every ? is settled, NEXT falls through to /retro.
+          fact "retro waits: $(printf '%s' "$b" | tr ',' '\n' | grep -c .) task(s) unverified (?): settle each ? card first"
+          [ -n "$a" ] && fact "retro: trigger fired: $a"
+          setnext "${UV1:-/whip $ID}"
+        else
+          if [ -n "$a" ]; then fact "retro: trigger fired: $a"; else fact "retro: clean: closes instantly, zero agents"; fi
+          setnext "/retro $ID"
+        fi
+      fi
+    fi
+  fi
+  # The PIN means "launch without asking", so row 3 voids it: a live run lock or this cycle's own
+  # decomposition in flight says wait, and a PIN beside that wait launched a /go anyway. An amendment
+  # (row 7) or an uncovered D (row 8) does not: the approval still covers the focused work.
+  [ -n "$WAIT3" ] && PIN=""
+  [ -n "$after" ] && [ "$after" != complete ] && NEXT="act on the /go report above"
+  render "$HDR"
+}
+
+# ================================ check: the /task --plan gate ===================================
+cmd_check() {
+  local L age frozen known unc
+  [ $# -eq 1 ] || die 2 "usage: acfw-cycle check <plan>"
+  # Under the cycle's write lock: it serializes the decompose-lock takeover below (two checks that
+  # both saw a stale lock both rm'd it, the second rm deleting the lock the first had just made, and
+  # both answered go), and it keeps a concurrent `record` from moving HEAD under this answer.
+  cycle_or_refuse CHECK "$1" lock
+  [ "$TRACKED" = 1 ] || refuse CHECK 6 "not approved: $REL is a draft; show its card with /whip $ID"
+  case "$CSTATUS" in closed|abandoned) refuse CHECK 6 "the cycle is $CSTATUS" ;; esac
+  case "$APPROVAL" in
+    none) refuse CHECK 6 "not approved at HEAD: show its card with /whip $ID" ;;
+    row-mismatch) refuse CHECK 6 "record.md's Approved Content does not match its newest approved row: re-approve with /whip $ID" ;;
+    stale) refuse CHECK 6 "plan.md at HEAD is not the approved content $A_C12: re-approve with /whip $ID" ;;
+  esac
+  a=$(trailer_warn) && [ -n "$a" ] && echo "$a" >&2
+  known_ds "$HPLAN"; unc=$(uncovered_ds | csv)
+  [ -n "$unc" ] || { echo "CHECK|noop|cycle=$ID|reason=covered"; exit 0; }
+  [ "$unc" = "-" ] && unc=""
+  # Derivation row 3 outranks row 8: while a /go run is live, status says "wait", so the gate for
+  # /task --plan must agree. The two would share the root index (the files writer commits it whole
+  # while land() resyncs it), which is exactly the collision whip-go's own run-lock-held names.
+  if run_lock_fresh; then
+    L=$(acfw_run_lock_path "$REPO_ROOT")
+    refuse CHECK 7 "wait: /go is running (its run lock was touched in the last $LOCK_FRESH_MIN minutes); decompose after it finishes. If that /go is no longer running: rm $(shq "$L")"
+  fi
+  L=$(dlock_path "$ID"); age=$(acfw_plan_lock_age "$L")
+  if [ -n "$age" ] && [ "$age" -lt $LOCK_FRESH_MIN ]; then
+    refuse CHECK 7 "a decomposition of $REL/plan.md started ${age}m ago in this checkout; if that /task is no longer running: rm $(shq "$L")"
+  fi
+  ensure_run_ignored || refuse CHECK 5 ".acfwhip/run/ is not gitignored and the rule could not be added"
+  mkdir -p "$RUN" || refuse CHECK 5 "cannot create $RUN"
+  frozen="$RUN/$A_C12.md"
+  cat "$HPLAN" > "$frozen.tmp.$$" && mv -f "$frozen.tmp.$$" "$frozen" || refuse CHECK 5 "cannot write $frozen"
+  # Stale lock: taken over. Safe only because this check holds the cycle's write lock, so no other
+  # check sits between this rm and the noclobber create.
+  [ -n "$age" ] && rm -f "$L"
+  ( set -C; printf 'ts=%s\n' "$(date -u +%s)" > "$L" ) 2>/dev/null || refuse CHECK 7 "another /task --plan took the decomposition lock for $ID a moment ago; if it is not running: rm $(shq "$L")"
+  known=$(printf '%s\n' "$KNOWN" | cut -f1 | csv)
+  echo "CHECK|go|cycle=$ID|content=$A_C12|frozen=$frozen|lock=$L|uncovered=$unc|known=$known|coverage=$COV|kind=$KIND"
+}
+
+# ================================ approve ========================================================
+cmd_approve() {
+  local a plan="" expect="" by="" ov=() c40 c12 e rec old r out grc st n i ts ev pby pc pdet gate="" BY TS
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --expect) [ $# -ge 2 ] || die 2 "usage: --expect <hex>"; expect="$2"; shift 2 ;;
+      --override) [ $# -ge 2 ] || die 2 "usage: --override <tool>"; ov[${#ov[@]}]="--override"; ov[${#ov[@]}]="$2"; shift 2 ;;
+      --by) [ $# -ge 2 ] || die 2 "usage: --by <email>"; by="$2"; shift 2 ;;
+      -*) die 2 "FATAL: unknown approve flag '$1'" ;;
+      *) plan="$1"; shift ;;
+    esac
+  done
+  [ -n "$plan" ] || die 2 "usage: acfw-cycle approve <plan> --expect <content>"
+  cycle_or_refuse APPROVE "$plan" lock
+  [ -f "$WPLAN" ] || refuse APPROVE 3 "$REL/plan.md is missing"
+  case "$CSTATUS" in closed|abandoned) refuse APPROVE 6 "the cycle is $CSTATUS and frozen; start a new one with /whip \"<goal>\"" ;; esac
+  c40=$(acfw_plan_content "$WPLAN"); c12=$(acfw_plan_c12 "$c40")
+  # Rule 11: the bytes approved are the bytes a card showed. No approve command in the message: a
+  # context-absent session would paste it.
+  e="${expect#v1:}"
+  acfw_hex_ok "$e" 12 || refuse APPROVE 9 "this is not the plan on the last card: re-show it with /whip $ID"
+  case "${c40#v1:}" in "$e"*) ;; *) refuse APPROVE 9 "this is not the plan on the last card: re-show it with /whip $ID" ;; esac
+  if [ "$APPROVAL" = valid ] && [ "$A_C12" = "$c12" ]; then
+    cycle_unlock; echo "APPROVE|noop|cycle=$ID|content=$c12"; echo "already approved at content=$c12"; approve_next; exit 0
+  fi
+  a=$(dup_ds); [ -n "$a" ] && refuse APPROVE 8 "$a appear(s) more than once under ## Deliverables: give every deliverable its own number (new work takes the next unused one)"
+  # Rule 10: only once tasks name D-ids, and only against the last APPROVED body (found by content).
+  if [ "$c12" != "$A_C12" ]; then
+    r10_scope; e=$?
+    if [ $e -eq 0 ]; then r=$(acfw_plan_rule10 "$R10_OLD" "$WPLAN" "$R10_REC") || refuse APPROVE 8 "$r"
+    elif [ $e -eq 2 ]; then echo "WARN: the last approved plan body is not in reachable history (shallow clone?); D-id permanence was not checked" >&2; fi
+  fi
+  acfw_plan_has_conflict "$WPLAN" && refuse APPROVE 5 "$REL/plan.md has git conflict markers: resolve them, then /whip $ID"
+  r=$(git_refusal "$REL/plan.md" "$REL/record.md") || refuse APPROVE 5 "$r"
+  # Rule 12 (spec tools): cache-only, no network. Its ROW| lines become Plan Log rows.
+  if [ -x "$SPEC_BIN" ] && spec_decls; then
+    out=$(bash "$SPEC_BIN" gate "$REL/plan.md" --blob "$c12" ${ov[@]+"${ov[@]}"}); grc=$?
+    # Only 22 (unmet) and 26 (OUT in a workbench) are verdicts. Anything else means the gate could not
+    # run, and passing its code through collided with the pinned table (its 2 read as "usage" here).
+    case "$grc" in
+      0) ;;
+      22|26) printf '%s\n' "$out" | grep -v '^ROW|'; refuse APPROVE "$grc" "the spec gate refused this approval (acfw-spec gate exit $grc)" ;;
+      *) printf '%s\n' "$out" | grep -v '^ROW|'; refuse APPROVE 4 "spec gate could not run (acfw-spec gate exit $grc): run /whip-doctor" ;;
+    esac
+    gate=$(printf '%s\n' "$out" | grep '^ROW|' || true)
+  fi
+  ensure_run_ignored || refuse APPROVE 5 ".acfwhip/run/ is not gitignored and the rule could not be added"
+  autoclose_ra
+  rec_begin || refuse APPROVE 10 "cannot stage a working copy of $REL/record.md"
+  BY="${by:-$(who)}"; TS=$(now)
+  known_ds "$WPLAN"; st=approved; [ -z "$(uncovered_ds)" ] && st=decomposed
+  rec_set Status "$st" "Approved By" "$BY" "Approved At" "$TS UTC" "Approved Content" "v1:$c12"
+  # The record's title follows the plan it approved (a draft starts with the template's placeholder).
+  r=$(acfw_plan_cell "$(acfw_plan_h1 "$WPLAN")")
+  [ -n "$r" ] && ACFW_T="$r" awk 'BEGIN{t=ENVIRON["ACFW_T"]} !d && /^# Cycle Record:/ {print "# Cycle Record: " t; d=1; next} {print}' "$WORK" > "$WORK.n" && mv -f "$WORK.n" "$WORK"
+  n=0
+  if [ -s "$RUN/pending.log" ]; then
+    n=$(wc -l < "$RUN/pending.log" | tr -d ' ')
+    head -n "$n" "$RUN/pending.log" > "$TMPD/pending"
+    while IFS='|' read -r ts ev pby pc pdet; do [ -n "$ev" ] && rec_row "$ev" "$pby" "$pc" "$pdet" "$ts"; done < "$TMPD/pending"
+  fi
+  printf '%s\n' "$gate" | while IFS='|' read -r i ev pby pc pdet; do [ "$i" = ROW ] && rec_row "$ev" "$pby" "$pc" "$pdet" "$TS"; done
+  if [ "$COV" = on ]; then r="ds=$(printf '%s\n' "$KNOWN" | cut -f1 | csv)"; else r="coverage off"; fi
+  rec_row approved "$BY" "$c12" "$r" "$TS"
+  norm_in_place "$WPLAN"
+  # Rule 11 again, at the last moment: the spec gate, autoclose and the lock wait all sit between the
+  # hash above and this commit, and an edit made in that window would otherwise be committed under an
+  # approval whose card never showed it.
+  [ "$(acfw_plan_c12 "$(acfw_plan_content "$WPLAN")")" = "$c12" ] || { rec_restore; norm_restore; refuse APPROVE 9 "$REL/plan.md changed while approving: this is not the plan on the last card: re-show it with /whip $ID"; }
+  rec_commit approve approved "$c12" "$REL/plan.md"; rc=$?
+  [ $rc -eq 10 ] && { norm_restore; refuse APPROVE 10 "the approve commit failed; $REL/record.md was restored byte for byte"; }
+  # The commit landed on 0 AND on 11: fold the pending prefix out either way, or a re-approve after
+  # an 11 folds the same rows again (duplicated, and out of newest-first order).
+  if [ "$n" -gt 0 ]; then tail -n +$((n + 1)) "$RUN/pending.log" > "$RUN/pending.log.$$" && mv -f "$RUN/pending.log.$$" "$RUN/pending.log"; fi
+  [ $rc -eq 11 ] && exit 11
+  a=$(g show "$COMMIT_FULL:$REL/plan.md" 2>/dev/null | acfw_plan_content -)
+  [ "$(acfw_plan_c12 "$a")" = "$c12" ] || { echo "FATAL: $REL/plan.md in $COMMIT is not the approved content $c12. Re-show the card with /whip $ID." >&2; exit 11; }
+  cycle_unlock
+  echo "APPROVE|ok|cycle=$ID|content=$c12|commit=$COMMIT"
+  echo "approved $REL/plan.md at content=$c12 (commit $COMMIT, by $BY)"
+  approve_next
+}
+approve_next() { # /task --plan when anything is uncovered; otherwise the shared derivation's NEXT
+  local u nx
+  known_ds "$WPLAN"; TASKS=$(acfw_plan_tasks "$WREC"); u=$(uncovered_ds)
+  if [ -n "$u" ]; then echo "NEXT /task --plan $REL/plan.md"; return 0; fi
+  nx=$(bash "$0" status "$ID" 2>/dev/null | grep '^NEXT ' | tail -1)
+  echo "${nx:-NEXT /whip $ID}"
+}
+
+# ================================ init ===========================================================
+cmd_init() {
+  local arg="" src="" kind="" source="" title="" tpl pc12 sb
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from-file) [ $# -ge 2 ] || die 2 "usage: --from-file <src>"; src="$2"; shift 2 ;;
+      --kind) [ $# -ge 2 ] || die 2 "usage: --kind feature|retro-actions"; kind="$2"; shift 2 ;;
+      --source) [ $# -ge 2 ] || die 2 "usage: --source <text>"; source="$2"; shift 2 ;;
+      --title) [ $# -ge 2 ] || die 2 "usage: --title <H1>"; title="$2"; shift 2 ;;
+      -*) die 2 "FATAL: unknown init flag '$1'" ;;
+      *) arg="$1"; shift ;;
+    esac
+  done
+  [ -n "$arg" ] || die 2 "usage: acfw-cycle init <slug-or-ID> [--from-file <src>] --kind feature|retro-actions --source <text> [--title <H1>]"
+  case "$kind" in feature|retro-actions) ;; *) die 2 "FATAL: --kind must be feature or retro-actions" ;; esac
+  # Trimmed first: the blob decision below reads the shape of this value, and "gaptrap:SPEC-12 " (a
+  # stray blank or CR pasted from a REF| line) looked like prose, got a blob, and was trimmed only
+  # after that, into the corrupted lineage "gaptrap:SPEC-12 (blob ...)". A blank-only value is empty.
+  source=$(acfw_plan_cell "$source")
+  [ -n "$source" ] || die 2 "FATAL: --source <text> is required (e.g. '/whip draft', 'imported from <path>')"
+  need_repo
+  if acfw_cycle_id_ok "$arg"; then ID="$arg"
+  elif acfw_slug_ok "$arg"; then ID="$(date -u +%Y%m%d)-$arg"
+  else ID="-"; refuse INIT 3 "'$arg' is not a valid slug (^[a-z0-9][a-z0-9-]*$)"; fi
+  REL="docs/cycles/$ID"; DIR="$REPO_ROOT/$REL"; RUN=$(run_dir "$ID")
+  [ -e "$DIR" ] && refuse INIT 3 "$REL already exists"
+  # Deleted only locally, it is still a cycle at HEAD: a new draft there would be approved on top of the
+  # old record, and its plan committed under the old cycle's task map.
+  g cat-file -e "HEAD:$REL" 2>/dev/null && refuse INIT 3 "$REL exists at HEAD (deleted only in this working tree): restore it with git checkout HEAD -- $REL, or pick another slug"
+  if [ -n "$src" ]; then [ -f "$src" ] && [ -r "$src" ] || refuse INIT 3 "no readable file at $src"; fi
+  g check-ignore -q -- "$REL/plan.md" 2>/dev/null && refuse INIT 5 "$REL is gitignored, so this cycle could never be committed"
+  ensure_run_ignored || refuse INIT 5 ".acfwhip/run/ is not gitignored and the rule could not be added"
+  mkdir -p "$DIR" "$RUN" || refuse INIT 3 "cannot create $REL"
+  # Defence in depth behind the whole-string id check: whatever the id, the folder must physically
+  # sit in docs/cycles/, or nothing is written (a symlinked docs/cycles/ is followed, not refused).
+  [ "$(cd "$DIR/.." 2>/dev/null && pwd -P)" = "$(cd "$ROOT_P/docs/cycles" 2>/dev/null && pwd -P)" ] || refuse INIT 3 "$REL does not resolve inside docs/cycles/"
+  if [ -n "$src" ]; then
+    # Import, never mutate: the source is read once and never written.
+    cat "$src" > "$DIR/plan.md" || refuse INIT 3 "cannot copy $src"
+    # Source names what was imported: "imported from <path> (blob <sha12>)", the blob git would store
+    # for the original, so a later "did the original change?" is one hash-object away. The engine adds
+    # it rather than the model, which would have to hash a file it never needs to read. Two forms are
+    # left alone: one that already carries a blob, and the single-token "<tool>:<ref>" lineage of a
+    # /whip --from import. acfw-spec splits that one at its first colon to push back to the document
+    # it came from, and a " (blob ...)" suffix made the ref "SPEC-12 (blob ...)", which no tool accepts.
+    sb=$(git hash-object -- "$src" 2>/dev/null | cut -c1-12)
+    case "$source" in
+      *"(blob "*")"*) sb="" ;;
+      *[[:space:]]*) ;;
+      *:?*) sb="" ;;
+    esac
+    if [ -n "$sb" ]; then
+      # The cell holds 160 characters. A long path is shortened so the blob, the part a later check
+      # needs, is never the part that gets cut.
+      if [ "$(printf '%s' "$source" | LC_ALL=C wc -c | tr -d ' ')" -gt 140 ]; then
+        source="$(printf '%s' "$source" | LC_ALL=C awk '{ printf "%s", substr($0, 1, 137) }' | { iconv -c -f UTF-8 -t UTF-8 2>/dev/null || cat; })..."
+      fi
+      source="$source (blob $sb)"
+    fi
+    # The 3-way BASE for re-merging a changed original later (/whip --pull <ID> --file <original>):
+    # the import as plan.md held it, normalized as the pull normalizes plan.md, so an unedited plan
+    # fast-forwards to the new original instead of turning every changed region into a conflict.
+    # Gitignored run state and an optimization only: without it the pull merges against an empty base.
+    mkdir -p "$REPO_ROOT/.acfwhip/run/workbench/$ID" 2>/dev/null \
+      && acfw_plan_normalize "$DIR/plan.md" > "$REPO_ROOT/.acfwhip/run/workbench/$ID/base.md.$$" 2>/dev/null \
+      && mv -f "$REPO_ROOT/.acfwhip/run/workbench/$ID/base.md.$$" "$REPO_ROOT/.acfwhip/run/workbench/$ID/base.md" \
+      || { rm -f "$REPO_ROOT/.acfwhip/run/workbench/$ID/base.md.$$" 2>/dev/null; echo "WARN: could not write the merge base for $ID; a later /whip --pull --file merges against an empty base" >&2; }
+  else
+    # A base left by a dead draft of the same ID (deleted by hand, run state kept) would make a later
+    # pull merge against a text this cycle never had.
+    rm -f "$REPO_ROOT/.acfwhip/run/workbench/$ID/base.md" 2>/dev/null
+    tpl="$REPO_ROOT/docs/acf/backlog/plan-template.md"; [ -f "$tpl" ] || tpl="$PLUGIN_ROOT/content/backlog/plan-template.md"
+    if [ -n "$title" ]; then ACFW_T="$title" awk 'BEGIN{t=ENVIRON["ACFW_T"]} !d && /^# /{print "# " t; d=1; next} {print}' "$tpl" > "$DIR/plan.md"
+    else cat "$tpl" > "$DIR/plan.md"; fi
+  fi
+  [ -n "$title" ] || title=$(acfw_plan_h1 "$DIR/plan.md"); [ -n "$title" ] || title="$ID"
+  ACFW_FILL_TITLE="$(acfw_plan_cell "$title")" ACFW_FILL_ID="$ID" ACFW_FILL_KIND="$kind" ACFW_FILL_SOURCE="$(acfw_plan_cell "$source")" \
+  ACFW_FILL_CREATED_BY="$(who)" ACFW_FILL_CREATED_AT="$(now)" acfw_plan_fill "$PLUGIN_ROOT/content/backlog/record-template.md" > "$DIR/record.md" || refuse INIT 3 "cannot write $REL/record.md"
+  pc12=$(acfw_plan_c12 "$(acfw_plan_content "$DIR/plan.md")")
+  g symbolic-ref --short -q HEAD > "$RUN/branch" 2>/dev/null || true
+  printf '%s|drafted|%s|%s|%s\n' "$(now)" "$(acfw_plan_cell "$(who)")" "$pc12" "$(acfw_plan_cell "$source")" >> "$RUN/pending.log"
+  echo "INIT|$ID|$REL/plan.md"
+  echo "created $REL/ (plan.md, record.md). Nothing is committed until approval; content=$pc12"
+}
+
+# ================================ record =========================================================
+cmd_record() {
+  local plan="${1:-}" a stem ds d pairs new old drops="" added="" adds="" rows n
+  [ -n "$plan" ] || die 2 "usage: acfw-cycle record <plan> <stem>=<D1,D2|->... [--drop <stem>]..."
+  shift
+  # Arguments are checked before the lock, so a typo never waits on a writer. Everything derived from
+  # the record (the old pairs, the noop test, the D check) is computed only AFTER the lock is held.
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --drop) [ $# -ge 2 ] || die 2 "usage: --drop <stem>"; acfw_stem_ok "$2" || die 2 "FATAL: '$2' is not a task stem"; drops="$drops $2"; shift 2; continue ;;
+      *=*) stem="${1%%=*}"; ds="${1#*=}"; shift ;;
+      *) die 2 "FATAL: '$1' is not <stem>=<D1,D2> (use <stem>=- when the plan has no deliverables)" ;;
+    esac
+    acfw_stem_ok "$stem" || die 2 "FATAL: '$stem' is not a task stem"
+    case "$ds" in *[!D0123456789,-]*) die 2 "FATAL: '$ds' is not a list of deliverables (D1,D2 or -)" ;; esac
+    adds="$adds $stem=$ds"
+  done
+  cycle_or_refuse RECORD "$plan" lock
+  [ "$TRACKED" = 1 ] || refuse RECORD 6 "not approved: $REL has never been approved, so it cannot record tasks"
+  case "$CSTATUS" in closed|abandoned) refuse RECORD 6 "the cycle is $CSTATUS and frozen" ;; esac
+  known_ds "${HPLAN:-$WPLAN}"
+  pairs=$(printf '%s\n' "$TASKS" | awk -F'\t' 'NF>=2 && $2!="" {n=split($2,s,","); for(i=1;i<=n;i++) if (s[i]!="") print $1 "\t" s[i]}')
+  old=$(printf '%s\n' "$pairs" | grep -v '^$' | LC_ALL=C sort -u)
+  new="$pairs"
+  for a in $adds; do
+    stem="${a%%=*}"; ds="${a#*=}"
+    for d in $(printf '%s' "$ds" | tr ',' ' '); do
+      if [ "$COV" = off ]; then [ "$d" = "-" ] || die 2 "FATAL: $REL has no deliverables (coverage off): record $stem=-"
+      else printf '%s\n' "$KNOWN" | cut -f1 | grep -qxF "$d" || die 2 "FATAL: $d is not a deliverable of the approved plan (known: $(printf '%s\n' "$KNOWN" | cut -f1 | csv))"; fi
+      new="$new
+$d$TAB$stem"; added="$added $stem($d)"
+    done
+  done
+  for stem in $drops; do new=$(printf '%s\n' "$new" | awk -F'\t' -v s="$stem" '$2!=s'); done
+  new=$(printf '%s\n' "$new" | grep -v '^$' | LC_ALL=C sort -u)
+  [ "$new" = "$old" ] && { echo "RECORD|noop|cycle=$ID"; exit 0; }
+  r=$(git_refusal "$REL/record.md") || refuse RECORD 5 "$r"
+  ensure_run_ignored || true
+  autoclose_ra
+  rec_begin || refuse RECORD 10 "cannot stage a working copy of $REL/record.md"
+  rows="$TMPD/rows"
+  printf '%s\n' "$new" | acfw_plan_task_rows > "$rows"
+  acfw_plan_record_tasks "$WORK" "$rows" > "$WORK.n" && mv -f "$WORK.n" "$WORK" || { rec_restore; refuse RECORD 3 "$REL/record.md has no ## Tasks table to write"; }
+  rec_set Status decomposed
+  n=$(printf '%s\n' "$new" | cut -f2 | sort -u | grep -c .)
+  a="tasks=$n"; [ -n "$added" ] && a="$a; +$added"; [ -n "$drops" ] && a="$a; dropped$drops"
+  rec_row decomposed "$(who)" "$A_C12" "$a"
+  rec_commit decompose decomposed "$A_C12"; rc=$?
+  [ $rc -eq 10 ] && refuse RECORD 10 "the decompose commit failed; $REL/record.md was restored byte for byte"
+  [ $rc -eq 11 ] && exit 11
+  echo "RECORD|ok|cycle=$ID|tasks=$n"
+}
+
+# ================================ triggers =======================================================
+cmd_triggers() {
+  local st CL out a
+  [ $# -eq 1 ] || die 2 "usage: acfw-cycle triggers <plan>"
+  cycle_or_refuse TRIGGERS "$1"
+  # Same refusal as retro-begin, close and note: a run still writing the store would hand /retro
+  # counters (and a clean-close verdict) that the run's next transition makes false.
+  run_lock_fresh && refuse TRIGGERS 7 "wait: /go is running; triggers read what the run leaves behind"
+  STORE=$(acfw_resolve_store "$REPO_ROOT"); MODE=$(acfw_resolve_integration_mode "$REPO_ROOT" 2>/dev/null); MODE="${MODE:-default}"
+  dlock_fresh "$ID" && CREATING=1
+  if [ "$APPROVAL" = valid ]; then known_ds "$HPLAN"; else known_ds "$WPLAN"; fi
+  st=$(stems_of "$TASKS")
+  [ -n "$st" ] || { echo "TRIGGERS|none"; exit 0; }
+  command -v jq >/dev/null 2>&1 || die 4 "jq required: triggers read the task store (brew install jq)"
+  : > "$TMPD/snap.tsv"
+  # shellcheck disable=SC2086
+  snap $st || die 4 "stage unknown: run /whip-doctor ($SNAP_ERR)"
+  a=$(cycle_facts | classify | awk -F'\t' '$1=="SM"' ); a=$(sm "$a" absent)
+  # shellcheck disable=SC2046
+  if [ -n "$a" ]; then reads $(printf '%s' "$a" | tr ',' ' ') || die 4 "stage unknown: run /whip-doctor ($SNAP_ERR)"; fi
+  out=$(cycle_facts | classify | awk -F'\t' '$1=="TR" { o = ($2=="rework") ? 1 : ($2=="stuck") ? 2 : 3
+          if ($2=="gap") print o "\t" $3 "\tTRIGGER|gap|" $3; else print o "\t" $3 "\tTRIGGER|" $2 "|" $3 "|" $4 }' | LC_ALL=C sort -t"$TAB" -k1,1n -k2,2 | cut -f3 | awk '!s[$0]++')
+  if [ -n "$out" ]; then printf '%s\n' "$out"; else echo "TRIGGERS|none"; fi
+}
+
+# ================================ retro-begin / close / note =====================================
+porcelain() { acfw_plan_porcelain "$REPO_ROOT"; }
+
+# cycle_done: approved at HEAD, nothing uncovered, no recorded task can advance or is waiting, AND
+# every deliverable is ✓ or cancelled. Parked (✗) and unverified (?) tasks are final to the scheduler,
+# so adv=0 wait=0 alone closed a retro-actions cycle over a human gate and buried it: resolution
+# skips closed cycles, and follow-through only checks decomposition.
+# rc 0 done · 1 not done · 4 the store could not say (a guessed "done" would close live work).
+cycle_done() {
+  local st
+  [ "$APPROVAL" = valid ] || return 1
+  known_ds "$HPLAN"; [ -z "$(uncovered_ds)" ] || return 1
+  st=$(stems_of "$TASKS"); [ -n "$st" ] || return 1
+  command -v jq >/dev/null 2>&1 || { SNAP_ERR="jq required"; return 4; }
+  STORE=$(acfw_resolve_store "$REPO_ROOT"); MODE=$(acfw_resolve_integration_mode "$REPO_ROOT" 2>/dev/null); MODE="${MODE:-default}"
+  : > "$TMPD/snap.tsv"
+  # shellcheck disable=SC2086
+  snap $st || return 4
+  settle_absent || return 4
+  derive
+  [ "$(sm "$CL" adv)" = 0 ] && [ "$(sm "$CL" wait)" = 0 ] && [ "$(sm "$CL" clean)" = 1 ]
+}
+# autoclose_ra: retro-actions cycles close themselves when their tasks are done (plan §1). status
+# derives that read-only; the next mutating verb (approve, record, close, note) writes the stamp. Each
+# runs as its own `close <id> none --if-done` process, so its refusal can never change this verb's exit
+# code, and its commit lands BEFORE this verb's, so HEAD stays the commit this verb reports. Best effort
+# by design: without jq, a reachable store or a free run lock it is skipped, and status still derives it.
+autoclose_ra() {
+  local id out
+  command -v jq >/dev/null 2>&1 || return 0
+  for id in $(acfw_plan_scan "$REPO_ROOT" | awk -F'\t' -v me="${ID:-}" '$1!=me && $3=="retro-actions" && ($2=="approved" || $2=="decomposed") && $6!="-" {print $1}'); do
+    out=$(ACFW_TRUNK_ROOT="$REPO_ROOT" ACFW_CYCLE_LOCK_WAIT=0 bash "$0" close "$id" none --if-done </dev/null 2>/dev/null) || continue
+    case "$out" in "CLOSE|ok|"*) printf 'note: retro actions %s are done, so they were closed (commit %s)\n' "$id" "${out##*|commit=}" >&2 ;; esac
+  done
+}
+cmd_retro_begin() {
+  local h
+  [ $# -eq 1 ] || die 2 "usage: acfw-cycle retro-begin <plan>"
+  cycle_or_refuse RETRO "$1"
+  run_lock_fresh && refuse RETRO 7 "wait: /go is running; a retro reads what the run leaves behind"
+  ensure_run_ignored || refuse RETRO 5 ".acfwhip/run/ is not gitignored and the rule could not be added"
+  mkdir -p "$RUN"; h=$(g rev-parse HEAD)
+  { printf 'head=%s\n' "$h"; porcelain; } > "$RUN/retro-baseline"
+  echo "RETRO|begin|cycle=$ID|head=$h"
+}
+# governance <VERB> <actions-id|""> <lesson paths...>: the retro may change exactly its own outputs.
+# Sets GOV (newline list of exact paths to commit besides record.md).
+governance() {
+  local V="$1" act="$2" base="$RUN/retro-baseline" h0 h1 p s bad="" lp="" n=0; shift 2
+  [ -f "$base" ] || refuse "$V" 5 "no retro baseline for $ID: a retro starts with acfw-cycle retro-begin $ID"
+  h0=$(sed -n '1s/^head=//p' "$base"); h1=$(g rev-parse HEAD)
+  [ "$h0" = "$h1" ] || refuse "$V" 5 "HEAD moved during the retro ($h0 -> $h1): re-run /retro"
+  [ -f "$DIR/retro.md" ] || refuse "$V" 3 "$REL/retro.md does not exist"
+  GOV="$REL/retro.md"
+  for p in "$@"; do
+    p="${p#./}"; case "$p" in "$REPO_ROOT"/*) p="${p#"$REPO_ROOT"/}" ;; esac
+    case "$p" in docs/acf/lessons/*.md) ;; *) refuse "$V" 3 "--lesson $p is not docs/acf/lessons/<slug>.md" ;; esac
+    s="${p#docs/acf/lessons/}"; s="${s%.md}"
+    acfw_lesson_slug_ok "$s" || refuse "$V" 3 "lesson slug '$s' must be timeless: ^[a-z][a-z0-9-]*$, no 8-digit run, no -v<digits> anywhere, no leading v<digits>"
+    [ -f "$REPO_ROOT/$p" ] || refuse "$V" 3 "$p does not exist"
+    grep -q '^\*\*Rule\*\*:' "$REPO_ROOT/$p" || refuse "$V" 3 "$p has no '**Rule**: <one sentence>' line"
+    n=$((n + 1)); lp="$lp
+$p"
+  done
+  [ $n -le 3 ] || refuse "$V" 2 "a retro writes at most 3 lessons ($n given)"
+  if [ -n "$act" ]; then
+    acfw_cycle_id_ok "$act" || refuse "$V" 3 "--actions '$act' is not a cycle id"
+    [ -f "$REPO_ROOT/docs/cycles/$act/plan.md" ] && [ -f "$REPO_ROOT/docs/cycles/$act/record.md" ] || refuse "$V" 3 "docs/cycles/$act/ needs plan.md and record.md (create it with acfw-cycle init)"
+    [ "$(acfw_plan_meta "$REPO_ROOT/docs/cycles/$act/record.md" Kind)" = retro-actions ] || refuse "$V" 3 "docs/cycles/$act is not a retro-actions cycle"
+    lp="$lp
+docs/cycles/$act/plan.md
+docs/cycles/$act/record.md"
+  fi
+  GOV="$GOV$lp"
+  sed '1d' "$base" | LC_ALL=C sort > "$TMPD/b"; porcelain | LC_ALL=C sort > "$TMPD/c"
+  porcelain | awk -F'\t' '($1 ~ /D/ || $1 == "RO") && $2 ~ /^docs\/acf\/lessons\// {print $2}' > "$TMPD/del"
+  [ -s "$TMPD/del" ] && refuse "$V" 5 "retiring a lesson is yours: commit the git rm yourself ($(csv < "$TMPD/del"))"
+  LC_ALL=C comm -3 "$TMPD/b" "$TMPD/c" | sed 's/^[[:space:]]*//' | cut -f2 | LC_ALL=C sort -u > "$TMPD/chg"
+  while IFS= read -r p; do
+    [ "$p" = "$REL/record.md" ] && continue
+    printf '%s\n' "$GOV" | grep -qxF "$p" && continue
+    [ -n "$act" ] && case "$p" in "docs/cycles/$act/"*) continue ;; esac
+    bad="$bad $p"
+  done < "$TMPD/chg"
+  [ -z "$bad" ] || refuse "$V" 5 "the retro changed paths outside its outputs:$bad"
+}
+cmd_close() {
+  local plan="${1:-}" what="${2:-}" les=() act="" nl=0 rc ifdone=0 det
+  [ -n "$plan" ] && [ -n "$what" ] || die 2 "usage: acfw-cycle close <plan> none|retro.md [--lesson <path>]... [--actions <ID>]  |  close <plan> none --if-done"
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --lesson) [ $# -ge 2 ] || die 2 "usage: --lesson <path>"; les[${#les[@]}]="$2"; shift 2 ;;
+      --actions) [ $# -ge 2 ] || die 2 "usage: --actions <ID>"; act="$2"; shift 2 ;;
+      --if-done) ifdone=1; shift ;;
+      *) die 2 "FATAL: unknown close argument '$1'" ;;
+    esac
+  done
+  case "$what" in none|retro.md) ;; *) die 2 "FATAL: close takes none or retro.md" ;; esac
+  cycle_or_refuse CLOSE "$plan" lock
+  [ "$TRACKED" = 1 ] || refuse CLOSE 6 "not approved: nothing to close; drop a draft with /whip --abandon $ID"
+  case "$CSTATUS" in closed|abandoned) echo "CLOSE|noop|cycle=$ID|status=$CSTATUS"; exit 0 ;; esac
+  run_lock_fresh && refuse CLOSE 7 "wait: /go is running"
+  GOV=""; det="retro: $what; lessons: ${#les[@]}; actions: ${act:--}"
+  if [ $ifdone = 1 ]; then
+    # The derived close of a finished retro-actions cycle, made durable. Only that kind closes without
+    # a retro (plan §1: no retro-of-retro chain), and only when the store proves every task is done.
+    [ "$what" = none ] && [ ${#les[@]} -eq 0 ] && [ -z "$act" ] || die 2 "FATAL: --if-done goes with close <plan> none only"
+    [ "$KIND" = retro-actions ] || refuse CLOSE 3 "--if-done closes only retro-actions cycles; a feature cycle closes through /retro $ID"
+    cycle_done; rc=$?
+    [ $rc -eq 4 ] && refuse CLOSE 4 "stage unknown: run /whip-doctor (${SNAP_ERR:-the store did not answer})"
+    [ $rc -eq 0 ] || { echo "CLOSE|noop|cycle=$ID|reason=not-done"; exit 0; }
+    det="retro actions done: closed automatically; the next retro's follow-through covers them"
+  fi
+  if [ "$what" = none ]; then
+    [ ${#les[@]} -eq 0 ] && [ -z "$act" ] || die 2 "FATAL: close none takes no --lesson or --actions (a clean close writes nothing but the stamp)"
+  else governance CLOSE "$act" ${les[@]+"${les[@]}"}; nl=${#les[@]}; fi
+  # shellcheck disable=SC2046
+  r=$(git_refusal "$REL/record.md" $(printf '%s\n' "$GOV" | grep -v '^$')) || refuse CLOSE 5 "$r"
+  # Auto-close first, so the follow-through line reports a finished retro-actions cycle as closed.
+  [ $ifdone = 1 ] || { autoclose_ra; follow_through "$act"; }
+  # The retro's outputs are agent files written moments ago, and docs/acf/lessons/ sits outside every
+  # shipped hook exclude: normalize them so a trailing blank cannot fail the close once (norm_in_place).
+  norm_gov
+  rec_begin || { norm_restore; refuse CLOSE 10 "cannot stage a working copy of $REL/record.md"; }
+  rec_set Status closed Retro "$what"
+  rec_row closed "$(who)" "$A_C12" "$det"
+  # shellcheck disable=SC2046
+  rec_commit close closed "$A_C12" $(printf '%s\n' "$GOV" | grep -v '^$'); rc=$?
+  [ $rc -eq 10 ] && { norm_restore; refuse CLOSE 10 "the close commit failed; $REL/record.md was restored byte for byte"; }
+  [ $rc -eq 11 ] && exit 11
+  rm -f "$RUN/retro-baseline"
+  echo "CLOSE|ok|cycle=$ID|retro=$what|lessons=$nl|actions=${act:--}|commit=$COMMIT"
+}
+cmd_note() {
+  local plan="${1:-}" what="${2:-}" les=() rc
+  [ -n "$plan" ] && [ "$what" = retro.md ] || die 2 "usage: acfw-cycle note <plan> retro.md [--lesson <path>]..."
+  shift 2
+  while [ $# -gt 0 ]; do case "$1" in --lesson) [ $# -ge 2 ] || die 2 "usage: --lesson <path>"; les[${#les[@]}]="$2"; shift 2 ;; *) die 2 "FATAL: unknown note argument '$1'" ;; esac; done
+  cycle_or_refuse NOTE "$plan" lock
+  [ "$TRACKED" = 1 ] || refuse NOTE 6 "not approved: a mid-cycle retro needs an approved cycle"
+  case "$CSTATUS" in closed|abandoned) refuse NOTE 6 "the cycle is $CSTATUS and frozen" ;; esac
+  run_lock_fresh && refuse NOTE 7 "wait: /go is running"
+  governance NOTE "" ${les[@]+"${les[@]}"}
+  # shellcheck disable=SC2046
+  r=$(git_refusal $(printf '%s\n' "$GOV" | grep -v '^$')) || refuse NOTE 5 "$r"
+  autoclose_ra
+  norm_gov   # the same reason as close: the lessons are outside every shipped hook exclude
+  # shellcheck disable=SC2046
+  commit_paths note noted "$A_C12" $(printf '%s\n' "$GOV" | grep -v '^$'); rc=$?
+  [ $rc -eq 10 ] && { norm_restore; refuse NOTE 10 "the note commit failed; nothing was changed"; }
+  [ $rc -eq 11 ] && exit 11
+  rm -f "$RUN/retro-baseline"
+  echo "NOTE|ok|cycle=$ID|lessons=${#les[@]}|commit=$COMMIT"
+}
+
+# ================================ abandon ========================================================
+cmd_abandon() {
+  local plan="" reason="" rc
+  while [ $# -gt 0 ]; do
+    case "$1" in --reason) [ $# -ge 2 ] || die 2 "usage: --reason <text>"; reason="$2"; shift 2 ;; -*) die 2 "FATAL: unknown abandon flag '$1'" ;; *) plan="$1"; shift ;; esac
+  done
+  [ -n "$plan" ] || die 2 "usage: acfw-cycle abandon <plan> [--reason <text>]"
+  cycle_or_refuse ABANDON "$plan" lock
+  case "$CSTATUS" in closed|abandoned) echo "ABANDON|noop|cycle=$ID|status=$CSTATUS"; exit 0 ;; esac
+  if [ "$TRACKED" = 1 ]; then r=$(git_refusal "$REL/record.md") || refuse ABANDON 5 "$r"; fi
+  ensure_run_ignored || true
+  rec_begin || refuse ABANDON 10 "cannot stage a working copy of $REL/record.md"
+  rec_set Status abandoned
+  rec_row abandoned "$(who)" "${A_C12:--}" "${reason:-abandoned}"
+  if [ "$TRACKED" = 1 ]; then
+    rec_commit abandon abandoned "$A_C12"; rc=$?
+    [ $rc -eq 10 ] && refuse ABANDON 10 "the abandon commit failed; $REL/record.md was restored byte for byte"
+    [ $rc -eq 11 ] && exit 11
+    echo "ABANDON|ok|cycle=$ID|committed=yes|commit=$COMMIT"
+  else
+    # A draft was never committed; abandoning it stays local too. No open verb, so no wedge.
+    rec_install; rm -f "$PRE" 2>/dev/null
+    echo "ABANDON|ok|cycle=$ID|committed=no"
+  fi
+}
+
+# ================================ dispatch =======================================================
+case "$VERB" in
+  status)      cmd_status "$@" ;;
+  check)       cmd_check "$@" ;;
+  approve)     cmd_approve "$@" ;;
+  init)        cmd_init "$@" ;;
+  record)      cmd_record "$@" ;;
+  triggers)    cmd_triggers "$@" ;;
+  retro-begin) cmd_retro_begin "$@" ;;
+  close)       cmd_close "$@" ;;
+  note)        cmd_note "$@" ;;
+  abandon)     cmd_abandon "$@" ;;
+  ""|-h|--help|help) sed -n '2,/^set -u$/p' "$0" | sed -n '/^# Verbs:/,/^# Exit:/p' | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+  *) die 2 "FATAL: unknown verb '$VERB' (status check approve init record lessons triggers retro-begin close note abandon)" ;;
+esac

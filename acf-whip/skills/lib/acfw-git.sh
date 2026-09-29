@@ -104,9 +104,17 @@ git_with_lock_backoff() {
 #          untouched) · 1 environmental failure (FILE intact, row NOT written). Never 2, so a
 #          caller can never confuse a refusal with a usage error. Callers historically ignored the
 #          return and no acf-whip script runs `set -e`, so adopting it is opt-in per call site.
+#
+# HEADING and CAP (3.5.0): `append_log_row FILE ROW [HEADING] [CAP]`. HEADING (default "Transition
+# Log") is matched by STRING EQUALITY against the heading text after "## " (trailing whitespace
+# ignored), never as a regex: a heading is user-visible prose, and a regex metachar in it must not
+# widen the match. CAP defaults to $ACFW_LOG_ROW_CAP; the literal `none` means unlimited and is
+# checked BEFORE the cap<1 -> 1 clamp, because `none`+0 is 0 and would otherwise clamp to ONE row.
+# That sentinel exists for audit trails (a cycle's Plan Log) that a user's ACFW_LOG_ROW_CAP must
+# never truncate. Every 2-arg caller is byte-identical to before: same heading, same cap.
 ACFW_LOG_ROW_CAP="${ACFW_LOG_ROW_CAP:-80}"
 append_log_row() {
-  local file="$1" row="$2" dir tmp arc
+  local file="$1" row="$2" heading="${3:-Transition Log}" cap="${4:-$ACFW_LOG_ROW_CAP}" dir tmp arc
 
   # (1) Refusal gate. `[ -s ]` alone is defeated by a file holding only newlines — the same corpse
   # class — so test for a non-space byte. grep short-circuits on the first match; this is free.
@@ -131,16 +139,18 @@ append_log_row() {
     # awk receives ROW/CAP via ENVIRON (no interpolation, so notes with awk/shell metachars are safe).
     # A "separator" row is one whose inter-pipe cells are only dashes/spaces (the markdown header rule);
     # a data row always has alphanumerics in its first cell, so the two never collide.
-    ACFW_ROW="$row" ACFW_CAP="$ACFW_LOG_ROW_CAP" awk '
-      BEGIN { row=ENVIRON["ACFW_ROW"]; cap=ENVIRON["ACFW_CAP"]+0; if (cap<1) cap=1
+    ACFW_ROW="$row" ACFW_CAP="$cap" ACFW_HEAD="$heading" awk '
+      BEGIN { row=ENVIRON["ACFW_ROW"]; want=ENVIRON["ACFW_HEAD"]
+              unlimited = (ENVIRON["ACFW_CAP"] == "none")         # sentinel BEFORE the clamp
+              cap=ENVIRON["ACFW_CAP"]+0; if (cap<1) cap=1
               inLog=0; inserted=0; body=0; dropped=0; out=0 }
-      /^##[[:space:]]/ { inLog = ($0 ~ /^##[[:space:]]+Transition Log[[:space:]]*$/) ? 1 : 0 }
+      /^##[[:space:]]/ { h=$0; sub(/^##[[:space:]]+/, "", h); sub(/[[:space:]]+$/, "", h); inLog = (h == want) ? 1 : 0 }
       {
         if (inLog && !inserted && $0 ~ /^\|[ -]+\|/) {          # the header separator row
           print; out++; print row; out++; inserted=1; body=0; next
         }
         if (inLog && inserted && $0 ~ /^\|/) {                   # an existing body row (newest-first)
-          body++; if (body < cap) { print; out++ } else dropped++; next
+          body++; if (unlimited || body < cap) { print; out++ } else dropped++; next
         }
         if (inLog && inserted && $0 !~ /^\|/) inLog=0            # left the table body
         print; out++

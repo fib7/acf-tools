@@ -252,6 +252,202 @@ check "WHIP-23: still nothing committed" "[ \"\$(git rev-parse HEAD)\" = '$H1' ]
 check "WHIP-23: append_log_row refused rather than writing a row into the emptied file" \
   "[ ! -s '$REPO/.backlog/pending/t-torn.md' ]"
 
+echo "== 3.5.0: append_log_row FILE ROW [HEADING] [CAP] — 2-arg callers stay byte-identical =="
+# 3.5.0 generalizes append_log_row so acfw-cycle can write a cycle record's '## Plan Log'. Every
+# task-state writer (apply-transition.sh, the multica adapter, clean-checkout's token) still calls it
+# with two arguments, and those rows are what the review gate and the doctor grep. The EXPECTED bytes
+# below were produced by the 3.4.3 implementation and are pinned as literals, never re-derived from
+# the lib under test: comparing the new code against itself would pass whatever it did.
+# The fixture carries a SECOND table under '## Plan Log' on purpose. A 2-arg call must not touch it,
+# and a heading match that drifted to "first table in the file" or "last '## ... Log'" would.
+. "$LIB"
+ALB="$WORK/alr-bytes"; mkdir -p "$ALB"
+cat > "$ALB/fx.md" <<'EOF'
+# Task: fx-001-byte-identity
+
+## Metadata
+
+- **ID**: fx-001
+- **Status**: pending
+
+## Transition Log
+
+| Date Time | From | To | Agent | Reason/Comment |
+| --------- | ---- | -- | ----- | -------------- |
+| 2026-06-01 00:00:00 | draft | pending | task-engineer | Initial task creation |
+
+## Plan Log
+
+| Date Time | Event | By | Content | Details |
+|---|---|---|---|---|
+| 2026-06-01 00:00:00 | drafted | t@t | - | must stay untouched by 2-arg calls |
+
+## Implementation Notes
+
+(none)
+EOF
+cat > "$ALB/fx.expected" <<'EOF'
+# Task: fx-001-byte-identity
+
+## Metadata
+
+- **ID**: fx-001
+- **Status**: pending
+
+## Transition Log
+
+| Date Time | From | To | Agent | Reason/Comment |
+| --------- | ---- | -- | ----- | -------------- |
+| 2026-06-02 00:00:04 | pending | in-progress | orchestrator | dispatch 4 |
+| 2026-06-02 00:00:03 | pending | in-progress | orchestrator | dispatch 3 |
+| 2026-06-02 00:00:02 | pending | in-progress | orchestrator | dispatch 2 |
+
+## Plan Log
+
+| Date Time | Event | By | Content | Details |
+|---|---|---|---|---|
+| 2026-06-01 00:00:00 | drafted | t@t | - | must stay untouched by 2-arg calls |
+
+## Implementation Notes
+
+(none)
+EOF
+ALB_RC=0
+for i in 1 2 3 4; do
+  ACFW_LOG_ROW_CAP=3 append_log_row "$ALB/fx.md" "| 2026-06-02 00:00:0$i | pending | in-progress | orchestrator | dispatch $i |" || ALB_RC=$?
+done
+check "2-arg: every call returns 0" "[ $ALB_RC -eq 0 ]"
+check "2-arg: capped splice into '## Transition Log' is byte-identical to 3.4.3" "cmp -s '$ALB/fx.md' '$ALB/fx.expected'"
+
+# The table as the LAST section, starting empty, fed a row carrying the multica adapter's escaped
+# pipe and a backslash: awk -v and gsub both reinterpret backslashes, and '&' is gsub's
+# whole-match token, so a reimplementation that routes the row through either changes these bytes.
+cat > "$ALB/last.md" <<'EOF'
+# Task: fx-002-last-section
+
+- **ID**: fx-002
+
+## Transition Log
+
+| Date Time | From | To | Agent | Reason/Comment |
+| --------- | ---- | -- | ----- | -------------- |
+EOF
+cat > "$ALB/last.expected" <<'EOF'
+# Task: fx-002-last-section
+
+- **ID**: fx-002
+
+## Transition Log
+
+| Date Time | From | To | Agent | Reason/Comment |
+| --------- | ---- | -- | ----- | -------------- |
+| 2026-06-03 10:00:01 | rejected | pending | orchestrator | retry |
+| 2026-06-03 10:00:00 | in-review | rejected | quality-reviewer | a \| b & c/d \\n |
+EOF
+append_log_row "$ALB/last.md" '| 2026-06-03 10:00:00 | in-review | rejected | quality-reviewer | a \| b & c/d \\n |'
+append_log_row "$ALB/last.md" '| 2026-06-03 10:00:01 | rejected | pending | orchestrator | retry |'
+check "2-arg: an empty trailing table, escaped pipe, '&' and backslashes are byte-identical to 3.4.3" \
+  "cmp -s '$ALB/last.md' '$ALB/last.expected'"
+
+# No Transition Log at all: the never-lose-a-row EOF fallback, exact bytes.
+printf '# Task: no table\n\nnotes only\n' > "$ALB/eof.md"
+append_log_row "$ALB/eof.md" '| 2026-06-02 00:00:09 | a | b | c | d |'
+printf '# Task: no table\n\nnotes only\n| 2026-06-02 00:00:09 | a | b | c | d |\n' > "$ALB/eof.expected"
+check "2-arg: the EOF fallback is byte-identical to 3.4.3" "cmp -s '$ALB/eof.md' '$ALB/eof.expected'"
+
+# Naming the default heading explicitly must be the same call, not a second code path.
+cp "$ALB/fx.md" "$ALB/fx-2arg.md"; cp "$ALB/fx.md" "$ALB/fx-3arg.md"
+ACFW_LOG_ROW_CAP=3 append_log_row "$ALB/fx-2arg.md" '| 2026-06-02 00:00:05 | in-progress | completed | go-engineer | done |'
+ACFW_LOG_ROW_CAP=3 append_log_row "$ALB/fx-3arg.md" '| 2026-06-02 00:00:05 | in-progress | completed | go-engineer | done |' "Transition Log"
+check "3-arg with HEADING='Transition Log' writes the same bytes as the 2-arg call" \
+  "cmp -s '$ALB/fx-2arg.md' '$ALB/fx-3arg.md'"
+
+echo "== 3.5.0: HEADING targets '## Plan Log' by exact heading text =="
+# A cycle record.md is written only by acfw-cycle, newest first. The heading is matched by STRING
+# EQUALITY on the text after '## ': the decoy '## Plan Log Archive' sits ABOVE the real section, so a
+# prefix or substring match splices the row into the wrong table and the audit trail reads wrong.
+PLF="$ALB/record.md"
+cat > "$PLF" <<'EOF'
+# Cycle Record: fixture
+
+## Metadata
+
+- **Format**: 1
+
+## Plan Log Archive
+
+| Date Time | Event | By | Content | Details |
+|---|---|---|---|---|
+| 2025-01-01 00:00:00 | decoy | d@d | - | decoy table |
+
+## Transition Log
+
+| Date Time | From | To | Agent | Reason/Comment |
+| --------- | ---- | -- | ----- | -------------- |
+| 2026-06-01 00:00:00 | draft | pending | task-engineer | untouched |
+
+## Plan Log
+
+| Date Time | Event | By | Content | Details |
+|---|---|---|---|---|
+| 2026-06-01 00:00:00 | drafted | t@t | - | first |
+
+## Tail
+
+end
+EOF
+sec(){ # <file> <heading> — print the lines of one '## ' section (heading excluded)
+  awk -v h="## $2" '$0==h{f=1;next} f&&/^## /{f=0} f' "$1"
+}
+DECOY_BEFORE=$(sec "$PLF" "Plan Log Archive"); TL_BEFORE=$(sec "$PLF" "Transition Log")
+append_log_row "$PLF" '| 2026-06-02 00:00:00 | approved | t@t | 0123456789ab | card yes |' "Plan Log"; HRC=$?
+check "HEADING: returns 0" "[ $HRC -eq 0 ]"
+check "HEADING: the row lands directly under the '## Plan Log' separator (newest first)" \
+  "[ \"\$(sec '$PLF' 'Plan Log' | grep '^|' | sed -n 3p)\" = '| 2026-06-02 00:00:00 | approved | t@t | 0123456789ab | card yes |' ]"
+check "HEADING: the older row now sits below it" \
+  "[ \"\$(sec '$PLF' 'Plan Log' | grep '^|' | sed -n 4p)\" = '| 2026-06-01 00:00:00 | drafted | t@t | - | first |' ]"
+check "HEADING: the decoy '## Plan Log Archive' table is untouched (string equality, not prefix)" \
+  "[ \"\$(sec '$PLF' 'Plan Log Archive')\" = \"\$DECOY_BEFORE\" ]"
+check "HEADING: the Transition Log table is untouched" \
+  "[ \"\$(sec '$PLF' 'Transition Log')\" = \"\$TL_BEFORE\" ]"
+check "HEADING: the section after the log survives" "tail -1 '$PLF' | grep -qx 'end'"
+check "HEADING: exactly one new line was written" "[ \"\$(grep -c 'approved | t@t' '$PLF')\" -eq 1 ]"
+
+echo "== 3.5.0: CAP 'none' keeps every row even when ACFW_LOG_ROW_CAP=1 =="
+# The plan audit trail must never be truncated by a user's ACFW_LOG_ROW_CAP. 'none' has to be
+# recognised BEFORE the cap<1 -> 1 clamp: a clamp that ran first would read the non-numeric 'none'
+# as 0, clamp it to 1, and keep a single row, which is the exact loss the sentinel exists to stop.
+NONEF="$ALB/none.md"
+printf '# Cycle Record: none\n\n## Plan Log\n\n| Date Time | Event | By | Content | Details |\n|---|---|---|---|---|\n\n## After\n\nkept\n' > "$NONEF"
+i=1; NRC=0
+while [ $i -le 40 ]; do
+  ACFW_LOG_ROW_CAP=1 append_log_row "$NONEF" "| 2026-06-02 00:00:00 | amended | t@t | - | row $i |" "Plan Log" none || NRC=$?
+  i=$((i+1))
+done
+check "CAP none: every call returns 0" "[ $NRC -eq 0 ]"
+check "CAP none: all 40 rows are kept, inside the Plan Log section" \
+  "[ \"\$(sec '$NONEF' 'Plan Log' | grep -c '| amended | t@t | - | row [0-9]* |')\" -eq 40 ]"
+check "CAP none: newest first (row 40 is the first data row)" \
+  "[ \"\$(sec '$NONEF' 'Plan Log' | grep '^|' | sed -n 3p)\" = '| 2026-06-02 00:00:00 | amended | t@t | - | row 40 |' ]"
+check "CAP none: oldest last (row 1 is the last data row)" \
+  "[ \"\$(sec '$NONEF' 'Plan Log' | grep '^|' | tail -1)\" = '| 2026-06-02 00:00:00 | amended | t@t | - | row 1 |' ]"
+check "CAP none: the section after the log survives" "grep -qx 'kept' '$NONEF'"
+# The same call WITHOUT the sentinel still honours the env cap, so the test above is not vacuous:
+# ACFW_LOG_ROW_CAP=1 really does truncate on this heading.
+CAPPEDF="$ALB/capped-plan.md"; cp "$NONEF" "$CAPPEDF"
+ACFW_LOG_ROW_CAP=1 append_log_row "$CAPPEDF" '| 2026-06-02 00:00:01 | amended | t@t | - | row 41 |' "Plan Log"
+check "CAP omitted: ACFW_LOG_ROW_CAP=1 applies to a non-default heading (1 row left)" \
+  "[ \"\$(sec '$CAPPEDF' 'Plan Log' | grep -c '| amended |')\" -eq 1 ]"
+check "CAP omitted: the row it kept is the newest" "sec '$CAPPEDF' 'Plan Log' | grep -q 'row 41 |'"
+cp "$NONEF" "$CAPPEDF"
+ACFW_LOG_ROW_CAP=80 append_log_row "$CAPPEDF" '| 2026-06-02 00:00:01 | amended | t@t | - | row 41 |' "Plan Log" 5
+check "CAP numeric: an explicit CAP argument overrides the env cap (5 rows)" \
+  "[ \"\$(sec '$CAPPEDF' 'Plan Log' | grep -c '| amended |')\" -eq 5 ]"
+cp "$NONEF" "$CAPPEDF"
+ACFW_LOG_ROW_CAP=80 append_log_row "$CAPPEDF" '| 2026-06-02 00:00:01 | amended | t@t | - | row 41 |' "Plan Log" 0
+check "CAP numeric: a CAP below 1 still clamps to 1 (the sentinel did not replace the clamp)" \
+  "[ \"\$(sec '$CAPPEDF' 'Plan Log' | grep -c '| amended |')\" -eq 1 ]"
+
 echo ""
 echo "==================================================="
 echo "Phase 3 reliability test: $PASS passed, $FAIL failed"
