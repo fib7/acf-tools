@@ -34,6 +34,7 @@ REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
 BL="$REPO_ROOT/.backlog"
 
 ACTIVE_STATES="pending in-progress completed in-review accepted rejected blocked"
+INACTIVE_STATES="draft archive"
 ALL_STATES="draft $ACTIVE_STATES archive"
 
 SUB="${1:-}"
@@ -54,14 +55,48 @@ jesc_body() { # <file>
 valid_state() { case " $ALL_STATES " in *" $1 "*) return 0;; *) return 1;; esac; }
 
 # resolve_task_file <stem-or-unique-prefix> — echo the task's current path.
-# Exact stem match across the active folders first, then unique substring match
-# (mirrors whip-move.sh). Not found / ambiguous -> exit 3 with a FATAL on stderr.
+# Three tiers; the first that finds anything decides. Not found / ambiguous -> exit 3 with a FATAL
+# on stderr.
+#   1. the exact stem in an ACTIVE folder;
+#   2. the exact stem in draft/ or archive/;
+#   3. a unique substring match over the ACTIVE folders (whip-move.sh's fallback).
+#
+# Tier 2 is 3.4.3. Before it, the exact stem was only looked for in the active folders, so the FULL
+# stem of a paused or cancelled task fell through to the `*$q*` glob, which also saw only the active
+# folders. With no active stem containing it, that was a false exit 3: a task that exists, reported as
+# the key that names nothing. With one, it was worse. `read park` on a draft `park` returned the active
+# `park-v2` (folder, fields and body) as if it were the task asked for. Every subcommand below shares
+# this resolver, so `transition park draft`, a contract no-op, parked `park-v2` instead, and
+# update-field/update-body/log-event/comment wrote into the wrong document. multica, linear and beads
+# resolve the key exactly, in any state, and draft is how /whip-move pauses work on every backend
+# (3.4.0), so on files too the full stem has to answer for that task wherever it sits.
+#
+# Why a tier rather than one exact pass over all nine folders: doctor.sh's dup-folder check walks the
+# active folders only, so a stem sitting in pending/ AND archive/ is a duplicate no tool reports. A
+# flat pass would call it ambiguous, and every orchestrator transition on that live task would start
+# failing exit 3 over a duplicate nothing names. The tier keeps the pre-3.4.3 answer (the active copy,
+# which is the one the scanner schedules) whenever there was one. It only answers where the resolver
+# used to fail or name the wrong task. Why tier 3 stays active-only: widening the glob to draft/ and
+# archive/ would turn a prefix that is unique among live tasks today into an ambiguity against a
+# long-cancelled namesake. The prefix is a convenience for live work; a parked task is named in full.
 resolve_task_file() {
   local q="$1" st f n=0 hit=""
   for st in $ACTIVE_STATES; do
     f="$BL/$st/$q.md"
     if [ -f "$f" ]; then n=$((n+1)); hit="$f"; fi
   done
+  if [ "$n" -eq 0 ]; then
+    for st in $INACTIVE_STATES; do
+      f="$BL/$st/$q.md"
+      if [ -f "$f" ]; then n=$((n+1)); hit="$f"; fi
+    done
+  fi
+  # An exact-tier ambiguity is a DUPLICATE, not a vague query. "Use the full stem" was the advice for
+  # both, and it sent a caller who had already typed the full stem off to retype it.
+  if [ "$n" -gt 1 ]; then
+    echo "FATAL: task '$q' is a duplicate: the exact stem is in $n state folders — keep one copy (/whip-doctor --fix de-dups the active folders; a draft/ or archive/ copy is removed by hand)" >&2
+    return 3
+  fi
   if [ "$n" -eq 0 ]; then
     while IFS= read -r f; do
       [ -n "$f" ] && { n=$((n+1)); hit="$f"; }
@@ -218,8 +253,11 @@ cmd_transition() {
   fi
   valid_state "$to" || { echo "FATAL: invalid TO_STATE '$to' (one of: $ALL_STATES)" >&2; exit 7; }
   f=$(resolve_task_file "$stem") || {
-    # Fully archived/drafted stems are outside the active resolver; a re-applied
-    # transition whose destination already holds the file must still no-op (idempotency).
+    # Since 3.4.3 the resolver finds a draft/ or archive/ stem itself, so re-applying a transition
+    # into either folder reaches apply-transition's own no-op. What still lands here is a full stem
+    # the resolver refused as AMBIGUOUS, i.e. the exact stem in two folders. When one copy already
+    # sits in the destination, keep answering no-op as before: a resumed run depends on that
+    # idempotency, and the duplicate is a separate defect for the doctor, not a reason to fail here.
     if [ -f "$BL/$to/$stem.md" ]; then echo "noop: $stem.md already in $to"; exit 0; fi
     exit 3
   }

@@ -5,7 +5,8 @@
 #   capabilities → init (idempotent) → create (+ duplicate = exit 4) → snapshot fields
 #   → full lifecycle with reject loop (rejection-count bump) and re-apply idempotency
 #   → block (block-count bump) → read (fields + body sentinel round-trip)
-#   → update-field deps → typed errors (invalid state = 7, missing key = 3) → doctor.
+#   → update-field deps → typed errors (invalid state = 7, missing key = 3) → doctor
+#   → key resolution (a draft/archived task's full stem is that task, never an active one containing it).
 #
 # Usage:
 #   bash tests/phase9-store-conformance.test.sh                       # files adapter (default)
@@ -252,6 +253,56 @@ if printf '%s' "$CAPS" | grep -q '"doctor"'; then
 else
   ok "doctor capability absent (skipped)"
 fi
+
+# ---- key resolution: a FULL stem names that task, in every state ----
+# The key is the task's identity (CONTRACT.md "Task model"): a prefix MAY be accepted, but a full stem
+# that names a real task must answer for THAT task, wherever it sits. files looked for an exact stem in
+# the active folders only, then fell through to a substring glob that also saw only the active folders.
+# So a paused (draft) or cancelled (archive) task's full stem either came back exit 3 — a task that
+# exists reported as missing — or, once any active stem CONTAINED it, resolved to that active task and
+# returned its folder, fields and body as if it were the one asked for. The resolver is shared, so the
+# same full stem also steered transition/update-field/log-event into the wrong document. Draft is how
+# /whip-move pauses work on every backend (3.4.0).
+#
+# Parked by TRANSITION, not `create --folder draft|archive`: both targets are contract-legal on every
+# adapter ("archive is a legal target"), so the setup cannot fail for a reason this case is not about.
+# Each parked task is read TWICE — before its decoy exists (the false-not-found path) and after (the
+# wrong-task path) — because the two failures need different board shapes and both shipped.
+# Last in the file so the added cards cannot perturb any assertion above, the doctor's included.
+mkdoc conf-park slug-park none > "$WORK/conf-park.md"
+mkdoc conf-gone slug-gone none > "$WORK/conf-gone.md"
+"$ADAPTER" create --file "$WORK/conf-park.md" --folder pending >/dev/null
+"$ADAPTER" create --file "$WORK/conf-gone.md" --folder pending >/dev/null
+"$ADAPTER" transition conf-park draft orchestrator "pause" 0 0 >/dev/null
+"$ADAPTER" transition conf-gone archive orchestrator "cancel" 0 0 >/dev/null
+
+RD=$("$ADAPTER" read conf-park 2>/dev/null); RC=$?
+check "read of a DRAFT task's full stem finds it (exit 0; got $RC)" "[ $RC -eq 0 ]"
+check "...and reports it in draft" "[ \"\$(jget \"\$RD\" 'j.stem+\"@\"+j.folder')\" = 'conf-park@draft' ]"
+RD=$("$ADAPTER" read conf-gone 2>/dev/null); RC=$?
+check "read of an ARCHIVED task's full stem finds it (exit 0; got $RC)" "[ $RC -eq 0 ]"
+check "...and reports it in archive" "[ \"\$(jget \"\$RD\" 'j.stem+\"@\"+j.folder')\" = 'conf-gone@archive' ]"
+
+# Decoys: ACTIVE tasks whose stems contain the parked ones' full stems.
+mkdoc conf-park-next slug-park-next none > "$WORK/conf-park-next.md"
+mkdoc conf-gone-next slug-gone-next none > "$WORK/conf-gone-next.md"
+"$ADAPTER" create --file "$WORK/conf-park-next.md" --folder pending >/dev/null
+"$ADAPTER" create --file "$WORK/conf-gone-next.md" --folder pending >/dev/null
+
+RD=$("$ADAPTER" read conf-park 2>/dev/null)
+check "a full stem of a draft task returns that task, never an active task containing it" \
+  "[ \"\$(jget \"\$RD\" 'j.stem+\"@\"+j.folder')\" = 'conf-park@draft' ]"
+RD=$("$ADAPTER" read conf-gone 2>/dev/null)
+check "a full stem of an archived task returns that task, never an active task containing it" \
+  "[ \"\$(jget \"\$RD\" 'j.stem+\"@\"+j.folder')\" = 'conf-gone@archive' ]"
+# The write side of the same resolver, where the wrong answer is not a bad read but a moved card:
+# re-applying the parked task's own state is a contract no-op, and must not park the decoy instead.
+OUT=$("$ADAPTER" transition conf-park draft orchestrator "pause again" 0 0 2>&1); RC=$?
+check "re-parking a draft task by full stem is a no-op (exit 0; got $RC)" \
+  "[ $RC -eq 0 ] && printf '%s' \"\$OUT\" | grep -qi noop"
+RD=$("$ADAPTER" read conf-park-next 2>/dev/null)
+check "...and the active task containing its stem was not moved" \
+  "[ \"\$(jget \"\$RD\" 'j.stem+\"@\"+j.folder')\" = 'conf-park-next@pending' ]"
 
 echo
 echo "phase9-store-conformance ($(basename "$ADAPTER")): $PASS passed, $FAIL failed"
