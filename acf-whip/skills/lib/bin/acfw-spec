@@ -346,7 +346,7 @@ EOF
 secret_die() { # <hits>
   echo "FATAL: credential literal found (the value is not printed):" >&2
   printf '%s\n' "$1" | sed 's/^/  /' >&2
-  echo "Delete the literal, commit the deletion, and ROTATE the key: once a key has been committed or pushed it is in git history, and deleting the line does not un-share it. Keys belong in your shell (export NAME=...) or a gitignored .env, never in a committed file. Nothing ran." >&2
+  echo "Delete the literal, commit the deletion, and ROTATE the key: a committed key stays in git history and a pushed one is in every clone; deleting the line removes it from neither. Keys belong in your shell (export NAME=...) or a gitignored .env, never in a committed file. Nothing ran." >&2
   exit 20
 }
 lint_scope_or_die() { lint_scope; [ -z "$LINT_HITS" ] || secret_die "$LINT_HITS"; }

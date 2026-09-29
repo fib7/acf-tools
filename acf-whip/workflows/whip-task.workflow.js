@@ -846,7 +846,7 @@ if (planRef) {
       code: ck.code == null ? null : ck.code,
       reason: ck.verdict === 'refuse'
         ? `acfw-cycle check refused ${planRef.rel}: ${ck.reason}`
-        : `the plan check did not answer usably (${ck.why}); nothing was decomposed. If no other /task --plan is running in this checkout and ${expectLock} exists, it is a stale lock from this run: rm it`,
+        : `the plan check gave no usable answer (${ck.why}); nothing was decomposed. If no other /task --plan is running in this checkout and ${expectLock} exists, it is a stale lock from this run: rm it`,
       nextStep: `Nothing was decomposed. Act on the reason above, then re-run /task --plan ${planRef.rel}. /whip shows where the cycle stands.`,
       models: { shell: SHELL_MODEL, judge: MODELS.judge || null, author: MODELS.author || null, efforts: { shell: EFFORTS.shell || null } },
       agentsByTier,
@@ -896,7 +896,7 @@ if (!registeredAgents.length) {
   return {
     phase: 'decompose',
     aborted: true,
-    reason: 'no specialist agents installed (.claude/agents/ is empty) — /go cannot dispatch to agents that do not exist',
+    reason: 'no specialist agents installed (.claude/agents/ is empty), so /go cannot dispatch to agents that do not exist',
     nextStep: 'Run /whip-init (and /whip-add-agents) to scaffold specialist agents, then re-run /task.',
   }
 }
@@ -1093,7 +1093,7 @@ Return the index of the plan you adopt and one line on why.`,
   )
   const pick = (j && Number.isInteger(j.choice) && valid[j.choice]) ? valid[j.choice] : valid[0]
   planResult = pick.plan
-  log(`decompose: adopted plan ${pick.idx}${j && j.reason ? ` — ${String(j.reason).slice(0, 160)}` : ''}`)
+  log(`decompose: adopted plan ${pick.idx}${j && j.reason ? `; the judge's reason: ${String(j.reason).slice(0, 160)}` : ''}`)
 } else {
   // Nothing was structurally valid: fall back to the bounded repair loop on the least-broken plan.
   scored.sort((a, b) => a.defects.length - b.defects.length)
@@ -1104,7 +1104,7 @@ let defects = validatePlan(planResult, registeredAgents, cyc, EXISTING_IDS)
 let attempts = 1
 const MAX_PLAN_ATTEMPTS = 3
 while (defects.length && attempts < MAX_PLAN_ATTEMPTS) {
-  log(`plan attempt ${attempts}: ${defects.length} defect(s) — re-dispatching planner`)
+  log(`plan attempt ${attempts}: ${defects.length} defect(s); re-dispatching the planner`)
   planResult = await plan(PLANNER_ANGLES[0], 0, defects, planResult)
   defects = validatePlan(planResult, registeredAgents, cyc, EXISTING_IDS)
   attempts++
@@ -1166,7 +1166,7 @@ Return an empty array if the plan is sound. Do NOT invent defects to look thorou
   critique = (c && Array.isArray(c.defects)) ? c.defects.filter((d) => typeof d === 'string' && d.trim()) : []
   gaps = uncoveredBy(planResult, cyc)
   if (critique.length || gaps.length) {
-    log(`critic: ${critique.length} advisory defect(s)${gaps.length ? ` + ${gaps.length} coverage gap(s) (${gaps.join(', ')})` : ''} — one repair round`)
+    log(`critic: ${critique.length} advisory defect(s)${gaps.length ? ` + ${gaps.length} coverage gap(s) (${gaps.join(', ')})` : ''}; one repair round`)
     const repaired = await plan(PLANNER_ANGLES[0], 0, critique.concat(gapDefects(gaps)), planResult)
     const repairedDefects = repaired ? validatePlan(repaired, registeredAgents, cyc, EXISTING_IDS) : ['critic repair produced no plan']
     if (!repairedDefects.length) {
@@ -1176,7 +1176,7 @@ Return an empty array if the plan is sound. Do NOT invent defects to look thorou
     } else {
       // The repair broke something structural. Keep the structurally valid plan and surface the
       // critique in the report rather than shipping a plan that cannot be dispatched.
-      log(`critic: repair failed structural validation (${repairedDefects.length} defect(s)) — keeping the original plan and surfacing the critique`)
+      log(`critic: the repair failed structural validation (${repairedDefects.length} defect(s)); keeping the original plan and reporting the critique`)
     }
     // Both branches: the gaps are a fact about whichever plan is now adopted, not about the one that
     // was criticised.
@@ -1193,7 +1193,7 @@ const tasks = planResult.tasks.map((t) => ({
   // all read the same list. A free-text task gains no key at all.
   ...(cyc && cyc.coverage === 'on' ? { deliverables: taskDs(t, cyc) } : {}),
 }))
-log(`plan validated after ${attempts} attempt(s): ${tasks.length} task(s) — slugs: ${[...new Set(tasks.map((t) => t.worktreeSlug))].join(', ')}`)
+log(`plan validated after ${attempts} attempt(s): ${tasks.length} task(s); slugs: ${[...new Set(tasks.map((t) => t.worktreeSlug))].join(', ')}`)
 
 // ============================ AUTHOR (parallel) ============================
 phase('Author')
@@ -1782,12 +1782,12 @@ function planNextStep() {
     : heldCreated.length && runnableCount <= 0
       ? 'None of the tasks this run created can run yet: each is held in draft or waits on one that is; a bare /go runs only this plan\'s earlier unfinished tasks, if any.'
       : 'Run /go: it runs this plan\'s unfinished tasks as your focus (/go --all runs the whole backlog).'
-  return `${head}${notes.length ? ` NOTE: ${notes.join('; ')}.` : ''}`
+  return `${head}${notes.length ? ` Note: ${notes.join('; ')}.` : ''}`
 }
 // Free text with holds (only reachable when the review ran; without holds the 3.4.x strings below stand).
 function heldFreeNextStep() {
   const tail = `${heldNote(heldCreated)}${waiting.length ? `; ${waitNote(waiting)}` : ''}${critique.length ? `; ${critique.length} advisory critique(s) were left unresolved: review them first` : ''}.`
-  if (runnableCount > 0) return `Run /go: it runs these ${runnableCount} task(s) as your focus (/go --all runs the whole backlog). NOTE: ${tail}`
+  if (runnableCount > 0) return `Run /go: it runs these ${runnableCount} task(s) as your focus (/go --all runs the whole backlog). Note: ${tail}`
   // A waiting task IS in the focus, so "nothing new is in your focus" would be false once one exists.
   return waiting.length ? `Nothing new can run yet: ${tail}` : `Nothing new is in your focus: ${tail}`
 }

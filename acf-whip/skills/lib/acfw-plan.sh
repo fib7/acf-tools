@@ -749,7 +749,7 @@ acfw_plan_blocker() {
     paused)    printf '%s%s is paused (draft)\tit and everything behind it stay put; if a spec tool held it, /whip --review %s shows why\t/whip-move %s pending\n' "$s" "$r" "$r" "$r" ;;
     cancelled) printf '%s%s is cancelled (archived)\t%s can never start while it depends on a cancelled task\t/whip-move %s pending\n' "$s" "$r" "${d:-its dependent}" "$r" ;;
     parked) case "$m" in
-      sole:*)   printf "%s%s is blocked at the cap (%s)\t/whip-move %s pending buys exactly one more attempt: the counters are lifetime and stay where they are. This reply redesigns it inside the cycle instead: %s go back to /task --plan%s\t/whip-move %s archive, then bash '%s' record %s --drop %s, then /task --plan %s\n" \
+      sole:*)   printf "%s%s is blocked at the cap (%s)\t/whip-move %s pending buys exactly one more attempt: the counters are lifetime and stay where they are. To redesign it inside the cycle instead, the reply archives it and hands %s back to /task --plan%s\t/whip-move %s archive, then bash '%s' record %s --drop %s, then /task --plan %s\n" \
                   "$s" "$r" "$det" "$r" "$dl" "$add" "$r" "$7" "$5" "$r" "$6" ;;
       shared:*) printf "%s%s is blocked at the cap (%s)\t/whip-move %s pending buys exactly one more attempt: the counters are lifetime and stay where they are. To redesign it inside the cycle instead: /whip-move %s archive, /task \"<new scope>\", then bash '%s' record %s <new stem>=%s%s\t/whip-move %s pending\n" \
                   "$s" "$r" "$det" "$r" "$r" "$7" "$5" "${m#*:}" "$add" "$r" ;;
