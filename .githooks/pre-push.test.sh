@@ -12,6 +12,7 @@
 #   3b. an UNpublished one still cannot ride in through a merge
 #   3c. a STALE tracking ref cannot excuse a reintroduced commit, and a pruned one judges the facts
 #   4. a range that cannot be computed REFUSES rather than silently inspecting nothing
+#   5. an acf-whip plan commit (`ACFW-Plan-Event` trailer) passes both hooks; with attribution it does not
 #
 # (3) is the one worth explaining. The policy is that this clone does not INTRODUCE AI-attributed
 # commits. A commit already on the remote is not being introduced by us, and rejecting it makes any
@@ -120,6 +121,42 @@ if printf '%s' "$OUT" | grep -q 'REJECTED'; then
 else
   bad "after a prune the reintroduced commit was neither rejected nor explained"
 fi
+
+
+# ---- 5. acf-whip plan commits pass both hooks ---------------------------------------------------
+# acf-whip 3.5.0 commits every plan event as `docs(plan): <event> <slug>` with one
+# `ACFW-Plan-Event: <event> <c12> <cycle-id>` trailer. The hooks are a denylist, so it passes by
+# construction; this pins that, because a hook edit that started matching `ACFW-*` lines would make
+# every approve, record and close fail at the commit with the plan already rewritten.
+R=$(newrepo "$W/t7"); cd "$R"
+echo p > p; git add -A
+if git commit -q -m "docs(plan): approve owner-seat
+
+ACFW-Plan-Event: approved 3f9c0a1b2d4e 20260928-owner-seat" 2>/dev/null; then
+  ok "commit-msg accepts a docs(plan) commit carrying an ACFW-Plan-Event trailer"
+else
+  bad "commit-msg rejected a docs(plan) commit carrying an ACFW-Plan-Event trailer"
+fi
+PUSH_OUT=$(git push origin main 2>&1); PUSH_RC=$?
+if [ $PUSH_RC -eq 0 ]; then ok "...and pre-push lets it through"
+else bad "pre-push refused an ACFW-Plan-Event commit (rc=$PUSH_RC): $(printf '%s' "$PUSH_OUT" | tr '\n' ' ' | cut -c1-160)"; fi
+# Control: the same plan commit plus an AI attribution line is still refused at both hooks, so the
+# pass above is the trailer being allowed, not the gate being off.
+echo q > q; git add -A
+if git commit -q -m "docs(plan): close owner-seat
+
+ACFW-Plan-Event: closed 3f9c0a1b2d4e 20260928-owner-seat
+$TRAILER" 2>/dev/null; then
+  bad "commit-msg accepted an attributed plan commit"
+else
+  ok "commit-msg still rejects an attributed plan commit"
+fi
+git commit -q --no-verify -m "docs(plan): close owner-seat
+
+ACFW-Plan-Event: closed 3f9c0a1b2d4e 20260928-owner-seat
+$TRAILER"
+if git push origin main 2>&1 | grep -q 'REJECTED'; then ok "...and pre-push rejects it when --no-verify skipped commit-msg"
+else bad "an attributed plan commit was pushed"; fi
 
 # ---- 4. an uncomputable range must refuse -----------------------------------------------------
 R=$(newrepo "$W/t5"); cd "$R"
