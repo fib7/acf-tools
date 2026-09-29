@@ -99,6 +99,40 @@ Cards you may meet:
   alive. The lock expires after 30 minutes, and the card prints its age and the one `rm` that clears
   it sooner.
 
+### Autopilot: `/whip --auto`
+
+`/whip --auto [--approve] [--until "<condition>"] [--rounds <n>] "<goal>"` runs the cycle by itself
+until a judge finds the condition met. Without a goal, it drives the cycle or focus already in flight.
+
+- **What drives it.** A Stop hook (`hooks/handlers/autopilot-stop.sh`) runs at the end of every turn.
+  With no run in the checkout it costs a few file tests and no git call. With a run,
+  `skills/lib/bin/acfw-autopilot tick` maps `acfw-cycle status`'s NEXT line to one step
+  (`/task --plan`, `/go <ids>`, `/retro`, or the round's goal through `/whip --auto-round`) and hands
+  it to the session. While a background run is in flight it does nothing, because that run's
+  report starts the next turn.
+- **Who decides it is done.** At round end, when the work is finished and nothing waits on you, the
+  session dispatches a fresh judge subagent. Its prompt comes from `skills/lib/autopilot-judge.md`.
+  The judge checks the repository (runs the tests, reads the plan and the code), never the chat. It
+  records `met`, `not-met` or `impossible` with a one-time nonce. A verdict counts only for that nonce,
+  at the HEAD and tree it was issued at. `not-met` starts the next round with the judge's next goal,
+  up to `--rounds` (default 3, at most 10). The condition defaults to the goal itself.
+- **What still stops for you.** Every card: parked work, a blocking spec tool, a refusal. Plan
+  approval also stops for you, unless the run started with `--approve` or the project committed
+  `ACFW_AUTOPILOT=approve`. Then the hook approves every plan created after the run started,
+  including the retro-actions cycle its own `/retro` writes, as `approve --via autopilot`, and the Plan
+  Log row reads `via autopilot`. A plan that loosens a control
+  still waits. The run pauses with one line and resumes by itself once the card is resolved.
+- **Bounds.** 60 steps, then the run stops; `/whip --auto on` starts the count again. A step that did
+  not start pauses the run instead of repeating. Pushes, overrides and lesson retirement are never
+  automatic. `/whip --auto off` stops a run, and `/whip --auto on` resumes it and binds it to the
+  calling session. A run stopped at its round cap goes on only with `on --rounds <n>`; one the judge
+  found `impossible` needs a new run.
+- **Project default.** `ACFW_AUTOPILOT=on` (or `approve`) and an optional `ACFW_AUTOPILOT_UNTIL` in the
+  config file make every `/whip "<goal>"` a run. `/whip --no-auto "<goal>"` takes one goal step by
+  step.
+
+State lives in `.acfwhip/run/autopilot/` (gitignored). `events.log` there records every decision.
+
 ---
 
 ## Spec tools (reviewers and workbenches)
@@ -431,7 +465,8 @@ never overwrites an existing file. Example output:
 
 - Claude Code CLI installed
 - Git repository for your project
-- Python 3.8+ (for SessionStart hook)
+- Python 3.8+ (for the SessionStart hook and the autopilot's Stop hook)
+- jq (for `/whip` once a cycle or focus has tasks, and for every non-`files` task store)
 
 ### Install Plugin
 
@@ -672,6 +707,8 @@ verbatim and never works out a stage on its own.
 /whip <cycle-id>             # re-show that cycle's card, e.g. after you edited its plan.md
 /whip --abandon [<cycle-id>] # close a cycle you no longer want, zero agents
 yes                          # after a card: approve those exact bytes, then start /task --plan
+/whip --auto "<goal>"        # autopilot: the whole loop until a judge finds the goal met
+/whip --auto off | on        # stop, or resume, the autopilot run (on --rounds <n> after its round cap)
 ```
 
 **Behavior**:
@@ -679,7 +716,8 @@ yes                          # after a card: approve those exact bytes, then sta
   plan is edited, a new card is shown, and nothing is approved in the same turn
 - `--expect` always comes from the `content=` of a card you saw; a stale value is refused with
   exit 9 and nothing is written
-- `/go` and `/retro` stay printed NEXT lines: `/whip` never runs them for you
+- `/go` and `/retro` stay printed NEXT lines: `/whip` never runs them for you, except as the step an
+  autopilot run you started hands the session
 - Without the Workflow tool, approval still works and `/whip` prints the free-text `/task`
   fallback, with coverage off for that cycle
 
@@ -1234,7 +1272,8 @@ If they say **"I just need to copy-paste this code"**, you've failed.
 ### Runtime config keys
 
 Committed config lives in `.acfwhip/config` (or the legacy `.backlog/.acfw-config`; `acfw-store info`
-reports which file is active as `configFile`). Every key is also settable as an env var.
+reports which file is active as `configFile`). Every key except `ACFW_AUTOPILOT` and
+`ACFW_AUTOPILOT_UNTIL` is also settable as an env var.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
@@ -1246,6 +1285,8 @@ reports which file is active as `configFile`). Every key is also settable as an 
 | `ACFW_BRANCH_PREFIX` | `worktree` | Branch namespace acf-whip owns (`<prefix>/<slug>`). **Config wins over env.** Change only on a fresh backlog. |
 | `ACFW_GATE_CMD` | empty (skip) | Union quality gate, run by the integrator on the candidate tree before it lands. |
 | `ACFW_PARSE_SANITY_CMD` | empty (skip) | Cheap parse/lint check, run before the heavy gate; failure is a mechanism fault, not a quality reject. |
+| `ACFW_AUTOPILOT` | `off` | `on` makes every `/whip "<goal>"` an autopilot run. `approve` also approves plans created during a run, and counts only when committed at HEAD; uncommitted, it acts as `on`. Config file only. |
+| `ACFW_AUTOPILOT_UNTIL` | unset | The default `--until` condition for autopilot runs. Unset = the goal itself. Config file only. |
 
 Values are read literally: surrounding quotes and trailing whitespace are stripped, a trailing
 `# comment` is **not**. Keep comments on their own line.
@@ -1285,7 +1326,7 @@ re-run.
 | `.acfwhip/integrated/` | LP-CAS: one ledger marker per integrated task | committed, in the same commit as the change |
 | `.acfwhip/adapters/` | you: drop-in store adapters and spec-tool drivers | committed |
 | `.acfwhip/spec-tools/<name>` | `/whip --tools add`, or you | committed; the commit is the team's consent to send plans where it says |
-| `.acfwhip/run/` | run state: the focus, locks, cycle run state, spec-tool results, workbench state | gitignored |
+| `.acfwhip/run/` | run state: the focus, locks, cycle run state, autopilot state, spec-tool results, workbench state | gitignored |
 | `.worktree/<slug>/`, branches `worktree/<slug>` | `/go` | gitignored; reaped after integration |
 | `docs/cycles/YYYYMMDD-<slug>/` | `plan.md`: you (drafted by `/whip`, or copied on import); `record.md`: only `acfw-cycle`; `retro.md`: `/retro` | untracked until approval, then `docs(plan): ...` commits by `acfw-cycle` |
 | `docs/acf/lessons/<slug>.md` | `/retro` (at most 3 per retro, no frontmatter, one `**Rule**:` line) | committed by `acfw-cycle close` or `note`; after a plan-less retro you commit them; you retire one with `git rm` |
@@ -1462,7 +1503,8 @@ acf-whip/
 ├── hooks/
 │   ├── hooks.json
 │   └── handlers/
-│       └── session-start.py     # Installs and refreshes the docs below
+│       ├── session-start.py     # Installs and refreshes the docs below
+│       └── autopilot-stop.sh    # Stop hook: hands a /whip --auto run its next step
 └── content/                      # Templates and patterns
     ├── acf/
     │   └── research-protocol.md  # Research MCP tool usage

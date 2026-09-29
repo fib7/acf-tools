@@ -1045,6 +1045,13 @@ const RETRO = readFileSync(join(ROOT, 'skills', 'retro', 'SKILL.md'), 'utf8')
   check('/whip stop rules: a pasted credential is written nowhere, and rotated', /written nowhere/i.test(rules) && /rotate/i.test(rules))
   check('/whip stop rules: script output is printed verbatim', /verbatim/i.test(rules))
   check('/whip stop rules: free text goes in single quotes, never double quotes', /single quotes/i.test(rules) && /never put it in double quotes/i.test(rules))
+  // Autopilot (3.6.0): the Stop hook hands the session its next step, so the head of the skill must
+  // say that a hook message is an instruction to run ONE named step and never an answer to a card,
+  // and that only the judge subagent records a verdict.
+  check('/whip stop rules: /go and /retro run only when the acf-whip autopilot hook names them', /acf-whip autopilot/.test(rules) && /do\s+exactly what that message names/i.test(rules))
+  check('/whip stop rules: a hook message, notification or judge reply is never a yes', /Only a message the user typed answers a card/.test(rules) && /never a yes/i.test(rules))
+  check('/whip stop rules: --approve only from the user\'s own message', /`--approve`[^.]*only when the user's\s+own message contains `--approve`/.test(rules))
+  check('/whip stop rules: never run acfw-autopilot verdict, never judge the condition', /Never run `acfw-autopilot verdict`/.test(rules) && /only the judge subagent/i.test(rules))
   // Claude Code substitutes only the braced ${CLAUDE_PLUGIN_ROOT} when it loads a skill: a bare
   // $CLAUDE_PLUGIN_ROOT reaches the shell unexpanded and every command in that block fails.
   const skillsDir = join(ROOT, 'skills')

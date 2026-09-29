@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# acfw-autopilot: /whip --auto (acf-whip 3.6.0). Runs the cycle hands-off until a model-judged
+# condition holds, one ordinary /task, /go or /retro run at a time.
+#
+# WHY A STOP HOOK. A skill cannot keep a session going. A background run's report starts a new turn,
+# but whether the model then carries on is prose it can lose to compaction. So the Stop hook
+# (hooks/handlers/autopilot-stop.sh) calls `tick` at the end of every turn, and `tick` decides from
+# git and the store, never from the conversation, whether to hand Claude the next command. The command
+# goes back as the hook's block reason, which Claude Code feeds to the model as its next instruction.
+#
+# WHO DECIDES WHAT. This script decides WHAT RUNS NEXT: it maps `acfw-cycle status`'s NEXT line to one
+# skill invocation, and pauses on anything a person owns (a card, parked work, a refusal). A MODEL
+# decides WHETHER THE GOAL IS REACHED: at round end the tick has the session dispatch a fresh judge
+# subagent with a fixed prompt (skills/lib/autopilot-judge.md). The judge checks the repository, not
+# the chat, and records its own verdict with `verdict --nonce`. The tick reads that verdict from disk
+# and accepts it only for the current nonce, at the HEAD and working-tree diff the judge was issued
+# at, so a verdict from an earlier round or one that edited the tree never counts.
+#
+# HUMANS STILL GOVERN. A plan approval waits for the user's yes unless they opted in to pre-approval
+# (their own --approve, or ACFW_AUTOPILOT=approve committed at HEAD: an uncommitted edit cannot loosen
+# the gate). Even then a plan created before the run, or one that loosens a control, waits. Spec-tool
+# overrides, lesson retirement and pushes are never automatic.
+#
+# STATE: <repo>/.acfwhip/run/autopilot/ (gitignored): state (key=value, never sourced), events.log,
+# judge-<nonce>.md, verdict, hook.err. Every write holds the .lock mkdir lock.
+#
+# Verbs:  start [--approve] [--until <condition>] [--rounds <n>] [--goal <goal>] [--from-setting]
+#         tick                  (the Stop hook: hook JSON on stdin, hook JSON or nothing on stdout)
+#         verdict --nonce <n> met|not-met|impossible --reason <text> [--next <goal>]   (the judge only)
+#         status · setting · on [--rounds <n>] · off
+# Exit:   0 ok · 2 usage, or a verdict for a nonce that is not current · 3 no run · 7 another live run
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$LIB_DIR/acfw-plan.sh"
+. "$LIB_DIR/acfw-git.sh"
+
+VERB="${1:-}"; [ $# -gt 0 ] && shift
+REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+[ -n "$REPO_ROOT" ] || { echo "FATAL: not inside a git repository (and ACFW_TRUNK_ROOT is unset)" >&2; exit 2; }
+CYCLE_BIN="${ACFW_AUTOPILOT_CYCLE_BIN:-$SCRIPT_DIR/acfw-cycle}"
+FOCUS_BIN="$SCRIPT_DIR/acfw-focus"
+SELF="$SCRIPT_DIR/acfw-autopilot"
+TEMPLATE="$LIB_DIR/autopilot-judge.md"
+AP="$REPO_ROOT/.acfwhip/run/autopilot"
+ST="$AP/state"
+MAX_STEPS=60
+DEF_ROUNDS=3
+
+now() { date -u +"%Y-%m-%d %H:%M:%S"; }
+epoch() { date -u +%s; }
+die() { local c="$1"; shift; printf '%s\n' "$*" >&2; exit "$c"; }
+# One line, no control characters, capped: every value that reaches the state file, a hook reason or
+# the next round's goal passes through here.
+clean() { printf '%s' "${1:-}" | tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037\177' | cut -c1-"${2:-300}"; }
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# ---- state -------------------------------------------------------------------------------------
+sget() { [ -f "$ST" ] || return 0; sed -n "s/^$1=//p" "$ST" 2>/dev/null | head -1; }
+sset() { # <key> <value> [<key> <value>]...
+  local tmp="$ST.tmp.$$" k v
+  [ -f "$ST" ] || : > "$ST"
+  cp "$ST" "$tmp" 2>/dev/null || : > "$tmp"
+  while [ $# -ge 2 ]; do
+    k="$1"; v=$(clean "$2" 2000); shift 2
+    grep -v "^$k=" "$tmp" > "$tmp.x" 2>/dev/null || true
+    printf '%s=%s\n' "$k" "$v" >> "$tmp.x"; mv "$tmp.x" "$tmp"
+  done
+  mv "$tmp" "$ST"
+}
+ev() { # <what> <detail>
+  printf '%s|%s|%s\n' "$(now)" "$1" "$(clean "${2:-}" 400)" >> "$AP/events.log" 2>/dev/null || true
+  if [ "$(wc -l < "$AP/events.log" 2>/dev/null || echo 0)" -gt 600 ]; then
+    tail -n 400 "$AP/events.log" > "$AP/events.log.tmp" 2>/dev/null && mv "$AP/events.log.tmp" "$AP/events.log"
+  fi
+}
+HAVE_LOCK=""
+lock() {
+  mkdir -p "$AP" 2>/dev/null || die 2 "FATAL: cannot create $AP"
+  local i=0 age
+  while ! mkdir "$AP/.lock" 2>/dev/null; do
+    age=$(acfw_plan_lock_age "$AP/.lock/ts")
+    [ -n "$age" ] && [ "$age" -ge 15 ] && { rm -rf "$AP/.lock"; continue; }
+    i=$((i + 1)); [ $i -ge 40 ] && die 7 "FATAL: autopilot state is locked by another process ($AP/.lock)"
+    sleep 0.25
+  done
+  HAVE_LOCK=1; printf 'ts=%s\n' "$(epoch)" > "$AP/.lock/ts"
+}
+cleanup() { [ -n "$HAVE_LOCK" ] && rm -rf "$AP/.lock"; }
+trap cleanup EXIT
+
+# ---- setting: the project default, resolved by script so a model never reads config itself --------
+# ACFW_AUTOPILOT=on|approve. `approve` loosens a human gate, so it counts only as committed at HEAD
+# (the rule spec-tool policy follows): a local edit, by a person or an agent, cannot turn it on.
+setting_level() {
+  local wt head cfg rel
+  wt=$(acfw_config_get "$REPO_ROOT" ACFW_AUTOPILOT)
+  case "$wt" in on|approve) ;; *) printf 'off'; return 0 ;; esac
+  [ "$wt" = on ] && { printf 'on'; return 0; }
+  head=""
+  cfg=$(acfw_resolve_config_file "$REPO_ROOT" 2>/dev/null) || cfg=""
+  case "$cfg" in
+    "$REPO_ROOT"/*) rel="${cfg#"$REPO_ROOT"/}"
+      head=$(git -C "$REPO_ROOT" show "HEAD:$rel" 2>/dev/null | grep -E '^[[:space:]]*(export[[:space:]]+)?ACFW_AUTOPILOT=' | tail -1 \
+        | sed -E 's/^[[:space:]]*(export[[:space:]]+)?ACFW_AUTOPILOT=//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/; s/[[:space:]]+$//') ;;
+  esac
+  if [ "$head" = approve ]; then printf 'approve'; else printf 'on'; echo "WARN: ACFW_AUTOPILOT=approve is not committed at HEAD, so plans still wait for your yes. Commit it to turn pre-approval on." >&2; fi
+}
+
+# ---- reading the cycle ------------------------------------------------------------------------
+head_sha() { git -C "$REPO_ROOT" rev-parse -q --verify HEAD 2>/dev/null || echo none; }
+diff_sum() { git -C "$REPO_ROOT" diff HEAD 2>/dev/null | cksum | tr -d ' \t'; }
+focus_ts() { sed -n 's/^# ts=\(.*\) UTC$/\1/p' "$(acfw_focus_path "$REPO_ROOT")" 2>/dev/null | head -1; }
+# Focus stems still worth naming to /go: explicit ids skip /go's focus confirmation, and a draft or
+# archived id in an explicit scope aborts the run, so those are left out. Empty when the store (or
+# jq) cannot say; the caller then falls back to a bare /go.
+focus_live() { bash "$FOCUS_BIN" show --live 2>/dev/null | awk 'NR > 1 && NF >= 2 && $1 !~ /^\(/ { st = $1; $1 = ""; sub(/^ +/, ""); print st "\t" $0 }'; }
+runnable_stems() { focus_live | awk -F'\t' '$2 !~ /^(draft|archive|accepted|<not)/ && $2 != "" { print $1 }' | paste -sd' ' -; }
+parked_focus() { focus_live | awk -F'\t' '$2 ~ /^(blocked|draft)$/ { print $1 " (" $2 ")" }' | head -3 | paste -sd',' - | sed 's/,/, /g'; }
+record_created() { acfw_plan_meta "$REPO_ROOT/docs/cycles/$1/record.md" "Created At" 2>/dev/null | sed 's/ UTC$//'; }
+judge_alias() {
+  local j; j=$(acfw_resolve_models "$REPO_ROOT" | cut -f2)
+  case "$j" in *opus*) echo opus ;; *sonnet*) echo sonnet ;; *haiku*) echo haiku ;; *fable*) echo fable ;; *) echo "" ;; esac
+}
+
+# ---- hook output -------------------------------------------------------------------------------
+emit_block() { python3 -c 'import json,sys; print(json.dumps({"decision": "block", "reason": sys.argv[1]}))' "$1"; }
+hdr() { printf 'acf-whip autopilot (round %s/%s)' "$(sget round)" "$(sget rounds)"; }
+# issue <key> <reason>: hand Claude one step. The key plus the fingerprint is what the stall rule
+# compares: the same step derived again, from the same state, with no background run seen since,
+# means the last hand-off did not start anything.
+issue() {
+  local key="$1" reason="$2" text="${3:-$1}" steps
+  if [ "$key" = "$(sget issued)" ] && [ "$(sget saw_bg)" != 1 ] && [ "$FP" = "$(sget issued_fp)" ]; then
+    pause "the step did not start: $(sget issued_text). Run it yourself, or /whip --auto on to retry"
+    return
+  fi
+  steps=$(( $(sget steps | tr -cd 0-9) + 0 + 1 ))
+  if [ "$steps" -gt "$MAX_STEPS" ]; then finish stopped "stopped after $MAX_STEPS steps without meeting the condition"; return; fi
+  sset state running issued "$key" issued_text "$(clean "$text" 200)" issued_fp "$FP" saw_bg 0 steps "$steps" announced 0 why "" updated "$(epoch)"
+  ev issue "$key"
+  emit_block "$(hdr): ${reason%.}. /whip --auto off stops the run."
+}
+# pause <why>: a person owns the next step. Announced once, as a block that asks for one line and a
+# stop, because a systemMessage never reaches a `claude -p` user. Quiet while the same reason holds.
+pause() {
+  local why; why=$(clean "$1" 300)
+  if [ "$(sget state)" = paused ] && [ "$(sget why)" = "$why" ] && [ "$(sget announced)" = 1 ]; then return; fi
+  sset state paused why "$why" announced 1 updated "$(epoch)"
+  ev pause "$why"
+  emit_block "acf-whip autopilot paused: $why. Say this in one line, then stop. It resumes by itself once this is resolved."
+}
+finish() { # done|stopped <why>
+  local why; why=$(clean "$2" 400)
+  sset state "$1" why "$why" announced 1 updated "$(epoch)"
+  ev "$1" "$why"
+  emit_block "acf-whip autopilot $1: $why. Say this in one line, then stop."
+}
+
+# ---- verbs -------------------------------------------------------------------------------------
+cmd_start() {
+  local approve=0 until="" rounds="" goal="" from_setting=0 lvl src="" sid old cond
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --approve) approve=1; shift ;;
+      --until) [ $# -ge 2 ] || die 2 "usage: --until <condition>"; until="$2"; shift 2 ;;
+      --rounds) [ $# -ge 2 ] || die 2 "usage: --rounds <1-10>"; rounds="$2"; shift 2 ;;
+      --goal) [ $# -ge 2 ] || die 2 "usage: --goal <goal>"; goal="$2"; shift 2 ;;
+      --from-setting) from_setting=1; shift ;;
+      *) die 2 "FATAL: unknown start flag '$1'" ;;
+    esac
+  done
+  case "$rounds" in "") rounds=$DEF_ROUNDS ;; [1-9]|10) ;; *) die 2 "usage: --rounds takes 1 to 10" ;; esac
+  if [ "$approve" = 1 ]; then src=flag
+  else lvl=$(setting_level); [ "$lvl" = approve ] && { approve=1; src=config; }; fi
+  [ "$from_setting" = 1 ] && [ "$(setting_level 2>/dev/null)" = off ] && die 2 "FATAL: --from-setting, but ACFW_AUTOPILOT is off"
+  [ -n "$until" ] || until=$(acfw_config_get "$REPO_ROOT" ACFW_AUTOPILOT_UNTIL)
+  goal=$(clean "$goal" 1000); until=$(clean "$until" 1000)
+  if [ -n "$until" ]; then cond="$until"
+  # "plan" at the front of a goal asks /whip for the planned route; it is not part of what is built.
+  elif [ -n "$goal" ]; then cond="the goal is achieved: $(printf '%s' "$goal" | sed -E 's/^[Pp]lan([:,]|[[:space:]])[[:space:]]*//')"
+  else cond="the work in flight is finished and every deliverable it names is met"; fi
+  sid="${CLAUDE_CODE_SESSION_ID:-}"
+  lock
+  old=$(sget state)
+  case "$old" in running|paused)
+    if [ -n "$(sget session)" ] && [ -n "$sid" ] && [ "$(sget session)" != "$sid" ]; then
+      die 7 "REFUSED (7): an autopilot run started $(sget started) UTC is active in another session ($(sget goal)). Stop it with /whip --auto off, then start this one."
+    fi
+    echo "note: this replaces the run started $(sget started) UTC ($(sget goal))" ;;
+  esac
+  rm -f "$ST" "$AP/verdict" "$AP"/judge-*.md 2>/dev/null
+  sset run "$(date -u +%Y%m%d%H%M%S)" session "$sid" goal "$goal" until "$cond" rounds "$rounds" round 1 \
+    approve "$approve" approve_src "$src" state running why "" announced 0 issued "" issued_text "" issued_fp "" \
+    saw_bg 0 worked 0 steps 0 started "$(now)" round_started "$(now)" round_head0 "$(head_sha)" \
+    round_goal "$goal" judge_nonce "" updated "$(epoch)"
+  ev start "rounds=$rounds approve=$approve${src:+ ($src)} until=$cond"
+  printf 'AUTOPILOT|started|run=%s|rounds=%s|approve=%s\n' "$(sget run)" "$rounds" "$( [ "$approve" = 1 ] && echo yes || echo no)"
+  printf 'autopilot on: runs until a judge finds that %s; at most %s round(s).\n' "$cond" "$rounds"
+  if [ "$approve" = 1 ]; then
+    echo "plans this run drafts are approved for you ($( [ "$src" = flag ] && echo "--approve" || echo "ACFW_AUTOPILOT=approve")), recorded as 'via autopilot'; anything that loosens a control still waits for you."
+  else
+    echo "plans wait for your yes on their card; the run picks up again after it."
+  fi
+  echo "/whip --auto off stops it; Esc interrupts one step."
+}
+
+cmd_status() {
+  [ -f "$ST" ] || exit 0
+  local s up age cond
+  s=$(sget state); up=$(sget updated | tr -cd 0-9); age=$(( $(epoch) - ${up:-0} ))
+  case "$s" in done|stopped|off) [ "$age" -gt 86400 ] && exit 0 ;; esac
+  cond=$(sget until | cut -c1-120)
+  case "$s" in
+    running) printf 'autopilot: running, round %s/%s, last step %s; until %s\n' "$(sget round)" "$(sget rounds)" "$(sget issued_text | cut -c1-80)" "$cond" ;;
+    paused)  printf 'autopilot: paused, round %s/%s: %s\n' "$(sget round)" "$(sget rounds)" "$(sget why)" ;;
+    off)     printf 'autopilot: off (round %s/%s); /whip --auto on resumes it\n' "$(sget round)" "$(sget rounds)" ;;
+    *)       printf 'autopilot: %s, round %s/%s: %s\n' "$s" "$(sget round)" "$(sget rounds)" "$(sget why)" ;;
+  esac
+}
+
+cmd_off() {
+  [ -f "$ST" ] || { echo "no autopilot run in this checkout"; exit 0; }
+  lock; sset state off why "turned off" announced 1 updated "$(epoch)"; ev off ""
+  echo "autopilot off: nothing more runs by itself. /whip --auto on resumes this run."
+}
+
+cmd_on() {
+  local rounds=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rounds) [ $# -ge 2 ] || die 2 "usage: --rounds <1-10>"; rounds="$2"; shift 2 ;;
+      *) die 2 "FATAL: unknown on flag '$1'" ;;
+    esac
+  done
+  [ -f "$ST" ] || die 3 "no autopilot run in this checkout; start one with /whip --auto \"<goal>\""
+  lock
+  [ "$(sget state)" = done ] && die 3 "this run is done ($(sget why)); start a new one with /whip --auto \"<goal>\""
+  case "$rounds" in "") ;; [1-9]|10) ;; *) die 2 "usage: --rounds takes 1 to 10" ;; esac
+  # A verdict still on file for the current judge decides what `on` can do: the next tick acts on it
+  # at once. `impossible` would stop the run again, and so would `not-met` at the round cap unless the
+  # cap goes up. Say so here instead of resuming into the same stop.
+  local vv="" vn=""
+  [ -s "$AP/verdict" ] && IFS='|' read -r vn _ _ _ vv _ < "$AP/verdict"
+  if [ -n "$vn" ] && [ "$vn" = "$(sget judge_nonce)" ]; then
+    if [ "$vv" = impossible ]; then die 3 "REFUSED (3): the judge found this condition cannot be met ($(sget why)). Start a new run with a different --until."; fi
+    if [ "$vv" = not-met ] && [ "$(( ${rounds:-0} + 0 ))" -le "$(( $(sget round | tr -cd 0-9) + 0 ))" ]; then
+      die 3 "REFUSED (3): this run stopped at its round cap ($(sget round) of $(sget rounds)). Give it more rounds: /whip --auto on --rounds $(( $(sget round | tr -cd 0-9) + 1 ))"
+    fi
+  fi
+  [ -n "$rounds" ] && sset rounds "$rounds"
+  [ "$(sget round | tr -cd 0-9)" -gt "$(sget rounds | tr -cd 0-9)" ] 2>/dev/null && sset rounds "$(sget round)"
+  sset state running session "${CLAUDE_CODE_SESSION_ID:-}" issued "" issued_fp "" saw_bg 0 steps 0 announced 0 why "" updated "$(epoch)"
+  [ -n "$(sget judge_nonce)" ] && [ ! -s "$AP/verdict" ] && sset judge_nonce ""
+  ev on ""
+  printf 'autopilot on again (round %s/%s): the next step starts when this turn ends.\n' "$(sget round)" "$(sget rounds)"
+}
+
+cmd_verdict() {
+  local nonce="" v="" reason="" next=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --nonce) [ $# -ge 2 ] || die 2 "usage: --nonce <n>"; nonce="$2"; shift 2 ;;
+      --reason) [ $# -ge 2 ] || die 2 "usage: --reason <text>"; reason="$2"; shift 2 ;;
+      --next) [ $# -ge 2 ] || die 2 "usage: --next <goal>"; next="$2"; shift 2 ;;
+      met|not-met|impossible) v="$1"; shift ;;
+      *) die 2 "FATAL: unknown verdict argument '$1' (met, not-met or impossible)" ;;
+    esac
+  done
+  [ -n "$v" ] && [ -n "$nonce" ] || die 2 "usage: acfw-autopilot verdict --nonce <n> met|not-met|impossible --reason <text> [--next <goal>]"
+  [ -f "$ST" ] || die 3 "no autopilot run in this checkout"
+  lock
+  [ -n "$(sget judge_nonce)" ] && [ "$nonce" = "$(sget judge_nonce)" ] || die 2 "REFUSED (2): nonce $nonce is not the current judge's; this verdict does not count"
+  reason=$(clean "$reason" 300); next=$(clean "$next" 300)
+  [ -n "$reason" ] || die 2 "usage: --reason is required"
+  printf '%s|%s|%s|%s|%s|%s|%s\n' "$nonce" "$(sget round)" "$(head_sha)" "$(diff_sum)" "$v" "$(printf '%s' "$reason" | tr '|' '/')" "$(printf '%s' "$next" | tr '|' '/')" > "$AP/verdict"
+  ev verdict "$v: $reason"
+  printf 'VERDICT|%s|round=%s|nonce=%s\n' "$v" "$(sget round)" "$nonce"
+  printf 'autopilot judge: %s: %s\n' "$v" "$reason"
+}
+
+# ---- tick --------------------------------------------------------------------------------------
+parse_hook() { # stdin: hook JSON -> "session \t running-background-count"
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+bg = [t for t in (d.get("background_tasks") or []) if isinstance(t, dict) and t.get("status") == "running"]
+print("%s\t%d" % (d.get("session_id") or "", len(bg)))'
+}
+
+# Round end: the round's work is finished and nothing waits on a person. A model decides whether the
+# condition holds; this function only issues the judge and reads its verdict.
+round_end() {
+  local parked ft nonce vline vn vh vd vv vr vx r n rounds alias f reason
+  parked=""
+  ft=$(focus_ts)
+  [ -n "$ft" ] && ! [ "$ft" \< "$(sget started)" ] && parked=$(parked_focus)
+  if [ -n "$parked" ]; then pause "parked work needs you: $parked"; return; fi
+  nonce=$(sget judge_nonce)
+  if [ -n "$nonce" ] && [ -s "$AP/verdict" ]; then
+    vline=$(head -1 "$AP/verdict")
+    IFS='|' read -r vn r vh vd vv vr vx <<EOF
+$vline
+EOF
+    if [ "$vn" = "$nonce" ]; then
+      if [ "$vh" != "$(sget judge_head)" ] || [ "$vh" != "$(head_sha)" ] || [ "$vd" != "$(sget judge_diff)" ] || [ "$vd" != "$(diff_sum)" ]; then
+        sset judge_nonce ""; pause "the judge's verdict was not used because HEAD or the tracked files changed while it judged; put them back, then /whip --auto on"; return
+      fi
+      case "$vv" in
+        met) finish done "met in round $(sget round): $vr"; return ;;
+        impossible) finish stopped "the judge found the condition cannot be met: $vr"; return ;;
+      esac
+      n=$(( $(sget round | tr -cd 0-9) + 0 )); rounds=$(( $(sget rounds | tr -cd 0-9) + 0 ))
+      if [ "$n" -ge "$rounds" ]; then finish stopped "not met after $rounds round(s): $vr"; return; fi
+      [ -n "$vx" ] || vx="Finish what is still missing: $vr"
+      sset round $((n + 1)) round_started "$(now)" round_head0 "$(head_sha)" round_goal "$vx" worked 0 judge_nonce "" judge_head "" judge_diff ""
+      rm -f "$AP/verdict"
+      ev round "$((n + 1)): $vx"
+      issue "round:$((n + 1))" "round $n was judged not met ($vr). Start round $((n + 1)) now: invoke the acf-whip:whip skill with args --auto-round $(sq "$vx")" "/whip --auto-round (round $((n + 1)))"
+      return
+    fi
+  fi
+  if [ -z "$nonce" ]; then
+    nonce=$(od -An -N6 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ -n "$nonce" ] || nonce=$(printf '%s%s' "$(epoch)" "$$" | cksum | cut -d' ' -f1)
+    rm -f "$AP/verdict"
+    sset judge_nonce "$nonce" judge_head "$(head_sha)" judge_diff "$(diff_sum)"
+    f="$AP/judge-$nonce.md"
+    ACFW_J_CONDITION="$(sget until)" ACFW_J_GOAL="$(sget goal)" ACFW_J_ROUND_GOAL="$(sget round_goal)" \
+    ACFW_J_ROUND="$(sget round)" ACFW_J_ROUNDS="$(sget rounds)" ACFW_J_ROOT="$REPO_ROOT" ACFW_J_HEAD="$(head_sha)" \
+    ACFW_J_HEAD0="$(sget round_head0)" ACFW_J_NONCE="$nonce" ACFW_J_AUTOPILOT="$SELF" ACFW_J_CYCLE="$SCRIPT_DIR/acfw-cycle" \
+      LC_ALL=C awk '
+        function rep(s, tok, v,   i) { while ((i = index(s, tok)) > 0) s = substr(s, 1, i - 1) v substr(s, i + length(tok)); return s }
+        { s = $0; n = split("CONDITION GOAL ROUND_GOAL ROUND ROUNDS ROOT HEAD HEAD0 NONCE AUTOPILOT CYCLE", k, " ")
+          for (i = 1; i <= n; i++) s = rep(s, "{{" k[i] "}}", ENVIRON["ACFW_J_" k[i]]); print s }' "$TEMPLATE" > "$f" \
+      || { pause "cannot write the judge prompt $f"; return; }
+  fi
+  alias=$(judge_alias)
+  f="$AP/judge-$nonce.md"
+  reason="the round's work is finished. Dispatch the autopilot judge now, in the foreground (not in the background): use the Agent tool with subagent_type general-purpose${alias:+ and model $alias}, description 'autopilot judge', and exactly this prompt: Read $f and follow it exactly. Do not judge the condition yourself and never run acfw-autopilot verdict yourself. When the judge returns, print its last line."
+  issue "judge:$nonce" "$reason" "the autopilot judge"
+}
+
+cmd_tick() {
+  local parsed sid bg out rc next next2 id c12 path rec out2 stems what card rid
+  parsed=$(parse_hook) || exit 0
+  sid=$(printf '%s' "$parsed" | cut -f1); bg=$(printf '%s' "$parsed" | cut -f2)
+  [ -f "$ST" ] || exit 0
+  lock
+  case "$(sget state)" in running|paused) ;; *) exit 0 ;; esac
+  if [ -z "$(sget session)" ]; then [ -n "$sid" ] && sset session "$sid"
+  elif [ -n "$sid" ] && [ "$(sget session)" != "$sid" ]; then exit 0; fi
+  if [ "${bg:-0}" -gt 0 ]; then
+    [ "$(sget saw_bg)" = 1 ] || { sset saw_bg 1 worked 1; ev wait "a background run is in flight"; }
+    exit 0
+  fi
+  out=$(bash "$CYCLE_BIN" status 2>&1); rc=$?
+  FP="$(head_sha):$(printf '%s' "$out" | cksum | tr -d ' \t')"
+  if [ $rc -ne 0 ]; then pause "acfw-cycle status failed (exit $rc): $(printf '%s\n' "$out" | grep -v '^$' | head -1)"; exit 0; fi
+  next=$(printf '%s\n' "$out" | sed -n 's/^NEXT //p' | tail -1)
+  case "$next" in
+    "wait: "*) sset worked 1; exit 0 ;;
+    "/task --plan "*)
+      path="${next#/task --plan }"; sset worked 1
+      issue "task-plan:$path" "run /task --plan now: invoke the acf-whip:task skill with args --plan $path" "/task --plan $path"; exit 0 ;;
+    "/go")
+      sset worked 1; stems=$(runnable_stems)
+      if [ -n "$stems" ]; then issue "go:$stems" "run /go now: invoke the acf-whip:go skill with args $(sq "$stems")" "/go $stems"
+      else issue "go" "run /go now: invoke the acf-whip:go skill with no args" "/go"; fi
+      exit 0 ;;
+    "/retro "*)
+      id="${next#/retro }"; sset worked 1
+      issue "retro:$id" "run /retro now: invoke the acf-whip:retro skill with args $id" "/retro $id"; exit 0 ;;
+  esac
+  # Approval: the plan card itself, or a standing retro-actions card (its NEXT stays /whip "...").
+  rid=""
+  if printf '%s' "$next" | grep -qE '^yes: approve docs/cycles/[0-9]{8}-[a-z0-9][a-z0-9-]*/plan\.md \(content=[0-9a-f]{12}\)$'; then
+    rid=$(printf '%s' "$next" | sed -E 's#^yes: approve docs/cycles/([^/]+)/plan\.md.*#\1#'); c12=$(printf '%s' "$next" | sed -E 's/.*content=([0-9a-f]{12})\)$/\1/')
+  else
+    card=$(printf '%s\n' "$out" | sed -n -E 's#^  REPLY /whip ([0-9]{8}-[a-z0-9][a-z0-9-]*)$#\1#p' | head -1)
+    if [ -n "$card" ] && [ "$(sget approve)" = 1 ]; then
+      out2=$(bash "$CYCLE_BIN" status "$card" 2>/dev/null) || out2=""
+      next2=$(printf '%s\n' "$out2" | sed -n 's/^NEXT //p' | tail -1)
+      if printf '%s' "$next2" | grep -qE '^yes: approve docs/cycles/[0-9]{8}-[a-z0-9][a-z0-9-]*/plan\.md \(content=[0-9a-f]{12}\)$'; then
+        rid="$card"; c12=$(printf '%s' "$next2" | sed -E 's/.*content=([0-9a-f]{12})\)$/\1/')
+      fi
+    fi
+  fi
+  if [ -n "$rid" ]; then
+    sset worked 1
+    what=$(printf '%s\n' "$out" | sed -n 's/^  WHAT //p' | head -1)
+    if [ "$(sget approve)" != 1 ]; then pause "waiting for your yes on the card: ${what:-approve docs/cycles/$rid/plan.md}"; exit 0; fi
+    rec=$(record_created "$rid")
+    if [ -z "$rec" ] || [ "$rec" \< "$(sget started)" ]; then pause "waiting for your yes: docs/cycles/$rid was created before this autopilot run, so it is not pre-approved"; exit 0; fi
+    if grep -q '\[loosens: yes' "$REPO_ROOT/docs/cycles/$rid/plan.md" 2>/dev/null; then pause "waiting for your yes: docs/cycles/$rid loosens a control, which only you approve"; exit 0; fi
+    if [ "approve:$rid:$c12" = "$(sget issued)" ] && [ "$FP" = "$(sget issued_fp)" ]; then pause "pre-approval of docs/cycles/$rid did not go through; approve it on its card"; exit 0; fi
+    out2=$(bash "$CYCLE_BIN" approve "$rid" --expect "$c12" --via autopilot 2>&1); rc=$?
+    sset issued "approve:$rid:$c12" issued_fp "$FP"
+    if [ $rc -ne 0 ]; then pause "pre-approval of docs/cycles/$rid was refused: $(printf '%s\n' "$out2" | grep -m1 '^REFUSED' || printf '%s\n' "$out2" | grep -v '^$' | tail -1)"; exit 0; fi
+    ev approve "$rid content=$c12 via autopilot"
+    path=$(printf '%s\n' "$out2" | sed -n 's/^NEXT \/task --plan //p' | tail -1)
+    if [ -n "$path" ]; then
+      issue "task-plan:$path" "the plan docs/cycles/$rid (content=$c12) was approved for you, as your --approve allowed, and recorded as via autopilot. Now run /task --plan: invoke the acf-whip:task skill with args --plan $path" "/task --plan $path"
+    else
+      pause "docs/cycles/$rid was approved via autopilot; its next step needs you: $(printf '%s\n' "$out2" | sed -n 's/^NEXT //p' | tail -1)"
+    fi
+    exit 0
+  fi
+  if printf '%s\n' "$out" | grep -q '^NEED YOU$'; then
+    what=$(printf '%s\n' "$out" | sed -n 's/^  WHAT //p' | head -1)
+    pause "${what:-a card needs you}: see /whip"; exit 0
+  fi
+  case "$next" in
+    '/whip "'*)
+      if [ "$(sget worked)" = 1 ]; then round_end; exit 0; fi
+      if [ -z "$(sget round_goal)" ]; then finish stopped "nothing is in flight and the run has no goal"; exit 0; fi
+      issue "whip:$(sget round)" "start this round's goal now: invoke the acf-whip:whip skill with args --auto-round $(sq "$(sget round_goal)")" "/whip --auto-round"
+      exit 0 ;;
+  esac
+  pause "the next step needs you: $next"
+}
+
+case "$VERB" in
+  start) cmd_start "$@" ;;
+  tick) cmd_tick ;;
+  verdict) cmd_verdict "$@" ;;
+  status) cmd_status ;;
+  setting) printf 'SETTING|%s\n' "$(setting_level)" ;;
+  on) cmd_on "$@" ;;
+  off) cmd_off ;;
+  *) die 2 "usage: acfw-autopilot start|tick|verdict|status|setting|on|off" ;;
+esac

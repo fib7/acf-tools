@@ -138,6 +138,11 @@ non-files store:
    # has a protected trunk with review-gated merges. An unrecognized value is FATAL, and a trailing
    # "# comment" is part of the value, so keep comments on their own line.
    ACFW_INTEGRATION_MODE=default
+
+   # Autopilot, off unless set. `on` makes every /whip "<goal>" run hands-off until a judge finds
+   # the goal met; `approve` also approves the plans a run drafts, and counts only once committed.
+   # See /whip --auto.
+   # ACFW_AUTOPILOT=off
    EOF
      echo "✓ Pinned ACFW_INTEGRATION_MODE=default in .acfwhip/config (new project)"
    else
@@ -319,6 +324,11 @@ ACFW_INPROGRESS_TIMEOUT_HOURS=8
 # protected trunk with review-gated merges is the usual reason to pin `override`. An unrecognized
 # value is FATAL, and a trailing "# comment" is part of the value, so keep comments on their own line.
 # ACFW_INTEGRATION_MODE=override
+
+# Autopilot, off unless set. `on` makes every /whip "<goal>" run hands-off until a judge finds
+# the goal met; `approve` also approves the plans a run drafts, and counts only once committed.
+# See /whip --auto.
+# ACFW_AUTOPILOT=off
 
 # Worktree namespace acf-whip OWNS and may create/remove. acf-whip only ever touches
 # worktrees on the <ACFW_BRANCH_PREFIX>/<slug> branch — any other worktree (including one
@@ -921,7 +931,7 @@ fi
 
 ACF Whip active. State machine: `pending → in-progress → completed → in-review → [accepted|rejected]` (blocked/retry paths exist).
 
-**Commands**: `/whip` (where you are and the one command to run next; `/whip "<goal>"` starts work), `/task` (decompose), `/go` (execute your tasks), `/whip-doctor` (backlog integrity check; `--fix` auto-repairs), `/retro` (close a cycle, record lessons), `/whip-add-agents` (create specialists)
+**Commands**: `/whip` (where you are and the one command to run next; `/whip "<goal>"` starts work; `/whip --auto "<goal>"` runs the whole cycle until a judge finds the goal met), `/task` (decompose), `/go` (execute your tasks), `/whip-doctor` (backlog integrity check; `--fix` auto-repairs), `/retro` (close a cycle, record lessons), `/whip-add-agents` (create specialists)
 
 **Core Docs**: `docs/acf/backlog/workflow.md`, `docs/acf/backlog/recovery-runbook.md`, `docs/acf/backlog/task-template.md`, `docs/acf/style/task-descriptions.md`, `.backlog/README.md`
 

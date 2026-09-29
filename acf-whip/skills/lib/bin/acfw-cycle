@@ -44,7 +44,7 @@
 # gitignored; none of it is the truth. ACFW_CYCLE_LOCK_WAIT: seconds to wait on a busy cycle (20).
 #
 # Verbs:  status [<plan>] [--if-cycle] [--after-run <stopReason> --mode <m>]  ·  check <plan>
-#         approve <plan> --expect <hex> [--override <tool>]... [--by <email>]
+#         approve <plan> --expect <hex> [--override <tool>]... [--by <email>] [--via autopilot]
 #         init <slug|ID> [--from-file <src>] --kind feature|retro-actions --source <text> [--title <H1>]
 #         record <plan> <stem>=<D1,D2|->... [--drop <stem>]...  ·  lessons  ·  triggers <plan>
 #         retro-begin <plan>  ·  close <plan> none|retro.md [--lesson <path>]... [--actions <ID>]
@@ -1047,10 +1047,13 @@ cmd_check() {
 
 # ================================ approve ========================================================
 cmd_approve() {
-  local a plan="" expect="" by="" ov=() c40 c12 e rec old r out grc st n i ts ev pby pc pdet gate="" BY TS
+  local a plan="" expect="" by="" via="" ov=() c40 c12 e rec old r out grc st n i ts ev pby pc pdet gate="" BY TS
   while [ $# -gt 0 ]; do
     case "$1" in
       --expect) [ $# -ge 2 ] || die 2 "usage: --expect <hex>"; expect="$2"; shift 2 ;;
+      # The acf-whip autopilot approving under the user's opt-in (--approve or a committed
+      # ACFW_AUTOPILOT=approve). It only marks the row; every check below still applies.
+      --via) [ "${2:-}" = autopilot ] || die 2 "usage: --via autopilot"; via="$2"; shift 2 ;;
       --override) [ $# -ge 2 ] || die 2 "usage: --override <tool>"; ov[${#ov[@]}]="--override"; ov[${#ov[@]}]="$2"; shift 2 ;;
       --by) [ $# -ge 2 ] || die 2 "usage: --by <email>"; by="$2"; shift 2 ;;
       -*) die 2 "FATAL: unknown approve flag '$1'" ;;
@@ -1108,6 +1111,7 @@ cmd_approve() {
   fi
   printf '%s\n' "$gate" | while IFS='|' read -r i ev pby pc pdet; do [ "$i" = ROW ] && rec_row "$ev" "$pby" "$pc" "$pdet" "$TS"; done
   if [ "$COV" = on ]; then r="ds=$(printf '%s\n' "$KNOWN" | cut -f1 | csv)"; else r="coverage off"; fi
+  [ -n "$via" ] && r="$r; via $via"
   rec_row approved "$BY" "$c12" "$r" "$TS"
   norm_in_place "$WPLAN"
   # Rule 11 again, at the last moment: the spec gate, autoclose and the lock wait all sit between the
@@ -1124,7 +1128,7 @@ cmd_approve() {
   [ "$(acfw_plan_c12 "$a")" = "$c12" ] || { echo "FATAL: $REL/plan.md in $COMMIT is not the approved content $c12. Re-show the card with /whip $ID." >&2; exit 11; }
   cycle_unlock
   echo "APPROVE|ok|cycle=$ID|content=$c12|commit=$COMMIT"
-  echo "approved $REL/plan.md at content=$c12 (commit $COMMIT, by $BY)"
+  echo "approved $REL/plan.md at content=$c12 (commit $COMMIT, by $BY${via:+, via $via})"
   approve_next
 }
 approve_next() { # /task --plan when anything is uncovered; otherwise the shared derivation's NEXT

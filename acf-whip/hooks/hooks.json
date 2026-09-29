@@ -10,6 +10,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/handlers/autopilot-stop.sh\"",
+            "timeout": 600
+          }
+        ]
+      }
     ]
   }
 }

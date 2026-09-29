@@ -266,6 +266,15 @@ Two kinds of commit, made by different hands. Never mix them.
 Shows the cycle stage, what needs you, and the one command to run next. With a goal, small work goes
 straight to `/task`; risky work gets a plan you approve with one "yes".
 
+### Autopilot
+```bash
+/whip --auto "<goal>"
+/whip --auto off
+```
+Runs `/task`, `/go` and `/retro` by itself until a judge agent finds the goal met, for at most 3
+rounds unless you pass `--rounds <n>`. Plans still wait for your yes unless you add `--approve` (or
+commit `ACFW_AUTOPILOT=approve`). Parked work always waits for you, and nothing is pushed.
+
 ### Task Decomposition
 ```bash
 /task "Scope description"

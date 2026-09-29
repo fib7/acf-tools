@@ -43,6 +43,7 @@ phase20-cycle
 phase21-spec-tools
 phase21-gaptrap-driver
 phase22-cycle-e2e
+phase23-autopilot
 $OPTIONAL
 "
 SUITES_MJS="
@@ -152,7 +153,9 @@ done
 # as `bash <path>` by the skills, but acfw-cycle runs `acfw-spec` only when it is executable next to
 # it, and driver discovery requires an executable acfw-spec-<name>: a lost mode bit turns the spec
 # gate off silently instead of failing. So both halves are checked, like the child scripts above.
-for b in skills/lib/bin/acfw-cycle skills/lib/bin/acfw-spec spec-tools/*/acfw-spec-*; do
+# The autopilot's Stop hook handler is run directly by hooks.json, so without its mode bit every
+# turn end fails the hook and no autopilot run ever advances.
+for b in skills/lib/bin/acfw-cycle skills/lib/bin/acfw-spec skills/lib/bin/acfw-autopilot hooks/handlers/autopilot-stop.sh spec-tools/*/acfw-spec-*; do
   if [ -x "$b" ] && bash -n "$b" 2>/dev/null; then
     printf '  %-34s ok    (syntax + executable)\n' "$(basename "$b")"
   else
