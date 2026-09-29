@@ -126,7 +126,10 @@ TSV=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-tsv.XXXXXX")
 # per-task loop and its callees run inside command substitutions and pipelines, so a shell variable
 # assigned in there never reaches the parent.
 DERIVED=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-slugs.XXXXXX")
-trap 'rm -f "$FINDINGS" "$TSV" "$DERIVED"' EXIT
+# Parked stems (draft/archive), "<stem>\t<folder>" per line: the dependency-resolution fallback the
+# graph pass consults when no active task answers a dep token. See its builder above the awk.
+PARKED=$(mktemp "${TMPDIR:-/tmp}/acfw-doctor-parked.XXXXXX")
+trap 'rm -f "$FINDINGS" "$TSV" "$DERIVED" "$PARKED"' EXIT
 emit() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >> "$FINDINGS"; }
 field() { grep -E "^- \*\*$2\*\*:" "$1" 2>/dev/null | head -1 | sed -E "s/.*$2\*\*:[[:space:]]*//" | sed -E 's/[[:space:]]+$//'; }
 # The collapsed-document check, factored so the --active-only accepted screen can reuse it and the two
@@ -509,8 +512,27 @@ done
 # cross-task dependency that points at an accepted task (without the per-file field() cost on accepted).
 [ "$ACTIVE_ONLY" = "1" ] && emit_accepted_stub_tsv >> "$TSV"
 
+# PARKED dependency targets (3.4.3). The graph index below was built from $ACTIVE alone, so a task
+# depending on one that had been paused (`/whip-move X draft`, the supported way to park work) or
+# retired (`archive`) reported FATAL|dangling-dep — "this dep does not exist" — about a task that
+# exists. Under per-task quarantine that FATAL holds the dependent out of the run, and the remedy it
+# implies (fix the token) is the wrong one: the token is fine, the dep is behind the human gate. The
+# generic battery already answered WARN|dep-inactive from its inactive[] index, so the same board got
+# two verdicts depending on which store held it.
+# Stems ONLY — ONE find per folder, no per-file field() — and deliberately NOT rows in $TSV: a parked
+# task is a resolution target and nothing else. As a row it would join idcount/foldcount (a new
+# dup-folder whose --fix `git rm`s every copy but the Status-named one, i.e. could delete the parked
+# copy), the glob index and the cycle pass, none of which draft/archive has ever been part of here.
+# Built outside the per-file loop so --active-only (the per-iteration gate) sees exactly the same index.
+for _st in draft archive; do
+  [ -d "$BL/$_st" ] || continue
+  find "$BL/$_st" -maxdepth 1 -type f -name '*.md' ! -name 'README.md' 2>/dev/null \
+    | awk -v st="$_st" '{ n=split($0, p, "/"); b=p[n]; sub(/\.md$/, "", b); if(b!="") print b "\t" st }'
+done > "$PARKED"
+
 # ---- Cross-task analysis in awk (portable associative arrays) ----
-awk -F'\t' -v mode="$MODE" '
+awk -F'\t' -v mode="$MODE" -v parkedf="$PARKED" '
+BEGIN{ while((getline l < parkedf) > 0){ if(split(l, pp, "\t")==2 && pp[1]!="") parked[pp[1]]=pp[2] } close(parkedf) }
 # Memoised. A dep token is resolved once per DEPENDENT, so a token shared by many tasks rescanned the
 # whole stem table every time. The cache stores misses too ("" is a real answer), which is why the
 # presence test is on rcache and not on its value.
@@ -527,6 +549,22 @@ function resolve(d, self,   s, k){
   if(k in rcache) return rcache[k]
   for(s in stems){ if(s!=self && index(s,d)==1){ rcache[k]=s; return s } }
   rcache[k]=""; return ""
+}
+
+# The parked (draft/archive) fallback, consulted ONLY after resolve() found no active task — exact,
+# then prefix, with the same self-exclusion. The order is the point: parked stems are a strictly
+# additive index, so a token that resolved before still resolves to the same ACTIVE task, and only a
+# former dangling-dep can change verdict. That is also what the files scheduler does: its index is
+# the scanner output, which never lists draft/ or archive/, so a token that prefixes an active stem
+# resolves to that stem there even when a parked task carries the exact name. A union lookup (the
+# generic battery, whose adapters DO list parked tasks to their scheduler) would warn never
+# dispatched about a task this scheduler dispatches, and drop the edge that the cycle pass and the
+# cross-slug gate read. Misses are rare (they are dangling tokens), so this is not cached.
+# (No apostrophes in this block: it lives inside a single-quoted awk program.)
+function resolve_parked(d, self,   s){
+  if(d in parked) return d
+  for(s in parked){ if(s!=self && index(s,d)==1) return s }
+  return ""
 }
 
 # Tarjan strongly-connected components. The previous detector peeled nodes with no DEPENDENTS and
@@ -573,7 +611,20 @@ END{
     for(k=1;k<=n;k++){ d=da[k]; gsub(/[ \t]/,"",d);
       if(d=="" || d=="none") continue;
       r=resolve(d, s);
-      if(r==""){ sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|dangling-dep|" s "|depends on " d " which has no task file"; continue }
+      if(r==""){
+        # The dep EXISTS but is behind the human gate (draft) or retired (archive). The scheduler
+        # already refuses to dispatch on it, so this is not a gate FATAL — it is the reason a task
+        # will sit in pending forever, which an operator otherwise has to work out from silence.
+        # The line is the one acfw-doctor-generic.sh prints, byte for byte: field 3 is a routing
+        # decision matched exactly (CONTRACT.md), and one vocabulary means one line, not merely one
+        # code. No edge is added, as there: the cycle pass never saw parked tasks, and a dependent
+        # already dispatched was dispatched with this dep accepted (and, cross-slug in default mode,
+        # integrated) — parking it afterwards does not unland it.
+        rp=resolve_parked(d, s)
+        if(rp!=""){ print "WARN|dep-inactive|" s "|depends on " rp ", which is in " parked[rp] " — it will never be dispatched until that task is moved to pending"; continue }
+        # Only a token that names nothing in ANY folder, parked ones included, is dangling.
+        sev=(state[s]=="accepted")?"WARN":"FATAL"; print sev "|dangling-dep|" s "|depends on " d " which has no task file"; continue
+      }
       adj[s]=adj[s]" "r;
       # Branch-aware: a cross-slug dep that is accepted-but-unintegrated only blocks when it still
       # has a live worktree branch (genuinely pending integration). A branchless historical accepted

@@ -193,6 +193,70 @@ rm -f .backlog/pending/feature-231-api-v2.md .backlog/pending/target-900-real.md
       .backlog/pending/refers-by-prefix.md .backlog/pending/honest-self.md
 git add -A; git commit -qm rmprefixfixture
 
+# ============================ a dep on a PARKED task is dep-inactive, not dangling (3.4.3) ======
+# doctor.sh built its dependency index from the seven active folders only, so a pending task whose
+# dependency had been paused (`/whip-move X draft`) or retired (`archive`) reported
+# FATAL|dangling-dep — "this dep does not exist" — about a task that exists, and under per-task
+# quarantine that FATAL holds the dependent out of the run. The generic battery (every other backend)
+# already said WARN|dep-inactive with the remedy. Same board, two verdicts, depending on the store.
+# Only a token that names nothing in ANY folder is a dangling dependency.
+mk draft   parked-dep  pds "none"
+mk archive retired-dep rds "none"
+mk pending waits-on-draft   wod "parked-dep"
+mk pending waits-on-archive woa "retired-dep"
+mk pending waits-on-prefix  wop "parked-d"
+mk pending waits-on-ghost   wog "ghost-dep-999"
+git add -A; git commit -qm parkedfixture
+OUT=$(bash "$DOC" "$REPO" 2>/dev/null)
+check "a pending task depending on a DRAFT task is WARN|dep-inactive" \
+  "printf '%s\n' \"\$OUT\" | grep -q '^WARN|dep-inactive|waits-on-draft|'"
+check "...and is NOT reported as a dangling dependency" \
+  "! printf '%s\n' \"\$OUT\" | grep -q '|dangling-dep|waits-on-draft|'"
+check "...so no FATAL of any code names it (nothing holds it out of the run)" \
+  "! printf '%s\n' \"\$OUT\" | grep -q '^FATAL|[^|]*|waits-on-draft|'"
+check "the detail names the parked dep and the folder it is parked in" \
+  "printf '%s\n' \"\$OUT\" | grep -qF 'WARN|dep-inactive|waits-on-draft|depends on parked-dep, which is in draft'"
+check "an ARCHIVED dep is dep-inactive too, naming archive" \
+  "printf '%s\n' \"\$OUT\" | grep -qF 'WARN|dep-inactive|waits-on-archive|depends on retired-dep, which is in archive' && ! printf '%s\n' \"\$OUT\" | grep -q '^FATAL|[^|]*|waits-on-archive|'"
+check "a PREFIX token of a draft stem resolves to it, like any other dep token" \
+  "printf '%s\n' \"\$OUT\" | grep -qF 'WARN|dep-inactive|waits-on-prefix|depends on parked-dep, which is in draft'"
+check "a dep that exists NOWHERE is still FATAL|dangling-dep" \
+  "printf '%s\n' \"\$OUT\" | grep -q '^FATAL|dangling-dep|waits-on-ghost|'"
+check "...and it is not softened into dep-inactive" \
+  "! printf '%s\n' \"\$OUT\" | grep -q '|dep-inactive|waits-on-ghost|'"
+# The per-iteration gate runs --active-only, which skips the per-file pass over accepted/ for speed.
+# The parked index must not depend on that pass, or the fast path reintroduces the false FATAL.
+AOUT=$(bash "$DOC" --active-only "$REPO" 2>/dev/null)
+check "--active-only (the per-iteration gate) agrees: WARN, no FATAL" \
+  "printf '%s\n' \"\$AOUT\" | grep -q '^WARN|dep-inactive|waits-on-draft|' && ! printf '%s\n' \"\$AOUT\" | grep -q '^FATAL|[^|]*|waits-on-draft|'"
+check "--quiet (the /go gate's dump) carries no FATAL for it" \
+  "! bash \"\$DOC\" --quiet \"\$REPO\" 2>/dev/null | grep -q '^FATAL|[^|]*|waits-on-draft|'"
+# Byte parity with the generic battery. Field 3 is a routing decision (CONTRACT.md: the exact whip
+# key, matched exactly), so "the same finding" means the same LINE, not merely the same code. The
+# files scanner does not list draft/archive wholesale, so the generic is fed the snapshot shape an
+# adapter produces: the dependent in tasks[], the parked dep in inactive[].
+GSNAP='{"tasks":[{"stem":"waits-on-draft","folder":"pending","id":"waits-on-draft-id","status":"pending","slug":"wod","deps":["parked-dep"],"touchesGlobs":[]}],"inactive":[{"stem":"parked-dep","folder":"draft","id":"parked-dep-id","slug":"pds","deps":[],"touchesGlobs":[]}]}'
+GLINE=$(printf '%s' "$GSNAP" | bash "$GEN" "$REPO" 2>/dev/null | grep '^WARN|dep-inactive|waits-on-draft|')
+DLINE=$(printf '%s\n' "$OUT" | grep '^WARN|dep-inactive|waits-on-draft|')
+check "the files battery emits the generic battery's dep-inactive line byte for byte" \
+  "[ -n \"\$GLINE\" ] && [ \"\$GLINE\" = \"\$DLINE\" ]"
+# Parked stems are consulted only when NO active task answers the token. On files the scheduler's
+# dependency index is the scanner's output, which omits draft/ and archive/, so it resolves a token
+# that prefixes an active stem to THAT stem even when a parked task carries the exact name. The
+# doctor must reach the same answer: dep-inactive here would warn "never dispatched" about a task
+# the scheduler dispatches, and dropping the resolved edge would hide a real cycle or cross-slug FATAL.
+mk draft   shared-100      s100d "none"
+mk pending shared-100-live s100l "none"
+mk pending waits-on-shared wos   "shared-100"
+git add -A; git commit -qm shadowfixture
+check "a token an ACTIVE task answers keeps resolving to it (parked stems never shadow it)" \
+  "! bash \"\$DOC\" \"\$REPO\" 2>/dev/null | grep -q '|waits-on-shared|'"
+rm -f .backlog/draft/parked-dep.md .backlog/archive/retired-dep.md .backlog/draft/shared-100.md \
+      .backlog/pending/waits-on-draft.md .backlog/pending/waits-on-archive.md \
+      .backlog/pending/waits-on-prefix.md .backlog/pending/waits-on-ghost.md \
+      .backlog/pending/shared-100-live.md .backlog/pending/waits-on-shared.md
+git add -A; git commit -qm rmparkedfixture
+
 echo
 echo "phase19-doctor-graph: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
