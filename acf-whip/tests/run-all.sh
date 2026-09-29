@@ -36,6 +36,7 @@ phase18-artifact-provenance
 phase18-focus
 phase19-files-only
 phase19-doctor-graph
+phase19-research-preflight
 phase9-adapter-multica
 phase9-adapter-linear
 $OPTIONAL
