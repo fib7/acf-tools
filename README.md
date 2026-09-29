@@ -1,10 +1,12 @@
 # ACF Tools
 
-**Plan it with a human. Let agents build it. Learn from every cycle.** Humans govern, agents execute.
+Claude Code plugins that let agents plan, build and land code in your git repository. You approve what
+gets built, and you push what lands.
 
-Seven Claude Code plugins. The core one, **acf-whip**, runs the whole cycle in your repo and commits
-locally, never pushing: you approve a plan once; agents decompose, build, review and integrate it; a
-script checks coverage; a retro feeds lessons into the next plan. The other six are optional helpers.
+There are seven. The core one, **acf-whip**, runs the whole cycle and commits locally, never pushing.
+You approve a plan once. Agents split it into tasks, then build, review and integrate them. A script
+checks what landed against the plan, and when something went wrong, a retro writes lessons that feed
+the next plan. The other six are optional helpers.
 
 Proprietary: any use beyond reading the source, including installing it, needs a [license](#acknowledgements-and-license) from Fibonacci Seven. Requires Claude Code 2.1.154 or later.
 
@@ -44,8 +46,8 @@ optional. Thick arrows trace a planned cycle, D1…Dn are the plan's deliverable
 branch you have checked out. In words: **planned** is `/whip "<goal>"` → `yes` → `/go` → `/whip` →
 `/retro`. **Small** is `/whip "<goal>"` → `/task "<goal>"` → `/go`.
 
-**The one command to remember is `/whip`.** Run it bare and it tells you where you are and prints
-exactly one next command. Here is real output from a repo where the last task had just landed:
+**You only need to remember `/whip`.** Run it bare and it reports where you are and prints exactly
+one command to run next. Here is real output from a repo where the last task had just landed:
 
 ```text
 STATUS no active cycle
@@ -82,15 +84,16 @@ The repository is private: you need a license and read access to it. Then, in Cl
 
 From a local clone, replace the first line with `/plugin marketplace add ./acf-tools`, run from the
 clone's parent directory. acf-librarian is optional: it adds the naming and commit conventions the
-generated agents follow. Then run `/reload-plugins` (or restart Claude Code). To check it loaded, run
-a bare `/whip` in the repository you want to work in: it ends `NEXT /whip-init --with-specialists`.
+generated agents follow. Then run `/reload-plugins` (or restart Claude Code). To check that it loaded,
+run a bare `/whip` in the repository you want to work in. The output should end with
+`NEXT /whip-init --with-specialists`.
 
 ### 2. Set up your repository
 
 Run that `/whip-init` line. It asks a few setup questions, then creates the task store (`.backlog/`),
 the agents your stack needs, a pre-commit config and a short `CLAUDE.md` section ([What it writes](#what-it-writes-and-what-leaves-your-machine)).
-It does not commit: commit the new files before your first `/task`, since `/go` builds in worktrees
-made from your commits. Its hooks run only after `pre-commit install`.
+It does not commit. Commit the new files before your first `/task`, because `/go` builds in worktrees
+made from your commits. The pre-commit hooks run only after `pre-commit install`.
 
 ### 3. Your first small change
 
@@ -106,7 +109,7 @@ NEXT /task "add a --version flag that prints the version from package.json"
 If you want a plan to approve first, reply `plan`.
 ```
 
-> **Cost.** A task normally runs its own workflow of several agents, even a one-line change. In a test
+> **Cost.** A task normally runs its own workflow of several agents, even for a one-line change. In a test
 > run with Opus 5.5 as the session model, Claude Code reported $1.79 to decompose this flag and $5.06
 > to build it (17 agents); the three-task cycle in step 4 took $2.75 and $23.37 (69 agents). Each run
 > report lists the models it used and how many agents ran on each; acf-mission-control shows spend live.
@@ -143,10 +146,10 @@ NEED YOU
 NEXT yes: approve docs/cycles/20260929-lang-flag-greetrc/plan.md (content=36eba4c423af)
 ```
 
-Every `ASSUME` line is a default it chose for you; to veto one, say so, and it edits the plan and
+Each `ASSUME` line is a default `/whip` chose for you. To veto one, say so, and it edits the plan and
 shows a new card. Reply `yes`. That approves exactly the content on the card and starts `/task --plan`
-by itself. When its report lands, run `/go`; it starts without asking, since the focus is an approved
-plan. This build took about 95 minutes in the test run.
+by itself. When its report arrives, run `/go`. It starts without asking this time, because the focus
+is an approved plan. This build took about 95 minutes in the test run.
 
 ### 5. Check coverage and close the cycle
 
@@ -197,21 +200,21 @@ proposes fixes, they come back to you as a follow-up plan with its own approval 
 | Retro | `/retro` | A closed cycle; when something went wrong, lessons and an action plan | You approve the action plan | Your chat, plus one agent when triggered |
 | Ship | `git push`, a pull request | Your code on the remote | You, always | Your terminal |
 
-**Two routes, one rubric.** Small work goes straight to `/task`; that is the default. A goal gets a
-plan when it touches any of these: data, a schema or a migration; auth, secrets, payments or personal
-data; a breaking change to a public contract; three or more modules; a new user flow. Saying "plan"
-also gets you one. The full rubric is in [`skills/whip/SKILL.md`](acf-whip/skills/whip/SKILL.md).
+**Routing.** By default `/whip` sends a goal straight to `/task`. It drafts a plan instead when the
+goal touches any of these: data, a schema or a migration; auth, secrets, payments or personal data; a
+breaking change to a public contract; three or more modules; a new user flow. Saying "plan" also gets
+you one. The full rubric is in [`skills/whip/SKILL.md`](acf-whip/skills/whip/SKILL.md).
 
 **Background workflows.** `/task` and `/go` run as Claude Code workflows: scripts that dispatch many
 agents while your chat stays free. Keep the session open until the report arrives; closing it stops
 the run, and running `/go` again picks up where it stopped. `/workflows` shows what is running.
 
 While `/go` runs, it lands work into the files of the checkout you started it from. Do your own
-editing in another clone or wait for the report; if a landing overwrites an uncommitted edit, the
+editing in another clone, or wait for the report. If a landing overwrites an uncommitted edit, the
 report prints a `Recover:` command.
 
 Approval, decomposition and close each land as a `docs(plan):` commit with an `ACFW-Plan-Event`
-trailer, so `git log -- docs/cycles/` tells the same story as `record.md`.
+trailer, so `git log -- docs/cycles/` shows the same events as `record.md`.
 
 ## When agents stop for you
 
@@ -226,13 +229,15 @@ trailer, so `git log -- docs/cycles/` tells the same story as `record.md`.
 ## Going further
 
 **Bring your own plan.** `/whip path/to/plan.md` adopts a plan written anywhere: superpowers, spec-kit,
-Claude plan mode or by hand. It is copied into a cycle folder; your original file is never changed.
-Plans with `## Deliverables` and `### D1: ...` headings get coverage; others still work, with coverage off.
+Claude plan mode or by hand. `/whip` copies it into a cycle folder and leaves your original file
+unchanged. Coverage needs `## Deliverables` and `### D1: ...` headings; a plan without them still
+runs, with coverage off.
 
 **Plug in a spec reviewer or workbench.** A reviewer checks the plan; a workbench is an outside editor
 the plan goes to and comes back from. One committed file in `.acfwhip/spec-tools/` puts a tool on the
-approval card, and a linter needs no wrapper. `/whip --tools add no-tbd` commits this one, which blocks
-approval while the plan says TBD, TODO or FIXME, and holds a task that does in draft:
+approval card, and a linter works as-is, with no wrapper script. `/whip --tools add no-tbd`
+commits the file below. It blocks approval while the plan contains TBD, TODO or FIXME, and keeps any
+task that contains them in draft:
 
 ```text
 review=grep -nwE 'TBD|TODO|FIXME' "$ACFW_SPEC_FILE"; test $? -eq 1
@@ -251,9 +256,10 @@ To set it up, mint a key in GapTrap (Profile, then API keys), put it in your she
 `GAPTRAP_API_KEY` from a separate terminal, restart Claude Code and run `/whip --tools add gaptrap`.
 
 **Teams on a shared board.** Ask `/whip-init` for another task store: beads, multica or Linear (files
-is the default). Your focus is yours: a bare `/go` runs only the tasks your `/task` made, and
-`/go --all` runs everything, only when you ask. Teams that merge through pull requests set
-`ACFW_INTEGRATION_MODE=override` in acf-whip's config file, so `/go` stops at accepted work.
+is the default). acf-whip keeps your focus per checkout, so a bare `/go` runs only the tasks your
+own `/task` made. `/go --all` runs the whole board, and only when you type it. Teams that merge
+through pull requests set `ACFW_INTEGRATION_MODE=override` in acf-whip's config file, so `/go` stops
+at accepted work.
 
 **Second opinions.** acf-advisor's `/acf-advisor:advisor` asks another model, and `/acf-advisor:board`
 convenes a panel of personas in parallel, through any OpenAI-compatible endpoint.
@@ -270,8 +276,9 @@ convenes a panel of personas in parallel, through any OpenAI-compatible endpoint
 | **acf-arazor-mode** | Makes Claude state readiness as yes or no, with evidence | Build, Ship | Always on | You report status or deploy | python3 |
 | **acf-nitro** | Flags sequential work that could run in parallel | Build | Always on | You care about wall-clock time | python3 |
 
-Only acf-whip is required. Plugins detect each other and never assume another is installed. The three
-modes (challenger, arazor, nitro) change how Claude talks in every session: pick at most one.
+Only acf-whip is required. A plugin that can use another checks whether it is installed and falls
+back when it is not. The three modes (challenger, arazor, nitro) change how Claude talks in every
+session, so pick at most one.
 
 ## Commands at a glance
 
@@ -321,7 +328,7 @@ and `/task`; you never call them directly.
 
 1. **Humans govern, agents execute.** You approve plans and ship code; agents do the rest.
 2. **Knowledge is the product.** Plans, lessons and conventions live in git, next to the code.
-3. **Risk decides the route.** Small work runs direct; risky work gets a plan and one approval.
+3. **Route by risk.** Small work runs direct; risky work gets a plan and one approval.
 4. **Evidence over claims.** A task counts as landed only when its marker under `.acfwhip/integrated/` is committed on your branch; an approval counts only when its content hash matches the plan at HEAD.
 5. **Tighten automatically, loosen only by hand.** Retros may add checks; only you remove one.
 
@@ -329,7 +336,7 @@ and `/task`; you never call them directly.
 
 **Why does `/whip` say wait?** A run or a decomposition holds a lock in your checkout. If it is still
 going, wait for its report. If its session ended, the card under NEED YOU shows the lock's age and the
-`rm` that clears it; run that, then rerun the `/go` or `/task --plan`, which picks up where it stopped.
+`rm` that clears it. Run that, then rerun the `/go` or `/task --plan`; it picks up where it stopped.
 
 **How do I stop, pause or watch a run?** `/workflows` lists running workflows. Open one: `x` stops it,
 `p` pauses and resumes it.
@@ -348,16 +355,17 @@ file `/whip-init` made (`.backlog/.acfw-config` on the files store). Specialists
 its plugin prefix, for example `/acf-whip:whip` or `/acf-whip:go`.
 
 **How do I know an agent did not approve its own plan?** The card prints `content=`, a hash of the
-plan text; `yes` passes it to `approve`, which refuses it once the plan has changed. `approve` cannot
-tell a hash you saw from one an agent computed: the guard is the skill's rule to approve only on your
-reply. `record.md` logs the git identity behind each approval; its commit has an `ACFW-Plan-Event` trailer.
+plan text. Your `yes` passes it to `approve`, which refuses it once the plan has changed. But `approve`
+cannot tell a hash you saw from one an agent computed. The one guard against that is the skill's rule
+to approve only on your reply. `record.md` logs the git identity behind each approval, and the approval
+commit carries an `ACFW-Plan-Event` trailer.
 
-**How do I undo an approval?** `yes` starts `/task --plan` at once: stop it in `/workflows` if it is
-still running, then run `/whip --abandon <cycle-id>`. Tasks it already made stay pending and in your
-focus; archive each with `/whip-move <task> archive` (`record.md` lists them under `## Tasks`).
+**How do I undo an approval?** `yes` starts `/task --plan` at once, so first stop it in `/workflows` if
+it is still running. Then run `/whip --abandon <cycle-id>`. Tasks it already made stay pending and in
+your focus. Archive each with `/whip-move <task> archive` (`record.md` lists them under `## Tasks`).
 
-**Can I run it headless or in CI?** Yes, with `claude -p`. It waits for background workflows only
-10 minutes by default; set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` for runs that take longer.
+**Can I run it headless or in CI?** Yes, with `claude -p`. By default it waits only 10 minutes for
+background workflows. Set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` for runs that take longer.
 
 **Where do I report problems?** Open an issue in this repository or write to acf@fib7.ai.
 
