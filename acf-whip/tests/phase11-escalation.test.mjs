@@ -81,7 +81,7 @@ async function runGo(cfg) {
     }
   }
 
-  const calls = { architect: [], validate: [], scout: [], workflow: [], writer: [], wip: [], legacy: [], review: [], legacyPrompts: [], reviewPrompts: [], restore: [], probe: [], seq: [] }
+  const calls = { architect: [], validate: [], scout: [], workflow: [], writer: [], writerPrompts: [], integratePrompts: [], wip: [], legacy: [], review: [], legacyPrompts: [], reviewPrompts: [], restore: [], probe: [], seq: [] }
   let liveUnits = 0, maxLiveUnits = 0
   const logs = []
   const log = (m) => logs.push(String(m))
@@ -101,7 +101,8 @@ async function runGo(cfg) {
   const agent = async (prompt, opts) => {
     const label = (opts && opts.label) || ''
     if (/Bootstrap the acf-whip/.test(prompt)) {
-      return { detached: false, lockFresh: false, doctorOk: true, doctorSummary: 'SUMMARY|ok=true', fatals: [], cpuCores: c.cpuCores, agents: c.agents, scaffoldOk: c.scaffoldOk !== false }
+      // c.bootstrap overrides fields, so section 16 can drive a bootstrap abort (lockFresh, detached).
+      return Object.assign({ detached: false, lockFresh: false, doctorOk: true, doctorSummary: 'SUMMARY|ok=true', fatals: [], cpuCores: c.cpuCores, agents: c.agents, scaffoldOk: c.scaffoldOk !== false }, c.bootstrap || {})
     }
     // restoreCheckoutToken (3.4.3). A 'restored' outcome writes the token, exactly as the real
     // clean-checkout does, so the NEXT scan sees it — that is what lets section 14 run a whole cycle.
@@ -121,9 +122,12 @@ async function runGo(cfg) {
       return c.onProbe ? c.onProbe(stem, prompt) : { token: t && t.hasCleanCheckoutToken ? 'present' : 'absent' }
     }
     if (/acfw-store' snapshot/.test(prompt)) {
-      return { snapshotJson: JSON.stringify(withRelay(snapshot())), doctorOk: true, doctorSummary: 'SUMMARY|ok=true', doctorFatals: [] }
+      const scan = { snapshotJson: JSON.stringify(withRelay(snapshot())), doctorOk: true, doctorSummary: 'SUMMARY|ok=true', doctorFatals: [] }
+      // c.onScan may rewrite the scan result, so section 16 can raise a mid-run FATAL after a landing.
+      return c.onScan ? c.onScan(scan, model) : scan
     }
     if (/SINGLE backlog writer/.test(prompt)) {
+      calls.writerPrompts.push(prompt)
       // Each argument is sq()-quoted, so an apostrophe in the notes arrives as '\'' — a bare '([^']*)'
       // silently skipped every such row (the token-strand park note says "token's"), leaving the task
       // where it was in the model while the workflow believed it moved.
@@ -138,9 +142,10 @@ async function runGo(cfg) {
       return { applied: ['ok'], note: 'mock' }
     }
     if (/integrator for one accepted task/.test(prompt)) {
+      calls.integratePrompts.push(prompt)
       const stem = prompt.replace(/^[\s\S]*\/accepted\/([^/']+)\.md[\s\S]*$/, '$1')
       const post = /--post-resolver/.test(prompt)
-      const over = c.onIntegrate ? c.onIntegrate(stem, post) : null
+      const over = c.onIntegrate ? c.onIntegrate(stem, post, model) : null
       if (over) return over
       const t = model.get(stem); if (t) t.hasIntegratedAt = true
       return { exitCode: 0, outcome: 'integrated', note: '', resolverWorktree: '', resolverBranch: '', resolverAgent: '', resolverConflictedFiles: '', resolverConflictingCommits: '' }
@@ -681,6 +686,158 @@ async function runGo(cfg) {
   const noPanel = await runGo({ tasks: [{ stem: 't1', slug: 's1', hasCleanCheckoutToken: false }], onRestore: () => ({ outcome: 'dirty', exitCode: 0 }) })
   check('15i panel OFF -> no probe (the lone reviewer\'s PRE-STEP-0 CHECK types the fault itself)', noPanel.calls.probe.length === 0)
   check('15j ...and it charges no life either (baseline the panel path must match)', charged(noPanel).length === 0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// 16. 3.5.0: the RunReport's nextStep, cycles kept out of staging, and integrator WARNs relayed.
+// nextStep is how a resumed turn learns what to run after a long background /go (compaction keeps
+// only the head of go/SKILL.md). It must carry THIS run's stopReason and mode, run as written, and
+// appear on the final return only. The staging and WARN halves exist because a task that touches a
+// plan must never commit it, and the integrator's word that it dropped one must reach the operator.
+// ---------------------------------------------------------------------------------------------
+{
+  const PLUGIN = join(HERE, '..')
+  const CMD_RE = /^Run: (bash .*?) — print its output verbatim \(it prints nothing outside a planned cycle\)\.$/
+  // The real engine, run the way the nextStep says, in a throwaway repo with no cycle: it must accept
+  // the flags and print nothing, which is the whole promise to a plan-less run.
+  const runNext = (nextStep) => {
+    const m = String(nextStep || '').match(CMD_RE)
+    if (!m) return { status: -1, stdout: '', stderr: 'nextStep does not have the documented shape' }
+    const dir = mkdtempSync(join(tmpdir(), 'acfw-p11-next-'))
+    try {
+      spawnSync('git', ['init', '-q', '-b', 'trunk', dir])
+      const env = Object.assign({}, process.env)
+      delete env.ACFW_TRUNK_ROOT; delete env.ACFW_STORE
+      return spawnSync('/bin/bash', ['-c', m[1].replace("'/p/", `'${PLUGIN}/`)], { cwd: dir, env, encoding: 'utf8' })
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  }
+
+  const done = await runGo({})
+  const ns = done.report.nextStep
+  check('16a a complete run ends with a nextStep', done.report.stopReason === 'complete' && typeof ns === 'string')
+  check('16b ...naming acfw-cycle under the plugin root, quoted', typeof ns === 'string' && ns.includes('acfw-cycle') && ns.includes("bash '/p/skills/lib/bin/acfw-cycle' status"))
+  check('16c ...with this run\'s stopReason and mode substituted (status --if-cycle --after-run complete --mode default)',
+    typeof ns === 'string' && ns.includes(`status --if-cycle --after-run ${done.report.stopReason} --mode ${done.report.mode}`)
+    && ns.includes('status --if-cycle --after-run complete --mode default'))
+  check('16d ...in exactly the INTERFACES shape', CMD_RE.test(String(ns)))
+  const ran = runNext(ns)
+  check(`16e the command runs against the real engine: exit 0, prints nothing outside a cycle (rc=${ran.status}${ran.stderr ? `, stderr=${String(ran.stderr).trim().slice(0, 120)}` : ''})`,
+    ran.status === 0 && ran.stdout === '')
+
+  const ov = await runGo({ goArgs: { mode: 'override' } })
+  check('16f override mode is substituted too (--mode override)', ov.report.mode === 'override'
+    && String(ov.report.nextStep).includes(`status --if-cycle --after-run ${ov.report.stopReason} --mode override`))
+  const ranOv = runNext(ov.report.nextStep)
+  check('16g ...and that command runs too (exit 0, silent)', ranOv.status === 0 && ranOv.stdout === '')
+
+  // A run that stops short still gets the field: the engine answers "act on the /go report above"
+  // inside a cycle. What it must carry is the real reason, never a hard-coded "complete".
+  const short = await runGo({ onWorkflow: () => ({ ok: true, transition: 'not-a-real-transition' }) })
+  check(`16h a run that stopped short (${short.report.stopReason}) carries its own stopReason, not "complete"`,
+    short.report.stopReason !== 'complete' && !short.report.aborted
+    && String(short.report.nextStep).includes(`--after-run ${short.report.stopReason} --mode default`))
+
+  // Aborted returns are unchanged: no nextStep, before or after the heartbeat.
+  const locked = await runGo({ bootstrap: { lockFresh: true } })
+  check('16i a bootstrap abort (run-lock-held) has no nextStep', locked.report.aborted === true && locked.report.stopReason === 'run-lock-held' && !('nextStep' in locked.report))
+  const unres = await runGo({ goArgs: { only: ['no-such-task'] } })
+  check(`16j a mid-run abort (${unres.report.stopReason}) has no nextStep`, unres.report.aborted === true && !('nextStep' in unres.report))
+
+  // ---- safeStagePaths: a Worktree: none task that names cycle paths never stages them.
+  // git reads docs//cycles, docs/./cycles and ././docs/cycles as docs/cycles, so those spellings are
+  // cycle paths too. A state path in any spelling (bare folder included) is dropped here, because the
+  // writer refuses it with exit 2 and that would strand the move.
+  const cycleForms = ['docs/cycles/20260101-a/plan.md', './docs/cycles', 'docs/cycles/', 'docs//cycles/20260101-a/plan.md', 'docs/./cycles/20260101-a/plan.md', '././docs/cycles']
+  const stateForms = ['.backlog', '././.backlog/pending/x.md', '.acfwhip//run']
+  const files = ['docs/research/r.md', 'docs/cyclesx/n.md', 'docs', '././docs', ...cycleForms, ...stateForms]
+  const dir = await runGo({
+    tasks: [{ stem: 'd1', slug: 'none' }],
+    onWorkflow: () => ({ ok: true, transition: 'completed', commitSha: 'abc', rejectionIncrement: 0, notes: 'done', deliverableFiles: files, stagesRan: [], stagesReplayed: [], agentsUsed: 4 }),
+  })
+  const wp = dir.calls.writerPrompts.find((p) => /transition (--stage '[^']*' )*'d1' 'completed'/.test(p)) || ''
+  // An oracle written independently of the workflow's normalizer: drop empty and `.` segments.
+  const gitKey = (p) => p.split('/').filter((s) => s !== '' && s !== '.').join('/')
+  const staged = [...wp.matchAll(/--stage '([^']*)' /g)].map((m) => m[1])
+  check('16k the direct task\'s completed write stages its real deliverables', wp.includes("--stage 'docs/research/r.md' ") && wp.includes("--stage 'docs/cyclesx/n.md' "))
+  check(`16l ...and nothing git reads as docs/cycles or under it, in any spelling (staged: ${staged.join(' ')})`,
+    wp !== '' && staged.every((p) => { const k = gitKey(p); return k !== 'docs/cycles' && !k.startsWith('docs/cycles/') }))
+  check('16l2 ...nor a state path in any spelling (the writer would refuse it and strand the move)',
+    staged.every((p) => { const k = gitKey(p); return !['.backlog', '.acfwhip'].some((d) => k === d || k.startsWith(`${d}/`)) }))
+  check('16m ...an ancestor (docs, ./docs) is passed on: the writer\'s exclude pathspec filters it, dropping it here would lose its other files',
+    wp.includes("--stage 'docs' ") && wp.includes("--stage './docs' "))
+  const cycleWarns = dir.logs.filter((l) => /^WARN d1: not staging '[^']*': tasks never edit cycles; change a plan with \/whip$/.test(l))
+  check(`16n each refused cycle path is WARNed by name (${cycleWarns.length}/${cycleForms.length})`, cycleWarns.length === cycleForms.length
+    && ['docs//cycles/20260101-a/plan.md', 'docs/./cycles/20260101-a/plan.md', './docs/cycles'].every((f) => cycleWarns.some((l) => l.includes(`'${f}'`))))
+  check('16o the task still completes: skipped, never refused', dir.report.completed === true)
+
+  // ---- integrator WARNs reach the report.
+  const W1 = 'WARN: k1: dropped this task\'s edits under docs/cycles/ (tasks never edit cycles; a plan changes only through /whip and acfw-cycle): docs/cycles/20260101-a/plan.md'
+  const W2 = 'WARN: k1: the dropped change is still in refs/acfw/patch/k1. See it: git -C /r diff a b -- docs/cycles'
+  const integ = (note) => (stem, post, model) => { const t = model.get(stem); if (t) t.hasIntegratedAt = true; return { exitCode: 0, outcome: 'integrated', note, resolverWorktree: '', resolverBranch: '', resolverAgent: '', resolverConflictedFiles: '', resolverConflictingCommits: '' } }
+  check('16p the integrate prompt asks for every stderr WARN: line, verbatim, in note',
+    done.calls.integratePrompts.length > 0 && done.calls.integratePrompts.every((p) => /copy EVERY line the integrator printed on stderr that starts with "WARN:" into note, verbatim/.test(p)))
+  check('16q a run with no WARN reports an empty integrationWarnings and says nothing of it',
+    Array.isArray(done.report.integrationWarnings) && done.report.integrationWarnings.length === 0 && !/integration WARN/.test(done.report.note))
+  const warned = await runGo({ onIntegrate: integ(`integrated\n${W1}\n${W2}`) })
+  check('16r an integrated task\'s WARN lines land in integrationWarnings, one entry each, stem-prefixed',
+    JSON.stringify(warned.report.integrationWarnings) === JSON.stringify([`t1: ${W1}`, `t1: ${W2}`]))
+  check('16s ...the note points at them', /2 integration WARN\(s\) in integrationWarnings/.test(warned.report.note))
+  check('16t ...and the log carries them as they happen', warned.logs.some((l) => l.includes(`t1: ${W1}`)))
+  const joined = await runGo({ onIntegrate: integ(`integrated ${W1} ${W2}`) })
+  check('16u a note the agent joined onto one line still yields one entry per WARN', joined.report.integrationWarnings.length === 2
+    && joined.report.integrationWarnings[0] === `t1: ${W1}` && joined.report.integrationWarnings[1] === `t1: ${W2}`)
+  const many = await runGo({ onIntegrate: integ(Array.from({ length: 25 }, (_, i) => `WARN: k1: line ${i}`).join('\n')) })
+  check('16v the list is capped at 20 (the log keeps every one)', many.report.integrationWarnings.length === 20 && many.logs.filter((l) => /t1: WARN: k1: line /.test(l)).length === 25)
+  check('16v2 ...and the note says the list was cut, rather than miscounting it', /25 integration WARN\(s\) \(the first 20 are in integrationWarnings; the workflow log has every one\)/.test(many.report.note))
+  // The overwrite WARN as integrate-lpcas prints it: its Recover: command sits past the 400th char.
+  const oid = (c) => c.repeat(40)
+  const W3 = `WARN: landing k1 overwrote uncommitted work in '/Users/someone/work/a project with spaces' on 2 path(s) it also changed. Snapshot: ${oid('b')}; one path as it was: git show ${oid('b')}:<path>. The command below re-applies only your edits on top of the landed content, 3-way (a clash leaves conflict markers) and staged. Recover: git -C '/Users/someone/work/a project with spaces' diff --binary ${oid('a')} ${oid('b')} | git -C '/Users/someone/work/a project with spaces' apply -3`
+  const long = await runGo({ onIntegrate: integ(`integrated\n${W3}`) })
+  check(`16v3 a ${W3.length}-char overwrite WARN reaches the report and the log whole, Recover: command included`,
+    W3.length > 400 && long.report.integrationWarnings[0] === `t1: ${W3}` && long.logs.some((l) => l.endsWith('apply -3')))
+
+  // A cycle conflict is stripped (and WARNed) BEFORE exit 7; the --post-resolver pass has nothing
+  // left to strip and prints no WARN. Reading only the final result lost it.
+  const conflictNote = { exitCode: 7, outcome: 'resolver-needed', note: `resolver needed\n${W1}`, resolverWorktree: '/r/.acfwhip/run/integ', resolverBranch: '', resolverAgent: '', resolverConflictedFiles: 'src/a.go', resolverConflictingCommits: '' }
+  const viaResolver = await runGo({ goArgs: { escalate: false }, onIntegrate: (stem, post) => (post ? null : conflictNote) })
+  check('16w a WARN from the resolver-needed pass survives the clean --post-resolver pass',
+    viaResolver.report.completed === true && JSON.stringify(viaResolver.report.integrationWarnings) === JSON.stringify([`t1: ${W1}`]))
+
+  // A lost CAS retries next iteration and prints the same drop WARN again: reported once.
+  let casN = 0
+  const retried = await runGo({
+    onIntegrate: (stem, post, model) => (casN++ === 0
+      ? { exitCode: 11, outcome: 'transient', note: `cas lost\n${W1}`, resolverWorktree: '', resolverBranch: '', resolverAgent: '', resolverConflictedFiles: '', resolverConflictingCommits: '' }
+      : integ(`integrated\n${W1}`)(stem, post, model)),
+  })
+  check('16x the same WARN from a retried integration is reported once', retried.report.completed === true && retried.report.integrationWarnings.length === 1 && casN >= 2)
+
+  // A rejection's transition-log row takes the note's FIRST line only: a newline inside a table cell
+  // splits the markdown row it is written into.
+  let rejN = 0
+  const rej = await runGo({
+    onIntegrate: (stem, post, model) => (rejN++ === 0
+      ? { exitCode: 6, outcome: 'rejected', note: `union gate failed: 2 tests\n${W1}`, resolverWorktree: '', resolverBranch: '', resolverAgent: '', resolverConflictedFiles: '', resolverConflictingCommits: '' }
+      : integ('integrated')(stem, post, model)),
+  })
+  const rejWrite = rej.calls.writerPrompts.find((p) => /'t1' 'rejected' 'orchestrator'/.test(p)) || ''
+  check('16y a rejected integration writes only the note\'s first line into the transition row',
+    rejWrite.includes("'t1' 'rejected' 'orchestrator' 'union gate failed: 2 tests' '1'") && !rejWrite.includes('WARN:'))
+  check('16z ...while its WARN still reaches the report', rej.report.integrationWarnings.includes(`t1: ${W1}`))
+
+  // A run that lands work and THEN aborts. The overwrite WARN's snapshot is a commit no ref points at,
+  // so its Recover: command in the report may be the only way back to it; the workflow log alone is
+  // not read by the turn that reports the run. The next scan raises a repo-level FATAL.
+  const repoFatal = (scan, model) => (model.get('t1') && model.get('t1').hasIntegratedAt
+    ? Object.assign({}, scan, { doctorSummary: 'SUMMARY|fatal=1|repairable=0|warn=0|ok=false', doctorFatals: ['FATAL|detached-head|-|no branch at the trunk root'] })
+    : scan)
+  const landedThenAborted = await runGo({ onIntegrate: integ(`integrated\n${W3}`), onScan: repoFatal })
+  const law = landedThenAborted.report.integrationWarnings
+  check(`16za a run that integrated and then aborted (${landedThenAborted.report.stopReason}) still reports the WARN, Recover: command included`,
+    landedThenAborted.report.aborted === true && landedThenAborted.report.stopReason === 'integrity-fatal-midrun'
+    && Array.isArray(law) && law[0] === `t1: ${W3}` && law.some((l) => l.includes('Recover: git -C')))
+  check('16zb ...and that abort still carries no nextStep', !('nextStep' in landedThenAborted.report))
+  check('16zc an abort with nothing integrated keeps its old shape: no integrationWarnings key', !('integrationWarnings' in unres.report))
 }
 
 console.log(`\nphase11-escalation: ${PASS} passed, ${FAIL} failed`)

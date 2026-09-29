@@ -707,7 +707,7 @@ mv .backlog/in-progress/{task}.md .backlog/blocked/
 
 **Last Updated**: {date}
 **Agent Version**: 1.0
-**Manifest Maintained By**: retro agent
+**Manifest Maintained By**: the project (changes go through /retro action items a human approves)
 ```
 
 ### Step 6: Generate Quality Gate Documentation (if missing)

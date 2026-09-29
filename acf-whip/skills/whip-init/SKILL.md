@@ -26,6 +26,10 @@ Initialize ACF Whip backlog workflow in the current project:
 - Install stack-specific quality gate configuration
 - Initialize core documentation (via SessionStart hook)
 - Add CLAUDE.md section for backlog workflow
+- Pin `ACFW_INTEGRATION_MODE=default` for a **new** project only (an existing pin, or an existing
+  project's choice to stay unpinned, is never changed), and keep formatters away from
+  `docs/cycles/`, where `/whip` keeps planned cycles: the pre-commit config this skill installs
+  gets a top-level exclude, and existing ignore files get a line
 
 **Key Changes**:
 - Universal agents are now **GENERATED** from patterns and customized for each project's tech stack, not copied verbatim
@@ -76,22 +80,37 @@ The task store is pluggable behind an executable adapter contract (see the plugi
 `beads`, `multica`, `linear`; third-party adapters drop into `.acfwhip/adapters/`). For a
 non-files store:
 
-1. Write the backend-neutral config (this replaces `.backlog/.acfw-config` as the config home):
+1. Write the backend-neutral config (this replaces `.backlog/.acfw-config` as the config home).
+   A **new** project (no config file yet, no task documents) gets `ACFW_INTEGRATION_MODE=default`
+   pinned; an existing project keeps whatever it has, pinned or not. Never write a second pin over
+   an existing one:
    ```bash
    mkdir -p .acfwhip
+   # Decide "new" BEFORE the first write below creates the file.
+   new_project=1
+   if [ -f .acfwhip/config ] || [ -f .backlog/.acfw-config ]; then new_project=0; fi
+   if [ -n "$(find .backlog -type f -name '*.md' ! -name README.md 2>/dev/null | head -1)" ]; then new_project=0; fi
    printf 'ACFW_STORE=%s\n' "$task_store" >> .acfwhip/config
+   if [ "$new_project" = 1 ]; then
    cat >> .acfwhip/config <<'EOF'
 
-   # Integration mode. Unset = /go decides per run by reading CLAUDE.md/AGENTS.md.
+   # Integration mode. /whip-init pinned `default` because this project was new.
    #   default   accepted work is folded into the LOCAL trunk by LP-CAS (no push, no PR)
    #   override  /go stops at accepted and leaves worktree/<slug> intact; YOU push and open PRs
-   # Pin it if the repo has a delivery discipline that must not depend on a per-run judgement —
-   # a protected trunk with review-gated merges is the usual reason to pin `override`.
-   # An unrecognized value is FATAL, and a trailing "# comment" is part of the value, so keep
-   # comments on their own line.
-   # ACFW_INTEGRATION_MODE=override
+   # Unset = /go decides per run by reading CLAUDE.md/AGENTS.md. Switch to `override` if the repo
+   # has a protected trunk with review-gated merges. An unrecognized value is FATAL, and a trailing
+   # "# comment" is part of the value, so keep comments on their own line.
+   ACFW_INTEGRATION_MODE=default
    EOF
+     echo "✓ Pinned ACFW_INTEGRATION_MODE=default in .acfwhip/config (new project)"
+   else
+     echo "✓ Integration mode left as found (existing project)"
+   fi
    ```
+   Why pin at all: `/whip` counts a cycle's deliverable done only once its tasks are on trunk, and
+   an unpinned project decides the mode per run by reading prose. A run that guessed `override` never
+   integrates, so the cycle would never finish. An existing unpinned project gets a `/whip` card
+   asking you to pin instead of a silent change.
    Note `acfw_resolve_config_file` takes the **first existing** file — `.acfwhip/config`, then the
    legacy `.backlog/.acfw-config`. A project with both only ever reads `.acfwhip/config`, so the pin
    belongs in whichever one that project actually has.
@@ -102,8 +121,8 @@ non-files store:
    `ACFW_LINEAR_TEAM` (team key, e.g. `ENG`; optional `ACFW_LINEAR_PROJECT`, `ACFW_LINEAR_LABEL`).
 2. Initialize the store and verify it:
    ```bash
-   bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" init
-   bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info
+   bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" init
+   bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" info
    ```
    On **beads**, `init` runs `bd init`, which creates one commit of its own and appends a
    beads section to the project `.gitignore`. Because `bd init` commits the whole index, the
@@ -234,8 +253,18 @@ in-progress timeout (default 8h; lower it for overnight runs so an agent killed 
 frees its slug sooner) and the worktree namespace acf-whip owns. Read by `doctor.sh`,
 `scan-backlog.sh`, `clean-checkout.sh`, `integrate-lpcas.sh`, and `/go`.
 
+A **new** project also gets `ACFW_INTEGRATION_MODE=default` pinned (same rule and reason as
+Step 2.5: no config file and no task documents yet). An existing project keeps whatever it has, and
+an existing `.backlog/.acfw-config` is never rewritten, so an existing pin is never touched.
+
 ```bash
 if [ ! -f .backlog/.acfw-config ]; then
+  # Decide "new" BEFORE writing. Step 3 has already created the state folders, so the test is
+  # "no task documents", not "no .backlog/". A .acfwhip/config means the project was set up before
+  # (and shadows this file entirely), so it is never "new" here.
+  new_project=1
+  if [ -f .acfwhip/config ]; then new_project=0; fi
+  if [ -n "$(find .backlog -type f -name '*.md' ! -name README.md 2>/dev/null | head -1)" ]; then new_project=0; fi
   cat > .backlog/.acfw-config <<'EOF'
 # ACF Whip runtime config (sourced by doctor.sh, scan-backlog.sh, clean-checkout.sh,
 # integrate-lpcas.sh, and /go).
@@ -268,6 +297,10 @@ ACFW_BRANCH_PREFIX=worktree
 # ACFW_GATE_CMD='npm test --silent'
 EOF
   echo "✓ Created .backlog/.acfw-config (timeout=8h, worktree namespace .worktree / worktree)"
+  if [ "$new_project" = 1 ]; then
+    printf '\n# Pinned by /whip-init because this project was new (see "Integration mode" above).\n# Switch to override if the repo has a protected trunk with review-gated merges.\nACFW_INTEGRATION_MODE=default\n' >> .backlog/.acfw-config
+    echo "✓ Pinned ACFW_INTEGRATION_MODE=default (new project)"
+  fi
 fi
 ```
 
@@ -294,6 +327,66 @@ done
 | **Node.js** | `${CLAUDE_PLUGIN_ROOT}/content/pre-commit-configs/.pre-commit-config-nodejs.yaml` | `${CLAUDE_PLUGIN_ROOT}/content/quality-gates/nextjs-typescript.md` | `.pre-commit-config.yaml`, `docs/development/quality-gates-nodejs.md` |
 
 Use Read/Write tool sequence for each file. Create `docs/development/` directory if missing (bash mkdir -p).
+
+**If you wrote `.pre-commit-config.yaml` in this step, keep its hooks out of `docs/cycles/`.**
+`/whip` keeps each planned cycle in `docs/cycles/<ID>/`, and `acfw-cycle` hashes `plan.md` and
+`record.md` and commits them itself. A hook that rewrites either file fails that commit. The Node.js
+config runs prettier with `--write` on markdown, and prettier re-aligns `record.md`'s tables on every
+commit, so on a fresh Node.js project no plan could ever be approved. The whitespace fixers every
+stack ships cost one failed approval each time they fire. So the file this step installs carries a
+top-level `exclude`, which pre-commit applies to every hook. The shipped configs already have it, and
+the block below says so; it adds the line only to a copy that lacks it. Run this only when the file
+is the one you just wrote; an existing `.pre-commit-config.yaml` is the operator's (Step 4.5 covers
+it):
+
+```bash
+f=.pre-commit-config.yaml
+if grep -q 'docs/cycles' "$f"; then
+  echo "✓ $f already keeps its hooks out of docs/cycles/"
+elif grep -qE '^exclude:' "$f"; then
+  # A second top-level key would be invalid YAML, and merging two regexes by script is a guess.
+  echo "NOTE: $f has its own top-level exclude. Add docs/cycles/ to it by hand, or /whip approvals fail to commit."
+else
+  T=$(mktemp "${TMPDIR:-/tmp}/acfw-precommit.XXXXXX") || exit 1
+  # Insert before the first top-level `repos:` key. awk exits 0 only when it inserted, so a file
+  # without that key is never rewritten. `cat >` keeps the file's own mode (mktemp files are 0600).
+  if awk '
+       !done && /^repos:/ {
+         print "# acf-whip: acfw-cycle hashes docs/cycles/ and commits it itself, so no hook may rewrite it."
+         print "exclude: '"'"'^docs/cycles/'"'"'"
+         print ""
+         done = 1
+       }
+       { print }
+       END { exit done ? 0 : 1 }' "$f" > "$T"; then
+    cat "$T" > "$f" && echo "✓ $f: every hook skips docs/cycles/"
+  else
+    echo "NOTE: $f has no top-level repos: key. Add  exclude: '^docs/cycles/'  at its top level by hand."
+  fi
+  rm -f "$T"
+fi
+```
+
+### Step 4.5: Keep formatters out of `docs/cycles/`
+
+This runs **after** Step 4, so it sees the pre-commit config whether the operator had one or Step 4
+just installed it. Add the folder to the formatter ignore files the project **already has**; never
+create one:
+
+```bash
+for f in .prettierignore .markdownlintignore; do
+  [ -f "$f" ] || continue
+  if grep -qE '^/?docs/cycles/?$' "$f"; then echo "✓ $f already ignores docs/cycles/"; continue; fi
+  printf '\n# acf-whip cycle records: acfw-cycle hashes these bytes, so a formatter must not rewrite them\ndocs/cycles/\n' >> "$f"
+  echo "✓ Added docs/cycles/ to $f"
+done
+# A formatter wired straight into the OPERATOR's pre-commit config: say what to add, never edit it.
+# The config Step 4 installed already carries the exclude, so it never reaches this NOTE.
+if [ -f .pre-commit-config.yaml ] && grep -qiE 'prettier|markdownlint' .pre-commit-config.yaml \
+   && ! grep -q 'docs/cycles' .pre-commit-config.yaml; then
+  echo "NOTE: .pre-commit-config.yaml runs a markdown formatter. If it does not read .prettierignore or .markdownlintignore, add  exclude: ^docs/cycles/  to that hook, or /whip approvals will fail to commit."
+fi
+```
 
 ### Step 5: Initialize Core Documentation
 
@@ -347,7 +440,7 @@ Create `.claude/agents/` directory if missing. **Generate** 7-8 agents from patt
 | **quality-reviewer** | `{backend_stack}`, `{frontend_stack}`, `{coverage_threshold}`, `{api_coverage}`, `{core_coverage}`, `{backend_linter}`, `{backend_test_runner}`, `{frontend_linter}` | Coverage 80% → api 90-95%, golangci-lint, go test |
 | **lean-architect** | `{backend_stack}`, `{frontend_stack}`, `{database_stack}`, `{infrastructure}`, `{has_microservices}`, `{has_event_driven}`, `{project_name}` | kubernetes, microservices=true |
 | **precommit** | `{backend_stack}`, `{frontend_stack}`, `{backend_linter}`, `{backend_formatter}`, `{pre_commit_config_path}` | golangci-lint, gofmt, .pre-commit-config.yaml |
-| **retro** | `{project_name}`, `{retrospective_frequency}`, `{has_sla_priorities}` | weekly, sla=true if 5-level |
+| **retro** | `{project_name}`, `{has_sla_priorities}` | sla=true if 5-level |
 | **research-agent** | `{project_name}` | Replace project references |
 | **workflow-architect** | `{project_name}` | Replace project references. Do **not** add a `model:` pin — `/go` dispatches it with no model option so it runs on the session model. |
 | **devops** | `{LOCAL_ORCHESTRATION}`, `{DEPLOYMENT_TARGET}`, `{CI_TOOL}`, `{MONITORING_STACK}`, `{CLOUD_PROVIDER}`, `{HAS_K8S}`, `{PROJECT_NAME}`, `{ORCHESTRATION_RESPONSIBILITY}`, `{K8S_DELEGATION_SECTION}` | docker-compose, github-actions, prometheus-grafana, gke |
@@ -702,15 +795,40 @@ fi
 
 ACF Whip active. State machine: `pending → in-progress → completed → in-review → [accepted|rejected]` (blocked/retry paths exist).
 
-**Commands**: `/task` (decompose), `/go` (execute all), `/whip-doctor` (backlog integrity check; `--fix` auto-repairs), `/retro` (improvement), `/whip-add-agents` (create specialists)
+**Commands**: `/whip` (where you are and the one command to run next; `/whip "<goal>"` starts work), `/task` (decompose), `/go` (execute your tasks), `/whip-doctor` (backlog integrity check; `--fix` auto-repairs), `/retro` (close a cycle, record lessons), `/whip-add-agents` (create specialists)
 
 **Core Docs**: `docs/acf/backlog/workflow.md`, `docs/acf/backlog/recovery-runbook.md`, `docs/acf/backlog/task-template.md`, `docs/acf/style/task-descriptions.md`, `.backlog/README.md`
 
-**Universal Agents**: task-engineer (WHAT/WHY only), quality-reviewer (accept/reject), lean-architect (design, max 2-3 line snippets), retro, precommit, research-agent (Perplexity/Context7), workflow-architect (authors the per-task child-workflow harness)
+**Universal Agents**: task-engineer (WHAT/WHY only), quality-reviewer (accept/reject), lean-architect (design, max 2-3 line snippets), retro (root cause analysis; proposes, never edits), precommit, research-agent (Perplexity/Context7), workflow-architect (authors the per-task child-workflow harness)
 
 **Quality Gates**: `docs/development/quality-gates-{stack}.md` | **Zero Bypass Tolerance**: No `--no-verify`, no skipping.
 
-**Next Steps**: 1) `/whip-add-agents` for specialists, 2) `/task` to decompose scope, 3) `/go` for execution
+**Next Steps**: `/whip` shows where you are and the one command to run next (`/whip "<goal>"` → `/task` → `/go` → `/retro`). `/retro` records one-rule lessons in `docs/acf/lessons/`, relevant when changing an area a lesson names.
+```
+
+The Next Steps line is one **informational** pointer: it names where lessons live and loads none of
+them. `/whip`, `/retro` and `acfw-cycle` never write to `CLAUDE.md`; only this skill does.
+
+**On a re-run, replace the old Next Steps line.** Releases before 3.5.0 shipped exactly one variant of
+it. Replace that line only when it is byte-identical (a CRLF copy counts), and touch nothing else: an
+edited line is the team's, and it stays.
+
+```bash
+OLD='**Next Steps**: 1) `/whip-add-agents` for specialists, 2) `/task` to decompose scope, 3) `/go` for execution'
+NEW='**Next Steps**: `/whip` shows where you are and the one command to run next (`/whip "<goal>"` → `/task` → `/go` → `/retro`). `/retro` records one-rule lessons in `docs/acf/lessons/`, relevant when changing an area a lesson names.'
+if [ -f CLAUDE.md ]; then
+  T=$(mktemp "${TMPDIR:-/tmp}/acfw-claude-md.XXXXXX") || exit 1
+  # awk exits 0 only when it replaced something, so an unchanged file is never rewritten.
+  # `cat >` rather than `mv` keeps CLAUDE.md's own mode and inode (mktemp files are 0600).
+  if awk -v old="$OLD" -v new="$NEW" '
+       $0 == old      { print new;      hit = 1; next }
+       $0 == old "\r" { print new "\r"; hit = 1; next }
+                      { print }
+       END { exit hit ? 0 : 1 }' CLAUDE.md > "$T"; then
+    cat "$T" > CLAUDE.md && echo "✓ Replaced the old Next Steps line in CLAUDE.md"
+  fi
+  rm -f "$T"
+fi
 ```
 
 ### Step 9.5: Gap Analysis and Recommendations
@@ -766,6 +884,9 @@ Compare expected state (Steps 1-9) with actual state on disk:
 
 🎯 Quality Gates: ✓ .pre-commit-config.yaml ({stack}), ✓ docs/development/quality-gates-{stack}.md | Coverage: {threshold}%, Max retries: {attempts}
 
+{IF new_project}🔀 Integration mode: pinned ACFW_INTEGRATION_MODE=default (new project; accepted work lands on your local trunk, never pushed)
+{IF NOT new_project}🔀 Integration mode: left as found ({pinned value, or "unpinned: /whip will ask you to pin it"})
+
 📋 CLAUDE.md: {created|enhanced} with ✓ ACF definition{if_created}, ✓ Pure Delegation Architecture, ✓ Agent matrix ({total_agents} agents), ✓ Backlog Workflow, ✓ Enforcement: General agent CANNOT modify code
 
 {IF NOT with_specialists}⚠️  Note: Universal agents only created. Specialized agents (python-engineer, react-engineer, etc.)
@@ -776,8 +897,9 @@ Compare expected state (Steps 1-9) with actual state on disk:
 🚀 Next Steps:
 {IF NOT with_specialists}1. /whip-add-agents (generate specialists for {stack})
 {IF with_specialists}1. Review agents in .claude/agents/ and docs/agents/
-2. /task "Scope description" (decompose)
-3. /go (execute)
+2. /whip "<goal>" (small work goes straight to /task; risky work gets a plan you approve with one "yes")
+3. /go (execute), then /retro once a planned cycle is done
+   Any time: /whip shows where you are and the one command to run next
 
 📚 Quick Reference: docs/acf/backlog/workflow.md, docs/acf/backlog/recovery-runbook.md, docs/acf/style/task-descriptions.md, docs/acf/backlog/task-template.md, .backlog/README.md, docs/agents/
 

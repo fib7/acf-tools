@@ -126,10 +126,10 @@ legacy loop has). Prefer it.
 
 1. Resolve the environment with one bash call. **Refuse on detached HEAD** (empty branch):
    ```bash
-   echo "PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT"
+   echo "PLUGIN_ROOT=${CLAUDE_PLUGIN_ROOT}"
    echo "TRUNK_ROOT=$(git rev-parse --show-toplevel)"
    echo "TRUNK_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)"
-   bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info
+   bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" info
    ```
    If `TRUNK_BRANCH` is empty, STOP — `/go` requires a branch checked out at the repo root.
    The `acfw-store info` line is one JSON object carrying everything the rest of this procedure
@@ -156,7 +156,7 @@ legacy loop has). Prefer it.
 
    - **`focusCount` > 0** — read it and check it is still worth running, in one call:
      ```bash
-     bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-focus" show --live
+     bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-focus" show --live
      ```
      Two answers are not a list of tasks, and both need handling before you read one:
      - **exit 2 with a store mismatch** — the focus was written against a different backend.
@@ -172,6 +172,25 @@ legacy loop has). Prefer it.
      launch with `only: [<the stems>]`, `scopeSource: "focus"`, and
      `scopeFilter: "focus set by <setBy> <ts>"`. The confirmation matters because a focus is
      *standing* state — it may have been set by a `/task` run hours ago, or in another session.
+
+     **One exception skips that confirmation: a focus that is exactly an approved cycle.** When you
+     approved a plan with `/whip` and `/task --plan` set the focus, you already said yes to this
+     work on the approval card, so asking again is noise. The script decides this, never you (Bash
+     `timeout: 600000`; it reads the store only when the focus touches a cycle):
+     ```bash
+     out=$(bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-cycle" status --if-cycle 2>/dev/null) \
+       && printf '%s\n' "$out" \
+       | grep -E '^  focus = the [0-9]+ runnable task\(s\) of approved cycle [0-9]{8}-[a-z0-9][a-z0-9-]*$'
+     ```
+     The `&&` is load-bearing: a non-zero `acfw-cycle` exit (store unreachable, bad config) ends the
+     command there, so the grep never runs and nothing is printed. A printed line means `acfw-cycle`
+     exited 0 and derived from git and the task store that every focus task belongs to that one
+     cycle, every unfinished task of the cycle is in the focus, its approval is valid at HEAD, and at
+     least one task can run. Then say one line (`running the focus: approved cycle <ID>, <n>
+     task(s)`) and launch with `only: [<the stems>]`, `scopeSource: "focus"` and `scopeFilter:
+     "focus = approved cycle <ID>"`. Anything else (no line, a non-zero exit, a plan-less focus,
+     which prints nothing at all) means you take the confirmation as above. Never decide the match
+     yourself by comparing the focus list to a plan.
    - **`focusCount` is 0 and `bareGo` is `all`** (the `files` default) — omit `only`. Full-backlog
      behaviour, unchanged from every release before 3.4.0.
    - **`focusCount` is 0 and `bareGo` is `refuse`** (the default on every shared, API-backed store) —
@@ -193,7 +212,7 @@ legacy loop has). Prefer it.
    **(c) Anything else is a filter predicate** — "frontend tasks only", "bugfixes",
    "high priority backend", "the auth work". Resolve it to a concrete list *here*, before launching:
    ```bash
-   bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" snapshot --digest
+   bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" snapshot --digest
    ```
    Match the predicate against the fields the snapshot projects on every backend —
    `stem` · `id` · `folder` · `slug` · `agent` · `priority` · `deps` · `touchesGlobs`:
@@ -316,11 +335,18 @@ legacy loop has). Prefer it.
    resolver are pinned to the session model.
 5. When it completes, report the returned `RunReport` (completed?, iterations, finalCounts,
    integrated[], stopReason). If it returns `aborted: true`, surface `reason` + `fatals` and STOP.
+   An aborted report can carry `integrationWarnings[]` too, when the run landed work before it
+   aborted. Relay those first, exactly as described below.
    On a scoped run also report `scopeResolved`, so the operator sees which tasks actually ran and
    which dependencies were pulled in. Re-running `/go` is the documented resume — git + the task
    store (`.backlog/` on the default files backend) are the only durable state.
 
-   **Three fields change what you should say, and none of them is `completed` alone:**
+   **Four fields change what you should say, and none of them is `completed` alone:**
+   - **`integrationWarnings[]`**: `WARN:` lines the integrator printed, each prefixed with its
+     task's stem. One says the integrator dropped a task's edits under `docs/cycles/` (tasks never
+     edit cycles; a plan changes only through `/whip`). Another says a landing overwrote
+     uncommitted work at the root, and ends with a `Recover:` command. Relay every line verbatim,
+     before anything else in your summary: that command is printed nowhere else.
    - **`heldOut[]`** — tasks the run REFUSED to touch, and still refuses at the end:
      `quarantined` (a task-level integrity FATAL), `paused` (an inactive member of a focus), or
      `vanished` (someone retired it mid-run). Name them. A run with anything held out inside its
@@ -357,6 +383,13 @@ legacy loop has). Prefer it.
    - `escalation.authored === 0` with `escalation.fellBack > 0` means no harness was ever authored —
      check that `skills/lib/bin/acfw-child-*` are executable and `.claude/agents/` is populated.
    - `escalation.stagesReplayed` is work a re-run did **not** have to redo.
+
+   **After reporting the RunReport, do what its `nextStep` says.** This is a pointer only: the
+   exact command and its flags live in the field, because the completion payload is what a resumed
+   turn reliably reads after a long background run. It prints nothing outside a planned cycle, so a
+   plan-less run ends exactly as before. Inside one, print its output verbatim and add nothing of
+   your own. A report with no `nextStep` (every `aborted: true` one) ends here; never build the
+   command yourself.
 6. Do **not** also run the legacy loop below — the workflow replaces it.
 
 **Only if the `Workflow` tool is NOT available** (dynamic workflows disabled, or older Claude Code):
@@ -428,7 +461,7 @@ fi
 # Runs AFTER the detached-HEAD refusal (no subprocess on a run that is about to abort), and as an
 # if/fi rather than `[ ... ] && export`: that idiom evaluates to exit 1 whenever the mode is not
 # override, which is a landmine the day this line ends up last in a block or under `set -e`.
-ACFW_MODE_PIN=$(bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info | sed -E 's/.*"integrationMode":"([^"]*)".*/\1/')
+ACFW_MODE_PIN=$(bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" info | sed -E 's/.*"integrationMode":"([^"]*)".*/\1/')
 if [ "$ACFW_MODE_PIN" = "override" ]; then
   export ACFW_INTEGRATION_OVERRIDE=1
   echo "🔒 Integration mode: override (pinned) — accepted tasks are terminal; you integrate."
@@ -516,7 +549,7 @@ After every Task() return, parse the marker and perform the move at root:
 # shared apply-transition.sh primitive (idempotent; single source of truth; safe on resume).
 acfw_apply_result() {
   local task_file="$1" from_state="$2" result="$3"
-  local transition reject_inc notes new_state inc=0
+  local transition reject_inc notes new_state inc=0 dfile dseen dkey
   transition=$(echo "$result" | sed -nE 's/^[[:space:]]*transition:[[:space:]]*([a-z]+).*/\1/p')
   reject_inc=$(echo "$result" | sed -nE 's/^[[:space:]]*rejection_increment:[[:space:]]*([0-9]+).*/\1/p')
   notes=$(echo "$result" | sed -nE 's/^[[:space:]]*notes:[[:space:]]*(.*)/\1/p')
@@ -524,10 +557,40 @@ acfw_apply_result() {
   # THIS call or not at all: the next clean-checkout stashes the root tree and the work is gone. The
   # workflow path stages them (safeStagePaths); this path used to drop them on the floor. Same refusal
   # set as apply-transition.sh and the acfw-store dispatcher — no empty, absolute, .., or state paths.
+  # docs/cycles/ is skipped as well (3.5.0: tasks never edit cycles). This writer commits at the
+  # shared root, where a human may be mid-amendment of plan.md: staging it would commit their
+  # half-finished edit and void the approval at HEAD with no /whip card behind it. Skipped, never
+  # refused, so the state move still happens, and an UNSTAGED edit stays uncommitted for the human
+  # to judge. A STAGED one does not: the writer commits the whole root index, so a plan change the
+  # human has run `git add` on rides into this transition's commit. Commit or unstage it before /go.
+  # The bare folder counts too: `git add -- docs/cycles` stages the whole folder, a human's untracked
+  # draft included. An ancestor (`docs`, `.`) is passed on: dropping it here would lose its other
+  # files, and apply-transition.sh stages it with docs/cycles excluded.
+  # The checks read dkey, the spelling git acts on: git reads docs//cycles, docs/./cycles and
+  # ././docs as docs/cycles and docs, so a match on the spelling alone let those through. dseen is
+  # what apply-transition.sh sees after its own `./` strip; it refuses that when empty or absolute
+  # (exit 2 strands the move), so those are dropped here. The path passes on as given.
   STAGE_ARGS=()
   for dfile in $(echo "$result" | sed -nE 's/^[[:space:]]*deliverable_files:[[:space:]]*(.*)/\1/p' | tr ',[]"' '    '); do
-    case "$dfile" in
-      ""|/*|*..*|.backlog/*|.acfwhip/*) [ -n "$dfile" ] && echo "WARN: refusing --stage path '$dfile'" >&2; continue ;;
+    dfile="${dfile#./}"
+    dseen="${dfile#./}"
+    dkey="$dfile"
+    while :; do
+      case "$dkey" in
+        *//*)  dkey="${dkey%%//*}/${dkey#*//}" ;;
+        */./*) dkey="${dkey%%/./*}/${dkey#*/./}" ;;
+        ./*)   dkey="${dkey#./}" ;;
+        */.)   dkey="${dkey%/.}" ;;
+        ?*/)   dkey="${dkey%/}" ;;
+        *) break ;;
+      esac
+    done
+    case "$dseen" in
+      ""|/*|*..*) [ -n "$dfile" ] && echo "WARN: refusing --stage path '$dfile'" >&2; continue ;;
+    esac
+    case "$dkey" in
+      .backlog|.backlog/*|.acfwhip|.acfwhip/*) echo "WARN: refusing --stage path '$dfile'" >&2; continue ;;
+      docs/cycles|docs/cycles/*) echo "WARN: not staging '$dfile': tasks never edit cycles; change a plan with /whip" >&2; continue ;;
     esac
     [ -e "$dfile" ] && STAGE_ARGS+=(--stage "$dfile")
   done

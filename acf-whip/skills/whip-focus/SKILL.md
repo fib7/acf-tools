@@ -39,7 +39,7 @@ One bash call. The script does the resolution, the validation and the writing; d
 file, and do not construct it yourself.
 
 ```bash
-bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-focus" <subcommand> [tasks...]
+bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-focus" <subcommand> [tasks...]
 ```
 
 With no arguments, run `show --live` — the extra store read answers the question an operator actually

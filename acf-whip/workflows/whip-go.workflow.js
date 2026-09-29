@@ -58,6 +58,10 @@ const STORE = `${pluginRoot}/skills/lib/bin/acfw-store`
 // integrate-worktree (rebase-into-cached-snapshot fold), whose stale snapshot was the keystone defect.
 const INTEGRATE = `${pluginRoot}/skills/integrate-lpcas/bin/integrate-lpcas.sh`
 const CLEAN_CHECKOUT = `${pluginRoot}/skills/clean-checkout-before-task/bin/clean-checkout.sh`
+// Cycle engine (3.5.0). /go never runs it: it only names it in the final report's nextStep, so the
+// turn that reads the report (often a resumed one, after compaction dropped the skill's step 5)
+// knows the exact command without having to rebuild it.
+const CYCLE = `${pluginRoot}/skills/lib/bin/acfw-cycle`
 
 // Run lock (WHIP-15). Two concurrent /go runs collide on the same slugs: tasks cycle in-review without
 // accepting, and one run's broad `git add` in the SHARED root checkout sweeps the other's staged work
@@ -1001,6 +1005,7 @@ Capture the exit code and stdout (stdout carries an "ACFW-INTEGRATE: <verdict> .
   99 -> transient        (git lock contention)
   other -> error
 If and ONLY if exit code is 7, parse the resolver-needed stdout block and fill: resolverWorktree (the "worktree:" line value), resolverAgent ("assigned_agent:" — may be empty), resolverConflictedFiles (the lines under "conflicted_files:", newline-joined). Set resolverBranch and resolverConflictingCommits to "" (the LP-CAS integration worktree is detached — there is no branch and no commit list). Otherwise set all five to "".
+note: one line saying what happened. Then, whatever the exit code, copy EVERY line the integrator printed on stderr that starts with "WARN:" into note, verbatim and one per line, after that first line. They say when it dropped this task's edits under docs/cycles/ or overwrote uncommitted work at the root, and the recovery command they carry exists nowhere else.
 Return the structured IntegrateResult. Do NOT dispatch a resolver yourself; the orchestrator does that.`
 }
 
@@ -1086,6 +1091,23 @@ async function unlock(phaseName) {
   } catch (e) { /* lock expires on its own */ }
 }
 
+// The spelling git acts on, as apply-transition.sh's norm_path computes it (keep the two in step):
+// git reads docs//cycles, docs/./cycles, ././docs and docs/ as one pathspec, so a guard that tests the
+// spelling alone lets the others through. Collapse `//`, drop `.` segments, then a leading `./` and a
+// trailing `/`; the root comes back as `.`. Each step shortens the string, so the loop ends.
+function normStagePath(p) {
+  let q = String(p)
+  for (;;) {
+    if (q.includes('//')) q = q.replace('//', '/')
+    else if (q.includes('/./')) q = q.replace('/./', '/')
+    else if (q.startsWith('./')) q = q.slice(2)
+    else if (q.endsWith('/.')) q = q.slice(0, -2)
+    else if (q.length > 1 && q.endsWith('/')) q = q.slice(0, -1)
+    else break
+  }
+  return q || '.'
+}
+
 // Deliverable paths a NON-CODE task reported (WHIP-08). apply-transition.sh refuses a state path with
 // exit 2 — which would strand the state move — so filter here too: a specialist that names .backlog/
 // or an absolute path loses its staging, never its transition. Defense in depth, not duplication.
@@ -1094,8 +1116,26 @@ function safeStagePaths(files, stem) {
   for (const raw of (Array.isArray(files) ? files : [])) {
     const p = String(raw || '').trim().replace(/^\.\//, '')
     if (!p) continue
-    if (p.startsWith('/') || p.includes('..') || p.startsWith('.backlog/') || p.startsWith('.acfwhip/')) {
+    // The writer strips one more `./` and refuses what is then empty or absolute, and it tests the
+    // state paths on the normalized form (bare folders included). Mirror both, so no path it would
+    // refuse with exit 2 ever reaches it.
+    const seen = p.replace(/^\.\//, '')
+    const key = normStagePath(p)
+    const under = (dir) => key === dir || key.startsWith(`${dir}/`)
+    if (!seen || seen.startsWith('/') || p.includes('..') || under('.backlog') || under('.acfwhip')) {
       log(`WARN ${stem}: ignoring unstageable deliverable path '${p}' (absolute, traversing, or a state path)`)
+      continue
+    }
+    // 3.5.0: tasks never edit cycles. The writer commits at the shared root, where a human may be
+    // half way through amending a plan.md: staging it would commit their draft and void the approval
+    // at HEAD with no /whip card behind it. Skipped, never refused, so the state move still happens.
+    // The bare folder counts too: `git add -- docs/cycles` stages every cycle, an untracked draft
+    // included. An ancestor (`docs`, `.`) cannot be dropped here without losing its other files, so
+    // the `git add` behind the writer carries an exclude pathspec for docs/cycles instead. The test
+    // reads `key`, so docs//cycles/... and docs/./cycles/... are caught too; `p` is what gets passed
+    // on, and the writer normalizes it the same way.
+    if (under('docs/cycles')) {
+      log(`WARN ${stem}: not staging '${p}': tasks never edit cycles; change a plan with /whip`)
       continue
     }
     out.push(p)
@@ -1949,6 +1989,33 @@ const attemptedIntegrate = new Set() // every stem handed to integrateOne — us
                                      // was rejected at integration even if the agent failed to emit it.
 const parkedThisRun = new Set() // stems a specialist blocked on with dependency-missing (BUG-2) — not re-dispatched
 const parkedNeeds = new Map() // stem -> needs_task text (for the final operator report)
+// 3.5.0. WARN lines the integrator printed on stderr, relayed through the integrate agent's note.
+// An INTEGRATED task's note was read by nothing, so the two WARNs an operator must act on (this
+// task's docs/cycles/ edits were dropped; uncommitted root work was overwritten, with the only copy
+// of its Recover: command) reached no one. A Set: a task retried after a lost CAS prints the same
+// drop WARN on every attempt.
+const integrationWarnings = new Set()
+const INTEGRATION_WARN_CAP = 20
+function collectIntegrateWarnings(t, r) {
+  // Split on newlines AND before each "WARN:", so a note the agent joined onto one line still yields
+  // one entry per WARN rather than one run-on entry or none. The per-line bound is generous on
+  // purpose: the overwrite WARN carries two 40-hex oids and the root path twice before its Recover:
+  // command, which is the part that matters and the part a tight cut would drop.
+  const found = String((r && r.note) || '').split(/\n|(?=WARN: )/).map((l) => l.trim()).filter((l) => l.startsWith('WARN:'))
+  for (const w of found) {
+    const line = `${t.stem}: ${w}`.slice(0, 2000)
+    if (!integrationWarnings.has(line)) log(`⚠ ${line}`)
+    integrationWarnings.add(line)
+  }
+}
+// An aborted return is a report too. A run that landed work in an earlier iteration and then aborts
+// may hold the only copy of a Recover: command: the snapshot it names comes from commit-tree, no ref
+// points at it, and gc can prune it once the command is lost. So every abort inside the loop carries
+// what the run collected. The bootstrap aborts do not need it (nothing has integrated yet), and an
+// abort with no WARN is left exactly as it was.
+function abortWarnings() {
+  return integrationWarnings.size ? { integrationWarnings: [...integrationWarnings].slice(0, INTEGRATION_WARN_CAP) } : {}
+}
 let lastSnapshot = null
 // The resolved scope of the LAST iteration (stems). Null on an unscoped run. Held at run level so the
 // post-loop integration drain and the final report stay inside the scope the operator asked for —
@@ -2015,7 +2082,7 @@ Return the ScanResult.`
     if (v.reported) return null
     stopReason = 'doctor-unavailable-midrun'
     await unlock('Iterate')
-    return { aborted: true, stopReason, reason: `the mid-run integrity recheck could not RUN${whenNote} — the board is unverified, not known-bad. ${v.why}`, mode, iteration: iter, doctorUnavailable: true, doctorSummary: sc.doctorSummary, fatals: sc.doctorFatals }
+    return { aborted: true, stopReason, reason: `the mid-run integrity recheck could not RUN${whenNote} — the board is unverified, not known-bad. ${v.why}`, mode, iteration: iter, doctorUnavailable: true, doctorSummary: sc.doctorSummary, fatals: sc.doctorFatals, ...abortWarnings() }
   }
   if (scan && !scan.doctorOk) {
     const ab = await unavailableAbort(scan, '')
@@ -2091,7 +2158,7 @@ Return the ScanResult.`
     if (!drc.ok) {
       stopReason = 'doctor-relay-truncated'
       await unlock('Iterate')
-      return { aborted: true, stopReason, reason: `the integrity report was relayed incompletely (${drc.why}) — we cannot tell WHICH finding was dropped, and a dropped FATAL would silently un-hold the task it names. Nothing was dispatched. Re-run /go; if it recurs, scope the run (/go <ids>) or raise shellModel.`, mode, iteration: iter, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals }
+      return { aborted: true, stopReason, reason: `the integrity report was relayed incompletely (${drc.why}) — we cannot tell WHICH finding was dropped, and a dropped FATAL would silently un-hold the task it names. Nothing was dispatched. Re-run /go; if it recurs, scope the run (/go <ids>) or raise shellModel.`, mode, iteration: iter, doctorSummary: scan.doctorSummary, fatals: scan.doctorFatals, ...abortWarnings() }
     }
   }
   if (snap.branchPrefix) branchPrefix = snap.branchPrefix
@@ -2110,7 +2177,7 @@ Return the ScanResult.`
   if (cls.repo.length) {
     stopReason = 'integrity-fatal-midrun'
     await unlock('Iterate')
-    return { aborted: true, stopReason, reason: `repository-level integrity FATAL detected mid-run; aborting before dispatch (this class is not task-scoped — it affects the whole checkout): ${cls.repo.map((f) => f.code).join(', ')}`, mode, iteration: iter, doctorSummary: scan && scan.doctorSummary, fatals: cls.repo.map((f) => f.line), fatalsNotGating: cls.notGating.map((f) => f.line) }
+    return { aborted: true, stopReason, reason: `repository-level integrity FATAL detected mid-run; aborting before dispatch (this class is not task-scoped — it affects the whole checkout): ${cls.repo.map((f) => f.code).join(', ')}`, mode, iteration: iter, doctorSummary: scan && scan.doctorSummary, fatals: cls.repo.map((f) => f.line), fatalsNotGating: cls.notGating.map((f) => f.line), ...abortWarnings() }
   }
   const quarantined = new Set(cls.task.map((f) => f.stem))
   for (const f of cls.task) noteHeld(f.stem, 'quarantined', f.code, f.detail)
@@ -2173,7 +2240,7 @@ Return the ScanResult.`
     if (missingFromIndex.length || unaccounted.length) {
       stopReason = 'relay-truncated'
       await unlock('Iterate')
-      return { aborted: true, stopReason, reason: `the store resolved ${resolvedVals.length} of the tasks you named, but the snapshot handed to the orchestrator does not contain ${missingFromIndex.concat(unaccounted).join(', ')} — the snapshot was relayed incompletely, so the ids are NOT missing from the backlog. Nothing was dispatched. Re-run /go; if it recurs, name fewer tasks or raise shellModel.`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+      return { aborted: true, stopReason, reason: `the store resolved ${resolvedVals.length} of the tasks you named, but the snapshot handed to the orchestrator does not contain ${missingFromIndex.concat(unaccounted).join(', ')} — the snapshot was relayed incompletely, so the ids are NOT missing from the backlog. Nothing was dispatched. Re-run /go; if it recurs, name fewer tasks or raise shellModel.`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter, ...abortWarnings() }
     }
     seedStems = resolvedVals
   }
@@ -2197,13 +2264,13 @@ Return the ScanResult.`
     return { aborted: true, stopReason, reason: [
       scriptUnresolved.length ? `/go was scoped to tasks that do not exist in the backlog: ${scriptUnresolved.join(', ')} — check the ids` : '',
       ambText ? `/go was scoped by an AMBIGUOUS prefix, which is never guessed: ${ambText} — name one` : '',
-    ].filter(Boolean).join('. ') + ' (nothing was dispatched)', scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+    ].filter(Boolean).join('. ') + ' (nothing was dispatched)', scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter, ...abortWarnings() }
   }
   if (scoped && scoped.unresolved.length) {
     if (iter === 1) {
       stopReason = 'scope-unresolved'
       await unlock('Iterate')
-      return { aborted: true, stopReason, reason: `/go was scoped to tasks that do not exist in the backlog: ${scoped.unresolved.join(', ')} — check the ids (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+      return { aborted: true, stopReason, reason: `/go was scoped to tasks that do not exist in the backlog: ${scoped.unresolved.join(', ')} — check the ids (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter, ...abortWarnings() }
     }
     for (const st of scoped.unresolved) noteHeld(st, 'vanished', '', 'was in scope at iteration 1 but is no longer on the board — someone else moved or retired it')
   }
@@ -2221,7 +2288,7 @@ Return the ScanResult.`
     } else {
       stopReason = 'scope-not-actionable'
       await unlock('Iterate')
-      return { aborted: true, stopReason, reason: `/go was scoped to tasks that are not actionable: ${scoped.inactiveSeeds.join(', ')}. A draft task is behind the human gate, an archived one is retired, and one in no recognised state is quarantined — none can be dispatched. Give it a schedulable state (pending) first (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter }
+      return { aborted: true, stopReason, reason: `/go was scoped to tasks that are not actionable: ${scoped.inactiveSeeds.join(', ')}. A draft task is behind the human gate, an archived one is retired, and one in no recognised state is quarantined — none can be dispatched. Give it a schedulable state (pending) first (nothing was dispatched)`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter, ...abortWarnings() }
     }
   }
   const sched = scoped ? tasks.filter((t) => scoped.scope.has(t.stem)) : tasks
@@ -2268,7 +2335,7 @@ Return the ScanResult.`
     if (!scoped) {
       stopReason = 'snapshot-version-skew'
       await unlock('Iterate')
-      return { aborted: true, stopReason, reason: 'backlog snapshot is missing runtimeTerminal counts — snapshot engine / workflow version skew (or a store adapter emitting a pre-contract snapshot); reinstall acf-whip so both halves match', mode, iteration: iter }
+      return { aborted: true, stopReason, reason: 'backlog snapshot is missing runtimeTerminal counts — snapshot engine / workflow version skew (or a store adapter emitting a pre-contract snapshot); reinstall acf-whip so both halves match', mode, iteration: iter, ...abortWarnings() }
     }
     if (iter === 1) log('WARN snapshot is missing runtimeTerminal counts (snapshot/workflow version skew) — tolerated because this run is scoped, but reinstall acf-whip')
   }
@@ -2419,6 +2486,10 @@ Return the ScanResult.`
     const noEscalate = !!(opts && opts.noEscalate)
     attemptedIntegrate.add(t.stem)
     let r = await safeAgent(integratePrompt(t, false), shellOpts({ label: `integrate:${t.slug}`, phase: 'Iterate', schema: INTEGRATE_RESULT }), integTransient('integrate agent non-emit — left accepted, retry next iteration'))
+    // Read on EVERY pass, the resolver-needed one included: a conflict under docs/cycles/ is stripped
+    // (and its drop WARN printed) before the exit 7, and the --post-resolver pass then finds nothing
+    // left to strip, so it never prints that WARN again.
+    collectIntegrateWarnings(t, r)
     if (r && r.outcome === 'resolver-needed') {
       log(`integrate ${t.slug}: conflict — dispatching resolver ${r.resolverAgent || t.agent || '(default)'}`)
       // NO model: here — the conflict resolver does REAL merge-conflict reasoning; session model + agentType.
@@ -2458,6 +2529,7 @@ Return the ScanResult.`
         log(`  resolve ${t.slug}: ${resolved.staged} path(s) staged by the harness`)
       }
       r = await safeAgent(integratePrompt(t, true), shellOpts({ label: `integrate:${t.slug}:post`, phase: 'Iterate', schema: INTEGRATE_RESULT }), integTransient('integrate(post-resolver) agent non-emit — left accepted, retry next iteration'))
+      collectIntegrateWarnings(t, r)
     }
     if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); integratedThisIter++; log(`✓ integrated ${t.stem}`) }
     else if (r && r.outcome === 'rejected') {
@@ -2467,7 +2539,9 @@ Return the ScanResult.`
       // re-enters the rejection self-heal (retry as pending, or blocked at the cap) instead of being
       // re-attempted as an integration candidate every iteration. Keeps the run convergent.
       rejectedStems.push(t.stem)
-      await streamWrite([{ stem: t.stem, toState: 'rejected', agent: 'orchestrator', notes: (r.note || 'union gate failed at integration').slice(0, 200), inc: 1 }], `integ-reject#${iter}:${t.stem}`)
+      // First line only: the note now carries the integrator's WARN lines after it, and a newline
+      // inside a transition-log cell splits the markdown table row it is written into.
+      await streamWrite([{ stem: t.stem, toState: 'rejected', agent: 'orchestrator', notes: (String(r.note || '').split('\n')[0].trim() || 'union gate failed at integration').slice(0, 200), inc: 1 }], `integ-reject#${iter}:${t.stem}`)
       log(`✗ integrate rejected ${t.stem} — ${r.note}`)
     }
     else if (r && r.outcome === 'skipped') { log(`↷ skipped ${t.stem} — no worktree branch (historical; terminal)`) }
@@ -2476,7 +2550,7 @@ Return the ScanResult.`
       // .acfwhip/ ledger namespace). Isolate THIS task for an operator — never reject the others, never
       // re-run (a re-run re-quarantines). Integration of every other accepted task continues unaffected.
       parkedThisRun.add(t.stem)
-      parkedNeeds.set(t.stem, (r.note || `quarantined candidate for ${t.slug} — inspect refs/acfw/patch/${t.stem}; the candidate is not a single-parent code-only commit`).slice(0, 200))
+      parkedNeeds.set(t.stem, (String(r.note || '').split('\n')[0].trim() || `quarantined candidate for ${t.slug} — inspect refs/acfw/patch/${t.stem}; the candidate is not a single-parent code-only commit`).slice(0, 200))
       log(`⚑ ${t.stem}: quarantined candidate (${t.slug}) — parked for operator, isolated from the rest of the run`)
     }
     // transient/error -> leave accepted, retry next iteration
@@ -2797,6 +2871,7 @@ Final integration drain. Run  bash ${sq(STORE)} snapshot --digest --mode ${mode}
       // single defensive pass: an exit-7 here is intentionally left for the next /go run (no resolver post-loop)
       attemptedIntegrate.add(t.stem)
       const r = await safeAgent(integratePrompt(t, false), shellOpts({ label: `drain:${t.slug}`, phase: 'Drain', schema: INTEGRATE_RESULT }), () => ({ outcome: 'transient', note: 'drain integrate non-emit' }))
+      collectIntegrateWarnings(t, r)
       if (r && r.outcome === 'integrated') { integratedStems.push(t.stem); drained++ }
     }
   }
@@ -2873,6 +2948,11 @@ return {
   // rejection to every task it dispatched and still report completed:true with an empty reject list.
   rejectedAtReview: [...new Set(autoRejectedStems)],
   drainedPostLoop: drained,
+  // 3.5.0. "<stem>: WARN: ..." lines the integrator printed: cycle edits it dropped, and uncommitted
+  // root work a landing overwrote (with the Recover: command that exists nowhere else). Capped so a
+  // pathological run cannot grow the payload a resumed turn has to read; the log keeps every one.
+  // The in-loop aborts carry the same list (abortWarnings), since a run can land work and then abort.
+  integrationWarnings: [...integrationWarnings].slice(0, INTEGRATION_WARN_CAP),
   needsOperator,
   // Without these a run that silently degraded to 3.1.0 dispatch everywhere is indistinguishable from
   // a fully escalated one — the single most misleading way this feature could fail.
@@ -2927,5 +3007,15 @@ return {
       ? ` ⚑ NO harness was authored this run (${esc.fellBack} fell back to single-agent dispatch) — check that acf-whip/skills/lib/bin/acfw-child-* are executable and that .claude/agents/ is populated.`
       : '')
     + (needsOperator.length ? ` ${needsOperator.length} task(s) parked for an operator (re-block/rejection cap reached): ${needsOperator.map((n) => n.stem).join(', ')}.` : '')
+    + (integrationWarnings.size
+      ? ` ${integrationWarnings.size} integration WARN(s)${integrationWarnings.size > INTEGRATION_WARN_CAP ? ` (the first ${INTEGRATION_WARN_CAP} are in integrationWarnings; the workflow log has every one)` : ' in integrationWarnings'}: relay them verbatim, since one may hold the only Recover: command for overwritten work.`
+      : '')
     + (reconciled ? ' (integration tallies reconciled against final on-disk state).' : ''),
+  // 3.5.0 (plan section 4). The completion payload is the one thing a resumed turn reliably reads
+  // after a long background run: compaction keeps only the head of go/SKILL.md, and its step 5 is
+  // far below that. So the command lives HERE, with this run's own stopReason and mode already in
+  // it. `--if-cycle` prints nothing and reads no store outside a planned cycle, which keeps a
+  // plan-less run's ending exactly as before. Only this return carries it: an aborted run's `reason`
+  // is its next step, and no abort above gains a nextStep.
+  nextStep: `Run: bash ${sq(CYCLE)} status --if-cycle --after-run ${stopReason} --mode ${mode} — print its output verbatim (it prints nothing outside a planned cycle).`,
 }

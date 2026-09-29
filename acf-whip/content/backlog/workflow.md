@@ -214,8 +214,34 @@ Every schema-bearing agent call the orchestrator makes — bootstrap, scan, the 
 
 ## Run & resume model
 
-git plus `.backlog/` are the only durable state — **re-running `/go` is the resume**. A fresh run re-scans from disk and reconstructs the identical plan; the only loss across a Claude Code restart is the in-session agent cache and any in-flight worktree edit, which surfaces as a stale in-progress task that clean-checkout's stash and the timeout recover. `Block-Count` and `Rejection Count` are front-matter, so the loop-breaker and retry budgets also survive a restart. The workflow path also writes a gitignored `.backlog/.acfw-run.json` heartbeat each iteration for observability; the design does not depend on it.
+git plus `.backlog/` are the only durable state (and, for a planned cycle, its `docs/cycles/` folder) — **re-running `/go` is the resume**. A fresh run re-scans from disk and reconstructs the identical plan; the only loss across a Claude Code restart is the in-session agent cache and any in-flight worktree edit, which surfaces as a stale in-progress task that clean-checkout's stash and the timeout recover. `Block-Count` and `Rejection Count` are front-matter, so the loop-breaker and retry budgets also survive a restart. The workflow path also writes a gitignored `.backlog/.acfw-run.json` heartbeat each iteration for observability; the design does not depend on it.
+
+## Planned cycles in git (3.5.0)
+
+A planned cycle is the folder `docs/cycles/YYYYMMDD-<slug>/`: `plan.md` is the spec (yours), `record.md` holds the approval stamp, the deliverable-to-task map and the Plan Log (written only by `acfw-cycle`), and `retro.md` is written by `/retro`. **Tasks never edit cycles.** `integrate-lpcas` strips `docs/cycles/` from every candidate it lands and prints a WARN naming each dropped path, so neither a task that works in a worktree nor a conflict resolver can land a plan edit. A candidate whose only change was under `docs/cycles/` still lands its ledger marker, with a second WARN saying the task delivered nothing. A `Worktree: none` task never passes through the integrator: the single writer commits the deliverable files it lists, so it must never list a path under `docs/cycles/` (a plan changes only through `/whip`). The doctor's `dirty-trunk-root` check ignores `docs/cycles/`, where a human edits `plan.md` at the root by design.
+
+Every cycle event that reaches git is its own pathspec commit, never folded into a task or state commit:
+
+- **Subject**: `docs(plan): <event> <slug>`, for example `docs(plan): approve owner-seat-notice` or `docs(plan): decompose owner-seat-notice`. The slug is the folder name without its date, cut short so the subject stays within 50 characters.
+- **Trailer**, one line per event: `ACFW-Plan-Event: <event> <c12> <cycle-id>`, for example `ACFW-Plan-Event: approved 3f9c0a1b2d4e 20260928-owner-seat-notice`. `<c12>` is the first 12 hex characters of the plan's content hash (`v1:` plus the git hash of the normalized `plan.md`).
+
+**Plan trailers are audit only.** Nothing reads one to decide anything. The approval gate is a content check made from HEAD: `Approved Content` in `record.md`, the newest `approved` row of its Plan Log, and the hash of `plan.md` must all agree. A missing, indented or dropped trailer gives one WARN in `/whip` status and never a refusal. (Other `ACFW-*` trailers are not audit-only: `ACFW-Stage:` is the proof a child-workflow stage landed. Never strip or reword any `ACFW-*` line.)
+
+Which merge methods keep plan trailers:
+
+| Merge method | Plan trailers |
+|---|---|
+| Merge commit | Kept: the original commits stay in history unchanged |
+| Rebase, or fast-forward | Kept: each commit is replayed with its own message |
+| Squash | May be dropped, or indented inside the squashed message body. Only a WARN; the gate still passes because it never read them |
+
+## Operator gates — when to page a HUMAN (not review criteria)
+
+These say when a run must stop and ask a person. They are **not** criteria for accepting or rejecting a task; do not review against them. The normative list lives in the `/whip` skill (`skills/whip/SKILL.md`, "Gates and non-gates"). In short:
+
+- **Gates**: plan approval (including a blocking spec tool's NO-GO), retro action-item approval, parked work (blocked at the cap, dependency-missing, draft, a failed deliverable), and ship.
+- **Non-gates**: a rejection under the cap, a merge conflict, a red gate inside a worktree, a retry, an implementation choice the acceptance criteria leave open, advisory critique or findings, a plan without D headings, a missing sibling plugin, a spec tool that could not run.
 
 ---
 
-**Last Updated**: 2026-06-01
+**Last Updated**: 2026-09-28

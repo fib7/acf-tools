@@ -2,6 +2,11 @@
 # Install: https://pre-commit.com/
 # Usage: pre-commit install
 
+# acf-whip: acfw-cycle hashes docs/cycles/ and commits it itself, so no hook may rewrite it.
+# plan.md is bound to the exact bytes you approved and record.md is verified after each commit:
+# a whitespace fixer or a markdown formatter that touches either one fails that commit.
+exclude: '^docs/cycles/'
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
