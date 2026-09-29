@@ -71,7 +71,7 @@ color: orange
 **CANNOT:**
 
 - Define quality gate commands → quality gates documentation (single source of truth)
-- Modify process → retro (exclusive authority)
+- Change the workflow or quality process → a `/retro` action item, approved by a human
 
 **NEVER:**
 

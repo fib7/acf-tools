@@ -41,7 +41,7 @@ The following agents are available in this project:
 - **task-engineer**: Task decomposition (WHAT/WHY only, no HOW)
 - **quality-reviewer**: Binary accept/reject decisions
 - **lean-architect**: System architecture (WHAT/WHY, max 2-3 line code snippets)
-- **retro**: Process improvement and retrospectives
+- **retro**: Retrospectives: root causes, one-rule lessons, proposed action items (a human approves every change)
 - **precommit**: Pre-commit hook configuration
 - **research-agent**: Evidence-based research with Perplexity/Context7
 
@@ -225,6 +225,14 @@ Stack-specific quality gates are documented in:
 
 ## Commands
 
+### Where Am I
+```bash
+/whip
+/whip "<goal>"
+```
+Shows the cycle stage, what needs you, and the one command to run next. With a goal, small work goes
+straight to `/task`; risky work gets a plan you approve with one "yes".
+
 ### Task Decomposition
 ```bash
 /task "Scope description"
@@ -241,7 +249,10 @@ Executes entire backlog until 100% complete (all tasks in accepted/blocked). Loo
 ```bash
 /retro
 ```
-Analyzes blocked/rejected tasks, creates improvement tasks. Two-phase: retro agent → task-engineer.
+Closes a planned cycle. A clean cycle closes with zero agents. When a task was reworked or stuck, or a
+deliverable is not met, a retro agent writes the retro doc, at most 3 one-rule lessons in
+`docs/acf/lessons/`, and a retro-actions cycle you approve like any plan. It never creates tasks, edits
+agent files, or deletes a lesson itself. `/retro --force <task>...` analyzes work done without a plan.
 
 ### Generate Specialist Agents
 ```bash

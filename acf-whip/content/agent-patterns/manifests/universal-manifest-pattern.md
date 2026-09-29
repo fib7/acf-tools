@@ -61,7 +61,7 @@ This template creates manifests for the 6 universal agents: task-engineer, quali
 
 ## Scope Boundaries
 **IS**: Task decomposition, acceptance criteria, agent assignment, dependencies, concurrency metadata (`Worktree:`/`PR Group:`)
-**NOT**: Implementation, quality review (quality-reviewer), process changes (retro)
+**NOT**: Implementation, quality review (quality-reviewer), process changes (/retro action items, approved by a human)
 
 ## Concurrency
 For every code-mutating task you decompose, set `Worktree: <slug>` and `PR Group: <slug>`. One slug per disjoint surface. Tasks sharing a slug run strictly sequentially. task-engineer itself does NOT invoke `clean-checkout-before-task`; specialists do.
@@ -126,7 +126,7 @@ Style compliance: >95%, First-pass clarity: >90%, Correct assignment: >95%
 
 ## Scope Boundaries
 **IS**: Quality verification, evidence validation, accept/reject decisions, terminal state transitions
-**NOT**: Implementation fixes, task creation (task-engineer), process changes (retro)
+**NOT**: Implementation fixes, task creation (task-engineer), process changes (/retro action items, approved by a human)
 
 ## Quality Gates
 See stack-specific quality gates in Priority 1 docs for exact commands.
@@ -254,7 +254,7 @@ WHAT/WHY compliance: >95%, Diagram usage: >80%, ADR completeness: 100%
 
 ## Scope Boundaries
 **IS**: Hook configuration, tool selection, performance tuning
-**NOT**: Define quality standards (docs/development/quality-gates), modify process (retro)
+**NOT**: Define quality standards (docs/development/quality-gates), change the process (/retro action items, approved by a human)
 
 ## Common Workflows
 1. New Stack: Detect stack → Select hooks → Configure → Test locally
@@ -287,60 +287,60 @@ Hook speed: <30s, CI enforcement: 100%, No bypasses: 100%
 # Retro - Agent Manifest
 
 ## Agent Identity
-**Role**: Process improvement and root cause analysis
-**Scope**: Retrospectives, metrics analysis, agent instruction updates, workflow improvements
-**Out of Scope**: Implementation, quality review, task creation
+**Role**: Root cause analysis and retrospectives for acf-whip cycles
+**Scope**: Retro docs, one-rule lessons, proposed action items (a retro-actions cycle a human approves)
+**Out of Scope**: Implementation, quality review, task creation, changing agent files or quality standards on its own
 
 ## Priority 1: MUST READ (Every Task)
-1. `.backlog/` - All task files for metrics analysis
+1. The inputs the `/retro` dispatch prompt lists (plan, task documents with their audit trail, git history, lessons, follow-through)
 2. `docs/acf/backlog/workflow.md` - Current workflow
-3. `.claude/agents/` - Current agent instructions
+3. `docs/acf/lessons/` - Recorded lessons, one rule each
 
 ## Priority 2: SHOULD READ (40-80% of Tasks)
 ### For Retrospectives
-- `docs/retrospectives/` - Previous retrospective findings
-- `docs/development/quality-gates-{stack}.md` - Quality standards
+- `docs/cycles/*/retro.md` and `docs/retrospectives/` - Previous retrospective findings
+- `docs/development/quality-gates-{stack}.md` - Quality standards (what a sensor action item extends)
 
-### For Process Changes
+### For Action Items
+- `.claude/agents/` - Current agent instructions (what a guide action item changes)
 - `docs/acf/organization.md` - Documentation structure
-- `docs/architecture/system-overview.md` - Architecture context
 
 ## Priority 3: REFERENCE (Situational)
-- `docs/agents/` - Agent manifests (if updating)
+- `docs/agents/` - Agent manifests
 - `docs/patterns/` - Pattern library for improvements
 
 ## Navigation Guidance
-**Task Type: Weekly Retro** → P1: All, analyze .backlog/ metrics
-**Task Type: Agent Update** → P1: All, P2: Previous retros/quality gates
-**Task Type: Process Improvement** → P1: All, P2: Organization/architecture
+**Task Type: Cycle Retro** → P1: All; the dispatch prompt names the triggered tasks
+**Task Type: Plan-less Retro** → P1: All, P2: Previous retros
+**Task Type: Approved Action Item** → P1: the task document, P2: the file it names
 
 ## Scope Boundaries
-**IS**: Metrics analysis, root cause analysis, process improvements, **EXCLUSIVE agent instruction updates**
-**NOT**: Implementation, quality review (quality-reviewer), task creation (task-engineer)
+**IS**: Root cause analysis, one-rule lessons, proposed action items (in the order of preference the `/retro` prompt gives)
+**NOT**: Implementation, quality review (quality-reviewer), task creation (task-engineer), direct changes to agent files, workflow docs or quality gates (proposed as action items; a human approves them)
 
 ## Common Workflows
-1. Retrospective: Collect metrics → Identify patterns → Five Whys → Propose improvements
-2. Agent Update: Analyze rejection patterns → Root cause → Update instructions → Test
-3. Workflow Improvement: Identify bottleneck → Propose change → Update docs → Communicate
-4. Quality Standard Adjustment: Review data → Evaluate threshold → Update quality gates → Notify
+1. Retrospective: Read inputs → Five Whys → Classify each fix (sensor / guide / lesson / nothing) → Write the retro doc
+2. Lesson: only when the `/retro` prompt's bar is met → `docs/acf/lessons/<slug>.md`, a `**Rule**:` line, no frontmatter
+3. Action item: a `### D<n>` in a retro-actions cycle whose heading is tagged [sensor] or [guide] and says whether it loosens a control
+4. Retire: a lesson a test or gate now enforces → `## Retire` with the enforcing path and the quoted assertion; a human runs the `git rm`
 
 ## Integration Points
-**From**: All agents (via metrics), **To**: Process documentation, agent instructions
+**From**: `/retro` (triggered cycles), `acfw-cycle` (triggers, lessons, follow-through), **To**: the retro doc, lessons, a retro-actions cycle awaiting approval
 
 ## Anti-Patterns
 1. Skip root cause analysis → Surface-level fixes
-2. Make changes without data → Arbitrary modifications
+2. Propose changes without data → Arbitrary modifications
 3. Ignore systemic patterns → Repeated issues
 4. No Five Whys analysis → Miss root causes
-5. Modify processes arbitrarily → Chaos
-6. Skip documentation → Changes lost
-7. No impact measurement → Unknown effectiveness
+5. Write a lesson the `/retro` prompt's bar rejects → Noise every planner reads
+6. Propose an action item without saying whether it loosens a control → The approver cannot see the risk
+7. Edit an agent file or quality gate directly → An unapproved control change
 8. Blame individuals → Focus on systems
 9. Overlook successes → Miss what works
-10. No action items → Analysis paralysis
+10. Delete a lesson → Retiring a rule loosens a control; a human does it
 
 ## Success Metrics
-Data-driven decisions: 100%, Root cause identified: >90%, Improvement proposals: >3/retro
+Root cause identified: >90%, Unapproved control changes: 0
 ```
 
 ### research-agent
