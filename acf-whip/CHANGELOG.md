@@ -2,6 +2,64 @@
 
 All notable changes to acf-whip. The format loosely follows Keep a Changelog.
 
+## 3.6.0: `/whip --auto` runs the cycle until a judge finds the goal met
+
+The 3.5.0 cycle hands control back to you after every step. `/whip "<goal>"` prints `/task`, `/task`
+reports and waits, `/go` reports and waits, and `/retro` is yours to type. Nothing decides whether
+the goal was reached, and nothing starts another round when it was not.
+
+### Added
+
+- **`/whip --auto [--approve] [--until "<condition>"] [--rounds <n>] "<goal>"`.** It routes the goal as
+  usual, then runs `/task`, `/go` and, for a planned cycle, `/retro` by itself. When the round's work
+  is finished, a judge decides whether the condition holds. The condition defaults to the goal.
+  Without a goal, `/whip --auto` drives the cycle or focus already in flight. `/whip --auto off` stops
+  a run, and `/whip --auto on` resumes it; `on --rounds <n>` continues a run that used its rounds.
+  `on` refuses a run the judge found `impossible`.
+- **A Stop hook drives it** (`hooks/handlers/autopilot-stop.sh`). With no run in the checkout it costs
+  a few file tests per turn end, and no git call. With a run, `skills/lib/bin/acfw-autopilot tick` reads
+  `acfw-cycle status` and hands the session exactly one step: `/task --plan <path>`, `/go <ids>`
+  (explicit ids, so `/go` asks no focus confirmation), `/retro <ID>`, or the round's goal through
+  `/whip`. While a background workflow runs, the hook does nothing: the run's report starts the next
+  turn. The step goes out as the hook's block reason, so it survives compaction.
+- **A judge decides whether the goal is met.** At round end the session dispatches a fresh subagent
+  whose prompt comes from `skills/lib/autopilot-judge.md`. The judge runs the tests, reads the plan
+  and the code, and never takes a summary as evidence. It records `met`, `not-met` or `impossible`
+  with `acfw-autopilot verdict --nonce <n>`. A verdict counts only for the current nonce, at the HEAD
+  and working-tree diff it was issued at. `not-met` starts the next round with the judge's next goal,
+  up to `--rounds` (default 3, at most 10).
+- **Pre-approval, opt-in only.** With `--approve`, or a committed `ACFW_AUTOPILOT=approve`, the hook
+  approves the plans created during the run, retro-actions cycles included, through
+  `acfw-cycle approve --via autopilot`. The Plan Log row then reads `ds=...; via autopilot`. It
+  refuses a plan created before the run started and a plan with a `[loosens: yes` heading. Any
+  `approve` refusal pauses the run. An uncommitted `ACFW_AUTOPILOT=approve` counts as `on`, with a
+  WARN, so a local edit cannot loosen the gate.
+- **A project default.** `ACFW_AUTOPILOT=on` (or `approve`) and an optional `ACFW_AUTOPILOT_UNTIL` in
+  the config file make every `/whip "<goal>"` a run. `/whip --no-auto "<goal>"` opts one goal out.
+
+### Changed
+
+- **`/whip` stop rules.** Rule 11 gains one exception: do exactly the step an `acf-whip autopilot`
+  message names. New rule 13: only a message the user typed answers a card, `--approve` passes only
+  from the user's own message, and only the judge subagent records a verdict.
+- **Bare `/whip`** adds one `autopilot:` line when a run exists.
+- **Small route.** Under a run, the small route invokes `/task` instead of printing it.
+- **`/whip-init`.** It writes a commented `# ACFW_AUTOPILOT=off` line into a new config file on every
+  store, and names `/whip --auto` in the CLAUDE.md Commands line it adds.
+
+What still stops for you: every NEED YOU card, parked work (blocked or draft focus tasks), a blocking
+spec tool, and every `approve` refusal. A plan that loosens a control, overrides, lesson retirement
+and pushes also wait for you. A paused run says why in one line, then resumes by itself once the card
+is resolved. It never repeats a step that did not start: that pauses it. It stops after 60 steps.
+
+Tests: `phase23-autopilot` (69 checks: the step mapping, the stall rule, pauses, the judge's nonce
+and binding, rounds, pre-approval, the setting, session binding). phase17 adds 4 stop-rule checks.
+
+### Upgrading
+
+Nothing to do. The hook stays silent until you start a run. To make hands-off the default in an
+existing project, add `ACFW_AUTOPILOT=on` to acf-whip's config file.
+
 ## 3.5.1: a missing clean-checkout token can no longer loop a run
 
 A team ran one real feature, ENG-101, with `/task` and a first `/go` on 3.2.3, then the main `/go` on
