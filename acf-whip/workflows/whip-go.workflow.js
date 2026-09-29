@@ -1984,6 +1984,12 @@ const rejectedStems = []
 const autoRejectedStems = [] // review-time clean-checkout auto-rejects; rejectedStems only ever held integrateOne's
 const tokenStrandSeen = new Map()  // stem -> times this run hit the missing-token MECHANISM arm
 const tokenStrandedStems = []      // stems parked because the token never came back (see that arm)
+// The LAST token-relevant event per stem: 'parked' when the missing-token arm parks it, 'accepted' when a
+// review later accepts it. tokenStrandedStems is append-only, so without this a task that was parked,
+// re-dispatched (which re-records the token) and then accepted still showed in needsOperator as "token
+// never restored" on a run that ended complete: the 3.5.0 canary's own summary had to explain the
+// report away. Only a stem whose last event is still 'parked' needs an operator.
+const tokenLastEvent = new Map()
 const attemptedIntegrate = new Set() // every stem handed to integrateOne — used to reconcile the report
                                      // against disk (WS5 / retro #9): an attempted stem now in rejected/
                                      // was rejected at integration even if the agent failed to emit it.
@@ -2599,6 +2605,7 @@ Return the ScanResult.`
         }
         log(`⚠ ${t.stem}: clean-checkout token still missing after ${seen} reviews — parking in blocked/ for an operator instead of re-reviewing forever`)
         tokenStrandedStems.push(t.stem)
+        tokenLastEvent.set(t.stem, 'parked')
         // inc: 0 — this is mechanical. Charging a life for a token the orchestrator itself could not
         // write would spend the task's three rejections on a fault it never caused.
         await streamWrite([{ stem: t.stem, toState: 'blocked', agent: 'orchestrator', notes: `clean-checkout token absent on ${seen} consecutive reviews while ${branchPrefix}/${t.slug} exists. The token's only writer runs at dispatch, so no further review can restore it; a re-dispatch re-records it once that worktree is clean — verify the branch, then re-run /go to re-dispatch.`, inc: 0 }], `review#${iter}:${t.stem}`)
@@ -2645,6 +2652,7 @@ Return the ScanResult.`
     // which would make retry quality go down rather than up.
     await streamWrite([{ stem: t.stem, toState: rv.toState, agent: t.agent || 'orchestrator', notes: (rr.notes || '').slice(0, 400), inc: rv.inc }], `review#${iter}:${t.stem}`)
     productiveDispatch = true
+    if (rv.toState === 'accepted' && tokenLastEvent.has(t.stem)) tokenLastEvent.set(t.stem, 'accepted')
     if (rv.toState === 'accepted' && mode === 'default' && codeSlug(t)) await serializeIntegrate(() => integrateOne(t))
   }
 
@@ -2908,7 +2916,7 @@ const depParked = [...parkedThisRun].filter((s) => !capParkedStems.has(s)).map((
 // cap filter above nor parkedThisRun. Surface it on its own or the one class of park the operator
 // cannot fix from the task file alone would be the one class the report omits.
 const alreadyParked = new Set([...capParkedStems, ...parkedThisRun])
-const tokenParked = [...new Set(tokenStrandedStems)].filter((s) => !alreadyParked.has(s))
+const tokenParked = [...new Set(tokenStrandedStems)].filter((s) => !alreadyParked.has(s) && tokenLastEvent.get(s) === 'parked')
   .map((s) => ({ stem: s, blockCount: 0, rejectionCount: 0, needsTask: 'clean-checkout token never restored — verify the worktree branch, then re-run /go to re-dispatch' }))
 const needsOperator = [...capParked, ...depParked, ...tokenParked]
 // Tasks the run REFUSED to touch, and why. `completed` is true only when the run both reached

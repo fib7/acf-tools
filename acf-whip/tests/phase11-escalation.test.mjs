@@ -632,6 +632,7 @@ async function runGo(cfg) {
   check('14s ...and its re-dispatch re-records the token before the harness runs', at(cyc, 'restore') > parkAt && at(cyc, 'restore') < cyc.calls.seq.indexOf('workflow:impl', parkAt))
   check('14t ...so the cycle ENDS: accepted and integrated, run complete', cyc.model.get('t1').folder === 'accepted' && cyc.model.get('t1').hasIntegratedAt === true && cyc.report.completed === true)
   check('14u ...parked exactly once (the replay no longer re-parks it)', cyc.calls.writer.filter((w) => w.toState === 'blocked').length === 1)
+  check('14u2 ...and the report does not list it as needing an operator (the park was lifted and it was accepted)', !(cyc.report.needsOperator || []).some((n) => n.stem === 't1'))
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -182,6 +182,10 @@ history. The small-work route, `/task "<scope>"` then `/go`, is unchanged.
   formatters no longer touch `.backlog/`, `.acfwhip/`, `docs/acf/` or `docs/cycles/` (a formatted
   managed doc can never refresh again, and a reflowed ledger marker failed the integration commit);
   a frontend next to a Go or Python backend gets its own gates doc; the ruff pin moves to v0.16.9.
+- **A healed task stayed on the "needs operator" list.** A task parked for a missing clean-checkout
+  token, re-dispatched and then accepted still appeared in the run report as "token never
+  restored" on a run that ended complete. The report now lists only tasks whose last token event
+  is still the park.
 - **The templates disagreed about who moves task files.** `README.sample.md` and several agent and
   manifest templates told specialists and the reviewer to move task files; `workflow.md` gives every
   move to `/go`. They now agree. The research-agent template no longer relies on
