@@ -1,7 +1,7 @@
 ---
 name: task
 description: Decompose scope into atomic tasks using task-engineer agents. Pure orchestration - NEVER implements anything.
-argument-hint: "[scope description]"
+argument-hint: "[scope description] | --plan [<cycle ID or docs/cycles/<ID>/plan.md>]"
 allowed-tools:
   - Read
   - Grep
@@ -24,6 +24,88 @@ Pure delegation tool that decomposes complex scope into independent atomic tasks
 
 ---
 
+## Plan mode: `/task --plan [<cycle>]`
+
+`/task --plan` decomposes an approved cycle plan (`docs/cycles/<ID>/plan.md`, drafted and approved
+through `/whip`) instead of free text. After you answer "yes" on an approval card, `/whip` starts it for
+you. You can also run it by hand. If the argument does not start with `--plan`, skip this section: the
+run is free text and everything below applies unchanged.
+
+Do these in order:
+
+1. **Read the argument.** Everything after `--plan` is ONE plan reference: a cycle ID
+   (`20260928-owner-seat-notice`) or a path (`docs/cycles/<ID>/plan.md`, `docs/cycles/<ID>/`). If
+   anything else follows it (free text, a second path), refuse and stop with:
+   `--plan takes the plan and nothing else. Put extra work in the plan and re-approve it with /whip <cycle>, or run it separately as /task "<scope>".`
+   Never merge free text into a plan run, and never quietly drop it.
+2. **No reference given** (`/task --plan` alone): run
+   `bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-cycle" status` and read its `NEXT` line. If it reads
+   `NEXT /task --plan <path>`, use that path. Otherwise print the status output verbatim and stop.
+   Never guess a cycle.
+3. **The Workflow tool is required.** Plan mode exists only in the workflow; the legacy loop below
+   has no plan mode. If the `Workflow` tool is unavailable or the call is refused, print this and stop:
+   `/task --plan needs the Workflow tool. Without it, run: /task "Implement docs/cycles/<ID>/plan.md (D1..Dn)"`
+   That fallback decomposes the plan as free text with deliverable coverage off: the cycle record does
+   not map those tasks to deliverables, so `/whip` cannot show coverage for them. Say so.
+4. **Launch** with steps 1 and 2 of the workflow path below, passing `planPath: "<the reference, verbatim>"`
+   and **no `scope`**. The workflow validates the reference and re-checks the approval against HEAD
+   itself. Do not pre-check approval, coverage or locks in prose.
+5. **Report** by what comes back:
+   - `aborted: true` with `stopReason: "check-refused"`: print `reason` and `nextStep` verbatim and
+     stop. The plan is not approved at HEAD, another decomposition of it holds the lock, `/go` is
+     running, or git is in a state that refuses. Do not retry, do not route around it, and remove a
+     lock only if the reason itself tells you to.
+   - `aborted: true` with `error`: the reference is not a cycle. Print `error` and `nextStep`, stop.
+   - `aborted: true` with `defects`: the same as a free-text run (workflow step 3).
+   - `aborted: true` with `reason` and no `stopReason` or `defects`: the check answered with something
+     the run could not use, or no specialist agents are installed. Print `reason` and `nextStep`
+     verbatim and stop. The run already released the lock it took.
+   - `phase: "noop"`: every deliverable already has tasks. Say so and print `nextStep`.
+   - `phase: "complete"`: report as for free text, plus the `cycle` block: `cycle.decomposed` (the
+     deliverables this run planned), `cycle.record` (the task map line), and `cycle.coverageGaps`
+     (deliverables still without a task; advisory, and a re-run of `/task --plan` decomposes exactly
+     those). Say that the focus now holds this plan's unfinished tasks, so a bare `/go` runs the cycle
+     and nothing else. If `cycle.dropped` is not empty, name those ids: each one already belonged to
+     an existing task, so the store refused it and this run's claim on it was taken back out of the
+     cycle record. Someone else's task is then neither in the cycle record nor in your focus. One of
+     this cycle's own tasks from an earlier run keeps the deliverables it already had.
+   - `phase: "complete"` with a `review` block: a spec tool reviewed the tasks (see "Task-stage spec
+     review" below). A task in `review.held` is still this cycle's task and still covers its
+     deliverables, but it sits in draft and the focus leaves it out. Print its `next` command. A task
+     in `review.waiting` is in the focus but depends on a held one, so a bare `/go` does not run it yet.
+   - `phase: "complete"` with `cycle.recorded: false`: nothing was created, whatever was authored.
+     `created` is empty, the focus was not touched, and `cycle.unrecorded` lists the documents that
+     were written but never created. Print `nextStep` verbatim. When `cycle.record` starts with
+     `LOCK|lost`, another `/task --plan` took this plan over while this run was planning (this run ran
+     longer than the 30-minute lock window). Do not re-run to "win" it: that run is decomposing the
+     same deliverables. Run `/whip` to see where the cycle stands.
+
+What plan mode does that free text does not:
+- Planners read a **frozen copy** of the approved plan (`.acfwhip/run/cycle/<ID>/<content>.md`),
+  never the working-tree `plan.md`, so an edit nobody approved can never be built.
+- Only **uncovered** deliverables are decomposed. A fully covered plan is a no-op.
+- Every task names the deliverables it implements. The validation gate rejects a task that names none,
+  or names only deliverables that other tasks already cover (a duplicate).
+- Each task carries `- **Documentation**: docs/cycles/<ID>/plan.md (D2, D4)` and, in its Out of Scope,
+  `Implement only D2, D4 of docs/cycles/<ID>/plan.md; plan.md is read-only.`
+- The writer runs `acfw-cycle record` **first**, so the task map is committed before any task exists.
+  Every command that creates, stages, commits or sets the focus runs only after record succeeded, so
+  a refused record creates nothing.
+- A new task never reuses an existing id. The validation gate refuses an id the backlog already has.
+  If one still collides when the store creates it, the writer takes it back out of the cycle record in
+  the same command, so a teammate's task never counts as this plan's coverage or enters your focus.
+- The run focus is **set** (replaced) to the cycle's unfinished tasks. A free-text `/task` adds to it.
+- The decomposition lock is released on every exit the run controls, and only while it still carries
+  this run's stamp, so a run never deletes another run's lock. If a run is killed, the lock expires
+  after 30 minutes, and `/whip` prints its age and the `rm` command to clear it sooner. A run that
+  outlives the 30 minutes and finds its lock taken over stops before recording anything.
+
+**Lessons apply in both modes.** The planners and the critic run
+`acfw-cycle lessons` (read-only) and copy a relevant rule into the `constraints` of any task that walks
+into it. `/retro` records those rules in `docs/acf/lessons/`.
+
+---
+
 ## Execution: workflow-first, legacy fallback
 
 acf-whip ships a deterministic decomposition **workflow** that enforces worktree slugs and an
@@ -35,20 +117,26 @@ script, not in your context.
 
 1. Resolve the environment with one bash call at the repo root:
    ```bash
-   echo "PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT"
+   echo "PLUGIN_ROOT=${CLAUDE_PLUGIN_ROOT}"
    echo "TRUNK_ROOT=$(git rev-parse --show-toplevel)"
    echo "TRUNK_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)"
-   bash "$CLAUDE_PLUGIN_ROOT/skills/lib/bin/acfw-store" info
+   bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-store" info
+   echo "SPEC_TASK_TOOLS=$(bash "${CLAUDE_PLUGIN_ROOT}/skills/lib/bin/acfw-spec" list --at task --machine 2>/dev/null | grep -c '^TOOL|')"
    ```
    The `acfw-store info` line is one JSON object; step 2 consumes three fields from it: the active
    task-store backend (`store`, default `files`), the per-tier model routing (`models`) and the
-   shell-tier effort pin (`efforts`). Pass all three through verbatim.
+   shell-tier effort pin (`efforts`). Pass all three through verbatim. `SPEC_TASK_TOOLS` is the number
+   of spec tools that review tasks (declared in `.acfwhip/spec-tools/` with `at=` naming `task`); it is
+   `0` in a project without them, and then nothing about the run changes.
 2. Launch the workflow (runs in the background; intermediate state never enters your context):
    ```
    Workflow({
      name: "acf-whip:whip-task",
      args: {
        scope: "<the full /task argument text, verbatim>",
+       // Plan mode ONLY (3.5.0): the --plan reference, verbatim, INSTEAD of scope. Never pass both:
+       // the workflow refuses the pair rather than merge free text into an approved plan.
+       planPath: "<cycle ID or docs/cycles/<ID>/plan.md>",
        pluginRoot: "<PLUGIN_ROOT>",
        trunkRoot: "<TRUNK_ROOT>",
        trunkBranch: "<TRUNK_BRANCH>",
@@ -64,7 +152,11 @@ script, not in your context.
        // command and copy stdout into a schema — the registry ls, both writers, the doctor.
        // `models.judge` (planners, judge, critic) and `models.author` (task documents) ship unset,
        // which inherits the session model.
-       models: <info.models>, efforts: <info.efforts>
+       models: <info.models>, efforts: <info.efforts>,
+       // OPTIONAL (3.5.0). Pass SPEC_TASK_TOOLS from step 1 as a number when it is above 0, and
+       // omit it when it is 0. It turns on the Review phase (see "Task-stage spec review" below).
+       // Leaving it out when it is above 0 writes tasks no spec tool reviewed, so never drop it.
+       specTaskTools: <SPEC_TASK_TOOLS>
      }
    })
    ```
@@ -74,6 +166,11 @@ script, not in your context.
    the operator never has to name ids for the work they just planned. `/go --all` remains the way to
    run the whole backlog. `models`/`agentsByTier` report which tier ran how many agents — counted
    where an agent is charged, so a retried call shows up as the two agents it actually cost.
+   When the report has a `review` block, the tasks were reviewed by spec tools before they were
+   written: report it as described under "Task-stage spec review" below. A task in `review.held`
+   is **not** in the focus, and a bare `/go` will not run it. A task in `review.waiting` is in the
+   focus, but it depends on a held task, so `/go` will not run it until that task is released: do
+   not count it among the tasks a bare `/go` runs now.
    If it returns `aborted: true`, surface the `defects` list and
    **STOP** — do NOT hand-write task files to route around the validation gate. If it returns
    `error`, **or the `Workflow` call is refused outright**, fall back to the legacy path below — a
@@ -81,10 +178,65 @@ script, not in your context.
    `scriptPath` and never edit the user's settings.
 4. Do **not** also run the legacy steps — the workflow replaces them.
 
+### Task-stage spec review
+
+A spec tool is a reviewer a project declares in `.acfwhip/spec-tools/<name>` (`/whip --tools add
+<name>` sets one up). One whose `at=` names `task` reviews every task `/task` authors, before it is
+written to the task store. Without such a tool, none of this happens.
+
+What the run does when one exists:
+- Authors write every task document to `.acfwhip/run/staging/` first, on the `files` store too, so
+  a bare `/go` never sees a task nobody reviewed.
+- One shell agent runs the review. The script checks that every verdict line arrived and asks once
+  more if some did not; finished tools come from the review cache, so that costs nothing.
+- A task a `policy=block` tool rejects with findings gets ONE repair round: a task-engineer reads the
+  findings and edits the body only. If the repair changed the title, the Metadata section or the
+  Transition Log, the original document is put back. Then the task is reviewed again.
+- A task a `policy=block` tool still rejects is **held in draft**. It is created (and, with `--plan`,
+  recorded as the cycle's task), but in `draft`, with a Transition Log row like
+  `| <time> | pending | draft | spec-review | held: no-tbd nogo n=2; /whip --review <stem> |`,
+  and it is **not** added to your focus.
+- A tool that could not run (verdict `skip`) or failed (`error`) never holds a task. An `advisory`
+  tool never holds a task either; its findings are reported and nothing else happens.
+- A `block` tool with no result it can stand behind for those exact bytes reports `nogo`, so the
+  task is held: the tool is not trusted on this machine yet, its declaration has local edits, the
+  task document holds a credential literal, or the review ran out of time. Its `path` in the report
+  is then a `held.md` that says which, and no repair runs, because no edit to the task fixes it. If
+  the verdicts could not be read back, even after the second try, every `block` tool that has no
+  verdict for a task holds that task too. No tool gave a verdict there, so the entry is marked
+  `unreviewed` and the row says `held: <tool> unreviewed (verdict not relayed)`. The run reads the
+  list of tools twice (once at the start, once with the verdicts). If neither list arrived whole
+  either, it cannot tell which tools block, so it holds each such task under the name `unknown`.
+- A task that depends on a held task is not held, and it goes into your focus, but `/go` will not
+  run it until the held task is released. It is listed in `review.waiting` with the held ids it
+  waits on.
+
+How to report `review`: say how many tasks were reviewed and by which tools (`review.tools`). If
+`review.verdicts` is 0, say that no tool actually reviewed anything (spec tools are switched off
+with `ACFW_SPEC=off`, or the declarations went away during the run). If `review.relay` starts with
+`short:`, say that the verdicts did not all arrive and that some tasks may be held for that reason
+alone. Name each repaired task, and say when `metaRestored` is true
+(the repair touched metadata, so it was thrown away). For each entry of `review.held`, print the id,
+each tool with its `n` (or `unreviewed` when the entry says so), and the `next` command. For each
+entry of `review.waiting`, say which held task it waits on. For `review.notes`, give one line per
+advisory finding, skip or error. Do not re-run the review yourself, and do not move a held task out
+of draft.
+
+Releasing a held task is the user's call: `/whip --review <stem>` shows why it was held. After fixing
+the task, `/whip-move <stem> pending` releases it, and `/whip-focus add <stem>` (or `/go <stem>`)
+runs it.
+
+The legacy loop below runs no task-stage review. If `SPEC_TASK_TOOLS` was above 0 and you fall back
+to it, tell the user that the tasks it wrote were not reviewed by spec tools, and that
+`/whip --review <stem>` reviews one.
+
 **Launch by NAME, never by path.** `scriptPath` is checked against the readable set (the working
 directory plus any added directory); on a real marketplace install the plugin lives under
 `~/.claude/plugins/cache/`, which is neither, so a `scriptPath` launch is refused for every user who
 installed this plugin normally. The registry resolves `acf-whip:whip-task` without touching a path.
+
+**The legacy loop has no plan mode.** A `/task --plan` run never falls back to it (see Plan mode,
+rule 3).
 
 **The legacy loop is `files`-backend ONLY.** It writes and commits task documents directly into
 `.backlog/pending/`. On `beads`, `multica`, `linear` or a third-party adapter there is no such
@@ -545,6 +697,14 @@ API authenticates users and issues JWT tokens.
 
 ```bash
 /task "Migrate user service from REST to GraphQL API. Maintain backward compatibility with v1 endpoints during transition."
+```
+
+### From an Approved Plan
+
+```bash
+/task --plan 20260928-owner-seat-notice
+/task --plan docs/cycles/20260928-owner-seat-notice/plan.md
+/task --plan        # the cycle /whip says is next
 ```
 
 ---

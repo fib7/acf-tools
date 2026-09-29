@@ -220,6 +220,11 @@ nothing to commit, working tree clean
 - **AUTO-LOADED** (don't list): CLAUDE.md, agent manifests (docs/agents/*.md)
 - **VERIFY**: task-engineer validates all referenced files exist before task creation
 - **USE "none"**: When only auto-loaded docs needed
+- **PLANNED TASKS**: a task decomposed from an approved cycle plan (`/task --plan`) lists that plan with a
+  `(D<n>, ...)` suffix naming the deliverables it implements: `docs/cycles/<ID>/plan.md (D2, D4)`. The
+  field is still a path list; the suffix points at the `### D<n>` sections of that plan. `/task` stamps
+  this value, so do not edit it by hand. Deliverable coverage is read from the cycle's `record.md`, never
+  from this field, and `plan.md` is read-only for the task
 
 **Examples**:
 ```markdown
@@ -228,6 +233,9 @@ nothing to commit, working tree clean
 
 # Research relevant:
 - **Documentation**: docs/research/temporal-workflow-patterns.md
+
+# Decomposed from an approved plan (/task --plan): implements D2 and D4 of it
+- **Documentation**: docs/cycles/20260928-owner-seat-notice/plan.md (D2, D4)
 
 # Only CLAUDE.md needed:
 - **Documentation**: none
