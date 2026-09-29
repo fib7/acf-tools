@@ -4,13 +4,15 @@
 
 **ACF (Agentic Continuous Flow)** is software development where humans govern intelligent agent swarms rather than write code directly. Whip automates the complete task lifecycle with zero tolerance for incomplete work.
 
-Standalone ACF plugin that implements complete backlog workflow: task decomposition, continuous execution, quality review, and retrospective analysis. Enforces strict task description style and generates specialist agents on demand.
+Standalone ACF plugin that implements the complete cycle: plan approval, task decomposition, continuous execution, quality review, deliverable coverage, and retrospectives. Enforces strict task description style and generates specialist agents on demand.
 
 ## Overview
 
 ACF Whip is a hostile workflow enforcer that automates the entire task lifecycle:
 
 ```
+/whip "<goal>" → small work: /task; risky work: a plan you approve with one yes
+         ↓
 /task → decompose scope into atomic tasks (WHAT/WHY only, no HOW)
          ↓
 /go → continuous execution until 100% complete (loops until all terminal)
@@ -19,10 +21,113 @@ quality gates → zero bypass tolerance (all must pass)
          ↓
 review → binary accept/reject (no partial credit)
          ↓
-/retro → analyze failures, create improvement tasks
+/retro → close the cycle; when something went wrong: root causes, one-rule lessons, action items you approve
 ```
 
 **Philosophy**: Zero tolerance for incomplete work. Binary outcomes. Evidence required. No shortcuts.
+
+The one command to remember is `/whip`. With no argument it prints where you are, what needs you,
+and the one command to run next, derived from git and the task store on every call.
+
+---
+
+## The cycle (3.5.0)
+
+| Stage | Command | Artifact | Gate |
+|---|---|---|---|
+| Where am I | `/whip` | STATUS, NEED YOU cards, one NEXT line | none: read-only |
+| PLAN | `/whip "<goal>"` drafts, `/whip <file.md>` imports, `/whip <cycle-id>` re-shows the card | `docs/cycles/YYYYMMDD-<slug>/plan.md` (yours) and `record.md` (stamp, task map, Plan Log; written only by `acfw-cycle`) | **you**: one "yes" approves the exact bytes on the card (`content=<hash>`); a `block` spec tool also needs GO or your override |
+| DECOMPOSE | starts itself on "yes"; by hand: `/task --plan [<cycle>]` | tasks carrying `Documentation: docs/cycles/<ID>/plan.md (D2)`, the `## Tasks` map in `record.md`, your `/go` focus | re-checked in the workflow: approved at HEAD, built from a frozen copy of the approved text, every task names a deliverable |
+| BUILD | `/go` | code on your local trunk (LP-CAS) | per-task gates and review, `ACFW_GATE_CMD` |
+| VERIFY | `/whip` | coverage per deliverable: ✓ done, ◐ not finished, ✗ blocked, `?` unverified, cancelled | a ✗ fires the retro |
+| RETRO | `/retro [<cycle>]` | clean: `Status: closed`, zero agents; triggered: `retro.md`, up to 3 `docs/acf/lessons/<slug>.md`, a retro-actions cycle | **you**: action items become work only through the same approval card |
+| SHIP | yours: push, PR, merge | nothing | **you**, always: `/go` never pushes |
+
+**Two routes.** `/whip "<goal>"` picks one and says why. Small work is the default: it prints
+`NEXT /task "<goal>"` and runs exactly as before 3.5.0, with no plan. A goal that touches data, a
+schema or a migration; auth, secrets, payments or personal data; a breaking change to a public
+contract; three or more modules; or a new user flow gets a plan first, and so does
+`/whip plan <goal>`. The rubric lives once, in [`skills/whip/SKILL.md`](skills/whip/SKILL.md).
+
+What a plan's approval card looks like (real output):
+
+```
+NEED YOU
+  WHAT approve docs/cycles/20260929-owner-seat-notice/plan.md "Owner seat notice" (2 deliverables)
+  RISK nothing is built until you approve, and the approval binds exactly content=64075a203d34: any later edit needs a new card. Undo: /whip --abandon 20260929-owner-seat-notice
+  REPLY yes: approve, then start /task --plan in the background (sets your /go focus)
+  content=64075a203d34
+  D1: Owner gets an email when a seat is added
+  D2: The notice is logged
+  ASSUME Route: planned, because it touches payments.
+
+NEXT yes: approve docs/cycles/20260929-owner-seat-notice/plan.md (content=64075a203d34)
+```
+
+Rules the engine enforces, so you do not have to:
+
+- **Approval binds bytes.** It holds only while `record.md`'s `Approved Content`, the newest
+  `approved` row and the hash of `plan.md` agree at HEAD. Edit the plan after "yes" and `/whip`
+  says "amended since approval"; the approved text keeps building, the edit never builds unapproved.
+- **D-ids are permanent once a task names them.** New work takes the next number. To drop a
+  deliverable, keep its heading and archive its tasks: it shows as cancelled.
+- **Imports are copies.** `/whip <file.md>` never writes the source file (superpowers, spec-kit,
+  Claude plan mode, hand-written). A plan without `## Deliverables` / `### D<n>` runs with coverage
+  off, and the card says so.
+- **Tasks never edit cycles.** The integrator drops any `docs/cycles/` change a task carries and
+  names the dropped paths in a WARN. A plan changes only through `/whip`.
+- **Every plan event is its own commit**, `docs(plan): <event> <slug>`, with an `ACFW-Plan-Event`
+  trailer for audit. A squash merge may drop the trailer; that costs a WARN, never an approval.
+- **Lessons feed the next plan.** `/task` planners and critics read `docs/acf/lessons/`, and a
+  relevant rule goes into the constraints of any task that walks into it.
+- **A retro-actions cycle closes itself** once its tasks are done; the next approve, record or
+  `/retro` stamps it closed. There is no retro of a retro.
+
+Cards you may meet:
+
+- **Pin the integration mode.** In a project with no `ACFW_INTEGRATION_MODE` pin, as soon as a cycle
+  task is accepted with no ledger marker, `/whip` shows a card naming `ACFW_INTEGRATION_MODE`, with
+  the pin as its REPLY. Unpinned, `/go` infers the mode from `CLAUDE.md`, and an inferred `override`
+  never integrates, so the cycle would never finish. `/whip-init` pins `default` for new projects.
+- **`?` on a deliverable** means a task is accepted but no branch or ledger marker proves its change
+  reached trunk. On `files`, `/whip-move <stem> accepted --integrated-at <sha>` clears it. On other
+  stores, write the ledger marker by hand ("Clearing accepted-branchless-unverified" in
+  `docs/acf/backlog/recovery-runbook.md`), or `/whip-move <stem> pending` to build it again.
+- **A decomposition lock** is evidence that a `/task --plan` started, not proof it still runs. It
+  expires after 30 minutes, and the card prints its age and the one `rm` that clears it sooner.
+
+---
+
+## Spec tools (reviewers and workbenches)
+
+A spec tool reviews a plan before you approve it, reviews the tasks `/task` writes (free text or
+`--plan`), or lets you edit the plan somewhere else and merge it back. You plug one in with one committed file
+in `.acfwhip/spec-tools/`; acf-whip itself names no tool. The smallest is a grep:
+
+```
+# .acfwhip/spec-tools/no-tbd: refuse plans and tasks that still say TBD, TODO or FIXME
+review=grep -nwE 'TBD|TODO|FIXME' "$ACFW_SPEC_FILE"; test $? -eq 1
+at=plan,task
+policy=block
+```
+
+GapTrap (hosted spec gap analysis) is the worked example of a paid, remote tool
+([setup, cost and egress](spec-tools/gaptrap/README.md)):
+
+1. Create a key in GapTrap under Profile, API keys. In a separate terminal, add
+   `export GAPTRAP_API_KEY=...` to your shell profile and restart Claude Code, or add
+   `GAPTRAP_API_KEY=...` to a gitignored `.env`, which is read on every run. An export typed into
+   another terminal never reaches a running Claude Code. Never paste the key into the chat. The
+   exact lines are in [gaptrap/README.md](spec-tools/gaptrap/README.md).
+2. `/whip --tools add gaptrap`: a free probe shows the verbs, egress host and cost, then commits it.
+3. `/whip "<goal>"`: the card shows GapTrap's verdict, findings F1..F8 and questions.
+
+Hook points: before every approval card (`at=plan`), inside `/task` (free text or `--plan`) before
+tasks are written (`at=task`; a task a `block` tool still rejects is held in draft), at approval
+(`policy=block` needs GO on those exact bytes, or your reply `yes, override <tool>`), and on
+`/whip --push` / `--pull` for a workbench. **Never in `/go`**: the spec is frozen at approval, and a false positive there would
+cost a task one of its three lives. A tool that cannot run never blocks. Full guide:
+[`spec-tools/README.md`](spec-tools/README.md); protocol: [`spec-tools/CONTRACT.md`](spec-tools/CONTRACT.md).
 
 ---
 
@@ -434,6 +539,10 @@ Next Steps: Run /task to decompose work
 /task "Implement user authentication system with JWT tokens"
 ```
 
+Not sure whether the work needs a plan? Run `/whip "<goal>"` instead. For small work it prints this
+`/task` line for you to run; for risky work (auth, like this example) it drafts a plan and shows an
+approval card, and your "yes" starts `/task --plan` itself. See [The cycle](#the-cycle-350).
+
 **What it does**:
 - Reads `docs/acf/style/task-descriptions.md` (style enforcement)
 - Minimal research (Perplexity, Context7, Figma if applicable)
@@ -500,20 +609,58 @@ Next step: Run /go
    Iterations: 3
 ```
 
-### 5. Retrospective (if failures)
+### 5. Check coverage, then close the cycle
 
 ```bash
-/retro
+/whip      # a planned cycle: the coverage table, and NEXT /retro once every task is terminal
+/retro     # the cycle /whip names
 ```
 
 **What it does**:
-- Phase 1: retro agent analyzes blocked/rejected tasks (Five Whys)
-- Phase 2: task-engineer creates improvement tasks
-- Creates report in `docs/retrospectives/YYYYMMDD-topic.md`
+- A clean cycle closes with one script call and zero agents
+- When a task was reworked or stuck, or a deliverable is not met, the retro agent finds root causes (Five Whys) and writes docs/cycles/<ID>/retro.md, at most 3 one-rule lessons in docs/acf/lessons/, and a retro-actions cycle you approve like any plan
+- It never creates tasks, edits agent files, or deletes a lesson itself
+
+Work done without a plan has no cycle to close: `/retro --force <task>...` analyzes it (name no
+tasks and it reads your `/go` focus) and writes `docs/retrospectives/YYYYMMDD-<slug>.md` and its
+lessons for you to commit.
 
 ---
 
 ## Commands Reference
+
+Ten commands you type: `/whip`, `/task`, `/go`, `/retro`, `/research`, `/whip-init`,
+`/whip-add-agents`, `/whip-doctor`, `/whip-focus`, `/whip-move`. Two more skills,
+`clean-checkout-before-task` and `integrate-lpcas`, are invoked by agents and `/go`, never by you,
+and `whip-go` / `whip-task` are the workflow engines behind `/go` and `/task`.
+
+### /whip - Where you are, and the one command to run next
+
+**Purpose**: the front door of the cycle. It prints `acfw-cycle` output verbatim and never derives
+a stage in prose.
+
+**Usage**:
+```bash
+/whip                        # where you are: STATUS, NEED YOU, NEXT (read-only)
+/whip "<goal>"               # small: prints NEXT /task "<goal>"; risky: drafts a plan, shows the card
+/whip <file.md>              # adopt a plan written anywhere else; the source is never written
+/whip <cycle-id>             # re-show that cycle's card, e.g. after you edited its plan.md
+/whip --abandon [<cycle-id>] # close a cycle you no longer want, zero agents
+yes                          # after a card: approve those exact bytes, then start /task --plan
+```
+
+**Behavior**:
+- A reply that changes the plan (a vetoed assumption, "yes, but ...") is an edit, not a yes: the
+  plan is edited, a new card is shown, and nothing is approved in the same turn
+- `--expect` always comes from the `content=` of a card you saw; a stale value is refused with
+  exit 9 and nothing is written
+- `/go` and `/retro` stay printed NEXT lines: `/whip` never runs them for you
+- Without the Workflow tool, approval still works and `/whip` prints the free-text `/task`
+  fallback, with coverage off for that cycle
+
+**Output**: the STATUS block, cards, one `NEXT` line. Plans live in `docs/cycles/<ID>/`.
+
+---
 
 ### /task - Pure Orchestration
 
@@ -525,7 +672,15 @@ Next step: Run /go
 ```bash
 /task "Scope description"
 /task "Add real-time notifications. Figma: https://figma.com/design/ABC/App?node-id=1-2"
+/task --plan 20260928-owner-seat-notice   # decompose an approved plan (/whip starts this on "yes")
+/task --plan                              # the cycle /whip says is next
 ```
+
+**Plan mode** (`--plan`, workflow only): planners read a frozen copy of the approved `plan.md`,
+only deliverables with no task yet are decomposed, every task names the deliverables it implements
+(`Documentation: docs/cycles/<ID>/plan.md (D2)`), the task map is recorded in `record.md` before any
+task exists, and your `/go` focus is set to the cycle's unfinished tasks. Free text next to
+`--plan` is refused: extra work goes into the plan, or into a separate `/task "<scope>"`.
 
 **Behavior**:
 1. Reads style guide (mandatory)
@@ -668,27 +823,33 @@ commit stay atomic. Run `/whip-doctor` after.
 
 ---
 
-### /retro - Retrospective Analysis
+### /retro - Close a Cycle, and Learn from It
 
-**Purpose**: Root cause analysis and improvement task creation
+**Purpose**: Close a planned cycle, and learn from it when something went wrong
 
 **Usage**:
 ```bash
-/retro
+/retro                       # the cycle waiting for its retro (the one /whip's NEXT names)
+/retro <cycle>               # that cycle; mid-cycle with a trigger fired: the doc and lessons, not closed
+/retro [<cycle>] --force     # analyze even though no trigger fired
+/retro --force               # with no cycle waiting: a plan-less retro over your /go focus
+/retro --force <task>...     # work done without a plan: these tasks
 ```
 
 **Behavior**:
-- **Phase 1**: retro agent
-  - Scans `.backlog/blocked/` and `.backlog/rejected/`
-  - Applies Five Whys methodology
-  - Detects systemic vs individual issues
-  - Creates report in `docs/retrospectives/YYYYMMDD-topic.md`
-- **Phase 2**: task-engineer
-  - Reviews retrospective findings
-  - Creates improvement tasks in `.backlog/pending/`
-  - Prioritizes systemic issues as high
+- A clean cycle closes with one script call and zero agents
+- When a task was reworked or stuck, or a deliverable is not met, the retro agent finds root causes (Five Whys) and writes docs/cycles/<ID>/retro.md, at most 3 one-rule lessons in docs/acf/lessons/, and a retro-actions cycle you approve like any plan
+- It never creates tasks, edits agent files, or deletes a lesson itself
+- `/retro --force <task>...` (or a bare `/retro --force` with no cycle waiting, over your `/go`
+  focus) analyzes work done without a plan, and writes `docs/retrospectives/YYYYMMDD-<slug>.md`
+  and its lessons for you to commit
+- Which triggers fired, and their thresholds, come only from `acfw-cycle triggers`; it reads every
+  task store the same way, including reviewer comments on beads and linear
+- A lesson a test or gate now enforces is listed under `## Retire`; you run the `git rm`
+- It refuses only while `/go` runs
 
-**Output**: Retrospective report + improvement tasks
+**Output**: `docs/cycles/<ID>/retro.md`, lessons, and a retro-actions cycle awaiting your approval
+(or, for a clean cycle, only the `closed` stamp in `record.md`)
 
 ---
 
@@ -738,6 +899,7 @@ commit stay atomic. Run `/whip-doctor` after.
 **Usage**:
 ```bash
 /whip-init
+/whip-init --with-specialists   # also generate specialist agents for the detected stack
 ```
 
 **Behavior**:
@@ -745,11 +907,13 @@ commit stay atomic. Run `/whip-doctor` after.
 2. Asks user for customization (priority system, coverage thresholds)
 3. Analyzes repository for agent customization data
 4. Creates `.backlog/` structure (9 folders)
-5. Installs quality gate config (`.pre-commit-config.yaml`)
+5. Installs quality gate config (`.pre-commit-config.yaml`), with every hook kept out of `docs/cycles/`
 6. **Generates 6 universal agents** from patterns to `.claude/agents/` (customized for project)
 7. Generates agent manifests in `docs/agents/` (Priority 1/2/3 structure)
 8. Triggers SessionStart hook behavior (copies docs, generates README)
-9. Adds CLAUDE.md section (if exists)
+9. Adds CLAUDE.md section (if exists), naming `/whip` as the place to start
+10. In a **new** project only, pins `ACFW_INTEGRATION_MODE=default`; adds `docs/cycles/` to an
+    existing `.prettierignore` or `.markdownlintignore`, because approval hashes those bytes
 
 **Output**: Complete backlog workflow initialized
 
@@ -833,14 +997,15 @@ All projects get **6-7 universal agents** (devops optional) **GENERATED FROM PAT
 - **Style**: Max 2-3 line code snippets (interfaces only)
 
 ### retro
-- **Role**: Process improvement and retrospectives
-- **Authority**: Conduct retrospectives, analyze metrics, **update agent instructions** (EXCLUSIVE)
+- **Role**: Root cause analysis when a cycle's work went wrong (dispatched by `/retro`)
+- **Authority**: Root cause analysis, one-rule lessons, and proposed action items; a human approves every change to agents, workflow or quality standards
 - **Method**: Five Whys root cause analysis
+- **Existing projects**: a `.claude/agents/retro.md` generated before 3.5.0 still grants edit authority; the 3.5.0 CHANGELOG entry has the exact edit
 
 ### precommit
 - **Role**: Pre-commit hook configuration
 - **Authority**: Configure hooks, select repositories, optimize execution
-- **Prohibition**: Cannot modify quality standards (retro authority)
+- **Prohibition**: Cannot modify quality standards (a /retro action item, approved by a human)
 
 ### research-agent
 - **Role**: Evidence-based research
@@ -954,9 +1119,18 @@ npm run build
 
 ### Failure Protocol
 
-- Attempts 1-10: Fix actual issues
-- After 10 attempts: Move task to blocked with failure report
-- If systemic (3+ similar failures): Run `/retro`
+- **Red gate inside a worktree**: the default per-task harness runs your gates at most twice, with
+  one fix round after each failure, then sends the diff to a fresh reviewer. Fix causes; never
+  weaken or delete a test. This never pages you.
+- **Rejected in review**: the task goes back to pending with its rejection counted. The third
+  rejection blocks it, and a task its own specialist blocks a third time stays blocked (`/go` args
+  `maxReject` / `maxBlock`, default 3). The counters are lifetime counters on every store.
+- **Blocked at the cap**: parked work, which does page you. In a planned cycle `/whip` shows a card
+  with the exact reply. `/whip-move <task> pending` buys exactly one more attempt; the usual fix is
+  to archive the task and plan the work again.
+- **Learning from it**: when a planned cycle ends with a reworked or stuck task, or an unmet
+  deliverable, `/retro` finds the root cause and proposes the fix as an action item you approve.
+  For work done without a plan: `/retro --force <task>...`.
 
 ---
 
@@ -1002,7 +1176,8 @@ reports which file is active as `configFile`). Every key is also settable as an 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `ACFW_STORE` | `files` | Task-store backend: `files`, `beads`, `multica`, `linear`, or a drop-in adapter name. Env wins over config. |
-| `ACFW_INTEGRATION_MODE` | unset | `override` = `/go` stops at accepted and you integrate (PR per group); `default` = LP-CAS folds accepted work into the local trunk. Unset = decided per run from `CLAUDE.md`. Env wins over config. An unrecognized value is FATAL. |
+| `ACFW_INTEGRATION_MODE` | unset (`/whip-init` pins `default` in a new project) | `override` = `/go` stops at accepted and you integrate (PR per group); `default` = LP-CAS folds accepted work into the local trunk. Unset = decided per run from `CLAUDE.md`, and `/whip` shows a card asking you to pin it once a planned cycle's task is accepted with no ledger marker. Env wins over config. An unrecognized value is FATAL. |
+| `ACFW_TRUNK_BRANCH` | unset | The branch plan events (`docs(plan): ...` commits) may land on. Unset = the branch each cycle was created on; to move a cycle to another branch, `rm .acfwhip/run/cycle/<ID>/branch`. `acfw-cycle` refuses (exit 5) on any other branch. Env wins over config. |
 | `ACFW_INPROGRESS_TIMEOUT_HOURS` | `8` | Hours before an in-progress task is flagged stale / timed out to blocked. Env wins over config. |
 | `ACFW_WORKTREE_DIR` | `.worktree` | Directory acf-whip owns for task worktrees. **Config wins over env.** Change only on a fresh backlog. |
 | `ACFW_BRANCH_PREFIX` | `worktree` | Branch namespace acf-whip owns (`<prefix>/<slug>`). **Config wins over env.** Change only on a fresh backlog. |
@@ -1020,10 +1195,12 @@ Automatically initializes on every session:
 # Location: hooks/handlers/session-start.py
 
 def main():
-    # 1. Check/copy docs to docs/acf/ (only when missing)
-    check_and_copy("task-descriptions.md", "docs/acf/style/")
-    check_and_copy("task-template.md", "docs/acf/backlog/")
-    check_and_copy("workflow.md", "docs/acf/backlog/")
+    # 1. Install each doc when missing; refresh an unedited copy (by content digest);
+    #    report an edited copy as behind, never overwrite it
+    sync("task-descriptions.md", "docs/acf/style/")
+    sync("task-template.md", "docs/acf/backlog/")
+    sync("workflow.md", "docs/acf/backlog/")
+    sync("recovery-runbook.md", "docs/acf/backlog/")
 
     # 2. Warn if .backlog/ is missing (README.md is not auto-generated)
 
@@ -1035,6 +1212,27 @@ def main():
 afterwards — not by the SessionStart hook, and not by `/whip-add-agents`, which updates
 only its agent-roster line in place. Your gate commands, coverage thresholds and evidence
 rules are yours, and they survive every re-run.
+
+### What it writes in your repo
+
+| Path | Written by | In git? |
+|---|---|---|
+| `.backlog/<state>/*.md` | `/task`, `/go`, `/whip-move` (`files` store only) | committed on trunk |
+| `.acfwhip/config` | `/whip-init`, you | committed |
+| `.acfwhip/integrated/` | LP-CAS: one ledger marker per integrated task | committed, in the same commit as the change |
+| `.acfwhip/adapters/` | you: drop-in store adapters and spec-tool drivers | committed |
+| `.acfwhip/spec-tools/<name>` | `/whip --tools add`, or you | committed; the commit is the team's consent to send plans where it says |
+| `.acfwhip/run/` | run state: the focus, locks, cycle run state, spec-tool results, workbench state | gitignored |
+| `.worktree/<slug>/`, branches `worktree/<slug>` | `/go` | gitignored; reaped after integration |
+| `docs/cycles/YYYYMMDD-<slug>/` | `plan.md`: you (drafted by `/whip`, or copied on import); `record.md`: only `acfw-cycle`; `retro.md`: `/retro` | untracked until approval, then `docs(plan): ...` commits by `acfw-cycle` |
+| `docs/acf/lessons/<slug>.md` | `/retro` (at most 3 per retro, no frontmatter, one `**Rule**:` line) | committed by `acfw-cycle close` or `note`; after a plan-less retro you commit them; you retire one with `git rm` |
+| `docs/retrospectives/YYYYMMDD-<slug>.md` | `/retro --force [<task>...]` (no plan) | you commit it |
+| `docs/acf/style/`, `docs/acf/backlog/` | SessionStart hook | you commit them; unedited copies refresh themselves |
+| `.claude/agents/`, `docs/agents/`, `.backlog/README.md`, a `CLAUDE.md` section | `/whip-init`, `/whip-add-agents` | you commit them |
+| `.gitignore`, `.pre-commit-config.yaml`, `.prettierignore`, `.markdownlintignore` entries | `/whip-init` (keeps formatters out of `docs/cycles/`, whose bytes approval hashes) | you commit them |
+
+`/go` never pushes. What leaves your machine: task state, to a `multica` server or to Linear when
+you use those stores, and plan text, to the host a committed spec-tool declaration names.
 
 ---
 
@@ -1084,25 +1282,28 @@ rules are yours, and they survive every re-run.
 /go
 ```
 
-### Example 3: Quality Gate Failure Recovery
+### Example 3: A Planned Cycle Where a Task Fails Review
 
 ```bash
-# Scenario: Task fails quality gates 3 times
+# 1. A risky goal gets a plan and an approval card
+/whip "Charge the owner when a seat is added"
+yes          # approves those exact bytes and starts /task --plan in the background
+
+# 2. Build the plan's tasks (the focus now holds exactly them)
 /go
+# feature-001 is rejected three times (coverage 75% vs 85% required), so /go blocks it
 
-# Output in iteration 5:
-# ⚠️  feature-001 rejected 3 times (coverage 75% vs 85% required)
-# Continuing...
+# 3. Where are we?
+/whip
+# D2 shows ✗, a NEED YOU card names feature-001 with the exact reply,
+# and once nothing else can run, NEXT is /retro
 
-# Iteration 10: Still failing
-# → Moved to blocked with failure report
-
-# Run retrospective
+# 4. Close the cycle and learn from it
 /retro
-
-# Output:
-# Root Cause: Test coverage requirements unclear in task description
-# Created improvement task: docs-001-clarify-coverage-requirements.md
+# A trigger fired, so the retro agent writes:
+# - docs/cycles/<ID>/retro.md: the root cause (the coverage bar was never in the task)
+# - at most 3 lessons in docs/acf/lessons/, which the next /task planners read
+# - a retro-actions cycle proposing the fix; it becomes work only after you say yes on its card
 ```
 
 ---
@@ -1118,8 +1319,8 @@ rules are yours, and they survive every re-run.
 # Manually check in-review tasks
 ls .backlog/in-review/
 
-# Force re-review
-mv .backlog/in-review/*.md .backlog/completed/
+# Force re-review (the validated writer keeps Status and the transition log in sync)
+/whip-move <task> completed
 /go
 ```
 
@@ -1137,8 +1338,11 @@ ls .backlog/blocked/
 # Read blocker reports
 cat .backlog/blocked/*.md
 
-# Run retrospective to analyze
-/retro
+# In a planned cycle, /whip names the ROOT blocker and the exact reply
+/whip
+
+# Find out why (work done without a plan)
+/retro --force <task>...
 ```
 
 ### Style Guide Violations
@@ -1148,7 +1352,7 @@ cat .backlog/blocked/*.md
 **Solution**:
 - SessionStart hook injects style guide enforcement
 - `/task` command validates before spawning agents
-- If violations persist, run `/retro` to update task-engineer instructions
+- If violations persist, run /retro --force <task>...: it proposes a [guide] action item for the task-engineer file, which you approve
 
 ### Agent Generation Errors
 
@@ -1170,20 +1374,31 @@ ls -la  # Verify go.mod, package.json, etc. exist
 ### Plugin Structure
 
 ```
-plugins/acf-whip/
+acf-whip/
 ├── .claude-plugin/
 │   └── plugin.json              # Plugin manifest
-├── skills/                      # 6 slash commands
-│   ├── task/SKILL.md
-│   ├── go/SKILL.md
-│   ├── retro/SKILL.md
+├── skills/                      # 10 commands you type, 2 internal skills, shared lib
+│   ├── whip/SKILL.md            # /whip: the front door of the cycle
+│   ├── task/SKILL.md            # /task, /task --plan
+│   ├── go/SKILL.md              # /go
+│   ├── retro/SKILL.md           # /retro
 │   ├── research/SKILL.md
 │   ├── whip-init/SKILL.md
-│   └── whip-add-agents/SKILL.md
+│   ├── whip-add-agents/SKILL.md
+│   ├── whip-doctor/             # /whip-doctor (SKILL.md + bin/)
+│   ├── whip-focus/SKILL.md
+│   ├── whip-move/               # /whip-move (SKILL.md + bin/)
+│   ├── clean-checkout-before-task/   # internal: run by every code-mutating agent
+│   ├── integrate-lpcas/         # internal: run by /go's integrator
+│   └── lib/                     # acfw-cycle, acfw-spec, acfw-store, acfw-focus, shared shell libs
+├── workflows/                   # whip-go / whip-task: the engines behind /go and /task
+├── adapters/                    # task-store adapters (files, beads, multica, linear) + CONTRACT.md
+├── spec-tools/                  # spec-tool protocol, README, gaptrap and dir drivers, examples
+├── tests/                       # offline suites; run-all.sh runs them
 ├── hooks/
 │   ├── hooks.json
 │   └── handlers/
-│       └── session-start.py     # Auto-initialization
+│       └── session-start.py     # Installs and refreshes the docs below
 └── content/                      # Templates and patterns
     ├── acf/
     │   └── research-protocol.md  # Research MCP tool usage
@@ -1193,8 +1408,11 @@ plugins/acf-whip/
     ├── backlog/
     │   ├── task-template.md
     │   ├── workflow.md
+    │   ├── recovery-runbook.md
+    │   ├── plan-template.md      # a cycle's plan.md
+    │   ├── record-template.md    # a cycle's record.md
     │   └── README.sample.md
-    ├── quality-gates/            # 5 stack docs
+    ├── quality-gates/            # stack docs
     ├── pre-commit-configs/       # 3 stack configs
     └── agent-patterns/           # Agent generation patterns
         ├── universal/            # 6 universal agent patterns
@@ -1222,17 +1440,19 @@ plugins/acf-whip/
 ```
 User Request
     ↓
-/task → Read style guide → Research → Decompose → Validate → Spawn task-engineers → Exit
+/whip "<goal>" → small: NEXT /task "<goal>" · risky: plan.md → approval card → yes
     ↓
-.backlog/pending/ (tasks created)
+/task (or /task --plan) → Read style guide + lessons → Decompose → Validate → Record → Exit
+    ↓
+.backlog/pending/ (tasks created; in a cycle, also record.md ## Tasks and your focus)
     ↓
 /go → Loop: Scan states → Process transitions → Spawn agents → Check completion
     ↓
-quality-reviewer → Accept/Reject → Move to terminal state
+quality-reviewer → Accept/Reject → Move to terminal state → LP-CAS onto local trunk
     ↓
-.backlog/accepted/ OR .backlog/blocked/
+/whip → coverage per deliverable → NEXT /retro
     ↓
-/retro → Analyze failures → Create improvement tasks
+/retro → Root causes → Lessons + action items you approve
 ```
 
 ### Agent Generation Flow
@@ -1302,8 +1522,7 @@ Documentation: https://github.com/fib7/acf-tools/tree/main/docs
 
 ---
 
-**Version**: 1.0.0
-**Last Updated**: 2025-11-07
-**Status**: Stable
+**Version**: see `.claude-plugin/plugin.json`; what changed in each release: `CHANGELOG.md`
+**Last Updated**: 2026-09-29
 
 Zero tolerance. Binary outcomes. Evidence required. No shortcuts.

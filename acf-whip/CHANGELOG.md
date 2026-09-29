@@ -2,6 +2,249 @@
 
 All notable changes to acf-whip. Format loosely follows Keep a Changelog.
 
+## 3.5.0: the ACF cycle, out of the box
+
+Until now acf-whip ran the middle of the job: `/task` decomposed a scope and `/go` built it. Deciding
+what to build, keeping the plan, checking the result against it and learning from what went wrong
+were left to each user's own pipeline. 3.5.0 adds both ends and the thread between them, PLAN,
+DECOMPOSE, BUILD, VERIFY, RETRO, with one human approval, all of it in your repo and your git
+history. The small-work route, `/task "<scope>"` then `/go`, is unchanged.
+
+### What you get
+
+- **`/whip`, the front door.** A bare `/whip` prints where you are, what needs you, and the one
+  command to run next. `acfw-cycle` derives the stage from git and the task store on every call and
+  never stores it, and the skill prints its output verbatim. `/whip "<goal>"` sends small work to
+  `/task` and risky work (data, a schema or a migration; auth, secrets, payments or personal data;
+  a breaking change to a public contract; three or more modules; a new user flow) to a plan.
+  `/whip <file.md>` adopts a plan written anywhere else (superpowers, spec-kit, Claude plan mode, by
+  hand) and never writes the source. `/whip --abandon` closes a cycle you no longer want.
+- **A plan is a folder in your repo, and approval binds its bytes.** `docs/cycles/YYYYMMDD-<slug>/`
+  holds `plan.md` (yours), `record.md` (the approval stamp, the deliverable-to-task map and a
+  newest-first Plan Log, written only by `acfw-cycle`) and, later, `retro.md`. One "yes" on the
+  approval card approves the content hash that card showed, and `approve --expect` refuses any other
+  (exit 9), so an approval cannot bind text nobody saw. It holds only while `record.md`'s
+  `Approved Content`, its newest `approved` row and the hash of `plan.md` agree at HEAD. Edit the
+  plan afterwards and `/whip` says "amended since approval": the approved text keeps building, and
+  the edit never builds unapproved. Every plan event is its own pathspec commit,
+  `docs(plan): <event> <slug>`, with an `ACFW-Plan-Event` trailer for audit.
+- **`/task --plan` builds exactly what you approved.** Your "yes" starts it in the background.
+  Planners read a frozen copy of the approved `plan.md`, and only deliverables with no task yet are
+  decomposed. The validation gate rejects a task that names no deliverable, or only covered ones,
+  or reuses an id the store already has. Each task carries
+  `Documentation: docs/cycles/<ID>/plan.md (D2)`. The task map is committed to `record.md` before
+  any task exists, and every create, commit and focus change runs only after that record succeeded,
+  so a refused record creates nothing. The run sets your `/go` focus to the plan's unfinished tasks,
+  and `/go` launches on exactly that focus without asking again. D-ids are permanent once a task
+  names one: re-approving a plan that renumbers or removes a recorded D is refused (exit 8), so a
+  task never counts toward a deliverable it was not built for.
+- **Coverage per deliverable.** `/whip` shows each D as ✓ (every task accepted and, in default mode,
+  integrated), ◐ (not finished: started or not yet), ✗ (a task is blocked), `?` (accepted, but
+  nothing proves the change reached trunk) or cancelled (all its tasks archived). A cycle that
+  cannot move gets a card naming the root blocker and its exact reply, never a `/go` that has
+  nothing to run. A `?` holds the close: `/whip` shows that card's reply before `/retro`, so a clean
+  close cannot bury work nobody has shown reached trunk. In a planned cycle, `/go`'s run report ends
+  with a `nextStep` that prints this table. After a close, `/whip` says how many commits are not
+  pushed yet: shipping stays yours.
+- **`/retro` closes the loop, on every task store.** A clean cycle closes with one
+  `acfw-cycle close <plan> none` call and zero agents. When a task was reworked or stuck, or a
+  deliverable is not met, a retro agent reads the triggered tasks through
+  `acfw-store read --materialize` (which carries reviewer comments on beads and linear), their
+  commits and the recorded lessons. It writes `docs/cycles/<ID>/retro.md`, at most 3 one-rule
+  lessons in `docs/acf/lessons/<slug>.md`, and a retro-actions cycle you approve on the same card as
+  any plan. Each action item's heading says `[sensor]` or `[guide]` and whether it loosens a
+  control, because the card shows only headings. A script check refuses malformed output before
+  anything is committed. `/retro` never deletes a lesson: one a test now enforces is listed under
+  `## Retire`, and you run the `git rm`. The spec-tool verdicts committed at approval are an input:
+  when a declared tool had flagged the cause, the retro proposes tightening that declaration
+  (`policy=block`, `at=plan,task`), and never proposes loosening one. It refuses only while `/go`
+  runs. `/retro --force <task>...` analyzes work done without a plan.
+- **Lessons feed every `/task`.** Planners and critics run `acfw-cycle lessons` (read-only) and copy
+  a relevant rule into the constraints of any task that walks into it, in plan mode and free text.
+  `/whip` cites the lessons a goal walks into in the plan's Risks.
+- **Spec tools plug in with one committed file.** A declaration in `.acfwhip/spec-tools/<name>`
+  turns any command into a plan reviewer:
+  `review=grep -nwE 'TBD|TODO|FIXME' "$ACFW_SPEC_FILE"; test $? -eq 1` is a whole tool. Findings go
+  on the approval card. A `policy=block` tool needs GO on the exact approved bytes, or your recorded
+  `yes, override <tool>`. An `at=task` tool reviews what `/task` writes (free text or `--plan`), and
+  a task it still rejects is held in draft. A workbench driver lets you `/whip --push` the plan
+  elsewhere and `/whip --pull` it back with a 3-way merge that keeps your local edits. Push and pull
+  take plans only: a held task is fixed where it lives (its `.backlog/draft/` file, or the backend's
+  own editor), then `/whip --review <task>` checks it again. Tools never
+  run in `/go`, and a tool that cannot run never blocks. A new or changed declaration runs only
+  after you reply "run tools" having seen it in full, and a credential literal in a committed file
+  stops every tool (exit 20). Shipped: `no-tbd`, `vale`, `claude-critic`, an in-session `spec-critic` agent, a `dir`
+  folder workbench, and a GapTrap driver as the worked example of a paid remote reviewer. The GapTrap
+  driver never pays twice for the same bytes: it writes each paid request down before sending it,
+  and a lost reply is looked up with a free call instead of resent. Guide: `spec-tools/README.md`;
+  protocol: `spec-tools/CONTRACT.md`; GapTrap setup, cost and egress: `spec-tools/gaptrap/README.md`.
+- **When the cycle stops for a person is written down once.** Gates: plan approval, retro
+  action-item approval, parked work (blocked at the cap, dependency-missing, draft, a ✗
+  deliverable), and ship. A rejection under the cap, a merge conflict, a red gate in a worktree or
+  an advisory finding is never a reason to page you. The list lives in `skills/whip/SKILL.md`, and
+  `docs/acf/backlog/workflow.md` points to it.
+
+### Also changed
+
+- **Tasks can no longer edit a cycle.** The integrator drops any `docs/cycles/` change from a
+  candidate, names the dropped paths in a WARN, and says so again when the task then delivers
+  nothing. Both `/go` staging paths and the transition writer skip `docs/cycles` in every spelling
+  git reads as that path (`docs//cycles`, `docs/./cycles`, `././docs/cycles`), the bare folder
+  included, and the writer stages an ancestor (`docs`, `.`) with `docs/cycles` excluded. So an
+  unstaged plan amendment or an untracked draft cycle at the root is never committed along with a
+  task, and neither is one you staged with `git add`. Every writer that commits at the trunk root now
+  names the paths it wrote instead of committing the whole index: task transitions and their
+  deliverables, the non-`files` deliverables commit, the `files` store's create, field and body
+  edits, `/whip-move`, `doctor --fix`, and the `/task --plan` writer. Before, the first of them to run
+  committed whatever you had staged, a plan amendment included, under a `task: ...` subject, and the
+  approval stopped holding at HEAD. A free-text `/task` keeps its 3.4.x commit unchanged. The writer
+  also refuses a bare `.backlog` or `.acfwhip` now
+  (exit 2); it used to stage the whole task store. When trunk has deleted the cycle a task edited,
+  the drop resolves that modify/delete conflict instead of stalling every `/go`.
+- **No shipped agent pattern grants edit authority any more.** `retro-pattern.md` gave the generated
+  retro agent "EXCLUSIVE authority to modify agent instructions, workflows, and quality standards"
+  and let it "commit process changes to git". `precommit-pattern.md`, the retro manifest, the
+  backlog README sample and the specialist manifests `/whip-add-agents` writes repeated it. That
+  was a standing licence for one agent to loosen any control with no human involved. Changes to
+  agent files, workflow docs and quality gates are now action items a human approves. phase17 fails
+  if a pattern ships a grant again, and if a skill another skill invokes sets
+  `disable-model-invocation` (the Skill tool would refuse the handoff). Existing projects keep their
+  generated files: see Upgrading.
+- **`/retro`'s `--focus`, `--agent` and `--timeframe` flags are gone.** It never writes into
+  `.backlog/pending/` any more.
+- **`/whip-init`** pins `ACFW_INTEGRATION_MODE=default` in a new project only, lists `/whip`, keeps
+  every hook of the `.pre-commit-config.yaml` it writes out of `docs/cycles/`, and adds
+  `docs/cycles/` to an existing `.prettierignore` or `.markdownlintignore`. Its CLAUDE.md Next Steps
+  line now points at `/whip`; a re-run replaces the old line only when it is byte-identical.
+- **`/whip-doctor`** no longer counts edits under `docs/cycles/` as `dirty-trunk-root`: you amend
+  an approved `plan.md` at the root by design, and no landing can overwrite it.
+- **`ACFW_TRUNK_BRANCH`** in `.acfwhip/config` (the env var wins) pins the branch plan events may
+  land on. Unset, a cycle's events commit only on the branch it was created on;
+  `rm .acfwhip/run/cycle/<ID>/branch` moves it.
+- **`append_log_row FILE ROW [HEADING] [CAP]`** takes a section heading and a cap. `CAP=none` keeps
+  every row, so a user's `ACFW_LOG_ROW_CAP` never truncates a Plan Log. Every 2-argument caller is
+  byte-identical to 3.4.3.
+- **`workflow.md`** documents the `docs(plan)` subjects, the `ACFW-Plan-Event` trailer and which
+  merge methods keep it, and `task-template.md` documents the `(D<n>, ...)` suffix on
+  `Documentation`. Both are managed documents: unedited copies refresh at the next session.
+
+### Fixed
+
+- **Every integration printed a false "overwrote uncommitted work" WARN, and following its recovery
+  advice un-landed the integration.** `land()` checked the root checkout with `git status`, which
+  compares against HEAD. The compare-and-swap had already moved HEAD to the new trunk while the
+  index still held the old one, so every path the landing changed looked staged: the WARN fired on
+  every integration that changed a file, with a "snapshot" of work that never existed. Its advice,
+  `git stash apply <snapshot>`, replayed the new trunk back to the old one plus your edits, so it
+  reverted every other path the landing had changed, and committing that tree undid the
+  integration. The check now compares against the tree the root held before the landing, and it
+  counts untracked files the landing overwrote. The snapshot is built in a throwaway index from
+  exactly the overwritten paths, so it never takes `index.lock`, and it keeps those untracked files.
+  The `Recover:` command, `git diff --binary <observed> <snapshot> | git apply -3`, re-applies only
+  your edits on top of the landed content, 3-way (a clash leaves conflict markers) and staged;
+  `git show <snapshot>:<path>` shows one path as it was. The snapshot is an unreferenced commit, so
+  `git gc` prunes it after `gc.pruneExpire` (two weeks by default).
+- **`/task` on the `files` store dropped a task's dependencies when its author left out the line.**
+  The writer stamps the validated dependency graph over each authored task file. When the file had
+  no `Dependencies` line, the insert branch rendered `a\\` plus a newline, which GNU sed
+  (`unknown command`) and BSD sed (`extra characters after \`) both reject. The task kept no
+  dependencies, silently, and `/go` could dispatch it before its upstream landed. The stamp now uses
+  the one `a\` form both accept, and phase20-task-plan runs both branches under `/bin/bash`.
+- **`/retro` did nothing useful on most projects.** It gated on
+  `ls .backlog/blocked/ .backlog/rejected/` (`/go` empties `rejected/`, so a task reworked and then
+  accepted never triggered it); tested `[ -d .backlog ]`, which fails on beads, multica and linear; grepped
+  `rejection_count` where the field is `Rejection Count`; and wrote improvement tasks straight into
+  `.backlog/pending/`, around the `/task` validation gate. The rewrite reads tasks through the store
+  on every backend, and its trigger thresholds live only in `acfw-cycle triggers`.
+- **The WARNs an integration printed never reached the `/go` report.** Nothing read the integrate
+  agent's note for a task that landed, so the `Recover:` command for overwritten root work was at
+  best in the workflow log, and the snapshot it names is referenced by no ref. The report now
+  carries `integrationWarnings` (at most 20; the workflow log keeps all of them) on the final
+  return and on every abort inside the loop, so a run that landed work and then aborted still hands
+  you the command.
+- **`dirty-trunk-root` counted a quoted `.backlog/` path as dirty.** `git status --porcelain` quotes
+  a path with unusual characters, and the leading quote dodged the exclusion. Both doctor batteries
+  strip it first.
+
+### Upgrading
+
+Nothing is required to keep working as before: `/task "<scope>"` then `/go` behaves as in 3.4.3.
+To use the cycle in an existing project:
+
+1. **Pin the integration mode**, if you have not. Unpinned, `/go` infers it from `CLAUDE.md` on each
+   run, and an inferred `override` never integrates, so a planned cycle would never finish. `/whip`
+   shows a card naming `ACFW_INTEGRATION_MODE` once a cycle task is accepted with no ledger marker,
+   and its REPLY names the file your project reads. acf-whip reads only one config file, the first
+   of `.acfwhip/config` and `.backlog/.acfw-config` that exists, and never merges the two. So never
+   create `.acfwhip/config` next to an existing `.backlog/.acfw-config`: the new file hides every
+   key in the old one, your worktree dir and branch prefix included. This appends to the file that
+   is already active (`acfw-store info` names it as `configFile`), for the local-trunk default:
+   ```bash
+   cfg=.acfwhip/config
+   [ ! -f .acfwhip/config ] && [ -f .backlog/.acfw-config ] && cfg=.backlog/.acfw-config
+   mkdir -p "$(dirname "$cfg")"
+   # A last line with no newline would glue the pin onto that line's value.
+   [ -s "$cfg" ] && [ -n "$(tail -c1 "$cfg")" ] && echo >> "$cfg"
+   printf 'ACFW_INTEGRATION_MODE=default\n' >> "$cfg"
+   ```
+   Teams that merge through PRs pin `override` in the same file.
+2. **Keep formatters out of `docs/cycles/`.** `acfw-cycle` hashes `plan.md` and `record.md` and
+   commits them itself. A pre-commit hook that rewrites either one fails the commit (exit 10,
+   `record.md` restored byte for byte) or changes what was committed (exit 11). Add a top-level
+   `exclude: '^docs/cycles/'` to `.pre-commit-config.yaml`, and a `docs/cycles/` line to
+   `.prettierignore` and `.markdownlintignore` if you have them. If `.pre-commit-config.yaml`
+   already has a top-level `exclude:`, add `|^docs/cycles/` to that regex instead: a second
+   `exclude:` key is a duplicate YAML key, which is either an error or silently replaces yours.
+3. **Take the edit grant out of your generated retro agent.** `.claude/agents/retro.md` was written
+   once by `/whip-init` and still carries it. `/retro`'s prompt overrides it during a retro, but `/go`
+   still dispatches the agent with that file as its system prompt. Do not re-run `/whip-init` for
+   this: it either overwrites the file or leaves it alone. Edit it by hand:
+   1. Replace the `description:` line with:
+      `description: Use this agent for root cause analysis of work that went wrong - reworked, stuck or unmet tasks - and to propose fixes. It writes the retro doc, one-rule lessons and proposed action items that /retro names, and changes no agent file, workflow or quality standard itself; a human approves every change.`
+   2. Replace the line that starts `**MANDATORY**: You conduct retrospectives` with:
+      `**MANDATORY**: You find why work went wrong and propose what should change. You do not make the change: a human approves it first.`
+   3. Under `## Core Responsibilities`, replace `- Agent instruction updates` with
+      `- Proposing fixes as action items a human approves`.
+   4. Under `**CAN:**`, delete `- **Modify agent instructions** (EXCLUSIVE)`,
+      `- **Update quality standards** (EXCLUSIVE)`, `- Update workflow documentation` and
+      `- Commit process changes to git`. Add
+      `- Write the retro doc, lessons and action-item plan that a /retro prompt names` and
+      `- Propose changes to agent files, workflow and quality gates as action items`.
+   5. Under `**CANNOT:**`, add
+      `- Change an agent file, a workflow doc or a quality standard on your own → propose it as an action item; a human approves it on the plan card`,
+      `- Delete or retire a lesson → list it under ## Retire; a human runs the git rm` and
+      `- Commit, create tasks or move tasks`.
+   6. In `## Retrospective Process`, replace `5. **Update agent manifests** if needed (if using manifest system)`
+      with `5. **Propose manifest changes** as action items (if using manifest system)`.
+
+   In `.claude/agents/precommit.md`, replace `- Modify process → retro (exclusive authority)` with
+   `- Change the workflow or quality process → a /retro action item, approved by a human`.
+
+   If you use agent manifests, fix two more places. In `docs/agents/retro.md`, replace the
+   `**Scope**:` line with
+   `**Scope**: Retro docs, one-rule lessons, proposed action items (a retro-actions cycle a human approves)`
+   and the `**IS**:` line with
+   `**IS**: Root cause analysis, one-rule lessons, proposed action items (in the order of preference the /retro prompt gives)`.
+   In every specialist manifest `/whip-add-agents` wrote (`docs/agents/<agent>.md`), change the
+   footer `**Manifest Maintained By**: retro agent` to
+   `**Manifest Maintained By**: the project (changes go through /retro action items a human approves)`.
+4. **Know what a squash merge does to plan commits.** Each plan event is its own commit with one
+   trailer line, `ACFW-Plan-Event: <event> <c12> <cycle-id>`. Merge commits, rebase and fast-forward
+   keep it. A squash merge may drop it or indent it inside the squashed body, which costs one WARN in
+   `/whip` and nothing else: the approval gate is a content check made at HEAD and never reads
+   trailers. Push plan commits with the rest of trunk. `/whip` warns while one is not on your
+   upstream, because a teammate without it would decompose the plan a second time.
+5. **Update acf-librarian to 1.3.0 alongside.** Its conventions know `docs/cycles/` and
+   `docs/acf/lessons/`, and its audit reports what it finds there instead of editing it. The 1.2.x
+   audit's `--fix` rewrites broken links in any doc, a cycle's `plan.md` included (which re-arms that
+   plan's approval), and renames a lesson whose slug looks dated or versioned.
+6. **Optional: point CLAUDE.md at `/whip`.** If your CLAUDE.md has the line `/whip-init` wrote
+   before 3.5.0, the first line below, replace it with the second:
+   ```
+   **Next Steps**: 1) `/whip-add-agents` for specialists, 2) `/task` to decompose scope, 3) `/go` for execution
+   **Next Steps**: `/whip` shows where you are and the one command to run next (`/whip "<goal>"` → `/task` → `/go` → `/retro`). `/retro` records one-rule lessons in `docs/acf/lessons/`, relevant when changing an area a lesson names.
+   ```
+
 ## 3.4.3: four fixes the next release stands on
 
 - **Harness stages now get their stage rules.** `childPreamble`, the rules that tell every stage of an
