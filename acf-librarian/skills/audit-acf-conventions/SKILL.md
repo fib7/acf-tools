@@ -196,6 +196,8 @@ done
    📋 Create with: mkdir -p docs/snapshots/implementation/
 ```
 
+**Never required**: `docs/cycles/` and `docs/acf/lessons/` belong to acf-whip and exist only in projects that use it. Do not report them as missing and never create them (not here, not in 8A), even though the conventions tree lists them.
+
 ---
 
 #### 3. Check Naming Conventions
@@ -232,13 +234,45 @@ Scan these directories:
 - `docs/operations/`
 - `docs/development/`
 
-Check for embedded dates or version numbers:
+Check for embedded dates or version numbers. Run this block verbatim for `docs/acf/` and the same `find` for the other timeless directories. Only its `VIOLATION` lines go into `timeless_violations` for Step 8C:
 
 ```bash
-# Example for docs/acf/
+# acf-librarian:acf-timeless-check (docs/acf/lessons/ is skipped: lesson-check reports those, never renames)
 if [ -d docs/acf ]; then
-  find docs/acf -type f -name "*.md" ! -name "README.md" ! -name "CLAUDE.md" | while read file; do
+  find docs/acf -type f -name "*.md" ! -name "README.md" ! -name "CLAUDE.md" ! -path "docs/acf/lessons/*" | sort | while IFS= read -r file; do
     basename "$file" | grep -qE '[0-9]{8}|-v[0-9]+' && echo "VIOLATION: $file (has date or version)"
+  done
+fi
+```
+
+**Lessons** (`docs/acf/lessons/`, written by acf-whip `/retro`): the timeless rule holds for them too, so a slug with `[0-9]{8}` or `-v[0-9]+` in it is a violation. But a lesson's slug is its identity: `/retro` updates a lesson by rewriting the file with the same slug, so a lesson the audit renamed comes back under its old name on the next `/retro`, and the rule then exists twice. The block above therefore skips `docs/acf/lessons/`, and this block reports, never fixes, a lesson slug that breaks the timeless rule or is not `^[a-z][a-z0-9-]*$`. Run it verbatim:
+
+```bash
+# acf-librarian:lesson-check (report-only: this block never renames, moves or writes anything)
+if [ -d docs/acf/lessons ]; then
+  find docs/acf/lessons -type f -name "*.md" ! -name "README.md" | sort | while IFS= read -r file; do
+    slug=$(basename "$file" .md); why=""
+    printf '%s\n' "$slug" | grep -qE '[0-9]{8}|-v[0-9]+' && why="has a date or version"
+    printf '%s\n' "$slug" | grep -qE '^[a-z][a-z0-9-]*$' || why="${why:+$why; }must be lowercase letters, digits and hyphens"
+    [ -z "$why" ] || echo "REPORT: $file (lesson slug $why; rename it by hand, the audit never renames a lesson)"
+  done
+fi
+```
+
+**Dated living records** (`docs/cycles/`, REPORT-ONLY): each folder is one acf-whip cycle and its name is the cycle ID, so nothing in this audit renames, moves or writes anything under `docs/cycles/`, in either mode. Ownership is by content: a folder whose `record.md` has no acf `Format` stamp belongs to some other tool and is skipped. The files inside (`plan.md`, `record.md`, `retro.md`) carry no date by design. Run this block verbatim:
+
+```bash
+# acf-librarian:cycle-check (report-only: this block never renames, moves or writes anything)
+if [ -d docs/cycles ]; then
+  find docs/cycles -mindepth 1 -maxdepth 1 -type d | sort | while IFS= read -r d; do
+    name=${d##*/}; rec="$d/record.md"
+    [ -f "$rec" ] && grep -qE '^- \*\*Format\*\*:[[:space:]]*[0-9]' "$rec" || continue
+    id=$(sed -n 's/^- \*\*ID\*\*:[[:space:]]*//p' "$rec" | head -1 | tr -d '[:space:]')
+    if ! printf '%s\n' "$name" | grep -qE '^[0-9]{8}-[a-z0-9][a-z0-9-]*$'; then
+      echo "REPORT: $d (cycle folder missing YYYYMMDD- prefix; acf-whip ignores it until it is renamed back to its ID ${id:-unknown}; /whip prints the exact git mv)"
+    elif [ -n "$id" ] && [ "$id" != "$name" ]; then
+      echo "REPORT: $d (folder name differs from its recorded ID $id; acf-whip ignores it until it is renamed back; /whip prints the exact git mv)"
+    fi
   done
 fi
 ```
@@ -252,6 +286,14 @@ fi
 ❌ docs/acf/architecture-v2.md (has version number)
    📋 Rename to: docs/acf/architecture.md
    💡 Timeless docs update in place - git tracks history
+
+⚠️ docs/cycles/owner-seat-notice (cycle folder missing YYYYMMDD- prefix)
+   📋 Report only: rename it back to its ID by hand (/whip prints the exact git mv)
+   💡 A cycle folder's name is its ID; the audit never renames it
+
+⚠️ docs/acf/lessons/api-v2beta.md (lesson slug has a date or version)
+   📋 Report only: rename it by hand with git mv
+   💡 A lesson's slug is its identity; the audit never renames it
 ```
 
 ---
@@ -278,42 +320,133 @@ done
 
 #### 5. Validate Internal Links
 
-Scan all markdown files for broken internal links:
+Scan all markdown files under `docs/` for broken internal links. Links inside fenced code blocks or inline code spans (`` `[text](path.md)` ``) are examples and are skipped, as are external links (`http:`, `https:`, `mailto:`, any `scheme:`) and same-page `#anchors`; a `#section` or `?query` suffix is ignored when checking the file and kept when fixing it.
 
-**Logic**:
-1. Find all `.md` files in `docs/`
-2. Extract internal links (relative paths, not http/https)
-3. For each link, resolve from source file location
-4. Check if target exists
+**Report-only sources**: broken links in `docs/cycles/` and `docs/retrospectives/` are reported and NEVER edited, in either mode. Editing a cycle's `plan.md` changes its content hash and re-arms its approval, `record.md` is written only by acf-whip, and a retrospective is a frozen record of what was true when it was written. A doc that is a symlink is report-only too, wherever it points: an edit would land in the file behind the link (possibly a cycle's `plan.md`), and that file's links resolve from its own folder.
 
-**Implementation approach**:
-```python
-# Pseudocode (implement with Read and Bash tools)
-import re
+**Plugin-installed documents are report-only too**: `docs/acf/organization.md`, `docs/acf/git/commit-conventions.md`, everything under `docs/acf/backlog/` and `docs/acf/style/` (acf-whip), and any doc whose first line is an `acf-librarian-template` or `acf-whip-artifact` marker. Both plugins refresh an unedited copy of these to the current template by comparing its content. One audit edit makes the copy look customised, so it never gets another template fix.
+
+Run this block verbatim. With `fix_mode=false` it only reports; Step 8E runs the same block with `fix_mode=true`:
+
+```bash
+# acf-librarian:link-check (fix_mode=true rewrites single-match links outside the report-only sources)
+python3 - "${fix_mode:-false}" <<'PY'
+import os, re, sys
 from pathlib import Path
+from urllib.parse import unquote
 
-for md_file in Path("docs").rglob("*.md"):
-    content = read_file(md_file)
+FIX = sys.argv[1] == "true"
+PROTECTED = ("docs/cycles/", "docs/retrospectives/")
+# Documents a plugin installs and refreshes by content digest. An audit edit makes a pristine copy
+# look customised, so neither plugin would ever correct it again: exact paths for copies made before
+# the markers existed, the marker for anything else.
+MANAGED = ("docs/acf/organization.md", "docs/acf/git/commit-conventions.md")
+MANAGED_DIRS = ("docs/acf/backlog/", "docs/acf/style/")
+MARKERS = ("<!-- acf-librarian-template:", "<!-- acf-whip-artifact:")
+LINK = re.compile(r'\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)')
+SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+FENCE = re.compile(r"^\s*(```|~~~)")
+# An inline code span is an example, like a fenced block: the conventions document shows
+# `[Organization](docs/acf/organization.md)` as a sample, and resolving that from docs/acf/ "found"
+# it broken and rewrote the sample. Spans are blanked to spaces, not removed, so a link matched on
+# the blanked line sits at the same offsets in the real one, which is where the rewrite splices.
+CODE = re.compile(r"(`+)(?!`).*?(?<!`)\1(?!`)")
 
-    # Extract markdown links: [text](path)
-    links = re.findall(r'\[([^\]]+)\]\(([^)]+)\)', content)
 
-    for link_text, link_path in links:
-        # Skip external links
-        if link_path.startswith(('http://', 'https://', '#')):
+def prose(line):
+    return CODE.sub(lambda m: " " * len(m.group(0)), line)
+
+
+def managed(path):
+    return path in MANAGED or path.startswith(MANAGED_DIRS)
+
+docs = Path("docs")
+if not docs.is_dir():
+    print("LINKS: 0 broken, 0 fixed, 0 report-only (no docs/)")
+    sys.exit(0)
+by_name = {}
+for p in sorted(docs.rglob("*")):
+    if p.is_file():
+        by_name.setdefault(p.name, []).append(p)
+
+broken = fixed = report_only = 0
+here = os.path.realpath(".")
+for src in sorted(docs.rglob("*.md")):
+    rel = src.as_posix()
+    # Lock by where a write would LAND, not only by how rglob spells the path: a doc symlinked into
+    # a cycle (docs/patterns/current-plan.md -> ../cycles/<ID>/plan.md) is written through the link,
+    # changing the approved plan's hash. Every symlinked doc is report-only: the edit lands in
+    # another file, whose links resolve from another folder than the fix was computed from.
+    real = os.path.relpath(os.path.realpath(src), here).replace(os.sep, "/")
+    linked = src.is_symlink()
+    try:
+        with open(src, encoding="utf-8", newline="") as f:
+            text = f.read()
+    except Exception as exc:
+        print(f"SKIPPED: {rel} ({type(exc).__name__})")
+        continue
+    owned = managed(rel) or managed(real) or text.startswith(MARKERS)
+    locked = rel.startswith(PROTECTED) or real.startswith(PROTECTED) or linked or owned
+    why = (f"; {rel} is a symlink to {real}" if linked else
+           f"; {rel} is plugin-installed and an edit would stop its template refresh" if owned else "")
+    lines = text.split("\n")
+    in_fence, seen, rewrites = False, set(), {}
+    for line in lines:
+        if FENCE.match(line):
+            in_fence = not in_fence
             continue
-
-        # Resolve relative path from source file
-        source_dir = md_file.parent
-        target = (source_dir / link_path).resolve()
-
-        if not target.exists():
-            print(f"BROKEN: {md_file} → {link_path}")
-            # Try to find the target file
-            filename = Path(link_path).name
-            matches = list(Path("docs").rglob(filename))
-            if matches:
-                print(f"  SUGGESTION: File may have moved to {matches[0]}")
+        if in_fence:
+            continue
+        for m in LINK.finditer(prose(line)):
+            raw = m.group(1)
+            target = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
+            if not target or target.startswith("#") or SCHEME.match(target) or raw in seen:
+                continue
+            seen.add(raw)
+            path = re.split(r"[#?]", target, maxsplit=1)[0]
+            if not path or (src.parent / path).exists() or (src.parent / unquote(path)).exists():
+                continue
+            broken += 1
+            print(f"BROKEN: {rel} -> {target}")
+            hits = by_name.get(Path(path).name, [])
+            if len(hits) != 1:
+                print(f"   AMBIGUOUS: {len(hits)} files named {Path(path).name}; fix by hand" if hits
+                      else "   NOT FOUND: create the file or remove the link")
+                continue
+            new = os.path.relpath(hits[0], src.parent).replace(os.sep, "/") + target[len(path):]
+            if locked:
+                report_only += 1
+                print(f"   REPORT-ONLY: fix by hand, never by the audit (possible target: {new}{why})")
+            elif FIX:
+                rewrites[raw] = f"<{new}>" if raw != target else new
+            else:
+                print(f"   SUGGESTION: {new}")
+    if rewrites and not locked:
+        # Line by line with the same fence toggle and code-span blanking as detection: a whole-file
+        # substitution would also rewrite an identical link inside a fenced or inline example.
+        # Splitting on "\n" keeps any "\r".
+        in_fence = False
+        for i, line in enumerate(lines):
+            if FENCE.match(line):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            for raw, new in rewrites.items():
+                pat = re.compile(r"\]\(" + re.escape(raw) + r"(?=[)\s])")
+                for m in reversed(list(pat.finditer(prose(line)))):
+                    s, e = m.span()
+                    # The lookahead may have seen a blanked span; the real line must agree.
+                    if re.match(r"[)\s]", line[e:e + 1]):
+                        line = line[:s] + "](" + new + line[e:]
+            lines[i] = line
+        for raw, new in rewrites.items():
+            fixed += 1
+            print(f"   FIXED: {rel}: {raw} -> {new}")
+        with open(src, "w", encoding="utf-8", newline="") as f:
+            f.write("\n".join(lines))
+print(f"LINKS: {broken} broken, {fixed} fixed, {report_only} report-only")
+PY
 ```
 
 **Report format**:
@@ -324,6 +457,9 @@ for md_file in Path("docs").rglob("*.md"):
 
 ❌ docs/patterns/quality-gates.md → ../acf/missing.md (file doesn't exist)
    📋 Create the file or remove the link
+
+⚠️ docs/cycles/20260928-owner-seat-notice/plan.md → docs/x/README.md (broken link)
+   📋 Report only: fix it by hand (a plan edit re-arms the cycle's approval)
 ```
 
 ---
@@ -371,7 +507,7 @@ done
 
 #### 7. Check Documentation Verbosity
 
-Scan documentation for token waste patterns that violate Section 10 (Documentation Writing Standards):
+Scan documentation for token waste patterns that violate Section 10 (Documentation Writing Standards). Ignore any finding in `docs/cycles/*/record.md`: acf-whip writes it and nobody edits it.
 
 **Verbose code examples** (>10 lines in code blocks):
 
@@ -469,7 +605,7 @@ fi
 
 ### A. Create Missing Directories
 
-For each missing directory from Step 2:
+For each missing directory from Step 2 (never `docs/cycles/` or `docs/acf/lessons/`: Step 2 never reports them):
 
 ```bash
 # Array of missing directories collected during audit
@@ -483,7 +619,7 @@ done
 
 ### B. Fix Temporal Naming Violations
 
-For files in temporal directories missing YYYYMMDD prefix:
+For files in temporal directories missing YYYYMMDD prefix. Nothing under `docs/cycles/` is ever in this list: a cycle folder's name is its ID, so Step 3 only reports it.
 
 ```bash
 # Array of temporal violations from Step 3
@@ -516,19 +652,24 @@ done
 
 ### C. Fix Timeless Naming Violations
 
-For files in timeless directories with dates or versions:
+For files in timeless directories with dates or versions. Nothing under `docs/acf/lessons/` is ever in this list: Step 3 only reports a lesson, because renaming one forks it into two files on the next `/retro`. The `case` below skips one anyway.
 
 ```bash
 # Array of timeless violations from Step 3
 for file in "${timeless_violations[@]}"; do
+    case "$file" in
+        docs/acf/lessons/*|./docs/acf/lessons/*)
+            echo "⚠️  Report only: $file (a lesson's slug is its identity; rename it by hand)"
+            continue ;;
+    esac
     dir=$(dirname "$file")
     basename=$(basename "$file")
 
     # Remove YYYYMMDD prefix (8 digits + hyphen at start)
     new_basename=$(echo "$basename" | sed 's/^[0-9]\{8\}-//')
 
-    # Remove version suffixes (-v1, -v2, etc.)
-    new_basename=$(echo "$new_basename" | sed 's/-v[0-9]\+//')
+    # Remove version suffixes (-v1, -v2, etc.). -E, because BSD sed reads \+ as a literal plus.
+    new_basename=$(echo "$new_basename" | sed -E 's/-v[0-9]+//')
 
     new_name="${dir}/${new_basename}"
 
@@ -576,46 +717,11 @@ fi
 
 ### E. Fix Broken Internal Links
 
-For broken markdown links found in Step 5:
+Re-run the Step 5 `acf-librarian:link-check` block with `fix_mode=true` on the line before it, in the same Bash call (shell variables do not survive between calls). It rewrites a broken link only when exactly one file under `docs/` has the target's name, keeps any `#section` suffix, preserves line endings, and prints `FIXED` for each rewrite.
 
-```python
-# Use Edit tool to fix broken links
-# For each broken link:
-#   1. Find the actual location of target file
-#   2. Calculate correct relative path
-#   3. Update link in source markdown
-
-for broken_link in broken_links:
-    source_file = broken_link['source']
-    old_path = broken_link['link_path']
-    target_filename = os.path.basename(old_path)
-
-    # Search for target file in docs/
-    matches = glob(f"docs/**/{target_filename}", recursive=True)
-
-    if len(matches) == 1:
-        # Found single match - calculate relative path
-        source_dir = os.path.dirname(source_file)
-        target_path = matches[0]
-        rel_path = os.path.relpath(target_path, source_dir)
-
-        # Read source markdown
-        content = read_file(source_file)
-
-        # Replace old path with new path
-        updated_content = content.replace(f"]({old_path})", f"]({rel_path})")
-
-        # Write back using Edit tool
-        edit_file(source_file, content, updated_content)
-
-        print(f"✅ Fixed link in {source_file}: {old_path} → {rel_path}")
-    elif len(matches) > 1:
-        print(f"⚠️  Multiple matches for {target_filename}, skipping (manual review needed)")
-    else:
-        print(f"❌ Target not found for {old_path}, skipping")
-```
-
-**Implementation note**: Use Edit tool for markdown link updates to preserve file content.
+- **NEVER** edit a link in `docs/cycles/` or `docs/retrospectives/`, in a plugin-installed document (`docs/acf/organization.md`, `docs/acf/git/commit-conventions.md`, `docs/acf/backlog/`, `docs/acf/style/`, or any file with a plugin marker on its first line), or in a doc that is a symlink, by this block or by hand with the Edit tool: the block prints `REPORT-ONLY` for them and they go into the final report for a human.
+- Links inside fenced code blocks and inline code spans are examples: the block neither reports nor rewrites them, even when the same link appears broken in prose on the same line.
+- `AMBIGUOUS` and `NOT FOUND` links are reported, not guessed.
 
 ### F. Clean Root Directory
 
@@ -683,7 +789,7 @@ if [ "$fix_mode" = true ]; then
     echo "   Files renamed (temporal): ${#temporal_violations[@]}"
     echo "   Files renamed (timeless): ${#timeless_violations[@]}"
     echo "   Scripts moved: ${#root_scripts[@]}"
-    echo "   Links fixed: ${#broken_links[@]}"
+    echo "   Links fixed: ${#broken_links[@]} (docs/cycles/, docs/retrospectives/ and plugin-installed docs are report-only)"
     echo "   Root files cleaned: ${#root_violations[@]}"
     echo ""
     echo "📋 Re-running audit to verify fixes..."
@@ -714,12 +820,14 @@ fi
 
 ## Naming Conventions
 [violations or ✅ All files follow temporal/timeless patterns]
+[docs/cycles/ and docs/acf/lessons/ reports, marked report-only]
 
 ## Script Organization
 [violations or ✅ No scripts in forbidden locations]
 
 ## Link Validation
 [violations or ✅ All internal links resolve correctly]
+[docs/cycles/, docs/retrospectives/ and plugin-installed doc links, marked report-only]
 
 ## Root Directory
 [violations or ✅ Root directory is clean]
@@ -785,6 +893,8 @@ fi
 ### Link Validation
 ✅ Fixed 1 broken link:
    - docs/README.md: Updated docs/agents/research-agent.md → docs/agents/universal/research-agent.md
+⚠️ 1 report-only link (fix by hand):
+   - docs/cycles/20260928-owner-seat-notice/plan.md → docs/x/README.md
 
 ### Root Directory
 ✅ Cleaned 1 file from root:

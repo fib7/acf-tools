@@ -27,9 +27,11 @@ docs/
 ├── README.md                   # Documentation navigation hub (MANDATORY)
 ├── acf/                        # ACF process documentation (TIMELESS)
 │   ├── git/                   # Git conventions (commit-conventions.md)
+│   ├── lessons/               # one-rule lessons from /retro (TIMELESS; if using acf-whip)
 │   └── organization.md        # Naming/organization conventions
 ├── agents/                     # Agent manifests (TIMELESS, if used)
 ├── architecture/               # Technical design (TIMELESS)
+├── cycles/                     # acf-whip cycle records (DATED, LIVING until closed; if using acf-whip)
 ├── development/                # Developer workflow (TIMELESS)
 ├── operations/                 # DevOps, deployment (TIMELESS)
 ├── patterns/                   # Reusable patterns (TIMELESS)
@@ -40,7 +42,7 @@ docs/
     ├── mappings/              # Cross-reference mappings
     ├── migrations/            # Migration plans
     ├── evaluations/           # Tech evaluations
-    └── planning/              # Planning snapshots
+    └── planning/              # Planning snapshots (acf-whip plans live in docs/cycles/)
 ```
 
 ### Required .backlog/ Subdirectories (if using ACF)
@@ -72,8 +74,8 @@ Git worktrees for parallel task execution MUST live at the repo root in `.worktr
 **Rules**:
 - **Ephemeral**: created on demand by `clean-checkout-before-task`, removed after integration. Never commit worktree contents.
 - **Gitignored**: `.worktree/` MUST be in `.gitignore` (added by `/whip-init`).
-- **Branch namespace**: each worktree is checked out on `worktree/<slug>`. acf-whip manages **only** worktrees on this branch namespace — any other worktree you park under `.worktree/` (e.g. research/benchmarking) is left untouched.
-- **Configurable**: the directory and branch prefix are overridable via `.backlog/.acfw-config` (`ACFW_WORKTREE_DIR`, `ACFW_BRANCH_PREFIX`) — set them only on a fresh backlog.
+- **Branch namespace**: each worktree is checked out on `worktree/<slug>`. acf-whip manages **only** worktrees on this branch namespace. Any other worktree you park under `.worktree/` (e.g. research/benchmarking) is left untouched.
+- **Configurable**: the directory and branch prefix are overridable via `.acfwhip/config` or the legacy `.backlog/.acfw-config` (`ACFW_WORKTREE_DIR`, `ACFW_BRANCH_PREFIX`); set them only on a fresh backlog.
 
 ---
 
@@ -112,7 +114,7 @@ Git worktrees for parallel task execution MUST live at the repo root in `.worktr
 - Update in place (git tracks history)
 
 **Required Locations**:
-- `docs/acf/` (and subdirectories like `docs/acf/git/`)
+- `docs/acf/` (and subdirectories like `docs/acf/git/`, `docs/acf/lessons/`)
 - `docs/patterns/`
 - `docs/agents/`
 - `docs/architecture/`
@@ -126,6 +128,22 @@ Git worktrees for parallel task execution MUST live at the repo root in `.worktr
 - ❌ `quality-gates-v2.md` (version number)
 - ❌ `architecture-20251104.md` (date embedded)
 - ❌ `QualityGates.md` (not lowercase)
+
+### Dated Living Records (folder name is the ID)
+
+**Format**: `YYYYMMDD-description/` folder holding fixed file names
+- The folder name is the record's ID: NEVER rename or move it (tools find a record by its name and ignore a renamed one)
+- Update the files inside in place until the record is closed, then leave them frozen
+- Machine files are tooling-only: NEVER hand-edit them (in a cycle, `record.md` is written only by acf-whip)
+- Not a temporal snapshot: no new file per update, no date on the files inside
+
+**Location**: `docs/cycles/` (acf-whip creates it on first use; it is optional, so an audit never requires or creates it)
+
+**Examples**:
+- ✅ `docs/cycles/20260928-owner-seat-notice/plan.md` (you edit the plan)
+- ✅ `docs/cycles/20260928-owner-seat-notice/record.md` (acf-whip writes the record)
+- ❌ `docs/cycles/owner-seat-notice/` (missing date: acf-whip ignores the folder)
+- ❌ renaming `20260928-owner-seat-notice/` to `20261001-owner-seat-notice/` (the name no longer matches the recorded ID, so acf-whip stops recognising the record)
 
 ### Exceptions (Standard Conventions)
 
@@ -216,6 +234,7 @@ These files may use uppercase:
 - Every reference must stay synchronized
 - No duplicated content (link to single source of truth)
 - Update all referencing documents when moving files
+- Fix broken links under `docs/cycles/` and `docs/retrospectives/` by hand only: editing a cycle's `plan.md` re-arms its approval, and a retrospective is a frozen record
 
 ---
 

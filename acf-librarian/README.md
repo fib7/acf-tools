@@ -12,7 +12,7 @@ Nobody likes the hall monitor. Nobody enjoys the strict librarian. But your repo
 
 The ACF Librarian plugin:
 
-1. **Auto-initializes conventions** - Creates `docs/acf/organization.md` AND `docs/acf/git/commit-conventions.md` with comprehensive ACF standards on first session
+1. **Auto-initializes conventions** - Creates `docs/acf/organization.md` AND `docs/acf/git/commit-conventions.md` with the full ACF standards on first session, and refreshes an unedited copy to the current template on later sessions; an edited copy is never overwritten and gets a one-line notice instead
 2. **Injects into context** - Every session loads your project's conventions with STRICT compliance instructions
 3. **Enforces compliance** - Claude follows conventions automatically (the librarian is in his context)
 4. **Enforces token efficiency** - 🚨 All documentation MUST follow token optimization patterns (40-70% reduction target)
@@ -56,6 +56,12 @@ In Claude Code:
 4. Injects both convention documents into session context
 5. Claude now follows ACF conventions automatically (organization + git)
 
+**On later sessions** (1.3.0+), a copy you never edited is replaced with the current template when
+the plugin ships a new one, so convention fixes reach existing projects. The hook recognises an
+unedited copy by its content, so this also works on copies made by releases before 1.3.0. Each
+installed or refreshed copy starts with a marker line,
+`<!-- acf-librarian-template: <template> sha256:<12 hex> -->`, naming the template it came from.
+
 ---
 
 ## Usage
@@ -81,6 +87,17 @@ Run periodic audits to catch any violations:
 ```
 
 **Output**: Detailed report of all violations with actionable fixes.
+
+**What `--fix` never touches** (1.3.0+). These are reported, never edited, renamed or moved:
+- acf-whip cycle folders in `docs/cycles/` (the folder name is the cycle's ID). A folder without an
+  acf `Format` stamp in its `record.md` belongs to another tool and is skipped
+- lessons in `docs/acf/lessons/` (a lesson's slug is its identity: `/retro` updates it by name)
+- broken links in `docs/cycles/`, `docs/retrospectives/`, symlinked docs, and plugin-installed
+  documents: `organization.md`, `commit-conventions.md`, acf-whip's `docs/acf/backlog/` and
+  `docs/acf/style/`, and any doc whose first line is a plugin marker. An audit edit to an installed
+  document makes it look customised, which stops its template refresh for good
+
+The link check skips inline code spans and fenced blocks: those are examples.
 
 **Fix workflow:**
 1. `/audit-acf-conventions` - See violations
@@ -129,6 +146,12 @@ code docs/acf/git/commit-conventions.md
 
 Now Claude follows YOUR custom conventions. The librarian is flexible (but still stern).
 
+An edited copy is yours: the hook never overwrites it. When a later plugin release changes the
+template, each session prints one line naming the file and the template to merge from, plus the
+marker line to put first in your copy. Once your copy starts with that marker, the notice stops
+until the template changes again. The CHANGELOG lists what each template change added, ready to
+paste.
+
 ---
 
 ## How It Works
@@ -144,11 +167,17 @@ SessionStart Hook Fires
     ↓
 Check: docs/acf/organization.md exists?
 ├─ NO  → Create from template
-└─ YES → Read current version (may be customized)
+├─ YES, unedited older template → refresh it to the current template
+├─ YES, edited → keep it; one notice line until its first line carries the current
+│                <!-- acf-librarian-template: ... --> marker
+└─ YES, current → read it
     ↓
 Check: docs/acf/git/commit-conventions.md exists?
 ├─ NO  → Create from template
-└─ YES → Read current version (may be customized)
+├─ YES, unedited older template → refresh it to the current template
+├─ YES, edited → keep it; one notice line until its first line carries the current
+│                <!-- acf-librarian-template: ... --> marker
+└─ YES, current → read it
     ↓
 Wrap BOTH with STRICT compliance instructions
     ↓
@@ -163,9 +192,12 @@ Follows them automatically throughout session
 
 | File | Purpose |
 |------|---------|
-| `hooks/handlers/session-start.py` | Initialize & inject both convention sets |
+| `hooks/handlers/session-start.py` | Initialize, refresh & inject both convention sets |
 | `content/organization-template.md` | Default ACF organization conventions |
 | `content/git-commit-conventions-template.md` | Default git conventions |
+| `content/.digests.json` | sha256 of every template version ever shipped (how the hook tells an unedited copy from an edited one) |
+| `skills/lib/gen-digests.sh` | Regenerates the digest manifest at release |
+| `tests/` | Offline suites: `template-refresh.test.sh`, `conventions.test.sh` |
 | `skills/audit-acf-conventions/SKILL.md` | Compliance checker |
 | `skills/commit/SKILL.md` | Conventional commit enforcer |
 | `docs/acf/organization.md` | Your project's organization conventions (created by hook) |
@@ -184,8 +216,12 @@ The librarian enforces these categories:
 
 ### 2. Naming Conventions
 - **Temporal documents**: `YYYYMMDD-description.md` (research, retrospectives, snapshots)
-- **Timeless documents**: `feature-name.md` (acf, patterns, architecture, etc.)
+- **Timeless documents**: `feature-name.md` (acf, patterns, architecture, etc.), including acf-whip's one-rule lessons in `docs/acf/lessons/`
+- **Dated living records** (1.3.0+): a `YYYYMMDD-description/` folder whose name is its ID, such as an acf-whip cycle in `docs/cycles/`. Never rename or move it; the files inside are updated in place until the record closes, and machine files (a cycle's `record.md`) are for tooling only
 - **Exceptions**: README.md, CLAUDE.md, LICENSE
+
+`docs/cycles/` and `docs/acf/lessons/` belong to acf-whip. Neither is required, so the audit never
+reports them missing and never creates them.
 
 ### 3. Script Organization
 - Scripts MUST be in: `scripts/`, `ops/scripts/`, `tools/`, `plugins/*/scripts/`
@@ -200,6 +236,7 @@ The librarian enforces these categories:
 - Internal links must use relative paths
 - All links must resolve correctly
 - No broken references
+- Broken links under `docs/cycles/` and `docs/retrospectives/` are fixed by hand only: editing a cycle's `plan.md` re-arms its approval, and a retrospective is a frozen record
 
 ### 6. Single Source of Truth
 - Link to authoritative source
@@ -461,7 +498,7 @@ Now Claude follows YOUR rules.
 
 ## Integration with ACF Workflow
 
-The librarian integrates seamlessly with ACF:
+The librarian works alongside the rest of ACF:
 
 ### Pre-Commit Hooks
 ```yaml
@@ -520,10 +557,10 @@ The STRICT compliance wrapper transforms conventions from documentation into imp
 - Team can iterate on conventions
 
 ### Lean Implementation
-- 9 files total (~800 lines)
-- No dependencies beyond Python stdlib
-- SessionStart hook handles dual initialization (organization + git)
-- Two slash commands: `/audit-acf-conventions` (read-only) and `/commit` (git workflow)
+- 14 files, two of them offline test suites
+- No dependencies beyond Python stdlib (the tests and the digest generator need bash and git)
+- SessionStart hook handles dual initialization and refresh (organization + git)
+- Two slash commands: `/audit-acf-conventions` (report; `--fix` repairs what it may) and `/commit` (git workflow)
 
 ---
 
@@ -607,6 +644,10 @@ The librarian welcomes contributions to improve the default conventions template
 2. Add new section with clear rules
 3. Provide examples (✅ good, ❌ bad)
 4. Update `/audit-acf-conventions` if checking logic needed
+5. Run `bash skills/lib/gen-digests.sh`, then `bash tests/template-refresh.test.sh`, and commit
+   `content/.digests.json` with the template. Without the regenerated manifest, every installed copy
+   of the new template is treated as edited at the next template change, and never refreshes again
+6. Add a CHANGELOG entry with the lines you added, ready to paste, for users whose copy is edited
 
 ### Improving Audit Logic
 
