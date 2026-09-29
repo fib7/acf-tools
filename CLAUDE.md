@@ -29,14 +29,14 @@
 | Plugin | Type | Purpose | Files |
 |--------|------|---------|-------|
 | **acf-challenger-mode** | Cognitive | Logic validation enforcer | 6 |
-| **acf-arazor-mode** | Cognitive | Production verification enforcer | 6 |
+| **acf-arazor-mode** | Cognitive | Production verification enforcer | 7 |
 | **acf-nitro** | Cognitive | Parallel execution enforcer | 6 |
 | **acf-mission-control** | Functional | Two-line status line HUD (1M-aware fuel gauge, self-priced cost, rate limits, cache warmth); themeable glyphs (sleek/emoji/nerd/text); self-upgrading | 7 |
-| **acf-librarian** | Functional | Convention enforcement | 9 |
-| **acf-whip** | Functional | Backlog workflow automation (workflow-native, concurrency-safe; per-task authored child workflows; LP-CAS integration; pluggable task stores: files/beads/multica/linear; focus-driven bare /go; store-side snapshot narrowing with a verified relay; per-task integrity quarantine; tiered model routing; offline contract suite for every backend) | 117 |
+| **acf-librarian** | Functional | Convention enforcement; self-refreshing templates; report-only on cycle records | 14 |
+| **acf-whip** | Functional | The ACF cycle via `/whip` (plan records in docs/cycles/ with content-bound approval, /task --plan, coverage, /retro lessons, pluggable spec tools) on top of backlog workflow automation (workflow-native, concurrency-safe; per-task authored child workflows; LP-CAS integration; pluggable task stores: files/beads/multica/linear; focus-driven bare /go; store-side snapshot narrowing with a verified relay; per-task integrity quarantine; tiered model routing; offline contract suite for every backend) | 187 |
 | **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 17 |
 
-**Total**: 168 plugin files + 13 project/docs files = 181 tracked files.
+**Total**: 244 plugin files + 14 project/docs files = 258 tracked files.
 
 **acf-mission-control** prices sessions itself as of **1.3.0**. Claude Code only knows rates for models it ships, so anything behind a gateway (`nebius/zai-org/GLM-5.2`, `zai-org/GLM-5.2`) reported `$0.00` no matter the spend. The HUD now sums transcript token usage — deduplicated by `requestId`, since Claude Code writes one record per content block and repeats the full usage in each, which inflates naive sums 3-4× — and multiplies it by LiteLLM's rate table, cached under `~/.cache/acf-mission-control/` and refreshed daily in a detached process so the status line never blocks on the network. Provider prefixes are routing, not identity: segments are stripped left to right until an entry matches, then the bare model name is looked up wherever it is published. Self-priced figures are marked `≈`, a trailing `?` flags tokens the table could not price exactly, and `--price-check <model-id>` shows the resolved entry. With no cached table the segment degrades to Claude Code's own figure. **1.3.1** makes that figure the *whole* session: subagent and workflow conversations live in sibling transcripts under `<transcript>/subagents/` and were silently excluded, often most of the spend (a measured session read `≈$6.03` and actually cost `$25.71`). It also stops a zero-rate entry from producing a confident `≈$0.00` that suppressed the fallback, raises `?` when a missing cache rate forces tokens onto the input rate (~4× overstatement, reachable on gateway-served Claude ids), applies published speed multipliers (fast mode bills 2×), resolves context-window variants like `claude-opus-5[1m]`, and splits JSONL on newlines only — `splitlines()` also breaks on U+2028/U+2029/U+0085 and silently dropped those records' tokens.
 
@@ -135,10 +135,34 @@ that tier stays cheap and the payload is bounded instead. Adjacent fixes: `cycli
 task a cycle could *reach* (now Tarjan SCC in both batteries); the orphan reaper destroyed
 accepted-but-unintegrated worktrees on the next bootstrap `--fix`; `dup-folder-unresolvable` was
 invisible to the gate that reads it; and every pre-dispatch abort now releases the run lock instead of
-holding it for half an hour after dispatching nothing. See `acf-whip/CHANGELOG.md` for version history
+holding it for half an hour after dispatching nothing.
+
+**3.5.0 adds the cycle: PLAN, DECOMPOSE, BUILD, VERIFY, RETRO, usable without building a pipeline.**
+`/whip` is the front door. Bare, it prints STATUS / NEED YOU / NEXT, derived on every call by
+`skills/lib/bin/acfw-cycle` from git and the store; the stage is never stored. `/whip "<goal>"` routes
+small work straight to `/task` (the default) and risky work (data, auth, a breaking contract, three or
+more modules, a new user flow, or the user says plan) to a plan. A plan lives in the repo as
+`docs/cycles/YYYYMMDD-<slug>/`: `plan.md` is the human's spec, `record.md` is the stamp, task map and
+newest-first Plan Log that only `acfw-cycle` writes, `retro.md` is the frozen retro. Approval is one
+yes on a card and is bound to `plan.md`'s content hash at HEAD (`--expect` must match the card);
+`ACFW-Plan-Event` trailers are audit only, because squash merges drop them. On yes, `/whip` starts
+`/task --plan` itself, which decomposes a frozen copy of the approved text, only for uncovered D-ids,
+and records the task map before creating tasks. VERIFY is a per-deliverable coverage table.
+`/retro` is always explicit: a clean cycle closes with zero agents; a triggered one (rework, stuck,
+a deliverable not met) writes at most three one-rule lessons in `docs/acf/lessons/` and a
+retro-actions cycle behind the same approval; retiring a lesson is a human `git rm`. Spec reviewers
+and workbenches plug in with one committed declaration in `.acfwhip/spec-tools/`, run only by
+`skills/lib/bin/acfw-spec` (protocol in `spec-tools/CONTRACT.md`), advisory or blocking at approval,
+optionally at the task stage, never inside `/go`; GapTrap ships as the example driver. Tasks never
+edit cycles: integration strips `docs/cycles/`, and every root writer now commits by pathspec, never
+the whole index. See `acf-whip/CHANGELOG.md` for version history
 and `acf-whip/content/backlog/workflow.md` for the state-machine spec.
 
 **Plugin architecture**: Each plugin is fully self-contained with no cross-dependencies. Users can install any combination.
+
+**Optional composition rule**: when one plugin uses another's files or commands, it checks for them
+and falls back when they are absent. A hard exit on a missing sibling plugin is a bug (3.4.3 fixed one
+in `/research`).
 
 ---
 
@@ -152,11 +176,11 @@ acf-tools/
 ├── .claude-plugin/
 │   └── marketplace.json             # Plugin registry (7 plugins)
 ├── acf-challenger-mode/             # Logic validation (6 files)
-├── acf-arazor-mode/                 # Production verification (6 files)
+├── acf-arazor-mode/                 # Production verification (7 files)
 ├── acf-nitro/                       # Parallel enforcement (6 files)
 ├── acf-mission-control/             # Status HUD (7 files)
-├── acf-librarian/                   # Convention enforcement (9 files)
-├── acf-whip/                        # Workflow automation, workflow-native (117 files; skills/ + workflows/ + adapters/ + tests/)
+├── acf-librarian/                   # Convention enforcement (14 files)
+├── acf-whip/                        # The ACF cycle + workflow automation (187 files; skills/ + workflows/ + adapters/ + spec-tools/ + tests/)
 └── acf-advisor/                     # Second-opinion LLM client (17 files)
 ```
 
@@ -480,14 +504,16 @@ claude plugin validate .
 ### This is NOT a Development Repository
 
 **Do not add**:
-- Complex documentation organization (docs/acf/, docs/patterns/, etc.)
+- Complex documentation organization (docs/patterns/, etc.). The six files under `docs/acf/` are
+  what acf-librarian and acf-whip install into any repo they run in; they stay, refreshed by the
+  plugins. Do not add more.
 - Plugin development infrastructure
 - Pattern extraction workflows
 - Multi-agent coordination systems
 - Complex quality gates for code (these are pure markdown plugins)
 
 **This repository's scope**:
-- Distribute 6 working plugins
+- Distribute 7 working plugins
 - Keep marketplace.json synchronized
 - Maintain plugin integrity
 - Update documentation as plugins evolve
@@ -498,7 +524,10 @@ The plugins themselves CREATE documentation when installed in user projects:
 
 - `acf-librarian` creates `docs/acf/organization.md`
 - `acf-whip` creates `.backlog/` structure and workflow docs
+- `acf-whip` (3.5.0) writes cycle records in `docs/cycles/`, retro analyses of plan-less runs in
+  `docs/retrospectives/`, and one-rule lessons in `docs/acf/lessons/`
 - Users don't need pre-existing docs - plugins initialize them
+- This repository never runs cycles, so it has no `docs/cycles/` of its own
 
 **Do not copy** user project documentation patterns into this distribution repository.
 
@@ -513,6 +542,6 @@ The plugins themselves CREATE documentation when installed in user projects:
 ---
 
 **Repository Version**: v1.0
-**Last Updated**: 2026-09-22
+**Last Updated**: 2026-09-29
 **Marketplace Plugins**: 7
-**Total Files**: 181 (tracked)
+**Total Files**: 258 (tracked)
