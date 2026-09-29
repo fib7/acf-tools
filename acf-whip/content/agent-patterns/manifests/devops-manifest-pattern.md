@@ -57,7 +57,7 @@ Pattern for `docs/agents/devops.md` with Priority 1/2/3 structure and project-sp
 ---
 
 ## Concurrency
-**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. All commits land on `worktree/<slug>`, never on `main`. Token `clean-checkout: ok` must appear in the task transition log.
+**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. All commits land on `worktree/<slug>`, never on `main`, and hold code only: never the task file, never task state. Token `clean-checkout: ok` must appear in the task transition log.
 
 ## Common Workflows
 
@@ -111,19 +111,22 @@ fi
 # ... continue for other docs
 ```
 
-**If NO operations docs exist**:
+**If NO operations docs exist** (true of every new project). Do not tell the agent to create them:
+a MUST READ entry that is a to-do turns every devops task into a documentation task.
 ```markdown
 ## Priority 1: MUST READ
 
-**Note**: Create `docs/operations/` directory with:
-- `deployment.md` - Deployment workflows and patterns
-- `monitoring.md` - Monitoring stack setup and alerts
-- `environment.md` - Environment configuration
+1. The task document at the path your prompt gives
+2. The Quality Gates section below
+
+This project has no `docs/operations/` docs yet. Create one only when your task asks for it.
 ```
 
 ## Conditional Priority 2 Docs
 
-**Standard locations to check**:
+**Standard locations to check**. List only the files that exist (`[ -f <path> ]`), and drop a
+sub-heading whose docs are all absent. If none of them exist, the whole section body is
+`No project docs yet.`
 
 1. `docs/operations/troubleshooting.md`
 2. `docs/operations/ci-cd.md`
@@ -235,7 +238,7 @@ ops/scripts/health_check.sh
 ---
 
 ## Concurrency
-**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. All commits land on `worktree/<slug>`, never on `main`. Token `clean-checkout: ok` must appear in the task transition log.
+**Step 0** (every workflow): invoke `clean-checkout-before-task` before any edit. All commits land on `worktree/<slug>`, never on `main`, and hold code only: never the task file, never task state. Token `clean-checkout: ok` must appear in the task transition log.
 
 ## Common Workflows
 

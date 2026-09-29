@@ -4,7 +4,9 @@
 
 The `.backlog/` directory contains all task specifications in a structured workflow. Tasks move through states from `pending` to terminal states (`accepted` or `blocked`).
 
-This README is the **single source of truth** for task workflow. All agents MUST read this as Priority 1 documentation.
+This README summarizes the task workflow for this project. `docs/acf/backlog/workflow.md` owns the
+state machine and the State Transition Authority table: where this README disagrees with either of
+those two, workflow.md wins. All agents MUST read this README as Priority 1 documentation.
 
 ## Directory Structure
 
@@ -16,7 +18,7 @@ This README is the **single source of truth** for task workflow. All agents MUST
 ├── completed/      # Finished, awaiting quality review
 ├── in-review/      # Under quality-reviewer assessment
 ├── blocked/        # Blocked by dependencies or issues
-├── rejected/       # Failed quality review (retry if < 3 attempts)
+├── rejected/       # Failed quality review (/go retries it, up to its retry cap)
 ├── accepted/       # Passed quality review (DONE - terminal state)
 └── archive/        # Historical tasks (optional)
 ```
@@ -24,14 +26,15 @@ This README is the **single source of truth** for task workflow. All agents MUST
 ## Task State Machine
 
 ```
-pending → in-progress → completed → in-review → [accepted | rejected]
+pending → in-progress → completed → in-review → [accepted|rejected]
             ↓                                          ↓
-         blocked                                    pending (retry)
+         blocked                                    rejected → pending (retry)
 ```
 
 **Terminal States**:
-- `accepted` - Successfully completed and passed quality review
-- `blocked` - Failed after max retries (3) or unresolvable dependencies
+- `accepted` - Passed quality review
+- `blocked` - Stopped: its specialist blocked it, it timed out, or it hit `/go`'s retry cap. `/go`
+  returns it to `pending` when its dependencies resolve and it is still under the cap.
 
 ## Installed Agents
 
@@ -67,7 +70,8 @@ ALL agents MUST read on receiving a task:
 
 Implementer specialists and quality-reviewer invoke the `clean-checkout-before-task` skill as Step 0. The skill creates a git worktree at `.worktree/<slug>` on branch `worktree/<slug>`, validates the branch, stashes unrelated changes, and logs the `clean-checkout: ok` token to the task transition log. Without that token, quality-reviewer auto-rejects.
 
-All implementer/reviewer commits land on `worktree/<slug>`, never on `main` directly.
+Specialist commits land on `worktree/<slug>` and hold code only: never a task file, never anything
+under `.backlog/`, never a commit on trunk. quality-reviewer commits nothing.
 
 **Integration is automatic by default.** Once a task is accepted, `/go` cherry-picks its change onto the **local** trunk and CAS-lands it with an in-tree ledger marker (LP-CAS). Nothing is pushed and no PR is opened — the change is on your local trunk, waiting for you to push. If your process requires a PR per group with human review, pin the mode instead of relying on prose:
 
@@ -91,20 +95,29 @@ Every task file MUST follow this structure (from `docs/acf/backlog/task-template
 5. **Edge Cases to Handle**: Explicit handling requirements
 6. **Out of Scope**: What NOT to do (MANDATORY section)
 7. **Quality Review Checklist**: For implementer and quality-reviewer
-8. **Transition Log**: Timestamped state changes with agent names
+8. **Transition Log**: Timestamped state changes with agent names. task-engineer writes the creation
+   row. After that, `/go` writes the state rows, clean-checkout writes its token row, `/task` adds a
+   hold row to a task it parks in `draft`, and `/whip-move` logs a manual move. Never a specialist or
+   the reviewer.
 9. **Implementation Notes**: Developer notes during work
 10. **Quality Review Comments**: Round-by-round review feedback
 11. **Evidence of Completion**: Quality gate outputs (complete commands + results)
 
 ## Priority Levels
 
-This project uses a **3-level priority system**:
+Five levels, highest first. `/go` accepts all five; a small project can use just `high`, `medium` and
+`low`.
 
-| Priority | Description | Cycle Time Target |
-|----------|-------------|-------------------|
-| **high** | Critical path, blocks other work | Start immediately |
-| **medium** | Important but not blocking | Start after high |
-| **low** | Nice to have, can be deferred | Start after medium |
+| Priority | SLA (deadline) | Cycle Time Target (stretch goal) |
+|----------|----------------|-----------------------------------|
+| **blocker** | 1h | 30min |
+| **critical** | 4h | 2h |
+| **high** | 24h | 6h |
+| **medium** | 1 week | 2 days |
+| **low** | none | none |
+
+Priority orders tasks within a worktree partition. It does not let tasks run in parallel across
+partitions; the partition rule does that.
 
 ## Evidence Requirements
 
@@ -113,7 +126,8 @@ This project uses a **3-level priority system**:
 1. **Quality Gate Outputs**: ALL commands with complete output (not truncated)
 2. **Test Results**: Full test output with coverage report
 3. **Implementation Commit**: SHA, files changed, commit message
-4. **Transition Log**: Timestamps, agents, state changes, reasons
+4. **Transition Log**: written by `/go` (state rows) and clean-checkout (its token row), never by a
+   specialist or the reviewer. A task under review must carry the clean-checkout token
 5. **Task-Specific Verification**: Screenshots, API samples, metrics (as appropriate)
 
 **Authenticity Checks** (quality-reviewer validates):
@@ -125,20 +139,28 @@ This project uses a **3-level priority system**:
 
 ## State Transition Authority
 
-| From | To | WHO moves file & updates transition log |
-|------|----|----------------------------------------|
-| N/A | pending | task-engineer |
-| pending | in-progress | Implementer agent (specialist) |
-| in-progress | completed | Implementer agent |
-| in-progress | blocked | Implementer agent (or timeout) |
-| completed | in-review | quality-reviewer |
-| in-review | accepted | quality-reviewer |
-| in-review | rejected | quality-reviewer |
-| rejected | pending | task-engineer (retry, max 3 attempts) |
-| rejected | blocked | task-engineer (≥3 retries) |
-| blocked | pending | task-engineer (dependencies resolved) |
+All state moves happen at the repo root, on the trunk branch.
 
-**The agent DOING the work moves the file and updates the transition log.**
+| From | To | WHO performs the move |
+|------|----|-----------------------|
+| N/A | pending | task-engineer, through `/task` (creation only) |
+| pending | in-progress | `/go`, before it dispatches the specialist |
+| in-progress | completed | `/go`, on the specialist's `transition: completed` |
+| in-progress | blocked | `/go`, on the specialist's `transition: blocked` (adds 1 to `Block-Count`), or on timeout |
+| completed | in-review | `/go`, before it dispatches quality-reviewer |
+| in-review | accepted | `/go`, on the reviewer's `transition: accepted` |
+| in-review | rejected | `/go`, on the reviewer's `transition: rejected` (adds 1 to `Rejection Count`) |
+| rejected | pending | `/go`, on retry, while the task is under its retry cap |
+| rejected | blocked | `/go`, at the retry cap. The task waits for task-engineer to redesign it |
+| blocked | pending | `/go`, when the dependencies resolve and both counts are under the cap |
+
+**Only `/go` moves a task.** Specialists and quality-reviewer return an `ACFW-RESULT` marker and stop.
+`/go`'s single writer then moves the file, rewrites `Status` to the new folder, appends the Transition
+Log row, and commits all three together on trunk. An agent that moves the task itself turns that
+commit into a no-op, which drops the counter increment and leaves `Status` out of step with the folder.
+On the legacy markdown loop (no workflow support) the orchestrator dispatches task-engineer at the
+repo root for retry, unblock and redesign, then commits the move itself. An operator can move one task
+by hand with `/whip-move`, also at the repo root and never in a worktree.
 
 ## Workflow Guidelines
 
@@ -150,20 +172,24 @@ This project uses a **3-level priority system**:
 4. **Max 2-3 Line Code Snippets**: Signatures/shapes only, NO implementations
 5. **Use Task Template**: Follow structure from `docs/acf/backlog/task-template.md`
 6. **Pre-Creation Validation**: Uniqueness, size ≤8h, tech stack specified, "Out of Scope" present
-7. **Create in pending/**: Filename: `{category}-{XXX}-{descriptive-name}.md`
-8. **Commit**: `task: create {category}-{id}-{name}`
+7. **Create in pending/** at the repo root, never in a worktree: filename `{category}-{XXX}-{descriptive-name}.md`
+8. **Creation is the only move you make**: `/task` commits the new task (`task: create ...`). Every
+   later move belongs to `/go`.
 
 ### For Implementer Agents (Specialists)
 
 1. **Step 0: clean-checkout-before-task**: Invoke the skill before any edit; it creates the worktree, validates the branch, logs the OK token. Without the token, quality-reviewer rejects.
 2. **Read Priority 1 Docs**: This README, style guide, task template, manifest
-3. **Move to in-progress**: Start of work (state move happens inside the worktree)
-4. **Update Transition Log**: Every state change with timestamp
-5. **Implement Task**: Decide HOW (task specifies WHAT/WHY); all edits happen inside `.worktree/<slug>` on branch `worktree/<slug>`
-6. **Run Quality Gates**: ALL stack-specific quality gates MUST pass
-7. **Provide Complete Evidence**: Command outputs, test results, coverage, commit SHA on `worktree/<slug>`
-8. **Move to completed**: After all criteria met and evidence provided
-9. **Commit with Task File**: Atomic commit (code + task file) on `worktree/<slug>`. Never commit on `main`.
+3. **Leave task state alone**: `/go` moved the task to `in-progress` before it dispatched you. Do not
+   move the task file, edit its `Status`, or write Transition Log rows.
+4. **Implement Task**: Decide HOW (task specifies WHAT/WHY); all edits happen inside `.worktree/<slug>` on branch `worktree/<slug>`
+5. **Run Quality Gates**: ALL stack-specific quality gates MUST pass
+6. **Commit code only** on `worktree/<slug>`: never the task file, never anything under `.backlog/`,
+   never a commit on trunk
+7. **Provide Complete Evidence**: Command outputs, test results, coverage, commit SHA on
+   `worktree/<slug>`, written into the task document at the path `/go` gave you
+8. **Return the `ACFW-RESULT` marker**: `transition: completed` or `blocked`, with `commit_sha`.
+   `/go` performs the move.
 
 ### For quality-reviewer
 
@@ -188,15 +214,11 @@ This project uses a **3-level priority system**:
 
 ## Quality Gates Integration
 
-Stack-specific quality gates are documented in:
-- `docs/development/quality-gates-{stack}.md`
-
-**Common stacks**:
-- Go: `docs/development/quality-gates-go.md`
-- Python: `docs/development/quality-gates-python.md`
-- Node.js: `docs/development/quality-gates-nodejs.md`
-- React: `docs/development/quality-gates-react.md`
-- Next.js: `docs/development/quality-gates-nextjs.md`
+Stack-specific quality gates live in `docs/development/quality-gates-{stack}.md` when `/whip-init`
+installed one for your stack. Without one, each specialist's gate commands are in its manifest
+(`docs/agents/<agent>.md`). `ACFW_GATE_CMD` in the project config (`.acfwhip/config` or
+`.backlog/.acfw-config`, whichever exists), when set, is the gate `/go` runs on every change before it
+lands on trunk.
 
 **Zero Bypass Tolerance**:
 - ❌ FORBIDDEN: `git commit --no-verify`, `SKIP={hook}`, lowering thresholds
@@ -204,23 +226,25 @@ Stack-specific quality gates are documented in:
 
 ## Git Commit Protocol (MANDATORY)
 
-**Task files MUST be committed at every stage transition**:
+Two kinds of commit, made by different hands. Never mix them.
 
-1. **Task Creation** → pending: `task: create {category}-{id}-{name}`
-2. **Task Start** → in-progress: `task: start {category}-{id}-{name}`
-3. **Implementation Progress**: Include task file WITH code changes (atomic commits)
-4. **Task Completion** → completed: `task: complete {category}-{id}-{name}` (CRITICAL)
-5. **Quality Review Start** → in-review: `review: begin quality review`
-6. **Review Decision** → accepted/rejected: `review: accept|reject {category}-{id}-{name}`
+- **Task-state commits** land on trunk, at the repo root. `/go`'s single writer makes each one: the
+  file move, the `Status` rewrite and the Transition Log row in one commit, subject
+  `task: <stem>.md <from> -> <to>` (the task's file name, `.md` included, so
+  `git log --grep 'task: api-001-login.md in-progress'` finds it). `/task` commits new tasks
+  (`task: create ...`) and `/whip-move` commits a manual move. No specialist or reviewer ever makes
+  one.
+- **Code commits** land on `worktree/<slug>`, made by the specialist. They hold code only: never the
+  task file, never anything under `.backlog/`.
 
 **FORBIDDEN**:
 - ❌ `git add -A` or `git add .`
 - ❌ `git commit -a`
-- ❌ Leaving task files uncommitted
+- ❌ Staging a task file or anything under `.backlog/` on a `worktree/<slug>` branch
+- ❌ `git commit --no-verify`
 
 **REQUIRED**:
 - ✅ Explicit file staging
-- ✅ Atomic commits (task file WITH code changes)
 - ✅ Conventional commit messages
 
 ## Commands
@@ -242,8 +266,13 @@ Decomposes scope into atomic tasks. Uses task-engineer agents in parallel. NEVER
 ### Continuous Backlog Execution
 ```bash
 /go
+/go <task-id>...
+/go --all
 ```
-Executes entire backlog until 100% complete (all tasks in accepted/blocked). Loops continuously.
+A bare `/go` runs your focus: the tasks your last `/task` created. With no focus, the default `files`
+store runs the whole backlog. `/go <task-id>...` runs exactly those tasks plus their unmet
+dependencies, and `/go --all` runs everything. It loops until every task in scope is accepted or
+blocked.
 
 ### Retrospective Analysis
 ```bash
@@ -266,7 +295,7 @@ Analyzes repo and creates missing specialist agents + manifests following ACF co
 - **Workflow Details**: `docs/acf/backlog/workflow.md` (state machine, transition rules)
 - **Task Template**: `docs/acf/backlog/task-template.md` (task file structure)
 - **Task Style Guide**: `docs/acf/style/task-descriptions.md` (WHAT/WHY only, binary criteria)
-- **Quality Gates**: `docs/development/quality-gates-{stack}.md` (stack-specific requirements)
+- **Quality Gates**: `docs/development/quality-gates-{stack}.md` (stack-specific requirements, if present)
 - **Git Conventions**: `docs/acf/git/commit-conventions.md` (if exists)
 - **Agent Manifests**: `docs/agents/{agent-name}.md` (Priority 1/2/3 documentation)
 

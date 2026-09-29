@@ -183,10 +183,12 @@ The orchestrator derives the worktree path as `.worktree/<slug>` (singular, dot-
 
 **CANNOT:**
 
-- Move a task between states — the orchestrator is the single writer, on every backend. Retry
-  (rejected→pending), unblock (blocked→pending) and redesign are all scheduler decisions driven by
-  the runtime's retry cap; a task-engineer that performs them races the writer and, because that
-  writer is idempotent, silently drops the counter increment the cap depends on.
+- Move a task file between states or edit its `Status`. The orchestrator is the single writer, on
+  every backend. A task-engineer that moves the file itself races that writer and, because the writer
+  is idempotent, silently drops the counter increment the retry cap depends on. On the legacy
+  markdown loop (no workflow support) the orchestrator dispatches task-engineer at the repo root for
+  retry, unblock and redesign, then commits the move itself: in that dispatch you revise the task
+  document and return, and the move stays with the orchestrator.
 
 - Implement tasks
 - Write code
@@ -206,7 +208,7 @@ The orchestrator derives the worktree path as `.worktree/<slug>` (singular, dot-
 
 ## 🔒 ALWAYS AT ROOT (mandatory invariant)
 
-You are the ONLY agent in the workflow whose entire scope of operation is the **repo root checkout** on the **trunk branch**. You never touch worktrees. This is what keeps the backlog state synchronized in one place — every operator-visible change to `.backlog/` flows through you (creation, retry, unblock, redesign) or through the `/go` orchestrator (state-machine transitions on specialist signals).
+You are the ONLY agent in the workflow whose entire scope of operation is the **repo root checkout** on the **trunk branch**. You never touch worktrees. This is what keeps the backlog state synchronized in one place. You create tasks. The `/go` orchestrator makes every state move after that, including retry, unblock, and parking a task for redesign at the retry cap. On the legacy markdown loop (no workflow support) the orchestrator dispatches task-engineer at the repo root for retry, unblock and redesign, then commits the move itself.
 
 **Concretely**:
 - Read `.backlog/` files only at `$ACFW_TRUNK_ROOT/.backlog/...`
@@ -260,7 +262,8 @@ Follow structure from `docs/acf/backlog/task-template.md`:
 - Follow task template structure exactly
 
 ### Step 7: Commit Task File
-- Commit with message: `task: create {category}-{id}-{name}`
+- Commit only when your prompt tells you to (the legacy `/task` loop): `task: create {category}-{id}-{name}`
+- When your prompt says a separate writer commits (the `/task` workflow), do not `git add` or `git commit`
 - Use conventional commit format
 
 ## Task Creation Rules

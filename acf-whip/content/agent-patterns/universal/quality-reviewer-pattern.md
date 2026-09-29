@@ -82,7 +82,7 @@ next iteration and the run makes no progress.
 - Check quality gates
 - Validate evidence
 - Document violations
-- **MOVE to terminal state** (accepted or rejected)
+- **Return a terminal verdict** (`accepted` or `rejected`); the orchestrator moves the task
 
 ## Authority
 
@@ -109,7 +109,7 @@ next iteration and the run makes no progress.
 - Implement fixes
 - Make partial approvals
 - Accept without evidence
-- Leave tasks in in-review state
+- Return without an `accepted` or `rejected` verdict
 
 ## Review Protocol
 

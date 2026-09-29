@@ -38,21 +38,24 @@ This template creates manifests for the 6 universal agents: task-engineer, quali
 **Out of Scope**: Implementation, quality review, process changes
 
 ## Priority 1: MUST READ (Every Task)
+Paths marked *(if present)* are project docs a new project does not have. Read one when it exists.
+Skip it when it does not, and never create it just to read it.
+
 1. `.backlog/README.md` - Workflow state machine, priorities, evidence requirements
 2. `docs/acf/style/task-descriptions.md` - **ABSOLUTE style requirements** (CRITICAL)
 3. `docs/acf/backlog/task-template.md` - Task file structure
 
 ## Priority 2: SHOULD READ (40-80% of Tasks)
 ### For Technical Features
-- `docs/development/quality-gates-{stack}.md` - Stack-specific quality standards
-- `docs/architecture/service-architecture.md` - System boundaries
+- `docs/development/quality-gates-{stack}.md` *(if present)* - Stack-specific quality standards
+- `docs/architecture/service-architecture.md` *(if present)* - System boundaries
 
 ### For Process Tasks
 - `docs/acf/backlog/workflow.md` - State transitions
 
 ## Priority 3: REFERENCE (Situational)
 - `docs/agents/{agent-name}.md` - When assigning to specific agents
-- `docs/architecture/` - For architecture-heavy features
+- `docs/architecture/` *(if present)* - For architecture-heavy features
 
 ## Navigation Guidance
 **Task Type: New Feature** → P1: All, P2: Quality gates/architecture
@@ -102,22 +105,25 @@ Style compliance: >95%, First-pass clarity: >90%, Correct assignment: >95%
 **Out of Scope**: Implementation, fixing issues, task creation
 
 ## Priority 1: MUST READ (Every Task)
+Paths marked *(if present)* are project docs a new project does not have. Read one when it exists.
+Skip it when it does not, and never create it just to read it.
+
 1. `.backlog/README.md` - Evidence requirements, quality gate commands, workflow
 2. `docs/acf/backlog/workflow.md` - State transitions, review authority
-3. `docs/development/quality-gates-{stack}.md` - Stack-specific quality requirements
+3. `docs/development/quality-gates-{stack}.md` *(if present)* - Stack-specific quality requirements
 
 ## Priority 2: SHOULD READ (40-80% of Tasks)
 ### For Backend Reviews
-- `docs/architecture/api-contracts.md` - Expected API behavior
-- `docs/development/testing-standards.md` - Coverage thresholds
+- `docs/architecture/api-contracts.md` *(if present)* - Expected API behavior
+- `docs/development/testing-standards.md` *(if present)* - Coverage thresholds
 
 ### For Frontend Reviews
-- `docs/development/component-standards.md` - Component patterns
-- `docs/development/accessibility.md` - A11y requirements
+- `docs/development/component-standards.md` *(if present)* - Component patterns
+- `docs/development/accessibility.md` *(if present)* - A11y requirements
 
 ## Priority 3: REFERENCE (Situational)
-- `docs/architecture/security.md` - Security-sensitive features
-- `docs/operations/performance.md` - Performance requirements
+- `docs/architecture/security.md` *(if present)* - Security-sensitive features
+- `docs/operations/performance.md` *(if present)* - Performance requirements
 
 ## Navigation Guidance
 **Task Type: Backend API** → P1: All, P2: API contracts/testing
@@ -125,7 +131,7 @@ Style compliance: >95%, First-pass clarity: >90%, Correct assignment: >95%
 **Task Type: Infrastructure** → P1: All, P2: Security/performance
 
 ## Scope Boundaries
-**IS**: Quality verification, evidence validation, accept/reject decisions, terminal state transitions
+**IS**: Quality verification, evidence validation, accept/reject verdicts returned in `ACFW-RESULT` (the orchestrator performs the state move)
 **NOT**: Implementation fixes, task creation (task-engineer), process changes (/retro action items, approved by a human)
 
 ## Quality Gates
@@ -143,22 +149,22 @@ a task has exhausted them, and blocks it for redesign. You have no rejection bud
 threshold to compare against — review each attempt on its merits.
 
 ## Integration Points
-**From**: Specialist agents (via .backlog/completed/), **To**: Terminal states (accepted/rejected)
+**From**: `/go` (the task is already in review), **To**: `/go` via the `ACFW-RESULT` verdict (it moves the task to accepted or rejected)
 
 ## Anti-Patterns
 1. Partial approval → Binary decision required
 2. Fix issues yourself → Reject and provide feedback
 3. Accept without evidence → Require complete quality gate output
-4. Leave in in-review → MUST move to terminal state
+4. Return without a verdict → The task stays in review and the run stalls; always return `accepted` or `rejected`
 5. Vague rejection feedback → Specific issues required
 6. Skip coverage check → Quality degradation
-7. Ignore rejection count → Systemic issues unaddressed
+7. Ignore earlier rounds' review comments → The same defect passes on retry
 8. Trust claims over evidence → Verify everything
 9. Bypass quality gates → Tech debt accumulation
-10. Incomplete transition log → Audit trail broken
+10. Move the task or edit its `Status` → `/go`'s move becomes a no-op and the rejection goes uncounted
 
 ## Success Metrics
-Terminal state compliance: 100%, Evidence presence: 100%, Rejection clarity: >95%
+Verdict returned: 100%, Evidence presence: 100%, Rejection clarity: >95%
 ```
 
 ### lean-architect
@@ -172,23 +178,26 @@ Terminal state compliance: 100%, Evidence presence: 100%, Rejection clarity: >95
 **Out of Scope**: Implementation, deployment, quality review
 
 ## Priority 1: MUST READ (Every Task)
-1. `docs/acf/style/architecture-documents.md` - **ABSOLUTE doc style requirements**
-2. `docs/architecture/system-overview.md` - Current architecture state
-3. `docs/architecture/architectural-principles.md` - Design principles
+Paths marked *(if present)* are project docs a new project does not have. Read one when it exists.
+Skip it when it does not, and never create it just to read it.
+
+1. `docs/acf/style/architecture-documents.md` *(if present)* - **ABSOLUTE doc style requirements**
+2. `docs/architecture/system-overview.md` *(if present)* - Current architecture state
+3. `docs/architecture/architectural-principles.md` *(if present)* - Design principles
 
 ## Priority 2: SHOULD READ (40-80% of Tasks)
 ### For Service Design
-- `docs/architecture/service-architecture.md` - Service patterns
-- `docs/architecture/api-contracts.md` - Existing contracts
+- `docs/architecture/service-architecture.md` *(if present)* - Service patterns
+- `docs/architecture/api-contracts.md` *(if present)* - Existing contracts
 
 ### For Technology Evaluation
-- `docs/architecture/tech-stack.md` - Current tech choices
-- `docs/operations/operational-requirements.md` - Ops constraints
+- `docs/architecture/tech-stack.md` *(if present)* - Current tech choices
+- `docs/operations/operational-requirements.md` *(if present)* - Ops constraints
 
 ## Priority 3: REFERENCE (Situational)
-- `docs/architecture/security.md` - Security architecture
-- `docs/architecture/data-architecture.md` - Data modeling
-- `docs/operations/monitoring.md` - Observability patterns
+- `docs/architecture/security.md` *(if present)* - Security architecture
+- `docs/architecture/data-architecture.md` *(if present)* - Data modeling
+- `docs/operations/monitoring.md` *(if present)* - Observability patterns
 
 ## Navigation Guidance
 **Task Type: New Service** → P1: All, P2: Service architecture/API contracts
@@ -235,17 +244,20 @@ WHAT/WHY compliance: >95%, Diagram usage: >80%, ADR completeness: 100%
 **Out of Scope**: Quality standard definition, process changes
 
 ## Priority 1: MUST READ (Every Task)
-1. `docs/development/quality-gates-{stack}.md` - Quality standards (single source of truth)
-2. `.pre-commit-config.yaml` - Current hook configuration
+Paths marked *(if present)* are project docs a new project does not have. Read one when it exists.
+Skip it when it does not, and never create it just to read it.
+
+1. `docs/development/quality-gates-{stack}.md` *(if present)* - Quality standards (single source of truth)
+2. `.pre-commit-config.yaml` *(if present)* - Current hook configuration
 
 ## Priority 2: SHOULD READ (40-80% of Tasks)
 ### For Hook Configuration
-- `docs/development/testing-standards.md` - Test requirements
-- `docs/development/security.md` - Security checks
+- `docs/development/testing-standards.md` *(if present)* - Test requirements
+- `docs/development/security.md` *(if present)* - Security checks
 
 ## Priority 3: REFERENCE (Situational)
-- `docs/operations/ci-cd.md` - CI/CD integration
-- `docs/development/developer-setup.md` - Developer environment
+- `docs/operations/ci-cd.md` *(if present)* - CI/CD integration
+- `docs/development/developer-setup.md` *(if present)* - Developer environment
 
 ## Navigation Guidance
 **Task Type: Add Stack** → P1: All, P2: Testing standards/security
@@ -292,22 +304,26 @@ Hook speed: <30s, CI enforcement: 100%, No bypasses: 100%
 **Out of Scope**: Implementation, quality review, task creation, changing agent files or quality standards on its own
 
 ## Priority 1: MUST READ (Every Task)
+Paths marked *(if present)* are project docs a new project does not have. Read one when it exists.
+Skip it when it does not, and never create it just to read it.
+
 1. The inputs the `/retro` dispatch prompt lists (plan, task documents with their audit trail, git history, lessons, follow-through)
 2. `docs/acf/backlog/workflow.md` - Current workflow
-3. `docs/acf/lessons/` - Recorded lessons, one rule each
+3. `docs/acf/lessons/` *(if present)* - Recorded lessons, one rule each. A new project has none;
+   the first retro that records a lesson creates the directory
 
 ## Priority 2: SHOULD READ (40-80% of Tasks)
 ### For Retrospectives
-- `docs/cycles/*/retro.md` and `docs/retrospectives/` - Previous retrospective findings
-- `docs/development/quality-gates-{stack}.md` - Quality standards (what a sensor action item extends)
+- `docs/cycles/*/retro.md` *(if present)* and `docs/retrospectives/` *(if present)* - Previous retrospective findings
+- `docs/development/quality-gates-{stack}.md` *(if present)* - Quality standards (what a sensor action item extends)
 
 ### For Action Items
 - `.claude/agents/` - Current agent instructions (what a guide action item changes)
-- `docs/acf/organization.md` - Documentation structure
+- `docs/acf/organization.md` *(if present)* - Documentation structure
 
 ## Priority 3: REFERENCE (Situational)
 - `docs/agents/` - Agent manifests
-- `docs/patterns/` - Pattern library for improvements
+- `docs/patterns/` *(if present)* - Pattern library for improvements
 
 ## Navigation Guidance
 **Task Type: Cycle Retro** → P1: All; the dispatch prompt names the triggered tasks
@@ -354,22 +370,25 @@ Root cause identified: >90%, Unapproved control changes: 0
 **Out of Scope**: Implementation, architecture design, quality review
 
 ## Priority 1: MUST READ (Every Task)
+Paths marked *(if present)* are project docs a new project does not have. Read one when it exists.
+Skip it when it does not, and never create it just to read it.
+
 1. `docs/acf/style/research-documents.md` - **ABSOLUTE research doc style**
-2. Task file in `.backlog/in-progress/` - Research scope and objectives
+2. The task document at the path your prompt gives - Research scope and objectives
 
 ## Priority 2: SHOULD READ (40-80% of Tasks)
 ### For Technology Research
-- `docs/architecture/tech-stack.md` - Current technology choices
-- `docs/architecture/system-overview.md` - Architecture context
+- `docs/architecture/tech-stack.md` *(if present)* - Current technology choices
+- `docs/architecture/system-overview.md` *(if present)* - Architecture context
 
 ### For Competitive Research
-- `docs/research/market-research/` - Previous market analyses
-- `docs/architecture/architectural-principles.md` - Design principles
+- `docs/research/market-research/` *(if present)* - Previous market analyses
+- `docs/architecture/architectural-principles.md` *(if present)* - Design principles
 
 ## Priority 3: REFERENCE (Situational)
-- `docs/operations/operational-requirements.md` - Ops constraints
-- `docs/development/quality-gates-{stack}.md` - Quality requirements
-- `docs/architecture/security.md` - Security requirements
+- `docs/operations/operational-requirements.md` *(if present)* - Ops constraints
+- `docs/development/quality-gates-{stack}.md` *(if present)* - Quality requirements
+- `docs/architecture/security.md` *(if present)* - Security requirements
 
 ## Navigation Guidance
 **Task Type: Tech Assessment** → P1: All, P2: Tech stack/system overview
@@ -410,5 +429,6 @@ Multi-source verification: 100%, Recency: <6 months, Recommendations: 100%, Cita
 1. **Generate one manifest per universal agent** during `/whip-init` Step 7
 2. **Customize Priority 1/2/3 docs** based on detected project structure
 3. **Update quality gates references** to match detected tech stack
-4. **Ensure stack-specific docs exist** before referencing them in manifests
+4. **Keep *(if present)* on every doc path the project does not have.** Remove the marker only from a
+   path you checked exists. A MUST READ entry for a missing file makes an agent stall or improvise.
 5. **Maintain 58-74% token reduction** by keeping manifests concise

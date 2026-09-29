@@ -15,6 +15,11 @@ This template creates frontend specialist agent implementations for `.claude/age
 - `{test-runner}`: go test, pytest, vitest
 - `{build}`: go build, python -m build, npm run build
 
+The values above are examples, not defaults. Fill each from the project's own scripts (`package.json`
+`scripts`, `Makefile`, `pyproject.toml`), and delete the line for any tool the project does not have.
+A generated agent told to run `eslint` or `tsc` in a repo without them can only fail its gates or skip
+them. For a project whose only script is `"test": "node --test"`, the block is one line: `npm test`.
+
 ## Agent Implementation Template
 
 ```markdown
