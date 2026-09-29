@@ -595,6 +595,9 @@ sc_alpha() {
   unlock "$ID"
   cy status "$ID"
   ck "$S status: wait: /go is running" has "wait: /go is running"
+  # A dead /go leaves a fresh lock; the card is the way out (a lock is evidence, not liveness).
+  ck "$S ...with a NEED YOU card for the run lock" has "  WHAT a /go run touched its run lock"
+  ck "$S ...naming its one-command override" has "rm $RUNLOCK"
   rm -f "$RUNLOCK"
 
   echo "== $S /task --plan decomposes the frozen HEAD copy, never the working tree =="

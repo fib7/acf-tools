@@ -816,7 +816,15 @@ cmd_status() {
   fi
 
   # Row 3: locks. Evidence that work started, never proof it is still running.
-  run_lock_fresh && { fact "wait: /go is running (its run lock was touched in the last $LOCK_FRESH_MIN minutes)"; setnext "wait: /go is running"; WAIT3=1; }
+  # The run lock gets the same card as a decompose lock. A /go that died with its session (a closed
+  # terminal, a crash, `claude -p` reaching its background-wait ceiling) leaves a fresh lock behind,
+  # and "wait" with no age and no way out held a user for half an hour (found by the 3.5.0 canary).
+  if run_lock_fresh; then
+    local rl rage; rl=$(acfw_run_lock_path "$REPO_ROOT"); rage=$(acfw_plan_lock_age "$rl")
+    fact "wait: /go is running (its run lock was touched ${rage:-?}m ago)"
+    card "run-lock" "a /go run touched its run lock ${rage:-?}m ago in this checkout" "a second /go now would collide with it on task slugs and the root index" "if no /go is running (its session was closed or crashed): rm $(shq "$rl"), then /go"
+    setnext "wait: /go is running"; WAIT3=1
+  fi
   find "$REPO_ROOT/.acfwhip/run" -maxdepth 1 -name 'cycle-*.decomposing' -mmin -$LOCK_FRESH_MIN 2>/dev/null > "$TMPD/locks"
   while IFS= read -r a; do
     local lid="${a##*/cycle-}"; lid="${lid%.decomposing}"; local age; age=$(acfw_plan_lock_age "$a")
