@@ -2,6 +2,66 @@
 
 All notable changes to acf-whip. The format loosely follows Keep a Changelog.
 
+## 3.5.1: a missing clean-checkout token can no longer loop a run
+
+A team ran one real feature, ENG-101, with `/task` and a first `/go` on 3.2.3, then the main `/go` on
+3.4.2. After hours of active run time, most of its tasks were implemented and none was accepted. The
+run was stuck in a loop that 3.4.3 made rarer but did not remove.
+
+Here is the loop. A task that reaches review without its clean-checkout token, while its worktree
+branch exists, has a mechanism fault, so nothing is charged. It is re-reviewed once, then parked in
+`blocked/`, and the unblock pass re-queues it so that its re-dispatch can re-record the token. When
+that restore cannot succeed, the task comes back without a token and is parked again, for ever.
+`blocked` counts as terminal, so every park also reset the no-progress guard, and only `MAX_ITER`
+(1000) or the agent cap ended the run. The 3.4.2 run got there by replaying the 3.2.3 run's stage
+ledger, whose checkout wrote no token, onto branches whose worktree directories were gone.
+
+### Fixed
+
+- **The park re-queues a task once per run.** If the task reaches review without its token again
+  after that re-dispatch, `/go` holds it in `blocked/` for the rest of the run. It is listed under
+  `needsOperator` with the restore's cause and the command that clears it: `git worktree list` for
+  exit 2, the namespace settings for exit 3, `acfw-store info` for exit 6. A worktree the restore
+  found dirty gets one more cycle first, because its harness commits the work. The next `/go` tries
+  again.
+- **The no-progress guard counts settled tasks against a high-water mark.** A settled task is
+  accepted and terminal, or blocked where the unblock pass can no longer re-queue it. The guard uses
+  the unblock pass's own predicate, so a park/unblock cycle returns to the same count and can never
+  reset it. A scoped task that leaves the working set still counts as progress, as in 3.4.0.
+- **A branch that no worktree holds is re-attached.** The restore used to skip it and leave it to
+  the harness's checkout stage, which a replay never runs. clean-checkout could not have attached it
+  anyway: it only knew `git worktree add -b`, which fails on an existing branch and printed the
+  misleading "another agent owns branch". clean-checkout now attaches the existing branch without
+  resetting it, keeping its fork base or recording the real one (the merge-base with trunk), never
+  today's trunk tip. A branch checked out in another worktree still exits 2, and the message names
+  that worktree's path. A worktree directory deleted without `git worktree prune`, the usual way one
+  gets reaped, left the branch registered at a dead path, which the restore read as unreadable
+  forever. The restore now prunes dead registrations first; a directory that still exists is never
+  pruned and still goes through the unreadable and dirty checks.
+- **clean-checkout reads only the first `Worktree` line.** A materialized Linear or multica task
+  body appends store comments after the spec, and a comment that restated the field produced a
+  doubled slug.
+- **A token the store could not read is unknown, not absent.** On Linear every token answer costs one
+  GraphQL request per in-flight issue, and a failed request was reported as
+  `hasCleanCheckoutToken: false`, the one value that parks a task. It is now `null`. The review gate,
+  the enricher and the doctor treat `null` as "not known yet" and act on it no further; the next scan
+  asks again. `CONTRACT.md` documents the third value. multica does the same, and it no longer reports
+  `false` when its comment scan succeeded but the description, where the token has lived since 3.2.0,
+  was never read (the listing left it out and the follow-up `issue get` failed).
+- **The final drain scan asks for the same 5-minute shell timeout as the loop's scan.** On an
+  API-backed store a slow walk could otherwise be killed into a truncated relay at the end of a run.
+- **`/go`'s skill claimed that a Linear URL resolves as a task id. No code did that.** It now says
+  what resolves: a backend id such as `ENG-102`, only for an issue that is a whip task. A bare
+  number, a URL, or the hand-made parent issue a feature was decomposed from does not resolve.
+  `CONTRACT.md` now lists `backendId`, and its note on parents describes what the adapters do.
+
+### Upgrading
+
+Run `/task` and `/go` on the same release. A `/go` on a newer release replays an older run's stage
+ledger and attaches to its worktrees, which is how the 3.2.3 → 3.4.2 run reached this loop. To re-run
+work an older release started, start from a fresh clone, or first clear that work's worktrees and
+branches (`git worktree list`, `git branch --list 'worktree/*'`).
+
 ## 3.5.0: the ACF cycle, out of the box
 
 Before 3.5.0, acf-whip ran the middle of the job: `/task` decomposed a scope and `/go` built it.
