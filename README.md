@@ -220,13 +220,24 @@ trailer, so `git log -- docs/cycles/` shows the same events as `record.md`.
 
 | Agents stop and ask you when | Agents do not stop for |
 |---|---|
-| A plan needs approval, including a blocking spec tool's NO-GO, which you can override on the card | A rejection under the three-strike cap |
-| A retro's action plan needs approval | A merge conflict (an agent resolves it) |
+| A plan needs approval, including a blocking spec tool's NO-GO, which you can override on the card. An autopilot run with `--approve`, or a committed `ACFW_AUTOPILOT=approve`, approves the plans it drafts; one that loosens a control still waits | A rejection under the three-strike cap |
+| A retro's action plan needs approval, unless an `--approve` autopilot run wrote it and it loosens no control | A merge conflict (an agent resolves it) |
 | Work is parked: blocked at the cap, a missing dependency, a task held in draft, a deliverable marked ✗ | A red test inside a worktree |
 | Code is ready to push | Retries inside the tooling, and choices within the acceptance criteria |
-| `/go` would run a focus that is not an approved plan (one `yes`) | Advisory reviewer findings, or a spec tool that could not run |
+| `/go` would run a focus that is not an approved plan (one `yes`). An autopilot run names the task ids, so it does not ask | Advisory reviewer findings, or a spec tool that could not run |
 
 ## Going further
+
+**Hands-off runs.** `/whip --auto "<goal>"` runs the whole loop by itself. It routes the goal, runs
+`/task` and `/go`, and runs `/retro` on a planned cycle. Once the work is finished, a fresh judge agent
+checks the repository against your condition. The condition is the goal itself, unless you pass one
+with `--until "npm test passes and greet --version prints the version"`. When the judge finds it not
+met, the next round starts on what is missing, up to `--rounds` (3). Plans still wait for your `yes`.
+With `--approve`, the run approves the plans created while it runs, retro action plans included, and
+records each `via autopilot`. Parked work and plans that loosen a control always wait for you.
+`/whip --auto off` stops the run. `ACFW_AUTOPILOT=on` in acf-whip's config file makes it the default
+for every goal, and `/whip --no-auto "<goal>"` opts one goal out. `approve` there counts only once
+committed. Headless: `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 claude -p --permission-mode auto "/whip --auto '<goal>'"`.
 
 **Bring your own plan.** `/whip path/to/plan.md` adopts a plan written anywhere: superpowers, spec-kit,
 Claude plan mode or by hand. `/whip` copies it into a cycle folder and leaves your original file
@@ -284,7 +295,7 @@ session, so pick at most one.
 
 | Command | What it does |
 |---|---|
-| `/whip` | Where you are, and the one command to run next. With a goal, a plan file or a cycle id: routes, drafts, shows the approval card |
+| `/whip` | Where you are, and the one command to run next. With a goal, a plan file or a cycle id: routes, drafts, shows the approval card. `/whip --auto "<goal>"` runs the whole loop until a judge finds the goal met |
 | `/whip-init` | Sets up a repository: task store, agents, quality gates |
 | `/task "<scope>"` · `/task --plan <cycle-id>` | Decomposes a goal, or an approved plan, into tasks |
 | `/go` | Builds, reviews and integrates your focus in the background. `/go --all` or `/go <ids>` to choose |
@@ -306,7 +317,7 @@ and `/task`; you never call them directly.
 | `.backlog/.acfw-config` (files store) or `.acfwhip/config` (other stores); `.acfwhip/spec-tools/` | `/whip-init`, `/whip --tools add` | Yes | Delete the files. Never keep both config files: `.acfwhip/config` hides every key in the other |
 | `.acfwhip/integrated/` | `/go`: one marker per landed task, in the same commit as its code | Yes | Keep while you use acf-whip: it is how `/go` and `/whip` know what landed |
 | `.worktree/`, `worktree/<slug>` branches | `/go`, one per task group | No (gitignored) | `/whip-doctor --fix` removes finished ones |
-| `.acfwhip/run/`, `.acfwhip/specs/`, `.backlog/.acfw-run.json` | Runs: locks, focus, cycle state, frozen plan copies, spec-tool results | No (gitignored) | Leave it; deleting it drops your focus and cycle state, and a paid spec tool bills again |
+| `.acfwhip/run/`, `.acfwhip/specs/`, `.backlog/.acfw-run.json` | Runs: locks, focus, cycle and autopilot state, frozen plan copies, spec-tool results | No (gitignored) | Leave it; deleting it drops your focus and cycle state, and a paid spec tool bills again |
 | `docs/cycles/<cycle-id>/` | `/whip` drafts or imports `plan.md`, yours to edit; only the tooling writes `record.md`; `/retro` writes `retro.md` | Yes, from approval on (a draft stays untracked) | Never rename or move a cycle folder; `/whip --abandon` closes one |
 | `docs/acf/lessons/`, `docs/retrospectives/`; `docs/research/` | `/retro`; `/research` | Yes | `git rm` a lesson to retire it; delete the rest |
 | `.claude/agents/`, `docs/agents/`, `docs/development/`, `CLAUDE.md` section, `.pre-commit-config.yaml`, `.worktreeinclude`, `.gitignore` lines | `/whip-init`, `/whip-add-agents` | Yes | Delete the files; edit the lines out |
@@ -339,7 +350,9 @@ going, wait for its report. If its session ended, the card under NEED YOU shows 
 `rm` that clears it. Run that, then rerun the `/go` or `/task --plan`; it picks up where it stopped.
 
 **How do I stop, pause or watch a run?** `/workflows` lists running workflows. Open one: `x` stops it,
-`p` pauses and resumes it.
+`p` pauses and resumes it. An autopilot run stops with `/whip --auto off` and resumes with
+`/whip --auto on`, or `on --rounds <n>` once it has used its rounds. Bare `/whip` shows its round and last step. When it pauses for you, it says why
+in one line and picks up again once you have answered.
 
 **What does it cost?** More than the task size suggests; see the [cost note](#3-your-first-small-change).
 To pin cheaper models, set `ACFW_MODEL_SHELL`, `ACFW_MODEL_JUDGE` or `ACFW_MODEL_AUTHOR` in the config
@@ -360,12 +373,18 @@ cannot tell a hash you saw from one an agent computed. The one guard against tha
 to approve only on your reply. `record.md` logs the git identity behind each approval, and the approval
 commit carries an `ACFW-Plan-Event` trailer.
 
+**Can it approve plans by itself?** Only if you ask it to. Start an autopilot run with `--approve`, or
+commit `ACFW_AUTOPILOT=approve`. The run then approves plans created after it started, including the
+action plan its own retro writes. Their `record.md` rows read `via autopilot`. It never overrides a blocking spec tool, retires a lesson or
+approves a plan that loosens a control; those still wait for you.
+
 **How do I undo an approval?** `yes` starts `/task --plan` at once, so first stop it in `/workflows` if
 it is still running. Then run `/whip --abandon <cycle-id>`. Tasks it already made stay pending and in
 your focus. Archive each with `/whip-move <task> archive` (`record.md` lists them under `## Tasks`).
 
 **Can I run it headless or in CI?** Yes, with `claude -p`. By default it waits only 10 minutes for
-background workflows. Set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` for runs that take longer.
+background workflows. Set `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` for runs that take longer. For a
+whole loop with no one at the keyboard, use `/whip --auto` (see [Going further](#going-further)).
 
 **Where do I report problems?** Open an issue in this repository or write to acf@fib7.ai.
 

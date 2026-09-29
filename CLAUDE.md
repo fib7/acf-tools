@@ -34,10 +34,10 @@ in sync.
 | **acf-nitro** | Cognitive | Parallel execution enforcer | 6 |
 | **acf-mission-control** | Functional | Two-line status line HUD (1M-aware fuel gauge, self-priced cost, rate limits, cache warmth); themeable glyphs (sleek/emoji/nerd/text); self-upgrading | 7 |
 | **acf-librarian** | Functional | Convention enforcement; self-refreshing templates; report-only on cycle records | 14 |
-| **acf-whip** | Functional | The ACF cycle via `/whip`: plan records in docs/cycles/ with content-bound approval, /task --plan, per-deliverable coverage, /retro lessons, pluggable spec tools. Underneath, the backlog engine: workflow-native and concurrency-safe, a child workflow authored per task, LP-CAS integration, pluggable task stores (files/beads/multica/linear), focus-driven bare /go, store-side snapshot narrowing with a verified relay, per-task integrity quarantine, tiered model routing, an offline contract suite for every backend | 187 |
+| **acf-whip** | Functional | The ACF cycle via `/whip`: plan records in docs/cycles/ with content-bound approval, /task --plan, per-deliverable coverage, /retro lessons, pluggable spec tools, and `/whip --auto`, which runs the loop until a judge agent finds the goal met. Underneath, the backlog engine: workflow-native and concurrency-safe, a child workflow authored per task, LP-CAS integration, pluggable task stores (files/beads/multica/linear), focus-driven bare /go, store-side snapshot narrowing with a verified relay, per-task integrity quarantine, tiered model routing, an offline contract suite for every backend | 191 |
 | **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 17 |
 
-**Total**: 244 plugin files + 14 project/docs files = 258 tracked files.
+**Total**: 248 plugin files + 14 project/docs files = 262 tracked files.
 
 **acf-mission-control** has priced sessions itself since **1.3.0**. Claude Code only knows rates for
 the models it ships, so a model behind a gateway (`nebius/zai-org/GLM-5.2`, `zai-org/GLM-5.2`)
@@ -276,7 +276,7 @@ because squash merges drop them. On yes, `/whip` starts `/task --plan` itself. I
 frozen copy of the approved text, only for D-ids no task covers yet, and records the task map
 before it creates any task. VERIFY is a coverage table with one row per deliverable.
 
-`/retro` runs only when you call it. A clean cycle closes with zero agents. A triggered one
+`/retro` runs only when you call it, or when an autopilot run you started reaches it (3.6.0). A clean cycle closes with zero agents. A triggered one
 (rework, a stuck task, a deliverable not met) writes at most three one-rule lessons in
 `docs/acf/lessons/` and a retro-actions cycle that goes through the same approval. A human
 retires a lesson with `git rm`.
@@ -286,6 +286,18 @@ Only `skills/lib/bin/acfw-spec` runs them (protocol in `spec-tools/CONTRACT.md`)
 blocking at approval, optionally at the task stage, never inside `/go`. GapTrap ships as the
 example driver. Tasks never edit cycles: integration strips `docs/cycles/` from a candidate, and
 every root writer now commits by pathspec, not the whole index.
+
+**3.6.0 lets the cycle run by itself, on request.** `/whip --auto "<goal>"` starts a run, and acf-whip's
+Stop hook drives it. At the end of every turn, `skills/lib/bin/acfw-autopilot tick` maps
+`acfw-cycle status`'s NEXT line to exactly one step (`/task --plan`, `/go <ids>`, `/retro`, or the round's goal through `/whip`)
+and hands it to the session. It does nothing while a background run is in flight. With no run in the
+checkout, the hook costs a few file tests and no git call. The script decides what runs next; a model decides whether
+the goal is met. At round end a fresh judge subagent checks the repository, not the chat, and records
+its verdict with a one-time nonce, bound to HEAD and the working tree. `not-met` starts another round,
+up to `--rounds`. Plan approval still waits for a person unless the run started with `--approve` or
+the project committed `ACFW_AUTOPILOT=approve`. Even then, the hook approves only plans the run
+drafted (`approve --via autopilot`), never one that loosens a control, and never overrides, retires
+a lesson or pushes.
 
 See `acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the
 state-machine spec.
@@ -313,7 +325,7 @@ acf-tools/
 ├── acf-nitro/                       # Parallel enforcement (6 files)
 ├── acf-mission-control/             # Status HUD (7 files)
 ├── acf-librarian/                   # Convention enforcement (14 files)
-├── acf-whip/                        # The ACF cycle + workflow automation (187 files; skills/ + workflows/ + adapters/ + spec-tools/ + tests/)
+├── acf-whip/                        # The ACF cycle + workflow automation (191 files; skills/ + workflows/ + adapters/ + spec-tools/ + tests/)
 └── acf-advisor/                     # Second-opinion LLM client (17 files)
 ```
 
@@ -680,4 +692,4 @@ The plugins create documentation in the projects they are installed in:
 **Repository Version**: v1.0
 **Last Updated**: 2026-09-29
 **Marketplace Plugins**: 7
-**Total Files**: 258 (tracked)
+**Total Files**: 262 (tracked)
