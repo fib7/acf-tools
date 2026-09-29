@@ -1,0 +1,12 @@
+# A folder workbench: /whip --push copies the plan into a folder you edit with any tool (an
+# Obsidian vault, iCloud Drive, Dropbox), and /whip --pull 3-way merges your edits back.
+# Point it at the folder in your shell or a gitignored .env (never in this file):
+#   export ACFW_WORKBENCH_DIR="$HOME/Notes/plans"
+# A push never overwrites folder edits you have not pulled yet (a phone edit that synced late):
+# it saves that copy, refuses once, and tells you how to merge it.
+# /whip --from dir <file> starts a cycle from a file in that folder (a name, or a path inside it).
+# A file anywhere else is refused: import it directly with /whip <path>.
+# No at= line: a workbench runs only when you push or pull, never on its own.
+driver=dir
+policy=advisory
+timeout=30

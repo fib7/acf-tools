@@ -1,0 +1,2 @@
+200
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"error\":{\"code\":\"NOT_FOUND\",\"message\":\"Spec not found\"}}"}],"isError":true}}

@@ -1,0 +1,4 @@
+200
+event: message
+data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"specId\":\"Xy12pQ7rT3uV9wZ1aB4c\",\"status\":\"pending\"}"}]}}
+

@@ -1,0 +1,2 @@
+200
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"MCP error -32602: Tool get_spec not found"}],"isError":true}}

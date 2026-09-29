@@ -1,0 +1,2 @@
+200
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"error\":{\"code\":\"quota_exceeded\",\"message\":\"Your team's spec quota is exhausted.\"}}"}],"isError":true}}

@@ -1,0 +1,10 @@
+# An LLM spec critic that runs as a subagent inside your Claude Code session, from the prompt in
+# spec-critic.md (copied next to this file by `acfw-spec add spec-critic`). No key, no network of
+# its own: it uses your session. Agent tools run at the plan stage only.
+# It costs a subagent per run, so it reviews on the first card and again when you reply "review".
+# It can also act as a workbench: /whip --push asks it to draft a revised plan, /whip --pull merges
+# that draft into your plan with a 3-way merge that keeps your own edits.
+agent=spec-critic.md
+at=plan
+policy=advisory
+rerun=ask

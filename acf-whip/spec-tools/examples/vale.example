@@ -1,0 +1,9 @@
+# Vale prose linter (vale.sh), run as-is with no wrapper. Its line output goes through the
+# unstructured fallback: on NO-GO each "file:line:col:rule:message" line becomes a finding at L<line>.
+# Needs vale on PATH and a .vale.ini at the repo root (run `vale sync` once to fetch its styles).
+# Vale exits 1 when it finds error-level alerts (NO-GO) and 2 when it cannot run (an error, never GO).
+# No vale installed means exit 3: the tool is skipped and never blocks.
+review=command -v vale >/dev/null 2>&1 || { echo "vale is not installed (see vale.sh)" >&2; exit 3; }; vale --output=line "$ACFW_SPEC_FILE"
+at=plan
+policy=advisory
+timeout=60

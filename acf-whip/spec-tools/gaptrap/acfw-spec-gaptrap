@@ -1,0 +1,658 @@
+#!/usr/bin/env bash
+# acfw-spec-gaptrap — the GapTrap spec-tool driver (acf-whip spec-tool protocol, spec-tools/CONTRACT.md).
+#
+# WHY CURL AND NOT AN MCP REGISTRATION
+# GapTrap's /mcp is stateless Streamable HTTP: a fresh server per POST and no session id, so a bare
+# JSON-RPC `tools/call` with no `initialize` is accepted (MCP SDK 1.29 skips session validation when
+# sessionIdGenerator is undefined). The request must say Content-Type application/json (else 415) and
+# Accept both application/json and text/event-stream (else 406). curl + jq is therefore the whole
+# client: nothing to register, no OAuth, and nothing for a session to call by hand. Every review goes
+# through acfw-spec, which caches, gates and records it.
+#
+# THE RULE THAT SHAPES THE CODE: never bill twice for the same bytes.
+# create_spec reserves one spec unit (Solo: 15 a month); every other call is free. The engine caches
+# only go/nogo, so a timeout, a watchdog kill or a `failed` analysis would otherwise create a new spec
+# on the next card. Three things close that:
+#   - STATE/creating/<blob> is written BEFORE create_spec is sent, naming the attempt. GapTrap commits
+#     the spec and reserves the unit before it answers (specService createOrgSpecCore: set, reserve,
+#     enqueue, an awaited diagram prewarm), so a reply lost to a timeout, a reset, a 5xx or a SIGKILL
+#     may still have been billed. create_spec is therefore never re-sent blind: the next run asks the
+#     free list_specs for the spec by its attempt-tagged filename and adopts it. Only a request curl
+#     never sent (no DNS, no connect, no TLS) is retried, or a transient failure once GapTrap lists
+#     idempotencyKey, which makes a resend return the same spec.
+#   - STATE/pending/<blob> gets the specId the moment the reply is read, and the TERM handler writes it
+#     too, so a watchdog TERM between reply and write loses nothing. Any later run resumes polling it.
+#   - done/<blob> is re-read for free; failed/<blob> is memoized as an error, never a new charge, until
+#     ACFW_SPEC_FRESH=1, a push that pays for a new attempt, or new bytes. Slots record the endpoint,
+#     template and mode they were made under, so a staging spec is never polled on production.
+# A fresh attempt (ACFW_SPEC_FRESH=1, or a resumed spec that vanished) bumps STATE/gen/<blob>, which
+# feeds the filename tag and the idempotencyKey: a retry of one attempt keeps them, a new one does not.
+#
+# THE VERDICT IS WRITTEN TWICE. Write-1 flips the spec to completed with the gap-based verdict and
+# contractStatus=extracting; write-2 may force NO-GO (a required template section is missing) and add
+# that finding. A verdict is final only at contractStatus ready|failed (a report with no contractStatus
+# predates the split write and is final as written). At the deadline a still-extracting NO-GO is
+# reported, since write-2 only ever adds NO-GO, and a still-extracting GO is an error, never a GO.
+# GapTrap stamps `failed` and keeps write-1's verdict when extraction outlives its join budget, but a
+# write-2 that fails after its one retry, or an instance that dies after write-1, leaves `extracting`
+# forever. So 15 minutes after the spec was created (past the 600 s Cloud Tasks wall) write-1's
+# verdict is accepted as GapTrap's own timeout path would have, and the SUMMARY says so.
+#
+# FINDINGS. gap_id is a fresh uuid4 on every analysis, so fp = the first 12 hex of the git blob hash of
+# "<pattern>|<extraction_text lowercased, whitespace collapsed>" (the title when there is no quote):
+# the same gap in the next revision keeps its fp, which the card's new/persisting/resolved labels need.
+# source_offset is a Python codepoint index into the exact submitted text, and jq slices strings by
+# codepoint, so L<n> is computed by jq on the frozen file and never with byte tools (an em dash is three
+# bytes and one codepoint).
+#
+# THE KEY. GAPTRAP_API_KEY reaches curl as `-K <(printf ...)`: printf is a builtin and the config
+# arrives on a pipe, so the key is in no process's argv (ps shows /dev/fd/NN), and it is never printed.
+# `-q` comes first because curl honors it only there: it stops ~/.curlrc from adding `verbose` or
+# `trace-ascii`, which would write the Authorization header to stderr or a file.
+# A gitignored, untracked <repo>/.env may supply GAPTRAP_* values that the environment leaves unset; it
+# is read line by line, never sourced, and a key read from it is not exported to children.
+#
+# FEATURE DETECTION happens at call time, from a free tools/list, because acfw-spec caches the
+# capabilities answer per driver hash: VERBS is static (review push pull from), and pull/from say
+# "not offered yet" with a HINT until GapTrap lists what they need. get_spec gives pull and from as
+# text (remote.md), list_answers gives pull as decisions (ANSWER records), a parentSpecId input on
+# create_spec gives lineage (re-analysis free along it; the lineage itself is kept in STATE), and
+# idempotencyKey gives server-side dedupe of create_spec. None of these exists on GapTrap today.
+#
+# Verbs: capabilities | review | push | pull | from      ($1, else ACFW_SPEC_VERB)
+# In:    ACFW_SPEC_{FILE,BLOB,KEY,OUT,REF,SAME_REF,STATE,DEADLINE,FRESH}, ACFW_TRUNK_ROOT;
+#        GAPTRAP_API_KEY (required), GAPTRAP_MCP_URL, GAPTRAP_APP_URL, GAPTRAP_TEMPLATE_ID,
+#        GAPTRAP_FOLDER_ID, GAPTRAP_MODE, GAPTRAP_POLL_INTERVAL (seconds, default 3);
+#        ACFW_GAPTRAP_TRANSPORT (test seam: a command that reads the JSON-RPC request on stdin and
+#        prints "<http status>\n<body>"; it replaces curl entirely, and a non-zero exit is a transport
+#        failure, with curl's 6, 7 and 35 meaning the request was never sent)
+# Out:   FINDING|sev|fp|loc|title · Q|question · ANSWER|fp|decision · REF|id · URL|link ·
+#        SUMMARY|verdict=go|nogo|... · HINT|... ; capabilities: VERBS| NEEDS| EGRESS| COST|
+# Exit:  0 GO / ok · 1 NO-GO · 3 unavailable (the first stderr line is the reason) · 2 error
+set -u
+
+VERB="${1:-${ACFW_SPEC_VERB:-}}"
+ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+TAB=$(printf '\t')
+NL='
+'
+STUCK=900   # seconds after creation: past GapTrap's 600 s Cloud Tasks wall, nothing more will land
+
+# Progress lines ("created GapTrap spec X (1 unit)") are held and printed after the outcome: the
+# protocol reads the FIRST stderr line as the reason, and a progress line must never displace it.
+NOTES=""
+note() { NOTES="${NOTES}$*${NL}"; }
+flush_notes() { [ -z "$NOTES" ] || printf '%s' "$NOTES" >&2; NOTES=""; }
+die() { # die <rc> <reason> [hint] — the first stderr line is the reason acfw-spec shows
+  printf '%s\n' "$2" >&2; flush_notes; [ -z "${3:-}" ] || printf 'HINT|%s\n' "$3"; exit "$1"; }
+ok_id() { case "$1" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac; [ "${#1}" -le 128 ]; }
+
+# ---- config: env first, then a gitignored untracked .env for GAPTRAP_* names only ------------------
+DOTENV_REFUSED=0
+if [ -f "$ROOT/.env" ] && grep -q '^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}GAPTRAP_' "$ROOT/.env" 2>/dev/null; then
+  if git -C "$ROOT" check-ignore -q .env 2>/dev/null && ! git -C "$ROOT" ls-files --error-unmatch .env >/dev/null 2>&1; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=${line%$'\r'}; line=${line#"${line%%[![:space:]]*}"}; line=${line#export }
+      name=${line%%=*}; val=${line#*=}
+      [ "$name" != "$line" ] || continue
+      case "$name" in
+        GAPTRAP_API_KEY|GAPTRAP_MCP_URL|GAPTRAP_APP_URL|GAPTRAP_TEMPLATE_ID|GAPTRAP_FOLDER_ID|GAPTRAP_MODE) ;;
+        *) continue ;;
+      esac
+      eval "cur=\${$name:-}"; [ -z "$cur" ] || continue          # the environment wins
+      case "$val" in \"*\") val=${val#\"}; val=${val%\"} ;; \'*\') val=${val#\'}; val=${val%\'} ;; esac
+      eval "$name=\$val"                                          # a plain, unexported assignment
+    done < "$ROOT/.env"
+  else
+    DOTENV_REFUSED=1
+  fi
+fi
+
+command -v jq >/dev/null 2>&1 || die 3 "jq is required by the gaptrap driver (brew install jq, or your package manager)"
+[ -n "${ACFW_GAPTRAP_TRANSPORT:-}" ] || command -v curl >/dev/null 2>&1 || die 3 "curl is required by the gaptrap driver"
+
+MCP_URL="${GAPTRAP_MCP_URL:-https://app.gaptrap.ai/mcp}"
+case "$MCP_URL" in
+  https://*|http://localhost[:/]*|http://127.0.0.1[:/]*) ;;
+  *) die 3 "GAPTRAP_MCP_URL must be an https:// URL, because the API key travels in a request header" ;;
+esac
+ORIGIN=$(printf '%s' "$MCP_URL" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/?#]+).*#\1#')
+HOST=$(printf '%s' "$ORIGIN" | sed -E 's#^[^:]*://##; s#^[^@]*@##')
+APP_URL="${GAPTRAP_APP_URL:-$ORIGIN}"; APP_URL=${APP_URL%/}
+case "${GAPTRAP_MODE:-}" in ''|standard|multipass) ;; *) die 3 "GAPTRAP_MODE must be standard or multipass" ;; esac
+POLL="${GAPTRAP_POLL_INTERVAL:-3}"
+case "$POLL" in ''|*[!0-9]*) POLL=3 ;; esac
+[ -n "${ACFW_GAPTRAP_TRANSPORT:-}" ] || [ "$POLL" -ge 1 ] || POLL=1   # 0 only against the test seam
+NOW=$(date +%s)
+DEADLINE="${ACFW_SPEC_DEADLINE:-}"
+case "$DEADLINE" in ''|*[!0-9]*) DEADLINE=$((NOW + 110)) ;; esac      # under the engine's 120 s default
+
+# ---- per-(tool, key) state: pending/ done/ failed/ creating/ gen/ slots named by blob, plus lineage --
+FILE="${ACFW_SPEC_FILE:-}"
+BLOBF=$(printf '%s' "${ACFW_SPEC_BLOB:-}" | tr -cd 'A-Za-z0-9')
+[ -n "$BLOBF" ] || { [ -n "$FILE" ] && [ -r "$FILE" ] && BLOBF=$(git hash-object "$FILE" 2>/dev/null); } || BLOBF=""
+KEYN=$(printf '%s' "${ACFW_SPEC_KEY:-plan}" | tr -cd 'A-Za-z0-9._-'); [ -n "$KEYN" ] || KEYN=plan
+STATE="${ACFW_SPEC_STATE:-$ROOT/.acfwhip/run/spec/gaptrap/$KEYN}"
+VARIANT="$HOST|${GAPTRAP_TEMPLATE_ID:-}|${GAPTRAP_MODE:-}"
+
+slot_get() { # <kind> -> the id in that slot, if it was written under this endpoint/template/mode
+  local f="$STATE/$1/$BLOBF" id
+  [ -n "$BLOBF" ] && [ -f "$f" ] || return 1
+  id=$(sed -n 1p "$f"); ok_id "$id" || return 1
+  [ "$(sed -n 's/^variant=//p' "$f")" = "$VARIANT" ] || return 1
+  printf '%s' "$id"
+}
+slot_put() { # <kind> <id> [at] — temp + mv, so a kill never leaves a half-written slot. at= is when the
+  # spec was asked for (local clock), carried from pending/ to done/ so the stuck rules see its real age
+  mkdir -p "$STATE/$1" || die 2 "cannot write $STATE"
+  printf '%s\nvariant=%s\nat=%s\n' "$2" "$VARIANT" "${3:-$(date +%s)}" > "$STATE/$1/.$BLOBF.$$" \
+    && mv -f "$STATE/$1/.$BLOBF.$$" "$STATE/$1/$BLOBF" || die 2 "cannot write $STATE/$1/$BLOBF"
+}
+slot_del() { rm -f "$STATE/$1/$BLOBF"; }
+slot_at() { local at; at=$(sed -n 's/^at=//p' "$STATE/$1/$BLOBF" 2>/dev/null); case "$at" in ''|*[!0-9]*) echo 0 ;; *) echo "$at" ;; esac; }
+age_of() { [ "${1:-0}" -gt 0 ] 2>/dev/null && echo $(( $(date +%s) - $1 )) || echo 0; }
+
+# park <specId> [at] — the one write that makes a paid spec resumable; a new paid attempt also ends a
+# failed memo (it is what review should now read) and the creating/ marker it answers
+park() { slot_put pending "$1" "${2:-}"; slot_del failed; slot_del creating; CREATING=0; }
+
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/acfw-gaptrap.XXXXXX") || die 2 "cannot create a temp directory"
+CREATING=0
+reply_spec() { # <file> → the specId in a create_spec reply (plain JSON, a JSON array, or SSE data: lines)
+  [ -s "$1" ] || return 1
+  sed -n -e 's/^data:[[:space:]]\{0,1\}//' -e '/^[[{]/p' "$1" | jq -rR 'fromjson? | (if type == "array" then .[] else . end)
+    | objects | select((.result.isError // false) | not) | .result.content[0].text? | strings | fromjson? | .specId? | strings' 2>/dev/null | tail -n 1
+}
+on_sig() { # <exit code> — the watchdog's TERM: a create_spec reply that already arrived is kept
+  local f id
+  trap '' TERM INT HUP
+  if [ "$CREATING" = 1 ]; then
+    for f in msg body raw; do id=$(reply_spec "$TMPD/$f"); if ok_id "$id"; then park "$id"; break; fi; done
+  fi
+  exit "$1"
+}
+trap 'rm -rf "$TMPD"' EXIT
+trap 'on_sig 143' TERM
+trap 'on_sig 130' INT HUP
+
+need_key() {
+  if [ -z "${GAPTRAP_API_KEY:-}" ]; then
+    [ "$DOTENV_REFUSED" = 0 ] || die 3 "GAPTRAP_API_KEY is not set, and <repo>/.env was not read because git tracks it or does not ignore it" \
+      "untrack .env (git rm --cached .env), list it in .gitignore, and ROTATE the key if it was ever committed"
+    die 3 "GAPTRAP_API_KEY is not set" \
+      "mint a key in GapTrap (Profile > API keys), set GAPTRAP_API_KEY in a separate terminal or in the gitignored .env, then restart Claude Code"
+  fi
+  case "$GAPTRAP_API_KEY" in *[[:space:]\"\\]*) die 3 "GAPTRAP_API_KEY contains whitespace or quotes (a stray newline from a paste?)" ;; esac
+}
+need_file() {
+  [ -n "$FILE" ] && [ -f "$FILE" ] && [ -r "$FILE" ] || die 2 "ACFW_SPEC_FILE is not a readable file"
+  [ -n "$BLOBF" ] || die 2 "cannot derive a blob id for ACFW_SPEC_FILE"
+  [ "$(wc -c < "$FILE" | tr -d ' ')" -le 1048576 ] || die 3 "spec_too_large: the plan is over GapTrap's 1 MiB limit"
+}
+
+# ---- transport: one JSON-RPC POST; HTTP-level errors are mapped here --------------------------------
+# rpc <reqfile> [max seconds] → 0 with the reply in $TMPD/msg; else 1 with FRC (3 unavailable · 2 error ·
+# 9 transient), FWHY, UNSENT=1 when the request provably never left, RPCERR=1 for a JSON-RPC error body
+rpc() {
+  local left rc=0; left=$((DEADLINE - $(date +%s) - 1)); [ "$left" -le "${2:-30}" ] || left=${2:-30}; [ "$left" -ge 3 ] || left=3
+  HTTP=000; UNSENT=0; RPCERR=0; : > "$TMPD/body"; : > "$TMPD/terr"; : > "$TMPD/msg"; : > "$TMPD/raw"
+  if [ -n "${ACFW_GAPTRAP_TRANSPORT:-}" ]; then
+    eval "$ACFW_GAPTRAP_TRANSPORT" < "$1" > "$TMPD/raw" 2> "$TMPD/terr"; rc=$?
+    [ "$rc" != 0 ] || { HTTP=$(head -n 1 "$TMPD/raw" | tr -cd '0-9'); sed 1d "$TMPD/raw" > "$TMPD/body"; }
+  else
+    local k="${GAPTRAP_API_KEY}"
+    HTTP=$(curl -q -sS --max-time "$left" -X POST -K <(printf 'header = "Authorization: Bearer %s"\n' "$k") \
+      -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+      --data-binary @"$1" -o "$TMPD/body" -w '%{http_code}' "$MCP_URL" 2> "$TMPD/terr"); rc=$?
+  fi
+  [ "$rc" = 0 ] && [ -n "$HTTP" ] || HTTP=000
+  case "$HTTP$rc" in 0006|0007|00035) UNSENT=1 ;; esac   # no DNS, no connect, no TLS: GapTrap saw nothing
+  case "$HTTP" in
+    200|202) ;;
+    401) FRC=3; FWHY="unauthorized: GapTrap refused GAPTRAP_API_KEY (revoked or mistyped, or its minter left the org)"; return 1 ;;
+    403) FRC=3; FWHY="plan_required: GapTrap's MCP needs the $(jq -r '.error.requiredPlan // "solo"' "$TMPD/body" 2>/dev/null) plan or an active trial for this key"; return 1 ;;
+    404|405) FRC=3; FWHY="HTTP $HTTP from $MCP_URL: check GAPTRAP_MCP_URL"; return 1 ;;
+    000|408|429|5??) FRC=9; FWHY="GapTrap at $HOST did not answer (HTTP $HTTP$( [ -s "$TMPD/terr" ] && printf ', %s' "$(head -n 1 "$TMPD/terr" | cut -c1-120)"))"; return 1 ;;
+    *) FRC=2; FWHY="HTTP $HTTP from $HOST: $(jq -r '.error.message // .error // "no detail"' "$TMPD/body" 2>/dev/null | head -c 160)"; return 1 ;;
+  esac
+  if jq -e . "$TMPD/body" >/dev/null 2>&1; then
+    jq -c 'if type == "array" then (map(select(type == "object" and (has("result") or has("error")))) | last) else . end' "$TMPD/body" > "$TMPD/msg"
+  else # SSE framing: the reply is the last data: payload that is a JSON-RPC response
+    sed -n 's/^data:[[:space:]]\{0,1\}//p' "$TMPD/body" \
+      | jq -cR 'fromjson? | select(type == "object" and (has("result") or has("error")))' 2>/dev/null | tail -n 1 > "$TMPD/msg"
+  fi
+  jq -e 'type == "object" and (has("result") or has("error"))' "$TMPD/msg" >/dev/null 2>&1 \
+    || { FRC=2; FWHY="unreadable reply from $HOST (HTTP $HTTP)"; return 1; }
+  if jq -e 'has("error")' "$TMPD/msg" >/dev/null 2>&1; then
+    FRC=2; RPCERR=1; FWHY="JSON-RPC error from $HOST: $(jq -r '.error.message // "unknown"' "$TMPD/msg" | head -c 160)"; return 1
+  fi
+}
+nap() { sleep "$1" & wait $! 2>/dev/null; }   # wait is interruptible, so the watchdog's TERM lands at once
+rpc_retry() { # free calls only: transient failures get two more tries inside the deadline, then are errors
+  local n=0
+  while :; do
+    rpc "$1" && return 0
+    [ "$FRC" = 9 ] || return 1
+    n=$((n + 1)); { [ "$n" -le 2 ] && [ $(( $(date +%s) + 2 )) -lt "$DEADLINE" ]; } || { FRC=2; return 1; }
+    nap 2
+  done
+}
+mkreq() { jq -c --arg n "$1" '{jsonrpc:"2.0", id:1, method:"tools/call", params:{name:$n, arguments:.}}' "$2" > "$TMPD/req"; }
+# tool_result <tool> → 0 with the tool's JSON payload in $TMPD/out; 1 with TCODE/TMSG on isError (TCODE
+# tool_error when the text is not GapTrap's {error:{code}}); 2 when the payload is not JSON
+tool_result() {
+  if jq -e '.result.isError == true' "$TMPD/msg" >/dev/null 2>&1; then
+    jq -r '[.result.content[]? | select(.type == "text") | .text] | join(" ")' "$TMPD/msg" > "$TMPD/etext"
+    TCODE=$(jq -r '.error.code // empty' "$TMPD/etext" 2>/dev/null); TMSG=$(jq -r '.error.message // empty' "$TMPD/etext" 2>/dev/null)
+    [ -n "$TCODE" ] || { TCODE=tool_error; TMSG=$(tr -s '[:space:]' ' ' < "$TMPD/etext" | sed 's/^ //; s/ $//' | head -c 200); }
+    return 1
+  fi
+  jq -r '.result.content[0].text // empty' "$TMPD/msg" > "$TMPD/out"
+  jq -e 'type == "object" or type == "array"' "$TMPD/out" >/dev/null 2>&1 || return 2
+}
+call() { # <tool> <args.json> — a free call: 0 with the payload in $TMPD/out; 1 with TCODE/TMSG on isError
+  local rc
+  mkreq "$1" "$2"
+  rpc_retry "$TMPD/req" || die "$FRC" "$FWHY"
+  tool_result "$1"; rc=$?
+  [ "$rc" != 2 ] || die 2 "$1: GapTrap returned a result that is not JSON"
+  return "$rc"
+}
+tool_die() { # a tool-level (HTTP 200 + isError) failure, mapped onto the protocol's exits
+  case "$TCODE" in
+    quota_exceeded) die 3 "quota_exceeded: the GapTrap spec quota for this key's scope is used up (each review of new plan bytes costs 1 unit)" \
+      "reviews resume when the quota renews or the GapTrap plan is upgraded; the plan can still be approved" ;;
+    spec_too_large|file_too_large|unauthorized|plan_required|FORBIDDEN) die 3 "$TCODE: $TMSG" ;;
+    template_*|INVALID_TEMPLATE_ID) die 3 "$TCODE: $TMSG (check GAPTRAP_TEMPLATE_ID)" ;;
+    FOLDER_NOT_FOUND) die 3 "$TCODE: $TMSG (check GAPTRAP_FOLDER_ID)" ;;
+    *) die 2 "$1: $TCODE: $TMSG" ;;
+  esac
+}
+args_id() { jq -cn --arg id "$1" '{specId:$id}' > "$TMPD/args"; }
+
+features() { # one free tools/list → F_* flags; returns 1 (FRC/FWHY set) when the probe fails
+  [ -z "${F_DONE:-}" ] || return 0
+  printf '%s' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' > "$TMPD/req"
+  rpc_retry "$TMPD/req" || return 1
+  jq -c '.result.tools // []' "$TMPD/msg" > "$TMPD/tools"
+  has() { jq -e --arg n "$1" 'any(.[]; .name == $n)' "$TMPD/tools" >/dev/null 2>&1 && echo 1 || echo 0; }
+  prop() { jq -e --arg p "$1" 'any(.[]; .name == "create_spec" and ((.inputSchema.properties // {}) | has($p)))' "$TMPD/tools" >/dev/null 2>&1 && echo 1 || echo 0; }
+  F_GET_SPEC=$(has get_spec); F_ANSWERS=$(has list_answers); F_PARENT=$(prop parentSpecId); F_IDEM=$(prop idempotencyKey)
+  F_COUNT=$(jq 'length' "$TMPD/tools"); F_DONE=1
+}
+
+status_of() { # <spec> → ST, ORG (empty for a personal key); 1 when the spec is not visible to this key
+  args_id "$1"; call get_analysis_status "$TMPD/args" || { [ "$TCODE" = NOT_FOUND ] && return 1; tool_die get_analysis_status; }
+  ST=$(jq -r '.status // "unknown"' "$TMPD/out"); ORG=$(jq -r '.orgId // empty' "$TMPD/out"); ok_id "$ORG" || ORG=""
+}
+url_of() { if [ -n "$ORG" ]; then printf '%s/orgs/%s/report/%s' "$APP_URL" "$ORG" "$1"; else printf '%s/report/%s' "$APP_URL" "$1"; fi; }
+list_page() { # <cursor> — one free list_specs page (newest first) into $TMPD/out
+  jq -cn --arg c "$1" '{limit: 50} + (if $c != "" then {cursor: $c} else {} end)' > "$TMPD/args"
+  call list_specs "$TMPD/args" || tool_die list_specs
+}
+
+# ---- create, and the free recovery of a create whose reply never arrived --------------------------
+create_unknown() { # <why> — GapTrap may have made (and billed) the spec: keep creating/, never resend blind
+  CREATING=0
+  die 2 "create_spec outcome unknown ($1); if GapTrap made the spec, the next review finds it at no cost" \
+    "rerun the review: it looks the spec up in GapTrap (free) before it would pay again"
+}
+create() { # bills 1 unit → SPEC, parked in pending/ before anything else can fail
+  local parent="" idem="" gen att tag n=0 rc
+  features || die "$FRC" "$FWHY"
+  # A create needs time to hear its reply: one cut short is an unknown outcome, never a free retry.
+  [ $(( DEADLINE - $(date +%s) )) -ge 20 ] || die 2 "not enough time left before the deadline to create a GapTrap spec safely (1 unit); nothing was sent" \
+    "rerun the review; it creates the spec with a full time budget"
+  [ "$F_PARENT" = 0 ] || parent=$(awk -v h="$HOST" -v b="$BLOBF" '$4 == h && $2 != b { s = $3 } END { print s }' "$STATE/lineage" 2>/dev/null)
+  ok_id "$parent" || parent=""
+  gen=$(sed -n 1p "$STATE/gen/$BLOBF" 2>/dev/null); case "$gen" in ''|*[!0-9]*) gen=0 ;; esac
+  if [ "${NEWGEN:-0}" = 1 ]; then
+    gen=$((gen + 1)); mkdir -p "$STATE/gen" && printf '%s\n' "$gen" > "$STATE/gen/.$BLOBF.$$" \
+      && mv -f "$STATE/gen/.$BLOBF.$$" "$STATE/gen/$BLOBF" || die 2 "cannot write $STATE/gen/$BLOBF"
+  fi
+  # The attempt id: same bytes, endpoint, template, mode and generation → same filename tag and
+  # idempotencyKey, so a retry of one attempt is recognised and a fresh attempt is not mistaken for it.
+  att=$(printf '%s|%s|%s|%s' "$KEYN" "$BLOBF" "$VARIANT" "$gen" | git hash-object --stdin); tag=$(printf '%s' "$att" | cut -c1-8)
+  [ "$F_IDEM" = 0 ] || idem="acfw-$att"
+  jq -n --rawfile spec "$FILE" --arg fn "$KEYN.$tag.md" --arg tpl "${GAPTRAP_TEMPLATE_ID:-}" --arg folder "${GAPTRAP_FOLDER_ID:-}" \
+     --arg mode "${GAPTRAP_MODE:-}" --arg parent "$parent" --arg idem "$idem" \
+     '{spec:$spec, format:"markdown", filename:$fn}
+      + (if $tpl != "" then {templateId:$tpl} else {} end) + (if $folder != "" then {folderId:$folder} else {} end)
+      + (if $mode != "" then {mode:$mode} else {} end) + (if $parent != "" then {parentSpecId:$parent} else {} end)
+      + (if $idem != "" then {idempotencyKey:$idem} else {} end)' > "$TMPD/args"
+  mkreq create_spec "$TMPD/args"
+  slot_put creating "$tag"
+  CREATING=1
+  while ! rpc "$TMPD/req" 55; do   # GapTrap's function timeout is 60 s; the reply is worth waiting for
+    if [ "$UNSENT" = 1 ] || { [ "$F_IDEM" = 1 ] && [ "$FRC" = 9 ]; }; then
+      n=$((n + 1)); if [ "$n" -le 2 ] && [ $(( DEADLINE - $(date +%s) )) -ge 22 ]; then nap 2; continue; fi
+    fi
+    case "$HTTP" in
+      000) [ "$UNSENT" = 1 ] || create_unknown "$FWHY" ;;
+      408|5??) create_unknown "$FWHY" ;;
+      200|202) [ "$RPCERR" = 1 ] || create_unknown "$FWHY" ;;   # an unreadable 200: the handler ran
+    esac
+    slot_del creating; CREATING=0                                  # refused before any spec existed
+    die "$( [ "$FRC" = 9 ] && echo 2 || echo "$FRC")" "$FWHY"
+  done
+  # The specId first, in one jq, before any other check: the TERM window is as short as it can be.
+  # (--arg why names this call for tracing; the TERM test holds its jq on that name.)
+  SPEC=$(jq -r --arg why create-reply 'select((.result.isError // false) | not) | .result.content[0].text | fromjson? | .specId | strings' "$TMPD/msg" 2>/dev/null)
+  if ok_id "$SPEC"; then park "$SPEC"; note "created GapTrap spec $SPEC (1 unit)"; return 0; fi
+  tool_result create_spec; rc=$?
+  # GapTrap's own refusals ({error:{code}}: quota, size, template, folder, and enqueue failures) delete
+  # the spec before answering. Plain-text isError is an uncaught throw that may come after the write.
+  if [ "$rc" = 1 ] && [ "$TCODE" != tool_error ]; then slot_del creating; CREATING=0; tool_die create_spec; fi
+  create_unknown "$( [ "$rc" = 1 ] && printf '%s' "$TMSG" || printf 'the reply carried no usable specId')"
+}
+
+reconcile() { # a create_spec whose reply was lost: adopt its spec from the free list_specs, or forget it
+  local tag at lo want page=0 cursor="" id="" f age
+  [ -f "$STATE/creating/$BLOBF" ] || return 0
+  if slot_get pending >/dev/null || slot_get 'done' >/dev/null; then slot_del creating; return 0; fi
+  tag=$(slot_get creating) || return 0      # made under another endpoint/template/mode: not adoptable here
+  at=$(slot_at creating); lo=$((at - 120)); want="$KEYN.$tag.md"   # 120 s of clock skew against GapTrap's
+  { for f in "$STATE"/pending/* "$STATE"/done/* "$STATE"/failed/*; do [ -f "$f" ] && sed -n 1p "$f"; done
+    awk '{ print $3 }' "$STATE/lineage" 2>/dev/null; } > "$TMPD/known"
+  while [ "$page" -lt 10 ]; do
+    list_page "$cursor"
+    id=$(jq -r --arg fn "$want" --argjson lo "$lo" --rawfile known "$TMPD/known" '
+      def ep: if type == "string" then (sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null) else null end;
+      ($known | split("\n")) as $k
+      | [ .specs[]? | objects | select(.filename == $fn and ((.isDraft // false) | not))
+          | select((.createdAt | ep) as $t | $t != null and $t >= $lo)
+          | (.specId | tostring) as $i | select(any($k[]; . == $i) | not) | $i ] | first // empty' "$TMPD/out")
+    ok_id "$id" && break; id=""
+    jq -e --argjson lo "$lo" '[.specs[]? | .createdAt | strings | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch empty] | (min // 0) < $lo' \
+      "$TMPD/out" >/dev/null 2>&1 && break                          # newest first: the rest is older
+    cursor=$(jq -r '.nextCursor // empty' "$TMPD/out"); [ -n "$cursor" ] || break
+    page=$((page + 1))
+  done
+  if [ -n "$id" ]; then park "$id" "$at"; note "found GapTrap spec $id from an interrupted create_spec (0 units)"; return 0; fi
+  age=$(age_of "$at")
+  # GapTrap's function can run 60 s: a spec not listed yet may still be written by that request.
+  [ "$age" -ge 90 ] || die 2 "create_spec from ${age}s ago has not shown up in GapTrap yet; nothing was billed by this run" \
+    "rerun the review in a minute: it looks again (free) before it would pay"
+  slot_del creating
+  note "an interrupted create_spec left no spec in GapTrap; submitting again"
+}
+
+# ---- report → records ----------------------------------------------------------------------------
+JQ_GAPS='
+def clean: tostring | gsub("[[:cntrl:]]"; " ") | gsub("\\s+"; " ") | sub("^ +"; "") | sub(" +$"; "");
+def norm: clean | ascii_downcase;
+def arr: if type == "array" then . elif type == "object" and (.items | type) == "array" then .items elif . == null then [] else [.] end;
+def rank: {"critical": 0, "high": 1, "medium": 2, "low": 3}[.] // 2;
+($spec | length) as $len
+| [ (.report.gaps // [] | arr)[] | select(type == "object")
+    | ((.severity // "medium") | norm) as $s0 | (if ($s0 | rank) == 2 then "medium" else $s0 end) as $sev
+    | ((.source_offset // .sourceOffset // []) | arr) as $off
+    | (if ($off[0] | type) == "number" then $off[0] else -1 end) as $st
+    | (if ($off[1] | type) == "number" then $off[1] else $st end) as $en
+    | (if $st >= 0 and $st <= $len and ($st > 0 or $en > 0)
+       then "L" + ([1, ($spec[0:$st] | split("\n") | length)] | max | tostring) else "-" end) as $loc
+    | ((.title // .description // .pattern // "") | clean | .[0:200]) as $t0 | (if $t0 == "" then "untitled" else $t0 end) as $title
+    | ((.extraction_text // .extractionText // "") | norm) as $q
+    | { sev: $sev, st: $st, loc: $loc, title: $title, gid: ((.gap_id // .gapId // "-") | clean | if . == "" then "-" else . end),
+        src: (((.pattern // "gap") | norm) + "|" + (if $q != "" then $q else ($title | ascii_downcase) end)),
+        qs: [ (.resolution_questions // .resolutionQuestions // []) | arr | .[]
+              | (if type == "object" then (.question // .text // "") else . end) | clean | select(. != "") | .[0:300] ] } ]
+| sort_by([(.sev | rank), .st])
+| .[] | ("F\t" + .sev + "\t" + .loc + "\t" + .gid + "\t" + .src + "\t" + .title), (.qs[] | "Q\t" + .)'
+
+map_gaps() { # <report.json> → $TMPD/records (FINDING/Q lines) and $TMPD/gapfp (gap_id TAB fp)
+  local spec="${FILE:-/dev/null}" kind a b c d e fp n seen=" "
+  [ -r "$spec" ] || spec=/dev/null
+  jq -r --rawfile spec "$spec" "$JQ_GAPS" "$1" > "$TMPD/gaps.tsv" 2>"$TMPD/jqerr" || die 2 "cannot read the GapTrap report: $(head -n 1 "$TMPD/jqerr")"
+  : > "$TMPD/records"; : > "$TMPD/gapfp"; NF=0; NC=0; NH=0; NM=0; NL=0
+  while IFS="$TAB" read -r kind a b c d e; do
+    case "$kind" in
+      F) fp=$(printf '%s' "$d" | git hash-object --stdin | cut -c1-12)
+         case "$seen" in *" $fp "*) n=2; while case "$seen" in *" $fp-$n "*) true ;; *) false ;; esac; do n=$((n + 1)); done; fp="$fp-$n" ;; esac
+         seen="$seen$fp "; NF=$((NF + 1))
+         case "$a" in critical) NC=$((NC + 1)) ;; high) NH=$((NH + 1)) ;; medium) NM=$((NM + 1)) ;; low) NL=$((NL + 1)) ;; esac
+         printf 'FINDING|%s|%s|%s|%s\n' "$a" "$fp" "$b" "$e" >> "$TMPD/records"
+         printf '%s\t%s\n' "$c" "$fp" >> "$TMPD/gapfp" ;;
+      Q) printf 'Q|%s\n' "$a" >> "$TMPD/records" ;;
+    esac
+  done < "$TMPD/gaps.tsv"
+}
+
+# emit_review <spec> <report.json> <mode> → records on stdout; exits 0 GO / 1 NO-GO. mode: 0 final ·
+# 1 still extracting at the deadline (NO-GO only) · 2 extraction never finished, write-1 accepted
+emit_review() {
+  local v summary
+  v=$(jq -r '.report.verdict // "" | tostring | ascii_upcase | gsub("[^A-Z]"; "")' "$2")
+  case "$v" in GO) VERDICT=go ;; NOGO) VERDICT=nogo ;; *) die 2 "the GapTrap report for spec $1 has no GO/NO-GO verdict" ;; esac
+  map_gaps "$2"
+  summary=$(jq -r '.report | [ (if (.completeness_score // null) != null then "completeness \(.completeness_score)" else empty end),
+      (if (.contractStatus // .contract_status) == "failed" then "contract extraction failed" else empty end),
+      ((.verdictSummary // .verdict_summary // "") | tostring | gsub("[[:cntrl:]|]"; " ") | gsub("(?i)verdict="; "verdict: ")
+        | .[0:200] | select(. != ""))] | join("; ")' "$2")   # third-party text must not carry a second verdict=
+  case "$3" in
+    1) summary="contract extraction still running, findings may grow${summary:+; $summary}" ;;
+    2) summary="contract extraction never finished, so this is GapTrap's first-pass verdict${summary:+; $summary}" ;;
+  esac
+  cat "$TMPD/records"
+  printf 'REF|%s\nURL|%s\n' "$1" "$(url_of "$1")"
+  printf 'SUMMARY|verdict=%s|%s findings (critical %s, high %s, medium %s, low %s)%s\n' "$VERDICT" "$NF" "$NC" "$NH" "$NM" "$NL" "${summary:+; $summary}"
+  if [ -n "${ACFW_SPEC_OUT:-}" ] && [ -d "$ACFW_SPEC_OUT" ]; then cp "$2" "$ACFW_SPEC_OUT/gaptrap-report.json" 2>/dev/null || true; fi
+  flush_notes
+  [ "$VERDICT" = go ] && exit 0 || exit 1
+}
+
+# poll <spec> <asked-at epoch|0> → 0 with the final report in $TMPD/report and XMODE (0 final, 2 write-1
+# accepted); 1 when the spec is gone. Exits on failure, on a stuck analysis, and at the deadline.
+poll() {
+  local spec="$1" born="${2:-0}" phase=status cs="" v
+  XMODE=0
+  while :; do
+    if [ "$phase" = status ]; then
+      status_of "$spec" || return 1
+      case "$ST" in
+        completed) phase=report; continue ;;
+        failed) slot_put failed "$spec"; slot_del pending; slot_del 'done'
+                die 2 "failed: GapTrap could not analyze these exact bytes (spec $spec); memoized, so the next card does not bill again" \
+                  "edit the plan, or rerun the review with --fresh to resubmit (1 unit)" ;;
+        *) if [ "$(age_of "$born")" -gt "$STUCK" ]; then
+             slot_put failed "$spec"; slot_del pending
+             die 2 "stuck: GapTrap spec $spec is still '$ST' after 15 minutes; memoized as failed" "rerun the review with --fresh to resubmit (1 unit)"
+           fi ;;
+      esac
+    else
+      args_id "$spec"; call get_analysis_report "$TMPD/args" || { [ "$TCODE" = NOT_FOUND ] && return 1; tool_die get_analysis_report; }
+      if jq -e '.report | type == "object"' "$TMPD/out" >/dev/null 2>&1; then
+        cs=$(jq -r '.report | (.contractStatus // .contract_status // "legacy") | tostring' "$TMPD/out")
+        case "$cs" in ready|failed|legacy) cp "$TMPD/out" "$TMPD/report"; return 0 ;; esac
+        # write-2 never landed: GapTrap's own join timeout keeps write-1's verdict, and so does this
+        if [ "$(age_of "$born")" -gt "$STUCK" ]; then cp "$TMPD/out" "$TMPD/report"; XMODE=2; return 0; fi
+      fi
+    fi
+    if [ $(( $(date +%s) + POLL + 3 )) -ge "$DEADLINE" ]; then   # the next poll could not finish in time
+      if [ "$phase" = report ] && [ -n "$cs" ]; then
+        v=$(jq -r '.report.verdict // "" | tostring | ascii_upcase | gsub("[^A-Z]"; "")' "$TMPD/out")
+        [ "$v" != NOGO ] || { cp "$TMPD/out" "$TMPD/report"; emit_review "$spec" "$TMPD/report" 1; }
+      fi
+      die 2 "timeout: GapTrap spec $spec is not final at the deadline (status $ST${cs:+, contractStatus $cs}); it is kept, so the next review resumes it at no cost" \
+        "watch it at $(url_of "$spec")"
+    fi
+    nap "$POLL"
+  done
+}
+
+# ---- verbs ---------------------------------------------------------------------------------------
+review() {
+  local spec="" kind src="" born=0
+  need_key; need_file
+  NEWGEN=0
+  if [ "${ACFW_SPEC_FRESH:-0}" = 1 ]; then
+    slot_del 'done'; slot_del failed; NEWGEN=1
+    # A pending spec past the stuck age is what --fresh is for; a younger one is still worth its unit.
+    if slot_get pending >/dev/null && [ "$(age_of "$(slot_at pending)")" -gt "$STUCK" ]; then slot_del pending; fi
+  fi
+  reconcile
+  if spec=$(slot_get failed); then
+    die 2 "failed earlier: GapTrap could not analyze these exact bytes (spec $spec); memoized, so this run did not bill again" \
+      "edit the plan, or rerun the review with --fresh to resubmit (1 unit)"
+  fi
+  for kind in 'done' pending; do
+    if spec=$(slot_get "$kind"); then src=$kind; born=$(slot_at "$kind"); break; fi; spec=""
+  done
+  if [ -n "$spec" ]; then
+    note "resuming GapTrap spec $spec ($src, 0 units)"
+    if ! poll "$spec" "$born"; then
+      note "GapTrap spec $spec is gone (deleted, or the key scope changed); submitting again"
+      slot_del "$src"; spec=""; src=""; NEWGEN=1
+    fi
+  fi
+  if [ -z "$spec" ]; then
+    create; spec=$SPEC; born=$(slot_at pending)
+    poll "$spec" "$born" || die 2 "GapTrap lost spec $spec right after creating it"
+  fi
+  slot_put 'done' "$spec" "$born"; slot_del pending
+  [ "$src" = 'done' ] || printf '%s %s %s %s\n' "$(date +%s)" "$BLOBF" "$spec" "$HOST" >> "$STATE/lineage"
+  emit_review "$spec" "$TMPD/report" "$XMODE"
+}
+
+push() { # reuse the spec already reviewed at these bytes (0 units), else create one (1 unit)
+  local spec="" how="" kind s
+  need_key
+  NEWGEN=0
+  if ok_id "${ACFW_SPEC_SAME_REF:-}" && status_of "$ACFW_SPEC_SAME_REF"; then
+    spec=$ACFW_SPEC_SAME_REF; how="reused the spec reviewed at these bytes (0 units)"
+  fi
+  if [ -z "$spec" ]; then
+    [ -z "$BLOBF" ] || reconcile
+    for kind in 'done' pending; do
+      s=$(slot_get "$kind") || continue
+      if status_of "$s"; then spec=$s; how="reused GapTrap spec $s for these bytes (0 units)"; break; fi
+      slot_del "$kind"; NEWGEN=1          # deleted in GapTrap: a replacement is a new attempt
+    done
+  fi
+  if [ -z "$spec" ]; then
+    # A failed memo does not stop a push: the new spec is a paid attempt, park() ends the memo, and
+    # the next review reads this spec instead of refusing on the old failure.
+    need_file; create; spec=$SPEC; how="created GapTrap spec $spec (1 unit)"
+    status_of "$spec" || die 2 "GapTrap lost spec $spec right after creating it"
+  fi
+  features || die "$FRC" "$FWHY"
+  printf 'REF|%s\nURL|%s\n' "$spec" "$(url_of "$spec")"
+  [ -n "$ORG" ] || printf 'HINT|personal key: only you can open this report; push with an org API key so teammates can open it\n'
+  if [ "$F_GET_SPEC" = 1 ]; then printf 'HINT|edit with Fork in GapTrap, then pull; Re-analyze and Enrich rewrite the plan into Feature Contract headings, which a pull refuses\n'
+  elif [ "$F_ANSWERS" = 1 ]; then printf 'HINT|answer the questions in GapTrap, then pull to fold the answers into the plan\n'
+  else printf 'HINT|GapTrap cannot send edits back yet: read the report there, then edit the plan here\n'; fi
+  note "pushed: $how"; flush_notes
+  exit 0
+}
+
+lineage_head() { # <ref> → HEAD = the newest submitted spec descending from ref (ref itself when none)
+  local cursor="" page=0
+  : > "$TMPD/specs.jsonl"
+  while [ "$page" -lt 10 ]; do
+    list_page "$cursor"
+    jq -c '.specs[]? | select(type == "object")' "$TMPD/out" >> "$TMPD/specs.jsonl"
+    jq -e --arg r "$1" 'any(.specs[]?; .specId == $r)' "$TMPD/out" >/dev/null 2>&1 && break   # newest first: older specs cannot descend from ref
+    cursor=$(jq -r '.nextCursor // empty' "$TMPD/out"); [ -n "$cursor" ] || break
+    page=$((page + 1))
+  done
+  HEAD=$(jq -rs --arg r "$1" '
+    (map({key: (.specId | tostring), value: (.parentSpecId // .parentSpecRef.specId // null)}) | from_entries) as $p
+    | def up($id; $n): if $id == null or $n > 50 then false elif $id == $r then true else up($p[$id]; $n + 1) end;
+    [ .[] | select((.isDraft // false) | not) | select(.specId != $r) | select(up(.specId; 0)) ] | first | .specId // $r' "$TMPD/specs.jsonl")
+}
+ref_of() { # <spec id or report URL> → the spec id
+  local r="$1"
+  case "$r" in */report/*) r=${r##*/report/}; r=${r%%[/?#]*} ;; esac
+  printf '%s' "$r"
+}
+fetch_text() { # <spec> → $ACFW_SPEC_OUT/remote.md, only when get_spec's content matches its contentSha256
+  local out="${ACFW_SPEC_OUT:-}" want got
+  [ -n "$out" ] && mkdir -p "$out" || die 2 "$VERB needs ACFW_SPEC_OUT"
+  args_id "$1"; call get_spec "$TMPD/args" || tool_die get_spec
+  jq -j '.content // empty' "$TMPD/out" > "$TMPD/remote.md"
+  [ -s "$TMPD/remote.md" ] || die 2 "get_spec returned no content for spec $1"
+  want=$(jq -r '.contentSha256 // .content_sha256 // empty' "$TMPD/out")
+  if [ -n "$want" ]; then
+    got=$( { shasum -a 256 "$TMPD/remote.md" 2>/dev/null || sha256sum "$TMPD/remote.md" 2>/dev/null; } | awk '{print $1; exit}')
+    [ -z "$got" ] || [ "$got" = "$want" ] || die 2 "get_spec content does not match its contentSha256 (spec $1); nothing written"
+  fi
+  mv -f "$TMPD/remote.md" "$out/remote.md"
+}
+
+pull() {
+  local ref head
+  need_key
+  features || die "$FRC" "$FWHY"
+  [ "$F_GET_SPEC" = 1 ] || [ "$F_ANSWERS" = 1 ] || die 3 "pull is not offered yet: GapTrap cannot return spec text or answers over MCP (no get_spec or list_answers tool)" \
+    "read the report in GapTrap, then edit the plan here (Fork-editor copy is plain text and Export is template-shaped)"
+  ref=$(ref_of "${ACFW_SPEC_REF:-}")
+  ok_id "$ref" || die 2 "pull needs ACFW_SPEC_REF (the pushed GapTrap spec id, or its report URL)"
+  status_of "$ref" || die 3 "GapTrap spec $ref is not visible to this key (deleted, or the key scope changed)"
+  head=$ref
+  if [ "$F_GET_SPEC" = 1 ]; then
+    lineage_head "$ref"; head=$HEAD; ok_id "$head" || head=$ref
+    fetch_text "$head"
+  fi
+  # Decisions only while no newer text exists: answers on ref are already folded into a newer version.
+  if [ "$F_ANSWERS" = 1 ] && [ "$head" = "$ref" ]; then
+    args_id "$ref"; call list_answers "$TMPD/args" || tool_die list_answers
+    cp "$TMPD/out" "$TMPD/answers.json"
+    args_id "$ref"; call get_analysis_report "$TMPD/args" || tool_die get_analysis_report
+    if jq -e '.report | type == "object"' "$TMPD/out" >/dev/null 2>&1; then map_gaps "$TMPD/out"; else : > "$TMPD/gapfp"; fi
+    jq -r 'def clean: tostring | gsub("[[:cntrl:]]"; " ") | gsub("\\s+"; " ") | sub("^ +"; "") | sub(" +$"; "");
+      (if type == "array" then . else (.answers // .items // []) end)[] | select(type == "object")
+      | [((.gapId // .gap_id // "-") | clean), ((.answerText // .answer_text // .answer // .text // "") | clean | .[0:1500]),
+         ((.question // "") | clean | .[0:300])] | select(.[1] != "") | join("\t")' "$TMPD/answers.json" \
+    | while IFS="$TAB" read -r gid ans q; do
+        fp=$(awk -F '\t' -v g="$gid" '$1 == g { print $2; exit }' "$TMPD/gapfp"); [ -n "$fp" ] || fp=-
+        printf 'ANSWER|%s|%s%s\n' "$fp" "$ans" "${q:+ (question: $q)}"
+      done
+  fi
+  [ "$head" = "$ref" ] || status_of "$head" || true
+  printf 'REF|%s\nURL|%s\n' "$head" "$(url_of "$head")"
+  exit 0
+}
+
+from() { # the exact spec the user named (an id or a report URL): no lineage walk, no plan needed
+  local ref
+  need_key
+  features || die "$FRC" "$FWHY"
+  [ "$F_GET_SPEC" = 1 ] || die 3 "from is not offered yet: GapTrap cannot return spec text over MCP (no get_spec tool)" \
+    "open the spec in GapTrap, copy its text into a .md file, then run /whip <that file>"
+  ref=$(ref_of "${ACFW_SPEC_REF:-}")
+  ok_id "$ref" || die 2 "from needs ACFW_SPEC_REF: a GapTrap spec id, or its report URL"
+  status_of "$ref" || die 3 "GapTrap spec $ref is not visible to this key (deleted, or it belongs to another account or org)"
+  fetch_text "$ref"
+  printf 'REF|%s\nURL|%s\n' "$ref" "$(url_of "$ref")"
+  exit 0
+}
+
+capabilities() {
+  # Static on purpose: acfw-spec caches this per driver hash, so a probed VERBS would keep pull dark
+  # after GapTrap ships get_spec. The probe below only checks the key and reports features on stderr.
+  local probe=1
+  [ -z "${GAPTRAP_API_KEY:-}" ] || need_key
+  if [ -n "${GAPTRAP_API_KEY:-}" ]; then features || probe=0; else probe=-1; fi
+  printf 'VERBS|review push pull from\nNEEDS|GAPTRAP_API_KEY\nEGRESS|%s\n' "$HOST"
+  printf 'COST|1 GapTrap spec unit per review of new plan bytes (Solo: 15 a month); polling and reports are free; re-reviewing identical bytes or pushing reviewed bytes is free\n'
+  case "$probe" in
+    1) printf 'gaptrap: %s tools listed at %s; pull=%s answers=%s lineage=%s idempotency=%s\n' "$F_COUNT" "$HOST" \
+         "$( [ "$F_GET_SPEC" = 1 ] && echo on || echo off)" "$( [ "$F_ANSWERS" = 1 ] && echo on || echo off)" \
+         "$( [ "$F_PARENT" = 1 ] && echo on || echo off)" "$( [ "$F_IDEM" = 1 ] && echo on || echo off)" >&2 ;;
+    # A refused key or plan is worth failing on (acfw-spec add shows it); a network blip is not.
+    0) if [ "$FRC" = 3 ]; then printf 'HINT|%s\n' "$FWHY"; die 3 "$FWHY"; fi
+       printf 'gaptrap: the tools/list probe did not complete (%s); features are checked again on each call\n' "$FWHY" >&2 ;;
+    *) printf 'gaptrap: GAPTRAP_API_KEY is not set, so the free tools/list probe did not run\n' >&2 ;;
+  esac
+  exit 0
+}
+
+case "$VERB" in
+  capabilities) capabilities ;;
+  review) review ;;
+  push) push ;;
+  pull) pull ;;
+  from) from ;;
+  '') die 2 "usage: acfw-spec-gaptrap capabilities|review|push|pull|from (acf-whip spec-tool protocol)" ;;
+  *) die 3 "verb not offered by the gaptrap driver: $VERB" "this driver offers capabilities, review, push, pull and from" ;;
+esac

@@ -1,0 +1,2 @@
+200
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"answers\":[{\"gapId\":\"3f0c9a52-1d7e-4b8a-9c11-2e5f7a6b8d01\",\"questionIndex\":0,\"question\":\"Is the per-seat price shown per month or per year? (default: per month)\",\"answerText\":\"Per month.\\nBilled on the first of the month.\"},{\"gapId\":\"ffffffff-0000-4000-8000-000000000000\",\"questionIndex\":0,\"question\":\"Unmapped question\",\"answerText\":\"Keep as is.\"}]}"}]}}

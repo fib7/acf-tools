@@ -1,0 +1,10 @@
+# Refuse plans and tasks that still say TBD, TODO or FIXME.
+# grep exits 0 when it finds a match, so `test $? -eq 1` turns "found one" into NO-GO (exit 1) and
+# "found none" into GO (exit 0). A grep error (exit 2) also lands on NO-GO, never on GO.
+# The matching lines ("12:... TBD ...") become findings at L12 through the unstructured fallback.
+# policy=block: approval needs GO at the exact plan bytes, or your recorded override. At the task
+# stage a task with a match is held in draft for you to fix.
+review=grep -nwE 'TBD|TODO|FIXME' "$ACFW_SPEC_FILE"; test $? -eq 1
+at=plan,task
+policy=block
+timeout=10

@@ -1,0 +1,24 @@
+# GapTrap spec reviewer (https://app.gaptrap.ai). This file is committed and shared with the team.
+# Committing it is the consent: every plan reviewed in this repo is sent to GapTrap.
+#
+# Never put an API key in this file. acfw-spec refuses a declaration that holds one.
+# The key comes from your environment, set in a separate terminal, or from a gitignored .env
+# at the repo root. Setup, cost and what leaves your machine: spec-tools/gaptrap/README.md
+#
+# Optional settings, read from the environment only:
+#   GAPTRAP_MCP_URL       endpoint (default https://app.gaptrap.ai/mcp)
+#   GAPTRAP_APP_URL       web app for report links (default: the endpoint's origin)
+#   GAPTRAP_TEMPLATE_ID   review against a custom GapTrap spec template
+#   GAPTRAP_FOLDER_ID     file the reviews in a GapTrap folder (org keys only)
+#   GAPTRAP_MODE          standard (default) or multipass
+#
+# Cost: each review of new plan bytes uses 1 GapTrap spec unit. Polling, reports, re-reviews of
+# identical bytes and a push of reviewed bytes are free. Because the tool reports a cost, acfw-spec
+# reviews on the first card and again only when you reply "review".
+#
+# advisory: the card shows GapTrap's verdict and findings; your "yes" approves either way.
+# Measure how often GapTrap says NO-GO on your plans before you consider policy=block.
+driver=gaptrap
+at=plan
+policy=advisory
+timeout=300

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# fake-transport — the ACFW_GAPTRAP_TRANSPORT test double for acfw-spec-gaptrap (phase21-gaptrap-driver).
+#
+# Reads ONE JSON-RPC request on stdin and replays a recorded reply: "<http status>\n<body>", the exact
+# shape the driver's seam expects. The reply is chosen by the call's slot name (the tools/call tool
+# name, or "tools-list") and how many times that slot was called before:
+#   $GT_SCEN/<slot>.<n>   for the n-th call (1-based); otherwise
+#   $GT_SCEN/<slot>       the catch-all; otherwise the highest <slot>.<m> with m < n.
+# So "status.1=pending status.2=analyzing status=completed" scripts a whole poll sequence.
+# A fixture whose whole content is "exit:<n>" makes the seam exit n and print nothing: a transport
+# failure, where the driver reads 6, 7 and 35 as curl's "never sent".
+#
+# Every call is appended to $GT_LOG as "<slot> <arguments minus the spec text>", which is what the
+# tests count (zero create_spec on resume) and inspect (parentSpecId, idempotencyKey, templateId).
+# The full request is kept as $GT_LOG.req.<slot>.<n>. The call is logged BEFORE any delay, so a run
+# killed mid-request still counts as having reached GapTrap (the spec exists, the unit is billed).
+# GT_DELAY=<s> sleeps before replying (a slow server), on every call or only on GT_DELAY_ON=<slot>.
+set -u
+req=$(cat)
+method=$(printf '%s' "$req" | jq -r '.method // empty')
+name=$(printf '%s' "$req" | jq -r '.params.name // empty')
+if [ "$method" = "tools/call" ] && [ -n "$name" ]; then slot=$name; else slot=$(printf '%s' "$method" | tr '/' '-'); fi
+n=1
+[ -f "$GT_LOG" ] && n=$(( $(awk -v k="$slot" '$1==k{c++} END{print c+0}' "$GT_LOG") + 1 ))
+printf '%s %s\n' "$slot" "$(printf '%s' "$req" | jq -c '.params.arguments // {} | del(.spec)')" >> "$GT_LOG"
+printf '%s\n' "$req" > "$GT_LOG.req.$slot.$n"
+if [ -n "${GT_DELAY:-}" ] && { [ -z "${GT_DELAY_ON:-}" ] || [ "$GT_DELAY_ON" = "$slot" ]; }; then sleep "$GT_DELAY"; fi
+reply() { case "$(head -c 16 "$1")" in exit:*) exit "$(sed -n 's/^exit://p' "$1" | tr -cd '0-9')" ;; esac; cat "$1"; exit 0; }
+[ -f "$GT_SCEN/$slot.$n" ] && reply "$GT_SCEN/$slot.$n"
+[ -f "$GT_SCEN/$slot" ] && reply "$GT_SCEN/$slot"
+i=$((n - 1))
+while [ "$i" -ge 1 ]; do
+  [ -f "$GT_SCEN/$slot.$i" ] && reply "$GT_SCEN/$slot.$i"
+  i=$((i - 1))
+done
+printf '599\n{"error":{"code":"no_fixture","message":"fake-transport: no fixture for %s call %s"}}\n' "$slot" "$n"

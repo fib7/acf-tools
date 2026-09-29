@@ -1,0 +1,2 @@
+200
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"error\":{\"code\":\"spec_too_large\",\"message\":\"Spec is too large (1200000 tokens; limit 1048576 tokens).\"}}"}],"isError":true}}

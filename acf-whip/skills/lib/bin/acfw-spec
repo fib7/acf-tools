@@ -1,0 +1,2544 @@
+#!/usr/bin/env bash
+# acfw-spec — the spec-tool engine: pluggable plan/task reviewers and workbenches (acf-whip 3.5.0).
+#
+# WHY THIS EXISTS
+# ---------------
+# A plan is the cheapest place to be wrong, and plenty of tools already know how to find what is
+# wrong with one: a prose linter, a grep for TBD, an LLM critic, a hosted spec analyzer. What they
+# lack is a seat in the cycle. A team wiring one in by hand re-invents the same five things and gets
+# the dangerous ones wrong: a hung network call that stalls the card, a paid review re-billed on
+# every edit, a local edit that quietly loosens a gate, a key pasted into a committed file, a URL
+# with a capability token landing in git history.
+#
+# This script is the ONLY thing that runs spec tools. A tool is one committed key=value file,
+# .acfwhip/spec-tools/<name>, and never touches acf-whip code. The engine:
+#   - freezes the exact (normalized) bytes it reviews under .acfwhip/run/spec/<key>/<blob12>/, named
+#     by the same content hash acfw-cycle binds approval to, so the tool, the cache, the card and the
+#     gate all talk about one text;
+#   - runs every tool in its own process group under a watchdog. macOS has neither setsid nor
+#     timeout, so: perl setpgrp + exec, then kill -TERM -<pgid>, then KILL. A curl the tool forked
+#     cannot outlive it, and a group left behind by a tool that exited is swept too;
+#   - caches go/nogo per (key, content, declaration sha, resolved executable + its git hash). skip
+#     and error are never cached, so a retry resumes instead of re-billing and a failure retries;
+#   - reads POLICY and at= from HEAD. A declaration or driver that is edited, uncommitted, or found
+#     via env or $PATH still runs, but advisory, and its result can never satisfy a block gate. A
+#     committed block tool gates plan approval when its committed at= names plan (or is absent) and
+#     holds tasks when it names task; a working-tree at= can add a stage, never remove one. What a
+#     local edit cannot reach is the declaration and a driver or prompt under .acfwhip/; a script a
+#     review= command calls elsewhere in the repo is outside what the engine can see;
+#   - refuses to run anything while a credential literal sits in a declaration (exit 20), and skips
+#     a new or changed declaration until the operator says "run tools" (trust on first use);
+#   - renders the REVIEW block the approval card embeds, and the Plan Log rows the approve commit
+#     carries: sanitized cells, no URLs, no capability links.
+#
+# It names no tool. Everything tool-specific lives in the tool; the protocol is
+# spec-tools/CONTRACT.md. Tools run sequentially at the plan stage and at most 4 at a time at the
+# task stage, inside one 540 s budget (callers give the Bash call a 600000 ms timeout).
+#
+# WHAT IT IS NOT
+# --------------
+# Never part of /go: every false positive there costs one of three lives, and the spec is frozen at
+# approval. Not a findings database: decisions become plain plan text, never waivers.
+#
+# Usage:
+#   acfw-spec list [--at plan|task] [--machine]
+#   acfw-spec add <name>                        copy a shipped example, probe, trust, commit
+#   acfw-spec trust [<name>|<name>=<key>]...    the "run tools" reply: trusts the version a full
+#                                              notice SHOWED (or exactly <key>), never one that
+#                                              changed since or was only on a capped status card;
+#                                              those get the full notice instead
+#   acfw-spec review <plan> [--fresh] [--tool <n>]... [--all] [--trust] [--machine]
+#   acfw-spec review --stage task [--machine] <task-file>...   (<= 4 at a time; human form for
+#                                              /whip --review <stem> on a held task)
+#   acfw-spec show <plan> --blob <c12>          the REVIEW block (cache only, no network)
+#   acfw-spec status [<plan>] [--machine]       FACT|/CARD| lines (cache only, no network)
+#   acfw-spec gate <plan> --blob <c12> [--override <tool>]...      (cache only, no network)
+#   acfw-spec push <plan> [--tool <n>] [--trust]
+#   acfw-spec pull <plan> [--tool <n>] [--clipboard|--file <f>] [--ours|--theirs] [--drop]
+#   acfw-spec from <tool> <ref|url>             prints FROM|<fetched markdown> for acfw-cycle init
+#   acfw-spec prompt <tool> <verb> [--order <file>]   the prompt an agent= tool's subagent follows
+# <plan>: a cycle ID, docs/cycles/<ID>[/], or docs/cycles/<ID>/plan.md|record.md.
+# Hook mode (review with no --tool/--all) runs tools whose at= includes plan; a rerun=ask tool runs
+# on the first card only and is shown "stale since your edit" after that until `review --all`.
+# Exit: 0 ran · 2 usage/declaration · 20 credential literal · 21 agent work pending (AGENT| lines)
+#       · 22 gate unmet · 23 pull conflict · 24 pull refused by validation
+#       · 25 verb not offered, or the tool could not perform it · 26 workbench state mismatch (OUT)
+# Env: ACFW_SPEC=off (nothing runs; the gate still needs GO or the override), ACFW_SPEC_TOOL_PATH,
+#      ACFW_SPEC_BUDGET (seconds, <= 540), ACFW_TRUNK_ROOT.
+# Portability: bash 3.2, BSD + GNU tools, no jq. perl is used for the watchdog and cell sanitizing.
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PLUGIN_ROOT="$(cd "$LIB_DIR/../.." && pwd)"
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+. "$LIB_DIR/acfw-git.sh"
+# The content hash and the D-id parser are acfw-cycle's (acfw-plan.sh). Sharing them is not a
+# convenience: the gate looks results up by the c12 acfw-cycle computed, so a second hash
+# implementation that drifted by one normalization rule would make every block tool look unreviewed.
+# The fallbacks below exist only so a partial install degrades instead of crashing.
+[ -r "$LIB_DIR/acfw-plan.sh" ] && . "$LIB_DIR/acfw-plan.sh"
+
+if ! type acfw_plan_normalize >/dev/null 2>&1; then
+acfw_plan_normalize() { # <file> — CRLF->LF, trailing whitespace stripped, exactly one final newline
+  awk '{ sub(/\r$/, ""); sub(/[ \t\r]+$/, ""); a[NR] = $0 }
+       END { n = NR; while (n > 0 && a[n] == "") n--; for (i = 1; i <= n; i++) print a[i] }' "$1"
+}
+fi
+if ! type acfw_plan_content >/dev/null 2>&1; then
+acfw_plan_content() { printf 'v1:%s\n' "$(acfw_plan_normalize "$1" | git hash-object --stdin)"; }
+fi
+if ! type acfw_plan_dids >/dev/null 2>&1; then
+acfw_plan_dids() { # <file> — "D<n>\t<heading>" under the first ## Deliverables; 3 when there is none
+  awk '
+    BEGIN { fence = 0; inD = 0; seen = 0 }
+    /^(   |  | )?(```|~~~)/ { fence = !fence; next }
+    fence { next }
+    /^## / { if (inD) exit; if ($0 ~ /^## Deliverables[ \t]*$/) { inD = 1; seen = 1 }; next }
+    inD && /^### D[0-9]+([^0-9]|$)/ {
+      s = substr($0, 6); n = s; sub(/[^0-9].*$/, "", n); t = substr(s, length(n) + 1)
+      sub(/^[ \t]*/, "", t); if (t ~ /^[:-]/) t = substr(t, 2); sub(/^[ \t]*/, "", t); sub(/[ \t]+$/, "", t)
+      printf "D%s\t%s\n", n, t
+    }
+    END { exit (seen ? 0 : 3) }' "$1"
+}
+fi
+if ! type acfw_plan_rule10 >/dev/null 2>&1; then
+acfw_plan_rule10() { # <old> <new> <recorded-csv> — 0 ok, 8 violation (one-line reason on stdout)
+  local old new d t other
+  old=$(acfw_plan_dids "$1" 2>/dev/null); new=$(acfw_plan_dids "$2" 2>/dev/null)
+  for d in $(printf '%s' "$3" | tr ',' ' '); do
+    case "$d" in D[0-9]*) ;; *) continue ;; esac
+    if ! printf '%s\n' "$new" | cut -f1 | grep -qxF "$d"; then
+      echo "$d is recorded in record.md ## Tasks but has no ### $d heading any more"; return 8
+    fi
+    t=$(printf '%s\n' "$old" | awk -F'\t' -v d="$d" '$1 == d { print substr($0, length($1) + 2); exit }')
+    [ -n "$t" ] || continue
+    other=$(printf '%s\n' "$new" | awk -F'\t' -v d="$d" -v t="$t" '$1 != d && substr($0, length($1) + 2) == t { print $1; exit }')
+    if [ -n "$other" ]; then echo "the heading of $d now sits under $other"; return 8; fi
+  done
+  return 0
+}
+fi
+
+REPO_ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+[ -n "$REPO_ROOT" ] || { echo "FATAL: not inside a git repo and ACFW_TRUNK_ROOT unset" >&2; exit 2; }
+
+DECL_REL=".acfwhip/spec-tools"
+DECL_DIR="$REPO_ROOT/$DECL_REL"
+RUN_DIR="$REPO_ROOT/.acfwhip/run"
+SPEC_RUN="$RUN_DIR/spec"
+WB_RUN="$RUN_DIR/workbench"
+TRUST_FILE="$SPEC_RUN/trusted"
+PATTERNS_FILE="$PLUGIN_ROOT/spec-tools/secret-patterns"
+ID_RE='^[0-9]{8}-[a-z0-9][a-z0-9-]*$'
+NAME_RE='^[a-z0-9][a-z0-9-]*$'
+KEY_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+BUDGET="${ACFW_SPEC_BUDGET:-540}"
+case "$BUDGET" in ''|*[!0-9]*) BUDGET=540 ;; esac
+[ "$BUDGET" -gt 540 ] && BUDGET=540
+MAX_JOBS=4
+SPEC_FRESH=0
+CR=$(printf '\r')
+US=$(printf '\037')
+DEADLINE=$(( $(date +%s) + BUDGET ))
+HAVE_PERL=0; command -v perl >/dev/null 2>&1 && HAVE_PERL=1
+
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/acfw-spec.XXXXXX") || { echo "FATAL: mktemp failed" >&2; exit 2; }
+LIVE_PGIDS="$TMPD/pgids"
+: > "$LIVE_PGIDS"
+# A caller that kills us (its Bash timeout, Ctrl-C) must not leave a tool's process group running:
+# the whole point of the watchdog is that nothing a tool started outlives the review.
+on_signal() {
+  local g
+  while IFS= read -r g; do [ -n "$g" ] && kill -TERM -- -"$g" 2>/dev/null; done < "$LIVE_PGIDS"
+  sleep 1
+  while IFS= read -r g; do [ -n "$g" ] && kill -KILL -- -"$g" 2>/dev/null; done < "$LIVE_PGIDS"
+  # Our own background subshells (a task-stage job, a tool's wrapper) go too.
+  for g in $(jobs -p 2>/dev/null); do kill -TERM "$g" 2>/dev/null; done
+  rm -rf "$TMPD"
+  exit 143
+}
+trap 'rm -rf "$TMPD"' EXIT
+trap on_signal INT TERM HUP
+
+# ---- small helpers ------------------------------------------------------------------------------
+say()  { printf '%s\n' "$*"; }
+# warn/die redact: their text often carries a declaration value back out (a driver name that is not
+# found, a field that failed to parse), and a pasted key must not reach the terminal through the very
+# error that is complaining about the declaration it sits in.
+warn() { printf 'WARN: %s\n' "$(redact "$*")" >&2; }
+die()  { local c="$1"; shift; printf 'FATAL: %s\n' "$(redact "$*")" >&2; exit "$c"; }
+now()  { date +%s; }
+utc()  { date -u +"%Y-%m-%d %H:%M:%S"; }
+b12_of() { local h="${1#v1:}"; printf '%s' "${h:0:12}"; }
+is_re() { [[ $1 =~ $2 ]]; }
+has_at() { case ",$1," in *",$2,"*) return 0 ;; esac; return 1; }
+kv_get() { [ -r "$1" ] || return 0; sed -n "s/^$2=//p" "$1" | head -1; }
+kv_write() { # <file> k=v... — atomic, one line per pair
+  local f="$1" tmp; shift
+  mkdir -p "$(dirname "$f")"
+  tmp=$(mktemp "$(dirname "$f")/.kv.XXXXXX") || return 1
+  printf '%s\n' "$@" > "$tmp" && mv -f "$tmp" "$f"
+}
+flat() { printf '%s' "$1" | tr '\n\r\t' '   ' | tr -d '\000-\010\013\014\016-\037'; }
+first_line() { [ -r "$1" ] && sed -n '/[^[:space:]]/{p;q;}' "$1" | tr -d '\000-\010\013-\037' | cut -c1-200; }
+fp_of() { printf '%s' "$1" | git hash-object --stdin | cut -c1-12; }
+age_of() { # <epoch> — "5m", "3h", "2d"
+  local s=$(( $(now) - ${1:-0} ))
+  [ "$s" -lt 0 ] && s=0
+  if [ "$s" -lt 3600 ]; then printf '%sm' $(( s / 60 ))
+  elif [ "$s" -lt 172800 ]; then printf '%sh' $(( s / 3600 ))
+  else printf '%sd' $(( s / 86400 )); fi
+}
+by_email() {
+  local e
+  e=$(git -C "$REPO_ROOT" config user.email 2>/dev/null)
+  [ -n "$e" ] || e=$(git -C "$REPO_ROOT" config user.name 2>/dev/null)
+  printf '%s' "${e:-unknown}"
+}
+verdict_word() { case "$1" in go) echo GO ;; nogo) echo NO-GO ;; skip) echo SKIPPED ;; error) echo ERROR ;; *) echo "$1" ;; esac; }
+sev_rank() { case "$1" in critical) echo 0 ;; high) echo 1 ;; medium) echo 2 ;; low) echo 3 ;; *) echo 4 ;; esac; }
+
+# cell <text> — one Plan Log / pending.log / CARD cell. What lands in git must never hold a link
+# (a shared URL is often a capability: whoever has it can open the spec), a '|' (it would split the
+# table row), or a control character; and it is capped at 160 characters, counted as characters so a
+# multibyte title is never cut mid-sequence.
+cell() {
+  local s; s=$(redact "$1")
+  if [ "$HAVE_PERL" = 1 ]; then
+    printf '%s' "$s" | perl -e '
+      use Encode qw(decode encode);
+      local $/; my $s = <STDIN>; $s = "" unless defined $s;
+      $s = decode("UTF-8", $s);
+      $s =~ s{\b[A-Za-z][A-Za-z0-9+.\-]*://\S*}{<link>}g;
+      $s =~ s/\|/\//g;
+      $s =~ s/[\t\n\r]/ /g;
+      $s =~ s/[\x00-\x1f\x7f]//g;
+      $s =~ s/ {2,}/ /g; $s =~ s/^ +//; $s =~ s/ +$//;
+      $s = substr($s, 0, 160);
+      print encode("UTF-8", $s);'
+  else
+    printf '%s' "$s" | sed -E 's#[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]]*#<link>#g' | tr '|' '/' \
+      | tr '\n\r\t' '   ' | tr -d '\000-\037\177' | cut -c1-160
+  fi
+}
+
+# ---- secret lint ----------------------------------------------------------------------------------
+# One shared pattern file (the shipped-file checks read the same one). Shape plus length, so prose
+# that merely NAMES a variable never matches and a pasted key always does. The value itself is never
+# printed. Two sets come out of it: PAT_CLEAN, every pattern, for committed configuration and for
+# redacting what the engine echoes; PAT_CONTENT, the `#@scope all` patterns only, for plan, task and
+# workbench text. A config-only shape (a JSON "...Key": "..." pair) is a real signal in .mcp.json and
+# noise in an API plan, where "partitionKey" or "nextPageToken" examples would refuse every review.
+PAT_CLEAN=""; PAT_CONTENT=""
+prep_patterns() {
+  [ -n "$PAT_CLEAN" ] && return 0
+  PAT_CLEAN="$TMPD/patterns"; PAT_CONTENT="$TMPD/patterns.content"
+  : > "$PAT_CLEAN"; : > "$PAT_CONTENT"
+  if [ -r "$PATTERNS_FILE" ]; then
+    awk -v all="$PAT_CLEAN" -v content="$PAT_CONTENT" '
+      /^#@scope[ \t]+config[ \t]*$/ { cfg = 1; next }
+      /^#@scope[ \t]+all[ \t]*$/    { cfg = 0; next }
+      /^[ \t]*#/ || /^[ \t]*$/      { next }
+      { print > all; if (!cfg) print > content }' "$PATTERNS_FILE" 2>/dev/null || true
+  fi
+  # Fail toward MORE checking, never less: a broken install still refuses the generic shapes.
+  if [ ! -s "$PAT_CLEAN" ]; then
+    warn "secret pattern file missing or empty ($PATTERNS_FILE): using the generic shapes only"
+    printf '%s\n' "(KEY|TOKEN|SECRET|PASSWORD)=[\"']?[^\$[:space:]\"'#]{16,}" \
+      'Bearer[[:space:]]+[A-Za-z0-9._~+/-]{16,}' \
+      '"[A-Za-z0-9_-]*([Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Aa]uthorization)"[[:space:]]*:[[:space:]]*"[^"$]{16,}"' > "$PAT_CLEAN"
+  fi
+  if [ ! -s "$PAT_CONTENT" ]; then
+    printf '%s\n' "(KEY|TOKEN|SECRET|PASSWORD)=[\"']?[^\$[:space:]\"'#]{16,}" \
+      'Bearer[[:space:]]+[A-Za-z0-9._~+/-]{16,}' > "$PAT_CONTENT"
+  fi
+}
+# redact_file <file> → stdout: the file with every credential-shaped match replaced by <redacted>.
+# The lint REFUSES to run a tool while a literal sits in a declaration, but refusing is not enough:
+# a status card, a warning, or the REVIEW block about that same declaration echoes its text (a
+# review= command line, a driver name that is not found), and would print the very value the
+# secret card says it is not showing. So everything that can carry declaration or tool text to a
+# terminal, a card or a committed row goes through here. Line by line, so a pattern's leading
+# "not a word character" group can never swallow a newline and join two lines. A line perl cannot
+# clean (a pattern it fails to compile, or no perl) is dropped whole: fail toward hiding more.
+redact_file() {
+  prep_patterns
+  if [ ! -s "$PAT_CLEAN" ] || ! grep -Eq -f "$PAT_CLEAN" "$1" 2>/dev/null; then cat "$1"; return 0; fi
+  local red nums
+  red=$(mktemp "$TMPD/red.XXXXXX") || { echo "<redacted: credential-shaped text>"; return 0; }
+  nums="$red.n"
+  if [ "$HAVE_PERL" = 1 ]; then
+    perl -e '
+      my $pf = shift @ARGV; my @re;
+      if (open(my $fh, "<", $pf)) { while (my $l = <$fh>) { chomp $l; next if $l =~ /^\s*$/; my $r = eval { qr/$l/ }; push @re, $r if $r } }
+      while (my $s = <STDIN>) { my $nl = ($s =~ s/\n\z//) ? "\n" : ""; for my $r (@re) { $s =~ s/$r/<redacted>/g } print $s, $nl }' \
+      "$PAT_CLEAN" < "$1" > "$red" 2>/dev/null || cp "$1" "$red"
+  else
+    cp "$1" "$red"
+  fi
+  grep -nE -f "$PAT_CLEAN" "$red" 2>/dev/null | cut -d: -f1 > "$nums"
+  # (Line numbers loaded in BEGIN, not the NR == FNR idiom: with no residual hits that file is empty
+  # and the idiom would swallow every line of the text as if it were the first file.)
+  awk -v nf="$nums" 'BEGIN { while ((getline l < nf) > 0) bad[l] = 1 }
+    (FNR in bad) { print "<redacted: credential-shaped text>"; next } { print }' "$red"
+  rm -f "$red" "$nums"
+}
+redact() { # <text> → the text, redacted (see redact_file); no trailing newline added
+  prep_patterns
+  if [ ! -s "$PAT_CLEAN" ] || ! printf '%s\n' "$1" | grep -Eq -f "$PAT_CLEAN" 2>/dev/null; then printf '%s' "$1"; return 0; fi
+  local f; f=$(mktemp "$TMPD/redin.XXXXXX") || { printf '<redacted: credential-shaped text>'; return 0; }
+  printf '%s\n' "$1" > "$f"
+  printf '%s' "$(redact_file "$f")"
+  rm -f "$f"
+}
+lint_hits() { # <file> <label> [content] → "<label>:<line>" per matching line (never the match itself)
+  local pf
+  prep_patterns
+  [ -r "$1" ] || return 0
+  pf="$PAT_CLEAN"; [ "${3:-}" = content ] && pf="$PAT_CONTENT"
+  grep -nE -f "$pf" "$1" 2>/dev/null | cut -d: -f1 | awk -v l="$2" '{ print l ":" $1 }'
+}
+LINT_HITS=""
+lint_scope() { # declarations (working tree AND HEAD), tracked .mcp.json/.env, repo-local drivers
+  local f rel name tmp
+  LINT_HITS=""
+  if [ -d "$DECL_DIR" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      rel=${f#"$REPO_ROOT"/}
+      LINT_HITS="$LINT_HITS$(lint_hits "$f" "$rel")
+"
+    done <<EOF
+$(find "$DECL_DIR" -type f 2>/dev/null | sort)
+EOF
+  fi
+  # A literal committed and then removed locally (the whole file, or just the line) is still in HEAD,
+  # and the next push carries it there: still a card and still a refusal, until the removal is
+  # committed. So every committed file in scope whose HEAD copy differs from the working tree is
+  # linted as HEAD has it, not only a file that is gone.
+  local hsha
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    hsha=$(git -C "$REPO_ROOT" rev-parse "HEAD:$rel" 2>/dev/null) || continue
+    if [ -f "$REPO_ROOT/$rel" ] && [ "$(git -C "$REPO_ROOT" hash-object "$REPO_ROOT/$rel" 2>/dev/null)" = "$hsha" ]; then continue; fi
+    tmp="$TMPD/lint.head.$(printf '%s' "$rel" | tr '/' '_')"
+    git -C "$REPO_ROOT" show "HEAD:$rel" > "$tmp" 2>/dev/null || continue
+    LINT_HITS="$LINT_HITS$(lint_hits "$tmp" "HEAD:$rel")
+"
+  done <<EOF
+$(git -C "$REPO_ROOT" ls-tree -r --name-only HEAD -- "$DECL_REL/" .acfwhip/adapters/ .mcp.json .env 2>/dev/null \
+    | grep -E "^($DECL_REL/|\\.acfwhip/adapters/acfw-spec-|\\.mcp\\.json\$|\\.env\$)")
+EOF
+  for rel in .mcp.json .env; do
+    if git -C "$REPO_ROOT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+      LINT_HITS="$LINT_HITS$(lint_hits "$REPO_ROOT/$rel" "$rel")
+"
+    fi
+  done
+  for f in "$REPO_ROOT"/.acfwhip/adapters/acfw-spec-*; do
+    [ -f "$f" ] || continue
+    LINT_HITS="$LINT_HITS$(lint_hits "$f" "${f#"$REPO_ROOT"/}")
+"
+  done
+  LINT_HITS=$(printf '%s\n' "$LINT_HITS" | grep -v '^[[:space:]]*$' || true)
+}
+secret_die() { # <hits>
+  echo "FATAL: credential literal found (the value is not printed):" >&2
+  printf '%s\n' "$1" | sed 's/^/  /' >&2
+  echo "Delete the literal, commit the deletion, and ROTATE the key: once a key has been committed or pushed it is in git history, and deleting the line does not un-share it. Keys belong in your shell (export NAME=...) or a gitignored .env, never in a committed file. Nothing ran." >&2
+  exit 20
+}
+lint_scope_or_die() { lint_scope; [ -z "$LINT_HITS" ] || secret_die "$LINT_HITS"; }
+lint_file_or_die() { # <file> <label> [content] — content: plan, task or workbench text (see prep_patterns)
+  local h; h=$(lint_hits "$1" "$2" "${3:-}")
+  [ -z "$h" ] || secret_die "$h"
+}
+
+# ---- run-state hygiene ----------------------------------------------------------------------------
+# Everything under .acfwhip/run/ is per-checkout state: frozen plans, cached findings, workbench URLs.
+# URLs in particular must never be committed. whip-init writes this ignore rule; a project that
+# adopted the plugin before it (or removed the line) would otherwise start tracking it silently.
+ensure_run_ignored() {
+  mkdir -p "$RUN_DIR" 2>/dev/null || true
+  if ! git -C "$REPO_ROOT" check-ignore -q ".acfwhip/run/" 2>/dev/null; then
+    grep -qxF '.acfwhip/run/' "$REPO_ROOT/.gitignore" 2>/dev/null \
+      || printf '\n# ACF Whip run state (per-task harness scripts, /task staging, the run focus, spec-tool results)\n.acfwhip/run/\n' >> "$REPO_ROOT/.gitignore"
+  fi
+  git -C "$REPO_ROOT" check-ignore -q ".acfwhip/run/" 2>/dev/null \
+    || die 2 ".acfwhip/run/ is not gitignored and the rule could not be added. Spec-tool state holds workbench URLs and must never be committed. Add '.acfwhip/run/' to .gitignore, then retry."
+}
+
+# ---- plan / key resolution -------------------------------------------------------------------------
+KEY=""; PLAN_DIR=""; PLAN_FILE=""; REC_FILE=""
+resolve_plan() { # <arg> [need-plan-file] — sets KEY PLAN_DIR PLAN_FILE REC_FILE, or exits 2
+  local a="${1:-}" base
+  [ -n "$a" ] || die 2 "missing <plan> (a cycle ID, docs/cycles/<ID>, or its plan.md)"
+  while [ "${a%/}" != "$a" ]; do a="${a%/}"; done
+  case "$a" in */plan.md|*/record.md) a=$(dirname "$a") ;; esac
+  base=$(basename "$a")
+  is_re "$base" "$ID_RE" || die 2 "'$1' is not a cycle (expected docs/cycles/YYYYMMDD-<slug>/)"
+  case "$a" in
+    "$base"|docs/cycles/"$base"|./docs/cycles/"$base"|"$REPO_ROOT"/docs/cycles/"$base") ;;
+    *)
+      # Any other spelling must be the same directory physically (/tmp vs /private/tmp, symlinks).
+      if [ -d "$a" ] && [ -d "$REPO_ROOT/docs/cycles/$base" ] \
+         && [ "$(cd "$a" && pwd -P)" = "$(cd "$REPO_ROOT/docs/cycles/$base" && pwd -P)" ]; then :
+      else die 2 "'$1' is outside docs/cycles/: import it as a cycle first (/whip <path>)"; fi ;;
+  esac
+  KEY="$base"
+  PLAN_DIR="$REPO_ROOT/docs/cycles/$KEY"
+  PLAN_FILE="$PLAN_DIR/plan.md"
+  REC_FILE="$PLAN_DIR/record.md"
+  if [ "${2:-}" = need ] && [ ! -f "$PLAN_FILE" ]; then
+    die 2 "no plan at docs/cycles/$KEY/plan.md"
+  fi
+  return 0
+}
+
+# ---- declarations -----------------------------------------------------------------------------------
+head_decl_names() {
+  git -C "$REPO_ROOT" ls-tree HEAD -- "$DECL_REL/" 2>/dev/null \
+    | awk -F'\t' '{ split($1, m, " "); if (m[2] == "blob") { n = $2; sub(/.*\//, "", n); print n } }' \
+    | grep -E "$NAME_RE" || true
+}
+decl_names() { # union of working tree and HEAD, sorted; files not matching NAME_RE (prompts, READMEs) ignored
+  {
+    if [ -d "$DECL_DIR" ]; then
+      local f
+      for f in "$DECL_DIR"/*; do [ -f "$f" ] && basename "$f"; done
+    fi
+    head_decl_names
+  } | grep -E "$NAME_RE" | sort -u
+}
+
+# bad_decl_files — files in .acfwhip/spec-tools/ (working tree or HEAD) that read like a declaration
+# but are ignored because their name is not a tool name: `no_tbd`, `NoTbd`, a `no-tbd.example` copied
+# without renaming. Ignoring one silently would leave a committed policy=block tool that never runs
+# and never gates, and nothing would say so. Prompts and notes (*.md) are never flagged.
+DECL_KEY_RE='^[[:space:]]*(driver|review|agent|policy|at)[[:space:]]*='
+bad_decl_files() {
+  local n f
+  {
+    if [ -d "$DECL_DIR" ]; then for f in "$DECL_DIR"/* "$DECL_DIR"/.[!.]*; do [ -f "$f" ] && basename "$f"; done; fi
+    git -C "$REPO_ROOT" ls-tree HEAD -- "$DECL_REL/" 2>/dev/null \
+      | awk -F'\t' '{ split($1, m, " "); if (m[2] == "blob") { n = $2; sub(/.*\//, "", n); print n } }'
+  } | sort -u | while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    is_re "$n" "$NAME_RE" && continue
+    case "$n" in *.md|*.MD|*.markdown) continue ;; esac
+    f="$DECL_DIR/$n"
+    if [ -f "$f" ]; then
+      grep -Eq "$DECL_KEY_RE" "$f" 2>/dev/null || continue
+    else
+      git -C "$REPO_ROOT" show "HEAD:$DECL_REL/$n" 2>/dev/null | grep -Eq "$DECL_KEY_RE" || continue
+    fi
+    printf '%s\n' "$n"
+  done
+}
+bad_name_text() { printf '%s/%s is not a valid spec tool name (lowercase letters, digits and dashes, no extension), so it is ignored' "$DECL_REL" "$1"; }
+warn_bad_names() {
+  local n
+  bad_decl_files | while IFS= read -r n; do [ -n "$n" ] && warn "$(bad_name_text "$n")"; done
+  return 0
+}
+
+D_KIND=""; D_TARGET=""; D_AT=""; D_POLICY=advisory; D_RERUN=""; D_TIMEOUT=120; D_ERR=""
+# decl_ctl_line <file> → the number of the first line holding a control character (tab and one
+# trailing CR excepted) or an invisible Unicode formatting character, or nothing. A trust notice
+# shows the declaration so the operator can consent to what runs; a CR in mid-line makes a terminal
+# (or a harness that keeps the text after the last \r) show only the tail, an ESC sequence can
+# repaint the line, and a bidi override reorders it. `review=evil #<CR>review=benign` would show the
+# benign half and run the other. Byte classes under LC_ALL=C, so BSD and GNU grep agree:
+# C0 and DEL; C1 (U+0080-U+009F, NEL included); U+200B-U+200F (zero-width, LRM/RLM); U+2028/U+2029
+# (line and paragraph separators, which viewers break lines on); U+202A-U+202E and U+2066-U+2069
+# (bidi embeddings, overrides and isolates); U+FEFF (BOM / zero-width no-break space).
+decl_ctl_line() {
+  local c0 uni
+  c0=$(printf '[\001-\010\013-\037\177]')
+  uni=$(printf '\302[\200-\237]|\342\200[\213-\217\250-\256]|\342\201[\246-\251]|\357\273\277')
+  LC_ALL=C sed "s/$CR\$//" "$1" 2>/dev/null | LC_ALL=C grep -anE -e "$c0" -e "$uni" 2>/dev/null | head -1 | cut -d: -f1
+}
+# parse_decl <file> — key=value, read line by line, NEVER sourced (a declaration is data a teammate
+# committed, not code this shell should execute). Strict on purpose: an unknown key or a trailing
+# comment after a value is an error, because a typo like `polcy=block` would otherwise fall back to
+# advisory and silently loosen the gate it was meant to set.
+parse_decl() {
+  D_KIND=""; D_TARGET=""; D_AT=""; D_POLICY=advisory; D_RERUN=""; D_TIMEOUT=120; D_ERR=""
+  local line n=0 k v seen=" " kinds=0 item
+  [ -r "$1" ] || { D_ERR="cannot read the declaration"; return 1; }
+  n=$(decl_ctl_line "$1")
+  if [ -n "$n" ]; then
+    D_ERR="line $n holds a control or invisible formatting character (a carriage return, an escape, a bidi override), so a terminal could show something other than what runs; retype that line"
+    return 1
+  fi
+  n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line="${line%"$CR"}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in
+      *=*) ;;
+      *) D_ERR="line $n is not key=value"; return 1 ;;
+    esac
+    k="${line%%=*}"; v="${line#*=}"
+    k="${k%"${k##*[![:space:]]}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    case "$seen" in *" $k "*) D_ERR="key '$k' is set twice (line $n)"; return 1 ;; esac
+    seen="$seen$k "
+    case "$k" in
+      driver)
+        kinds=$((kinds + 1)); D_KIND=driver; D_TARGET="$v"
+        is_re "$v" "$NAME_RE" || { D_ERR="driver='$v' is not a plain name (lowercase letters, digits, dashes)"; return 1; } ;;
+      review)
+        kinds=$((kinds + 1)); D_KIND=review; D_TARGET="$v"
+        [ -n "$v" ] || { D_ERR="review= is empty"; return 1; } ;;
+      agent)
+        kinds=$((kinds + 1)); D_KIND=agent; D_TARGET="$v"
+        case "$v" in
+          ''|/*|..|../*|*/../*|*/..) D_ERR="agent= must be a relative path inside .acfwhip/spec-tools/ (got '$v')"; return 1 ;;
+        esac ;;
+      at)
+        D_AT=""
+        while IFS= read -r item; do
+          item="${item// /}"
+          [ -n "$item" ] || continue
+          case "$item" in
+            plan|task) has_at "$D_AT" "$item" || D_AT="${D_AT:+$D_AT,}$item" ;;
+            *) D_ERR="at= takes plan, task or plan,task (got '$v')"; return 1 ;;
+          esac
+        done <<EOF
+$(printf '%s\n' "$v" | tr ',' '\n')
+EOF
+        ;;
+      policy)
+        case "$v" in advisory|block) D_POLICY="$v" ;; *) D_ERR="policy= is advisory or block (got '$v')"; return 1 ;; esac ;;
+      rerun)
+        case "$v" in every|ask) D_RERUN="$v" ;; *) D_ERR="rerun= is every or ask (got '$v')"; return 1 ;; esac ;;
+      timeout)
+        case "$v" in ''|*[!0-9]*) D_ERR="timeout= is a number of seconds, 5 to 540 (got '$v')"; return 1 ;; esac
+        v=$((10#$v))
+        { [ "$v" -ge 5 ] && [ "$v" -le 540 ]; } || { D_ERR="timeout= is a number of seconds, 5 to 540 (got '$v')"; return 1; }
+        D_TIMEOUT="$v" ;;
+      *) D_ERR="unknown key '$k' on line $n (known: driver review agent at policy rerun timeout)"; return 1 ;;
+    esac
+  done < "$1"
+  [ "$kinds" -eq 1 ] || { D_ERR="needs exactly one of driver= review= agent= (found $kinds)"; return 1; }
+  return 0
+}
+
+# head_blob <rel> → "<mode> <object id>" of HEAD's entry at exactly this path, or nothing.
+head_blob() {
+  local obj mode
+  obj=$(git -C "$REPO_ROOT" rev-parse -q --verify "HEAD:$1" 2>/dev/null) || return 0
+  [ "$(git -C "$REPO_ROOT" cat-file -t "$obj" 2>/dev/null)" = blob ] || return 0
+  mode=$(git -C "$REPO_ROOT" --literal-pathspecs ls-tree HEAD -- "$1" 2>/dev/null | head -1 | cut -d' ' -f1)
+  [ -n "$mode" ] && printf '%s %s' "$mode" "$obj"
+}
+# head_matches <abs path> <rel> — is the entry at this path (the path itself: a symlink is judged by
+# its link text) byte-identical to HEAD's? By CONTENT, never by index state: `git diff --quiet HEAD`
+# trusts the index, and `git update-index --assume-unchanged` (or --skip-worktree) makes an edited
+# file look clean to it, which would let a local edit to a block driver pass as the committed one.
+head_matches() {
+  local hb mode want got
+  hb=$(head_blob "$2"); [ -n "$hb" ] || return 1
+  mode="${hb%% *}"; want="${hb#* }"
+  if [ -L "$1" ]; then
+    [ "$mode" = 120000 ] || return 1
+    got=$(printf '%s' "$(readlink "$1")" | git -C "$REPO_ROOT" hash-object --stdin 2>/dev/null)
+  else
+    [ -f "$1" ] || return 1
+    case "$mode" in 100644|100755) ;; *) return 1 ;; esac
+    got=$(git -C "$REPO_ROOT" hash-object -- "$1" 2>/dev/null)
+  fi
+  [ -n "$got" ] && [ "$got" = "$want" ]
+}
+path_clean() { # <abs path inside the repo> — this path itself is committed and identical to HEAD
+  head_matches "$1" "${1#"$REPO_ROOT"/}"
+}
+# repo_clean <abs path> — can what RUNS at this path back a block gate? git compares a symlink's
+# text, but executing it runs the target, so a committed link to a script edited locally looked clean
+# while running whatever the edit made it. Every hop of the link chain, and the file it ends at, must
+# be inside the repo, committed and byte-identical to HEAD. A target outside the repo is never clean.
+repo_clean() {
+  local p="$1" root dir canon rel l i=0
+  root=$(cd "$REPO_ROOT" 2>/dev/null && pwd -P) || return 1
+  while :; do
+    dir=$(cd "$(dirname "$p")" 2>/dev/null && pwd -P) || return 1
+    canon="$dir/$(basename "$p")"
+    case "$canon" in "$root"/*) ;; *) return 1 ;; esac
+    rel="${canon#"$root"/}"
+    head_matches "$canon" "$rel" || return 1
+    [ -L "$canon" ] || return 0
+    i=$((i + 1)); [ "$i" -le 40 ] || return 1
+    l=$(readlink "$canon") || return 1
+    case "$l" in /*) p="$l" ;; *) p="$dir/$l" ;; esac
+  done
+}
+# committed_exec_dirty <abs path> — for a driver or prompt that is NOT clean: the git hash of its
+# COMMITTED version, which is what a result must have been produced by to stand behind a block gate
+# (a clean one is simply its own hash). HEAD's blob, but only for a plain file: through a symlink
+# chain the committed target cannot be named without trusting the working tree, so there is no
+# committed version to accept, and nothing gates until the edit is reverted or committed.
+committed_exec_dirty() {
+  local hb
+  [ -L "$1" ] && return 0
+  hb=$(head_blob "${1#"$REPO_ROOT"/}")
+  case "${hb%% *}" in 100644|100755) printf '%s' "${hb#* }" ;; esac
+}
+
+T_DRIVER=""; T_ORIGIN=""
+# Driver discovery mirrors the store adapters: env override, project drop-in, shipped, $PATH.
+# Only the project drop-in (committed, clean) and the shipped copy can back a block gate.
+locate_driver() { # <driver-name> → T_DRIVER T_ORIGIN; 1 when not found (T_ERR explains)
+  local name="acfw-spec-$1" d found
+  T_DRIVER=""; T_ORIGIN=""
+  if [ -n "${ACFW_SPEC_TOOL_PATH:-}" ]; then
+    while IFS= read -r d; do
+      [ -n "$d" ] && [ -f "$d/$name" ] && [ -x "$d/$name" ] && { T_DRIVER="$d/$name"; T_ORIGIN=env; return 0; }
+    done <<EOF
+$(printf '%s\n' "$ACFW_SPEC_TOOL_PATH" | tr ':' '\n')
+EOF
+  fi
+  for d in "$REPO_ROOT/.acfwhip/adapters" "$PLUGIN_ROOT/spec-tools/$1"; do
+    if [ -f "$d/$name" ]; then
+      [ -x "$d/$name" ] || { T_ERR="$d/$name exists but is not executable (chmod +x it)"; return 1; }
+      T_DRIVER="$d/$name"
+      if [ "$d" = "$PLUGIN_ROOT/spec-tools/$1" ]; then T_ORIGIN=plugin; else T_ORIGIN=repo; fi
+      return 0
+    fi
+  done
+  found=$(command -v "$name" 2>/dev/null) && [ -n "$found" ] && { T_DRIVER="$found"; T_ORIGIN=path; return 0; }
+  T_ERR="no executable $name (looked in \$ACFW_SPEC_TOOL_PATH, .acfwhip/adapters/, the plugin's spec-tools/$1/, and \$PATH)"
+  return 1
+}
+
+# load_tool <name> — every fact about one tool, as T_* globals. Never exits: a problem that stops
+# it running lands in T_ERR; one that only demotes it to advisory lands in T_WARN.
+load_tool() {
+  T_NAME="$1"; T_ERR=""; T_WARN=""; T_KIND=""; T_TARGET=""; T_AT=""; T_TIMEOUT=120; T_RERUN_DECL=""
+  T_DECL_POLICY=advisory; T_HEAD_POLICY=""; T_HEAD_ERR=""; T_POLICY=advisory; T_GATEABLE=0
+  T_HEAD_AT=""; T_HEAD_KIND=""; T_HEAD_TIMEOUT=120; T_HEAD_RERUN=""
+  T_DRIVER=""; T_ORIGIN=""; T_EXEC_HASH="-"; T_GATE_EXEC=""; T_MD=""; T_DECLSHA=""; T_HEADSHA=""; T_STATE=""
+  T_IDENT=""; T_TRUSTKEY=""; T_IN_HEAD=0; T_IN_WT=0; CAPS=""
+  local wt="$DECL_DIR/$T_NAME" head="$TMPD/head.$T_NAME" src wtsha="" clean=0 execid lines
+  if git -C "$REPO_ROOT" cat-file -e "HEAD:$DECL_REL/$T_NAME" 2>/dev/null; then
+    T_IN_HEAD=1
+    git -C "$REPO_ROOT" show "HEAD:$DECL_REL/$T_NAME" > "$head" 2>/dev/null
+    T_HEADSHA=$(git -C "$REPO_ROOT" rev-parse "HEAD:$DECL_REL/$T_NAME" 2>/dev/null)
+    if parse_decl "$head"; then
+      T_HEAD_POLICY="$D_POLICY"; T_HEAD_AT="$D_AT"; T_HEAD_KIND="$D_KIND"; T_HEAD_TIMEOUT="$D_TIMEOUT"; T_HEAD_RERUN="$D_RERUN"
+    else
+      T_HEAD_ERR="$D_ERR"
+      # A broken committed declaration still gates if it could MEAN block: failing open there would
+      # let a typo switch the gate off (`policy=block  # team rule`, `policy=Block`, `policy="block"`
+      # all fail the strict parse). So any policy line that is not recognizably advisory counts as
+      # block, and so does a misspelled key whose value is block (`polcy=block`: the typo the strict
+      # parser exists to catch). The gate then refuses naming the invalid declaration, and the
+      # override still works.
+      lines=$(tr -d '\r' < "$head" | grep -Ei '^[[:space:]]*policy[[:space:]]*=' || true)
+      if { [ -n "$lines" ] && printf '%s\n' "$lines" \
+             | grep -Eivq "^[[:space:]]*policy[[:space:]]*=[[:space:]]*[\"']?advisory[\"']?[[:space:]]*(#.*)?\$"; } \
+         || tr -d '\r' < "$head" | grep -Eiq "^[[:space:]]*[A-Za-z_-]+[[:space:]]*=[[:space:]]*[\"']?block[\"']?[[:space:]]*(#.*)?\$"; then
+        T_HEAD_POLICY=block
+      else
+        T_HEAD_POLICY=advisory
+      fi
+      # at= read just as leniently: the words plan and task on any at line; an at line naming
+      # neither means both, because an unreadable hook point must not drop a gate either.
+      lines=$(tr -d '\r' < "$head" | grep -Ei '^[[:space:]]*at[[:space:]]*=' || true)
+      if [ -n "$lines" ]; then
+        printf '%s' "$lines" | grep -qi plan && T_HEAD_AT=plan
+        printf '%s' "$lines" | grep -qi task && T_HEAD_AT="${T_HEAD_AT:+$T_HEAD_AT,}task"
+        [ -n "$T_HEAD_AT" ] || T_HEAD_AT="plan,task"
+      fi
+      T_HEAD_KIND=$(tr -d '\r' < "$head" | sed -n -E 's/^[[:space:]]*(driver|review|agent)[[:space:]]*=.*/\1/p' | head -1)
+    fi
+  fi
+  if [ -f "$wt" ]; then T_IN_WT=1; wtsha=$(git -C "$REPO_ROOT" hash-object "$wt" 2>/dev/null); fi
+  if [ "$T_IN_WT" = 1 ] && [ "$T_IN_HEAD" = 1 ]; then
+    src="$wt"; T_DECLSHA="$wtsha"
+    if [ "$wtsha" = "$T_HEADSHA" ]; then T_STATE=clean; else T_STATE=edited; fi
+  elif [ "$T_IN_WT" = 1 ]; then
+    src="$wt"; T_DECLSHA="$wtsha"; T_STATE=uncommitted
+  else
+    # Deleted locally but still at HEAD: it keeps running from HEAD until the deletion is committed,
+    # because the gate reads HEAD. Deleting a file must not be a way around a block tool.
+    src="$head"; T_DECLSHA="$T_HEADSHA"; T_STATE=deleted
+  fi
+  parse_decl "$src" || { T_ERR="$D_ERR"; return 0; }
+  T_KIND="$D_KIND"; T_TARGET="$D_TARGET"; T_AT="$D_AT"; T_TIMEOUT="$D_TIMEOUT"; T_RERUN_DECL="$D_RERUN"
+  T_DECL_POLICY="$D_POLICY"
+  case "$T_STATE" in
+    clean) clean=1 ;;
+    deleted) clean=1; T_WARN="deleted locally but still committed: it runs from HEAD until you commit the deletion" ;;
+    edited) T_WARN="the declaration has uncommitted edits: it runs advisory until committed" ;;
+    uncommitted) T_WARN="the declaration is not committed: it runs advisory until committed" ;;
+  esac
+  # T_GATE_EXEC: the executable or prompt hash a result must carry to stand behind a block gate (the
+  # committed version; empty when nothing can, e.g. a driver found via env or $PATH). A cached GO
+  # from an older committed driver is not a GO from this one: a teammate's fix to the driver must not
+  # be answered by the result the broken version gave.
+  case "$T_KIND" in
+    driver)
+      locate_driver "$T_TARGET" || return 0
+      T_EXEC_HASH=$(git -C "$REPO_ROOT" hash-object "$T_DRIVER" 2>/dev/null)
+      case "$T_ORIGIN" in
+        env)
+          clean=0; T_WARN="${T_WARN:+$T_WARN; }its driver was found via \$ACFW_SPEC_TOOL_PATH, so it runs advisory" ;;
+        path)
+          clean=0; T_WARN="${T_WARN:+$T_WARN; }its driver was found on \$PATH, so it runs advisory" ;;
+        plugin) T_GATE_EXEC="$T_EXEC_HASH" ;;
+        repo)
+          if repo_clean "$T_DRIVER"; then
+            T_GATE_EXEC="$T_EXEC_HASH"
+          else
+            clean=0; T_GATE_EXEC=$(committed_exec_dirty "$T_DRIVER")
+            T_WARN="${T_WARN:+$T_WARN; }its driver ${T_DRIVER#"$REPO_ROOT"/} is edited or uncommitted, so it runs advisory"
+          fi ;;
+      esac
+      execid="$T_DRIVER|$T_EXEC_HASH" ;;
+    agent)
+      T_MD="$DECL_DIR/$T_TARGET"
+      [ -f "$T_MD" ] || { T_ERR="agent prompt $DECL_REL/$T_TARGET does not exist"; return 0; }
+      T_EXEC_HASH=$(git -C "$REPO_ROOT" hash-object "$T_MD" 2>/dev/null)
+      if repo_clean "$T_MD"; then
+        T_GATE_EXEC="$T_EXEC_HASH"
+      else
+        clean=0; T_GATE_EXEC=$(committed_exec_dirty "$T_MD")
+        T_WARN="${T_WARN:+$T_WARN; }its prompt $DECL_REL/$T_TARGET is edited or uncommitted, so it runs advisory"
+      fi
+      execid="$T_MD|$T_EXEC_HASH" ;;
+    review) execid="review"; T_GATE_EXEC="-" ;;
+  esac
+  T_GATEABLE="$clean"
+  if [ "$clean" = 1 ] && [ "$T_IN_HEAD" = 1 ]; then T_POLICY="${T_HEAD_POLICY:-advisory}"; else T_POLICY=advisory; fi
+  if [ "$T_DECL_POLICY" = block ] && [ "$T_POLICY" != block ]; then
+    T_WARN="${T_WARN:+$T_WARN }(policy=block takes effect once it is committed and clean)"
+  fi
+  T_IDENT="$T_DECLSHA|$execid"
+  # Trust is keyed on what would EXECUTE: the declaration plus a repo/env/$PATH executable or agent
+  # prompt. A shipped driver is trusted by installing the plugin, so a plugin upgrade does not
+  # re-prompt every project.
+  if [ "$T_ORIGIN" = plugin ]; then execid="plugin:$T_TARGET"; fi
+  T_TRUSTKEY=$(printf '%s|%s' "$T_DECLSHA" "$execid" | git hash-object --stdin | cut -c1-16)
+  return 0
+}
+
+# ---- stages: where a tool runs, and where it gates ------------------------------------------------
+# The card, the hook run, the gate and the task hold must agree on one answer, or the card offers
+# "yes" while the gate refuses (and tells the operator to review bytes that review will never run).
+# gates_at <stage>: does the COMMITTED declaration make this a block gate there? Plan approval is
+# gated when the committed at= names plan or is absent (an on-request block tool still gates the
+# approval it is attached to); tasks are held only when it names task.
+gates_at() {
+  [ "$T_IN_HEAD" = 1 ] && [ "$T_HEAD_POLICY" = block ] || return 1
+  case "$1" in
+    plan) [ -z "$T_HEAD_AT" ] || has_at "$T_HEAD_AT" plan ;;
+    *) has_at "$T_HEAD_AT" "$1" ;;
+  esac
+}
+# in_stage <stage>: does this tool run at that hook point? Either at= counts: a local edit may add a
+# stage, and must not be able to take one away from a committed declaration.
+in_stage() { has_at "$T_AT" "$1" || has_at "$T_HEAD_AT" "$1"; }
+stage_policy() { if gates_at "$1"; then echo block; else echo advisory; fi; }
+policy_now() { if [ "$T_IN_HEAD" = 1 ] && [ "$T_HEAD_POLICY" = block ]; then echo block; else echo advisory; fi; }
+at_now() { # the union of both at= values, in plan,task order
+  local a=""
+  if in_stage plan; then a=plan; fi
+  if in_stage task; then a="${a:+$a,}task"; fi
+  printf '%s' "$a"
+}
+
+tool_trusted() { [ -r "$TRUST_FILE" ] && grep -qxF "$T_NAME $T_TRUSTKEY" "$TRUST_FILE"; }
+trust_record() {
+  local tmp
+  mkdir -p "$SPEC_RUN"
+  tmp=$(mktemp "$SPEC_RUN/.trusted.XXXXXX") || return 1
+  { grep -v "^$T_NAME " "$TRUST_FILE" 2>/dev/null; printf '%s %s\n' "$T_NAME" "$T_TRUSTKEY"; } > "$tmp"
+  mv -f "$tmp" "$TRUST_FILE"
+}
+# Trust is consent to what the operator SAW. "run tools" arrives a turn after the notice, and a git
+# pull in between can swap the declaration for one nobody displayed. So every full notice
+# (trust_notice: the TRUST| line plus every declaration line, uncapped) records the exact version it
+# showed, and a bare "run tools" trusts only a tool whose current version is the one shown; anything
+# else is shown afresh. A status CARD is not a notice and records nothing: its cells are capped, so
+# a command's tail could sit past what the card displayed.
+PENDING_TRUST="$SPEC_RUN/pending-trust"
+trust_shown() {
+  local tmp
+  # Record only where run state is already gitignored, so no caller can leave an untracked file
+  # behind (review, trust, push, pull and from run ensure_run_ignored before any notice).
+  git -C "$REPO_ROOT" check-ignore -q ".acfwhip/run/" 2>/dev/null || return 0
+  mkdir -p "$SPEC_RUN" 2>/dev/null || return 0
+  tmp=$(mktemp "$SPEC_RUN/.pending.XXXXXX") || return 0
+  { grep -v "^$T_NAME " "$PENDING_TRUST" 2>/dev/null; printf '%s %s\n' "$T_NAME" "$T_TRUSTKEY"; } > "$tmp"
+  mv -f "$tmp" "$PENDING_TRUST"
+}
+was_shown() { [ -n "$T_TRUSTKEY" ] && [ -r "$PENDING_TRUST" ] && grep -qxF "$T_NAME $T_TRUSTKEY" "$PENDING_TRUST"; }
+
+# ---- capabilities (drivers only) -----------------------------------------------------------------
+# Cached per driver executable hash. status/show/gate/list never probe: they must make zero network
+# calls, and a capabilities verb is allowed to (feature detection).
+CAPS=""; CAPS_ERR=""
+caps_file() { printf '%s/caps/%s.%s' "$SPEC_RUN" "$T_NAME" "$(printf '%s' "$T_EXEC_HASH" | cut -c1-12)"; }
+caps_load() { # [probe|fresh] — none: cache only · probe: refresh a cache older than a day · fresh: always
+  local mode="${1:-}" at envmode=noenv
+  CAPS=""; CAPS_ERR=""
+  [ "$T_KIND" = driver ] && [ -n "$T_DRIVER" ] || return 0
+  local f; f=$(caps_file)
+  if [ -s "$f" ]; then
+    CAPS=$(cat "$f")
+    [ -n "$mode" ] || return 0
+    # A driver may feature-detect (a verb lights up when its service ships it), so a probing caller
+    # refreshes a day-old answer. The old answer stays in CAPS if the refresh fails.
+    if [ "$mode" = probe ]; then
+      at=$(printf '%s\n' "$CAPS" | sed -n 's/^PROBED|//p' | head -1)
+      case "$at" in ''|*[!0-9]*) at=0 ;; esac
+      [ $(( $(now) - at )) -lt 86400 ] && return 0
+    fi
+    envmode=""   # the names it NEEDS are known now: a re-probe may use them to feature-detect
+  fi
+  [ -n "$mode" ] || return 0
+  local tdir="$TMPD/caps.$T_NAME" rem secs
+  rem=$(( DEADLINE - $(now) )); secs=30; [ "$rem" -lt "$secs" ] && secs=$rem
+  [ "$secs" -ge 1 ] || { CAPS_ERR="no time left in the review budget"; [ -n "$CAPS" ]; return; }
+  mkdir -p "$tdir"
+  run_tool "$tdir" capabilities plan _caps "" "" "$secs" "" "" $envmode
+  if [ "$RUN_RC" -eq 0 ]; then
+    mkdir -p "$SPEC_RUN/caps"
+    { grep -E '^(VERBS|NEEDS|EGRESS|COST)\|' "$tdir/raw.stdout" 2>/dev/null; printf 'PROBED|%s\n' "$(now)"; } > "$f.$$"
+    mv -f "$f.$$" "$f"
+    CAPS=$(cat "$f")
+    return 0
+  fi
+  CAPS_ERR=$(first_line "$tdir/raw.stderr"); [ -n "$CAPS_ERR" ] || CAPS_ERR="capabilities exited $RUN_RC"
+  [ -n "$CAPS" ] && return 0
+  return 1
+}
+caps_field() { # <FIELD> → space-joined values
+  # VERBS and NEEDS are word lists, so a comma separates words. COST and EGRESS are prose a person
+  # reads ("1 unit per review, billed monthly"), so they are shown as the driver printed them:
+  # splitting them on commas turned COST into word salad on the `add` screen.
+  case "$1" in
+    COST|EGRESS) printf '%s\n' "$CAPS" | sed -n "s/^$1|//p" | tr -s ' \t' '  ' | sed 's/^ //; s/ $//' | paste -sd' ' - 2>/dev/null ;;
+    *) printf '%s\n' "$CAPS" | sed -n "s/^$1|//p" | tr ',' ' ' | tr -s ' \t' '  ' | sed 's/^ //; s/ $//' | paste -sd' ' - 2>/dev/null ;;
+  esac
+}
+tool_offers() { # <verb> — 0 offered, 1 not, 2 unknown (driver not probed)
+  case "$T_KIND" in
+    review) [ "$1" = review ] && return 0; return 1 ;;
+    agent)  [ -n "$(md_section "$T_MD" "$1" | grep '[^[:space:]]')" ] && return 0; return 1 ;;
+    driver)
+      [ -n "$CAPS" ] || return 2
+      local vs; vs=" $(caps_field VERBS) "
+      [ "$vs" = "  " ] && return 2
+      case "$vs" in *" $1 "*) return 0 ;; esac
+      return 1 ;;
+  esac
+  return 1
+}
+tool_egress() {
+  case "$T_KIND" in
+    review) echo "see its command" ;;
+    agent)  echo "in-session subagent" ;;
+    driver) local e; e=$(caps_field EGRESS); echo "${e:-unknown until first run}" ;;
+  esac
+}
+tool_rerun() {
+  [ -n "$T_RERUN_DECL" ] && { echo "$T_RERUN_DECL"; return; }
+  case "$T_KIND" in
+    # The rule is "ask when capabilities print COST|". An agent prompt has no capabilities verb, so
+    # it defaults to every like a review= command; a paid critic says rerun=ask (spec-critic does).
+    review|agent) echo every ;;
+    # Unprobed drivers are assumed paid until their capabilities say otherwise.
+    driver) if [ -z "$CAPS" ] || printf '%s\n' "$CAPS" | grep -q '^COST|'; then echo ask; else echo every; fi ;;
+  esac
+}
+md_section() { # <md> <verb> — body of "## <verb>" up to the next "## " heading
+  [ -r "$1" ] || return 0
+  awk -v v="$2" '
+    BEGIN { lv = tolower(v) }
+    /^## / { h = tolower($0); sub(/^## +/, "", h); sub(/[ \t]+$/, "", h); if (on) exit; if (h == lv) { on = 1; next } }
+    on { print }' "$1"
+}
+
+# .env passthrough, for the names a driver declared in NEEDS| only, and only from a gitignored,
+# untracked .env: a tracked .env is a leak (secret lint flags it), never a source. Values are
+# exported inside the tool's subshell, never passed on argv where `ps` would show them.
+export_needs() {
+  local f="$REPO_ROOT/.env" name val
+  [ -f "$f" ] || return 0
+  git -C "$REPO_ROOT" ls-files --error-unmatch -- .env >/dev/null 2>&1 && return 0
+  git -C "$REPO_ROOT" check-ignore -q .env 2>/dev/null || return 0
+  for name in $(caps_field NEEDS); do
+    is_re "$name" '^[A-Za-z_][A-Za-z0-9_]*$' || continue
+    [ -n "${!name:-}" ] && continue
+    val=$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$name=//p" "$f" | tail -1 \
+          | sed -E "s/^\"(.*)\"[[:space:]]*$/\1/; s/^'(.*)'[[:space:]]*$/\1/")
+    [ -n "$val" ] && export "$name=$val"
+  done
+  return 0
+}
+
+# ---- the watchdog --------------------------------------------------------------------------------
+# watchdog <secs> <stdout-file> <stderr-file> <cmd> [args...] — the command's exit code, or 124.
+# The command becomes a process-group leader (perl setpgrp, then exec), so one kill reaches every
+# process it forked. A timer process in its own group sends TERM to the whole group at the deadline
+# and KILL 3 s later. After ANY exit, stragglers left in the group are swept: a tool that exits
+# while a curl it backgrounded is still talking would otherwise leak that process.
+watchdog() {
+  local secs="$1" out="$2" err="$3" pid timer rc mark
+  shift 3
+  mark="$out.timedout"; rm -f "$mark"
+  if [ "$HAVE_PERL" = 1 ]; then
+    perl -e 'setpgrp(0, 0); exec { $ARGV[0] } @ARGV or do { print STDERR "cannot run $ARGV[0]: $!\n"; exit 126 }' "$@" >"$out" 2>"$err" </dev/null &
+    pid=$!
+    printf '%s\n' "$pid" >> "$LIVE_PGIDS"
+    perl -e 'setpgrp(0, 0); $SIG{TERM} = sub { exit 0 }; my ($s, $g, $m) = @ARGV; sleep $s;
+             if (open(my $f, ">", $m)) { close $f } kill "TERM", -$g; sleep 3; kill "KILL", -$g;' \
+      "$secs" "$pid" "$mark" </dev/null >/dev/null 2>&1 &
+    timer=$!
+  else
+    # No perl: setsid where it exists (Linux); otherwise only the direct child can be killed.
+    if command -v setsid >/dev/null 2>&1; then setsid "$@" >"$out" 2>"$err" </dev/null &
+    else "$@" >"$out" 2>"$err" </dev/null & fi
+    pid=$!
+    printf '%s\n' "$pid" >> "$LIVE_PGIDS"
+    ( sleep "$secs"; : > "$mark"; kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+      sleep 3; kill -KILL -- -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+    timer=$!
+  fi
+  wait "$pid" 2>/dev/null; rc=$?
+  kill "$timer" 2>/dev/null; wait "$timer" 2>/dev/null
+  if kill -0 -- -"$pid" 2>/dev/null; then
+    kill -TERM -- -"$pid" 2>/dev/null; sleep 1; kill -KILL -- -"$pid" 2>/dev/null
+  fi
+  if [ -e "$mark" ]; then rm -f "$mark"; return 124; fi
+  return "$rc"
+}
+
+# run_tool <tdir> <verb> <stage> <key> <file> <blob> <secs> <ref> <same-ref> [noenv] → RUN_RC
+# Inputs reach the tool through the environment only, never by string substitution into a command
+# line: a plan title with a quote in it must not be able to become shell syntax.
+RUN_RC=0
+run_tool() {
+  local tdir="$1" verb="$2" stage="$3" key="$4" file="$5" blob="$6" secs="$7" ref="$8" same="$9" noenv="${10:-}"
+  local skey="${key:-_from}" state
+  state="$SPEC_RUN/$skey/state/$T_NAME"
+  mkdir -p "$tdir/out" "$state"
+  (
+    cd "$REPO_ROOT" || exit 2
+    export ACFW_SPEC_VERB="$verb" ACFW_SPEC_STAGE="$stage" ACFW_SPEC_KEY="$key" ACFW_SPEC_FILE="$file"
+    export ACFW_SPEC_BLOB="$blob" ACFW_SPEC_OUT="$tdir/out" ACFW_SPEC_REF="$ref" ACFW_SPEC_SAME_REF="$same"
+    export ACFW_SPEC_STATE="$state" ACFW_SPEC_DEADLINE="$(( $(date +%s) + secs ))" ACFW_SPEC_TOOL="$T_NAME"
+    export ACFW_SPEC_CONTRACT_VERSION=1 ACFW_TRUNK_ROOT="$REPO_ROOT" ACFW_SPEC_FRESH="$SPEC_FRESH"
+    [ "$noenv" = noenv ] || export_needs
+    case "$T_KIND" in
+      driver) watchdog "$secs" "$tdir/raw.stdout" "$tdir/raw.stderr" "$T_DRIVER" "$verb" ;;
+      review) watchdog "$secs" "$tdir/raw.stdout" "$tdir/raw.stderr" bash -c "$T_TARGET" ;;
+      *) echo "not a runnable tool kind: $T_KIND" > "$tdir/raw.stderr"; : > "$tdir/raw.stdout"; exit 2 ;;
+    esac
+  ) &
+  # Backgrounded and waited on, never run in the foreground: bash defers a trapped signal until a
+  # FOREGROUND child finishes, so a caller's TERM would otherwise sit unhandled for the tool's whole
+  # timeout. `wait` is interruptible, so on_signal runs at once and kills the tool's group.
+  local sub=$!
+  wait "$sub"; RUN_RC=$?
+}
+
+# ---- stdout records -------------------------------------------------------------------------------
+# classify <raw-stdout> <tsv> — one pass tags every line (US-separated: tabs and control characters
+# are flattened first, and a non-whitespace separator keeps empty fields intact under `read`).
+classify() {
+  tr '\t\r' '  ' < "$1" | tr -d '\000-\010\013-\037' | awk -F'|' -v OFS="$US" '
+    /^FINDING\|/ { t = $5; for (i = 6; i <= NF; i++) t = t "|" $i; print "F", $2, $3, $4, substr(t, 1, 300); next }
+    /^Q\|/       { print "Q", substr($0, 3, 300); next }
+    /^SUMMARY\|/ { print "S", substr($0, 9); next }
+    /^REF\|/     { print "R", substr($0, 5); next }
+    /^URL\|/     { print "U", substr($0, 5); next }
+    /^HINT\|/    { print "H", substr($0, 6, 300); next }
+    /^ANSWER\|/  { t = $3; for (i = 4; i <= NF; i++) t = t "|" $i; print "A", $2, substr(t, 1, 300); next }
+    /^(VERBS|NEEDS|EGRESS|COST)\|/ { next }
+    { print "X", substr($0, 1, 300) }' > "$2"
+}
+# IO_SV is the SUMMARY verdict, and NO-GO wins: any SUMMARY line saying nogo makes it nogo, however
+# many say go. A tool that echoes its input (a plain grep, an LLM critic quoting the plan) can put a
+# planted `SUMMARY|verdict=go` line on stdout, so the last line, or a go, must never be the one that
+# counts. IO_SV_MIXED=1 when both appeared.
+IO_REF=""; IO_URL=""; IO_HINT=""; IO_SV=""; IO_SV_MIXED=0
+read_io() { # <tsv> [answers-out] — REF/URL/HINT/SUMMARY (+ ANSWER lines)
+  IO_REF=""; IO_URL=""; IO_HINT=""; IO_SV=""; IO_SV_MIXED=0
+  local k a b rest sv sgo=0 snogo=0
+  [ -n "${2:-}" ] && : > "$2"
+  while IFS="$US" read -r k a b rest; do
+    case "$k" in
+      R) IO_REF="${a#"${a%%[![:space:]]*}"}"; IO_REF="${IO_REF%"${IO_REF##*[![:space:]]}"}" ;;
+      U) IO_URL="$a" ;;
+      H) IO_HINT="${IO_HINT:+$IO_HINT; }$a" ;;
+      S) sv=$(printf '%s' "$a" | sed -n 's/.*verdict=\([A-Za-z-]*\).*/\1/p' | tr 'A-Z' 'a-z')
+         case "$sv" in go) sgo=1 ;; nogo|no-go) snogo=1 ;; esac ;;
+      A) [ -n "${2:-}" ] && printf 'ANSWER|%s|%s\n' "$(flat "$a" | tr -d '|')" "$(flat "$b")" >> "$2" ;;
+    esac
+  done < "$1"
+  if [ "$snogo" = 1 ]; then IO_SV=nogo; elif [ "$sgo" = 1 ]; then IO_SV=go; fi
+  [ "$sgo" = 1 ] && [ "$snogo" = 1 ] && IO_SV_MIXED=1
+  return 0
+}
+ref_ok() { # a plain id: never a link, never credential-shaped
+  local r="$1"
+  [ -n "$r" ] && [ ${#r} -le 128 ] || return 1
+  is_re "$r" '^[A-Za-z0-9][A-Za-z0-9._:-]*$' || return 1
+  case "$r" in *://*|http:*|https:*|HTTP:*|HTTPS:*) return 1 ;; esac
+  prep_patterns
+  printf '%s\n' "$r" | grep -Eq -f "$PAT_CLEAN" && return 1
+  return 0
+}
+
+V_VERDICT=""; V_N=0; V_MAXSEV="-"; V_REF=""; V_URL=""; V_REASON=""; V_HINT=""; V_EXIT=0; V_NOHIST=0; V_UNRUN=0
+# V_UNRUN=1 marks a placeholder for a tool the ENGINE never started (the review budget ran out).
+# It is not a tool outcome, so it never counts as "could not run" (a non-gate): the gate treats it
+# as no result, or a slow advisory tool ahead of a block tool would switch that gate off.
+set_outcome() { V_VERDICT="$1"; V_REASON="${2:-}"; V_N=0; V_MAXSEV="-"; V_REF=""; V_URL=""; V_HINT=""; V_EXIT=-; V_NOHIST="${3:-0}"; V_UNRUN=0; }
+# note_findings <tdir> — for an outcome with no tool output (budget, trust, secret, no review verb):
+# empty records and a findings.md that says why, so a REVIEWED line never points at a stale file.
+note_findings() {
+  mkdir -p "$1"; : > "$1/records"
+  { printf '# %s: %s\n\n' "$T_NAME" "$(verdict_word "$V_VERDICT")"; [ -n "$V_REASON" ] && printf 'Reason: %s\n' "$V_REASON"; } > "$1/findings.md"
+}
+
+# normalize_outcome <tdir> <rc> <frozen-file> <secs> — exit code + records → one of go|nogo|skip|error,
+# the normalized records file, and findings.md (what the task-stage repair round is handed).
+normalize_outcome() {
+  local tdir="$1" rc="$2" frozen="$3" secs="$4"
+  local raw="$1/raw.stdout" err="$1/raw.stderr" tsv="$1/parsed" recs="$1/records.$$"
+  local k a b c d fe sev fp loc title lastfp="-" nf=0 line fn
+  V_VERDICT=""; V_N=0; V_MAXSEV="-"; V_REF=""; V_URL=""; V_REASON=""; V_HINT=""; V_EXIT="$rc"; V_NOHIST=0; V_UNRUN=0
+  [ -f "$raw" ] || : > "$raw"; [ -f "$err" ] || : > "$err"
+  classify "$raw" "$tsv"
+  read_io "$tsv"
+  : > "$recs"
+  fn="${frozen##*/}"
+  while IFS="$US" read -r k a b c d; do
+    case "$k" in
+      F)
+        case "$a" in
+          [Cc][Rr][Ii][Tt]*|[Bb][Ll][Oo][Cc][Kk]*) sev=critical ;;
+          [Hh][Ii][Gg][Hh]*|[Ee][Rr][Rr][Oo][Rr]*|[Mm][Aa][Jj][Oo][Rr]*) sev=high ;;
+          [Ll][Oo][Ww]*|[Mm][Ii][Nn][Oo][Rr]*) sev=low ;;
+          [Ii][Nn][Ff][Oo]*|[Nn][Oo][Tt][Ee]*|[Ss][Uu][Gg]*) sev=info ;;
+          *) sev=medium ;;
+        esac
+        fp="${b// /}"; is_re "$fp" '^[A-Za-z0-9._:-]{1,64}$' || fp=$(fp_of "$d")
+        loc="${c// /}"; is_re "$loc" '^(L[0-9]+|D[0-9]+|AC[0-9]+\.[0-9]+|-)$' || loc="-"
+        title="${d#"${d%%[![:space:]]*}"}"; title="${title//"$frozen"/$fn}"; [ -n "$title" ] || title="(untitled finding)"
+        printf 'FINDING|%s|%s|%s|%s\n' "$sev" "$fp" "$loc" "$title" >> "$recs"
+        lastfp="$fp"; nf=$((nf + 1)) ;;
+      Q) printf 'Q|%s|%s\n' "$lastfp" "${a//"$frozen"/$fn}" >> "$recs" ;;
+    esac
+  done < "$tsv"
+  fe=$(first_line "$err")
+  case "$rc" in
+    0) V_VERDICT=go ;;
+    1) V_VERDICT=nogo ;;
+    3) V_VERDICT=skip; V_REASON="${fe:-the tool reported itself unavailable (exit 3) and gave no reason}" ;;
+    124) V_VERDICT=error; V_REASON="timed out after ${secs}s; its whole process group was killed" ;;
+    *) V_VERDICT=error; V_REASON="exited $rc${fe:+: $fe}" ;;
+  esac
+  if [ "$T_KIND" = agent ]; then
+    case "$IO_SV" in
+      go|nogo) V_VERDICT="$IO_SV"; V_REASON=""
+               [ "$IO_SV_MIXED" = 1 ] && V_REASON="the agent wrote both SUMMARY|verdict=go and nogo lines: a disagreement counts as NO-GO" ;;
+      *) V_VERDICT=error; V_REASON="the agent wrote no SUMMARY|verdict=go or SUMMARY|verdict=nogo line (required for agent tools)" ;;
+    esac
+  elif [ -n "$IO_SV" ] && { [ "$V_VERDICT" = go ] || [ "$V_VERDICT" = nogo ]; } \
+       && { [ "$IO_SV" != "$V_VERDICT" ] || [ "$IO_SV_MIXED" = 1 ]; }; then
+    # Fail CLOSED. As an error this was a non-gate, so one planted `SUMMARY|verdict=go` line in the
+    # plan, echoed by a tool that exits 1, switched a block tool off. A disagreement is NO-GO, and
+    # the reason says why; error stays reserved for exit codes other than 0, 1 and 3.
+    V_REASON="its SUMMARY| line(s) disagree with exit code $rc; a disagreement counts as NO-GO"; V_VERDICT=nogo
+  fi
+  if [ "$V_VERDICT" = nogo ] && [ "$nf" -eq 0 ]; then
+    # Unstructured fallback: a NO-GO with no records turns the first 20 stdout lines into findings,
+    # which is why any linter works with no wrapper. Line numbers are lifted into L<n> and stripped
+    # from the fingerprint, so the same complaint on a line that moved stays "persisting".
+    awk -F"$US" '$1 == "X" && $2 ~ /[^ ]/ { print $2 }' "$tsv" | head -20 > "$tdir/fallback"
+    if [ ! -s "$tdir/fallback" ]; then
+      printf '%s\n' "NO-GO with no output${fe:+: $fe}" > "$tdir/fallback"
+    fi
+    local lre='^([^:[:space:]]*:)?([0-9]+):([0-9]+:)?[[:space:]]*(.*)$'
+    while IFS= read -r line; do
+      line="${line//"$frozen"/$fn}"
+      loc="-"
+      if [[ $line =~ $lre ]]; then
+        loc="L${BASH_REMATCH[2]}"; title="${BASH_REMATCH[4]}"
+      else
+        title="$line"
+      fi
+      title="${title#"${title%%[![:space:]]*}"}"; [ -n "$title" ] || title="$line"
+      printf 'FINDING|medium|%s|%s|%s\n' "$(fp_of "$title")" "$loc" "$title" >> "$recs"
+    done < "$tdir/fallback"
+  fi
+  case "$V_VERDICT" in
+    go|nogo)
+      V_N=$(grep -c '^FINDING|' "$recs" 2>/dev/null || true); V_N=${V_N//[^0-9]/}; V_N=${V_N:-0}
+      V_MAXSEV=$(awk -F'|' '$1 == "FINDING" { r = ($2 == "critical") ? 0 : ($2 == "high") ? 1 : ($2 == "medium") ? 2 : ($2 == "low") ? 3 : 4; if (min == "" || r < min) { min = r; s = $2 } } END { print (s == "" ? "-" : s) }' "$recs") ;;
+    *) : > "$recs" ;;
+  esac
+  mv -f "$recs" "$tdir/records"
+  V_HINT="$IO_HINT"
+  V_URL=$(flat "$IO_URL")
+  if [ -n "$IO_REF" ]; then
+    if ref_ok "$IO_REF"; then V_REF="$IO_REF"
+    else V_HINT="${V_HINT:+$V_HINT; }REF refused: it looks like a link or a credential, and a REF is recorded in git"; fi
+  fi
+  V_REASON=$(flat "$V_REASON"); V_HINT=$(flat "$V_HINT")
+  {
+    printf '# %s on %s: %s, %s finding(s)\n\n' "$T_NAME" "${tdir#"$SPEC_RUN"/}" "$(verdict_word "$V_VERDICT")" "$V_N"
+    [ -n "$V_REASON" ] && printf 'Reason: %s\n\n' "$V_REASON"
+    [ -n "$V_HINT" ] && printf 'Hint: %s\n\n' "$V_HINT"
+    awk -F'|' '
+      $1 == "FINDING" { t = $5; for (i = 6; i <= NF; i++) t = t "|" $i; printf "- [%s] %s: %s\n", $2, $4, t }
+      $1 == "Q"       { t = $3; for (i = 4; i <= NF; i++) t = t "|" $i; printf "  - Question: %s\n", t }' "$tdir/records"
+  } > "$tdir/findings.md"
+}
+
+# ---- results, history, refs -------------------------------------------------------------------------
+hist_append() { mkdir -p "$SPEC_RUN/$1"; printf '%s|%s|%s|%s|%s|%s\n' "$(now)" "$2" "$3" "$4" "$5" "$6" >> "$SPEC_RUN/$1/history"; }
+# hist_ran <key> <tool> — has it ever produced a go/nogo for this key? That, not "was it tried", is
+# what uses up a rerun=ask tool's first card: a skip (no key set yet) or an error billed nothing and
+# left nothing to be stale, so the next card tries again on its own.
+hist_ran() { [ -r "$SPEC_RUN/$1/history" ] && awk -F'|' -v t="$2" '$2 == t && ($4 == "go" || $4 == "nogo") { f = 1 } END { exit !f }' "$SPEC_RUN/$1/history"; }
+hist_last_other() { # <key> <tool> <b12> [goonly] → "b12|verdict|n" of the newest run at OTHER content
+  [ -r "$SPEC_RUN/$1/history" ] || return 0
+  awk -F'|' -v t="$2" -v b="$3" -v g="${4:-}" '$2 == t && $3 != b && (g == "" || $4 == "go" || $4 == "nogo") { last = $3 "|" $4 "|" $5 } END { if (last != "") print last }' "$SPEC_RUN/$1/history"
+}
+refs_append() { mkdir -p "$SPEC_RUN/$1"; printf '%s|%s|%s|%s|%s\n' "$(now)" "$2" "$3" "$4" "$5" >> "$SPEC_RUN/$1/refs"; }
+refs_latest() { [ -r "$SPEC_RUN/$1/refs" ] && awk -F'|' -v t="$2" '$2 == t { r = $4 } END { if (r != "") print r }' "$SPEC_RUN/$1/refs"; return 0; }
+refs_at() { [ -r "$SPEC_RUN/$1/refs" ] && awk -F'|' -v t="$2" -v b="$3" '$2 == t && $3 == b { r = $4 } END { if (r != "") print r }' "$SPEC_RUN/$1/refs"; return 0; }
+
+# result_gate_ok <result-file> — can this result satisfy a block gate (T_* loaded)? Only if it came
+# from the committed declaration AND the committed executable or prompt (T_GATE_EXEC), run while
+# both were committed and clean, or byte-identical to what is committed and clean now.
+result_gate_ok() {
+  [ -f "$1" ] && [ -n "$T_HEADSHA" ] && [ "$(kv_get "$1" declsha)" = "$T_HEADSHA" ] || return 1
+  [ -n "$T_GATE_EXEC" ] && [ "$(kv_get "$1" exec)" = "$T_GATE_EXEC" ] || return 1
+  [ "$(kv_get "$1" gateable)" = 1 ] && return 0
+  [ "$T_GATEABLE" = 1 ] && [ "$(kv_get "$1" ident)" = "$T_IDENT" ]
+}
+cache_hit() { # <result-file> — a go/nogo produced by exactly this declaration + executable
+  [ -f "$1" ] || return 1
+  case "$(kv_get "$1" verdict)" in go|nogo) ;; *) return 1 ;; esac
+  [ "$(kv_get "$1" ident)" = "$T_IDENT" ]
+}
+# The result slot (<key>/<b12>/<tool>/result) holds the LATEST run, whatever version of the tool ran
+# it. So every go/nogo is also kept under by-ident/<version>/, and result_restore puts it back when
+# that version is current again: a local experiment on a declaration (even an added comment) re-runs
+# the tool and fills the slot, and without this, reverting the experiment would leave the committed
+# GO evicted, the gate refusing, and a paid rerun=ask tool needing a second paid run.
+ident_key() { printf '%s' "$T_IDENT" | git hash-object --stdin | cut -c1-16; }
+result_restore() { # <tdir> — T_* loaded; 0 when the slot now holds a go/nogo from exactly this version
+  local d="$1" s f
+  cache_hit "$d/result" && return 0
+  s="$d/by-ident/$(ident_key)"
+  cache_hit "$s/result" || return 1
+  for f in records findings.md result; do   # result last: it is what cache_hit reads
+    [ -f "$s/$f" ] || continue
+    cp "$s/$f" "$d/.$f.$$" 2>/dev/null && mv -f "$d/.$f.$$" "$d/$f"
+  done
+  cache_hit "$d/result"
+}
+store_result() { # <tdir> <key> <b12> <blob> <stage>
+  local s f
+  kv_write "$1/result" "tool=$T_NAME" "kind=$T_KIND" "verdict=$V_VERDICT" "n=$V_N" "maxsev=$V_MAXSEV" \
+    "ref=$V_REF" "url=$V_URL" "reason=$V_REASON" "hint=$V_HINT" "exit=$V_EXIT" "ident=$T_IDENT" \
+    "exec=$T_EXEC_HASH" "declsha=$T_DECLSHA" "state=$T_STATE" "gateable=$T_GATEABLE" "policy=$T_POLICY" \
+    "stage=$5" "blob=$4" "unrun=$V_UNRUN" "ts=$(now)"
+  case "$V_VERDICT" in
+    go|nogo)
+      s="$1/by-ident/$(ident_key)"; mkdir -p "$s"
+      for f in records findings.md result; do [ -f "$1/$f" ] && cp "$1/$f" "$s/$f" 2>/dev/null; done ;;
+  esac
+  [ "$V_NOHIST" = 1 ] || hist_append "$2" "$T_NAME" "$3" "$V_VERDICT" "$V_N" "$V_MAXSEV"
+  [ -n "$V_REF" ] && refs_append "$2" "$T_NAME" "$3" "$V_REF" review
+  return 0
+}
+
+# ---- freezing -------------------------------------------------------------------------------------
+F_BLOB=""; F_B12=""; F_DIR=""; F_FILE=""
+freeze() { # <key> <src> <name> — the normalized bytes, read-only, named by their content hash
+  local norm="$TMPD/freeze.$$"
+  acfw_plan_normalize "$2" > "$norm"
+  F_BLOB=$(acfw_plan_content "$2"); F_B12=$(b12_of "$F_BLOB")
+  F_DIR="$SPEC_RUN/$1/$F_B12"; F_FILE="$F_DIR/$3"
+  mkdir -p "$F_DIR"
+  if [ ! -f "$F_FILE" ] || ! cmp -s "$norm" "$F_FILE"; then
+    chmod u+w "$F_FILE" 2>/dev/null
+    cp "$norm" "$F_FILE.$$" && mv -f "$F_FILE.$$" "$F_FILE"
+    chmod a-w "$F_FILE" 2>/dev/null
+  fi
+  printf '%s\n' "$F_BLOB" > "$F_DIR/blob"
+}
+
+# ---- one review ------------------------------------------------------------------------------------
+run_review_one() { # <key> <b12> <blob> <frozen> <stage> <fresh> — T_* loaded; writes the result
+  local key="$1" b12="$2" blob="$3" file="$4" stage="$5" fresh="$6"
+  local tdir="$SPEC_RUN/$1/$2/$T_NAME" rem secs ref same
+  mkdir -p "$tdir"
+  if [ "$fresh" != 1 ] && result_restore "$tdir"; then return 0; fi
+  rem=$(( DEADLINE - $(now) ))
+  if [ "$rem" -lt 5 ]; then
+    set_outcome error "the ${BUDGET}s review budget ran out before this tool started; review again to resume (finished tools are cached)" 1
+    V_UNRUN=1
+    note_findings "$tdir"
+    store_result "$tdir" "$key" "$b12" "$blob" "$stage"; return 0
+  fi
+  secs="$T_TIMEOUT"; [ "$secs" -gt "$rem" ] && secs="$rem"
+  rm -rf "$tdir/out"; mkdir -p "$tdir/out"
+  ref=$(refs_latest "$key" "$T_NAME"); same=$(refs_at "$key" "$T_NAME" "$b12")
+  run_tool "$tdir" review "$stage" "$key" "$file" "$blob" "$secs" "$ref" "$same"
+  normalize_outcome "$tdir" "$RUN_RC" "$file" "$secs"
+  # Killed at a deadline the ENGINE shortened (the shared budget, not the tool's own timeout=): that
+  # is the engine not letting it finish, not the tool failing, so it is no result, exactly like a tool
+  # never started. As an ordinary error it would be a non-gate, and a slow tool ahead of a block tool
+  # would switch that gate off. No history row either: nothing finished, so no first card is used up.
+  if [ "$RUN_RC" -eq 124 ] && [ "$secs" -lt "$T_TIMEOUT" ]; then
+    set_outcome error "the ${BUDGET}s review budget ran out while it ran (it got ${secs}s of its ${T_TIMEOUT}s); review again to resume (finished tools are cached)" 1
+    V_UNRUN=1
+    note_findings "$tdir"
+  fi
+  store_result "$tdir" "$key" "$b12" "$blob" "$stage"
+}
+
+# ---- agent tools -----------------------------------------------------------------------------------
+# An agent= tool is a prompt, not a process: the session runs it as a subagent (plan stage only;
+# the task stage is a background run with nobody to dispatch one). The engine writes an order file,
+# exits 21 with one AGENT| line per order, and the session dispatches one subagent per line in a
+# single message, then re-runs the same command to collect <out>/stdout.
+AGENT_LINES=""
+agent_order() { # <odir> <verb> <key> <file> <blob> <ref> <same> <stage>
+  local odir="$1"
+  rm -rf "$odir/out"; mkdir -p "$odir/out" "$SPEC_RUN/${3:-_from}/state/$T_NAME"
+  kv_write "$odir/order" "tool=$T_NAME" "verb=$2" "key=$3" "file=$4" "blob=$5" "ref=$6" "same_ref=$7" \
+    "stage=$8" "out=$odir/out" "state=$SPEC_RUN/${3:-_from}/state/$T_NAME" "md=$T_MD" "ts=$(now)"
+  # printf %q, never hand-written quotes: a checkout at ".../bob's plans" broke a '...'-quoted path
+  # (and a crafted directory name would have become shell code in the command the subagent runs).
+  AGENT_LINES="${AGENT_LINES}AGENT|$T_NAME|$2|$(printf 'bash %q prompt %q %q --order %q' "$SELF" "$T_NAME" "$2" "$odir/order")
+"
+}
+agent_review_step() { # <mode hook|explicit> <fresh> — plan stage, T_* loaded, F_* frozen
+  local tdir="$SPEC_RUN/$KEY/$F_B12/$T_NAME"
+  mkdir -p "$tdir"
+  if [ -f "$tdir/order" ]; then
+    if [ -f "$tdir/out/stdout" ]; then
+      cp "$tdir/out/stdout" "$tdir/raw.stdout"; : > "$tdir/raw.stderr"
+      normalize_outcome "$tdir" 0 "$F_FILE" "$T_TIMEOUT"
+    else
+      set_outcome error "the agent finished without writing $tdir/out/stdout"
+      note_findings "$tdir"
+    fi
+    rm -f "$tdir/order"
+    store_result "$tdir" "$KEY" "$F_B12" "$F_BLOB" plan
+    return 0
+  fi
+  [ "$2" != 1 ] && result_restore "$tdir" && return 0
+  if [ "$1" = hook ] && [ "$(tool_rerun)" = ask ] && hist_ran "$KEY" "$T_NAME"; then return 0; fi
+  if ! tool_offers review; then
+    set_outcome error "the agent prompt $DECL_REL/$T_TARGET has no ## review section"
+    note_findings "$tdir"
+    store_result "$tdir" "$KEY" "$F_B12" "$F_BLOB" plan; return 0
+  fi
+  agent_order "$tdir" review "$KEY" "$F_FILE" "$F_BLOB" "$(refs_latest "$KEY" "$T_NAME")" "$(refs_at "$KEY" "$T_NAME" "$F_B12")" plan
+}
+
+# ---- one verdict, three readers ---------------------------------------------------------------------
+# The plan gate, the card and the task stage's REVIEWED lines all ask the same question of a tool
+# that gates here, so they share one answer. gate_problem <result-file> prints why that result cannot
+# stand for these bytes at a block gate, and nothing when it can (a NO-GO it can stand for is the
+# caller's: only the plan gate has an override). Everything it names is a way a result could come
+# from something other than the committed declaration running on exactly these bytes.
+gate_problem() {
+  local res="$1"
+  if [ -n "$T_HEAD_ERR" ]; then printf 'its committed declaration is invalid (%s)' "$T_HEAD_ERR"; return 0; fi
+  if [ ! -f "$res" ]; then
+    if [ -n "$T_ERR" ]; then printf 'its declaration has an error (%s): fix it or revert your local edit, then review again' "$T_ERR"
+    elif [ -f "$(dirname "$res")/order" ]; then printf 'its agent work order is still open: dispatch it, then review again'
+    elif ! tool_trusted; then printf 'it is new or changed on this machine and nobody trusted it yet: reply "run tools", then review'
+    elif [ "$(tool_rerun)" = ask ]; then printf 'it has not reviewed these exact bytes (a rerun=ask tool: reply review)'
+    else printf 'it has not reviewed these exact bytes'; fi
+    return 0
+  fi
+  if [ "$(kv_get "$res" unrun)" = 1 ]; then printf '%s' "$(kv_get "$res" reason)"; return 0; fi
+  # Name the cause the operator can act on. "Commit or revert the edit" is wrong advice when there
+  # is no edit: a teammate's change pulled in after a clean GO, or a local experiment since reverted.
+  if [ "$(kv_get "$res" declsha)" != "$T_HEADSHA" ]; then
+    case "$T_STATE" in
+      edited|uncommitted)
+        printf 'its result came from a declaration that is uncommitted or edited locally: commit or revert the edit, then review again' ;;
+      *)
+        case "$(kv_get "$res" state)" in
+          clean|deleted) printf 'the committed declaration changed since this result (a commit or a pull): reply "run tools" if it asks, then review' ;;
+          *) printf 'its result came from a local edit of the declaration, not the committed one: review again' ;;
+        esac ;;
+    esac
+    return 0
+  fi
+  # The declaration is the committed one but the tool cannot load now (its driver is gone, say):
+  # there is no committed version to check the result against, so it cannot stand for it.
+  if [ -n "$T_ERR" ]; then printf 'it cannot run now (%s): fix that, then review again' "$T_ERR"; return 0; fi
+  if ! result_gate_ok "$res"; then
+    # The tool as it stands is committed and clean, so the result is what is off: it came from
+    # another version (a teammate's fix pulled in) or another copy (one found via env or $PATH).
+    if [ "$T_GATEABLE" = 1 ] && [ -n "$T_GATE_EXEC" ]; then
+      printf 'its driver or prompt changed since this result (a commit or a pull), or it ran from another copy: reply "run tools" if it asks, then review'
+    else
+      printf 'its result came from an executable or prompt that is not committed and clean, or was found via env or $PATH: commit or revert the local edit, then review again'
+    fi
+    return 0
+  fi
+  return 0
+}
+norun_reason() { # <key> <b12> — T_* loaded, no result at b12: why, for the Plan Log row
+  local prev
+  if [ "${ACFW_SPEC:-}" = off ]; then echo "spec tools were off (ACFW_SPEC=off)"
+  elif [ -n "$T_ERR" ]; then echo "declaration error"
+  elif [ -f "$SPEC_RUN/$1/$2/$T_NAME/order" ]; then echo "agent work order pending"
+  elif ! tool_trusted; then echo "untrusted on this machine"
+  else
+    prev=$(hist_last_other "$1" "$T_NAME" "$2" goonly)
+    if [ -n "$prev" ]; then echo "stale since ${prev%%|*}"; else echo "never run"; fi
+  fi
+}
+# emit_reviewed <key> <b12> <stage> — T_* loaded. One REVIEWED line, or nothing (return 1) when there
+# is no result and the tool does not gate here. The policy is the one in force NOW (a result cached
+# while the declaration was uncommitted must not keep saying advisory once it is committed), and a
+# block tool whose result cannot stand (gate_problem) reports nogo with held.md saying why: at the
+# task stage a released task would have skipped the gate, so it must hold, never go or advisory.
+emit_reviewed() {
+  local key="$1" b12="$2" stage="$3" rdir res pol v="" n=0 ms="-" path="-" why=""
+  rdir="$SPEC_RUN/$key/$b12/$T_NAME"; res="$rdir/result"
+  [ -n "$T_ERR" ] || [ -f "$rdir/order" ] || result_restore "$rdir" || true
+  pol=$(stage_policy "$stage")
+  if [ -f "$res" ]; then
+    v=$(kv_get "$res" verdict); n=$(kv_get "$res" n); ms=$(kv_get "$res" maxsev); path="$rdir/findings.md"
+  fi
+  if [ "$pol" = block ]; then
+    why=$(gate_problem "$res")
+    if [ -n "$why" ]; then
+      mkdir -p "$rdir"
+      {
+        printf '# %s: held (policy=block)\n\n' "$T_NAME"
+        printf 'Reason: %s.\n\n' "$(redact "$why")"
+        printf 'A committed policy=block tool has no result it can stand behind for these exact bytes, so they count as NO-GO. Fix the cause above, then review again: '
+        if [ "$stage" = task ]; then printf '/whip --review %s\n' "$key"; else printf '/whip %s\n' "$key"; fi
+        if [ -f "$rdir/findings.md" ]; then printf '\nIts last output on these bytes (advisory only):\n\n'; cat "$rdir/findings.md"; fi
+      } > "$rdir/held.md"
+      v=nogo; path="$rdir/held.md"
+    fi
+  fi
+  [ -n "$v" ] || return 1
+  printf 'REVIEWED|%s|%s|%s|%s|%s|%s|%s\n' "$key" "$T_NAME" "$pol" "$v" "${n:-0}" "${ms:--}" "$path"
+}
+
+# ---- the REVIEW block --------------------------------------------------------------------------------
+wb_state_file() { printf '%s/%s/state' "$WB_RUN" "$1"; }
+wb_out() { [ -f "$(wb_state_file "$1")" ]; }
+
+render_review() { # <key> <b12> [plan|task] — stdout; prints nothing when no declared tool is relevant here
+  local key="$1" b12="$2" stage="${3:-plan}" name res rdir v n reason hint ref url desc prev pb idx=0 any=0 unmet="" wbtools=""
+  local stale why
+  local fl="$TMPD/r.find" ql="$TMPD/r.q" tl="$TMPD/r.tools" rl="$TMPD/r.resolved"
+  : > "$fl"; : > "$ql"; : > "$tl"; : > "$rl"
+  for name in $(decl_names); do
+    load_tool "$name"
+    caps_load
+    rdir="$SPEC_RUN/$key/$b12/$name"; res="$rdir/result"
+    # A kept result from exactly this version goes back in the slot (see result_restore). It is a
+    # local copy, not a run: show and gate stay cache-only.
+    [ -n "$T_ERR" ] || [ -f "$rdir/order" ] || result_restore "$rdir" || true
+    if [ -z "$T_ERR" ] && tool_offers push; then wbtools="$wbtools $name"; fi
+    # On the card: whatever ran here, whatever runs at this hook point, and whatever gates it. A tool
+    # that gates must be listed even when it cannot run (a broken declaration, no at=), or the card
+    # offers a bare "yes" that the gate then refuses.
+    if [ ! -f "$res" ] && [ ! -f "$rdir/order" ] && ! in_stage "$stage" && ! gates_at "$stage"; then continue; fi
+    [ "$stage" = task ] && [ "$T_KIND" = agent ] && continue
+    any=1; idx=$((idx + 1))
+    desc="$name ($(stage_policy "$stage"), egress $(tool_egress))"
+    if [ -f "$res" ]; then
+      v=$(kv_get "$res" verdict); n=$(kv_get "$res" n); reason=$(kv_get "$res" reason)
+      hint=$(kv_get "$res" hint); ref=$(kv_get "$res" ref); url=$(kv_get "$res" url)
+      # A go/nogo from another version of the tool (a new driver, a changed declaration) says
+      # nothing about what this version would say: labeled, never shown as current.
+      stale=""
+      case "$v" in go|nogo) [ "$(kv_get "$res" ident)" = "$T_IDENT" ] || stale=" (stale: the tool changed since this result; reply review to re-run it)" ;; esac
+      case "$v" in
+        go|nogo) printf '  %s: %s, %s finding(s)%s%s%s\n' "$desc" "$(verdict_word "$v")" "$n" "${ref:+, ref $ref}" "${url:+, $url}" "$stale" >> "$tl"
+                 [ -n "$reason" ] && printf '    note: %s\n' "$reason" >> "$tl" ;;
+        *) printf '  %s: %s: %s%s\n' "$desc" "$(verdict_word "$v")" "${reason:-no reason given}" "${hint:+ ($hint)}" >> "$tl" ;;
+      esac
+      [ -n "$T_ERR" ] && printf '    note: its declaration has an error now: %s\n' "$T_ERR" >> "$tl"
+      why=""; gates_at "$stage" && why=$(gate_problem "$res")
+      [ -n "$why" ] && printf '    note: %s\n' "$why" >> "$tl"
+      if [ "$v" = go ] || [ "$v" = nogo ]; then
+        prev=$(hist_last_other "$key" "$name" "$b12" goonly); pb="${prev%%|*}"
+        awk -F'|' -v tool="$name" -v idx="$idx" -v US="$US" -v prevf="$SPEC_RUN/$key/$pb/$name/records" -v haveprev="${pb:+1}" '
+          BEGIN { if (haveprev) while ((getline l < prevf) > 0) { split(l, p, "|"); if (p[1] == "FINDING") pf[p[3]] = 1 } }
+          $1 == "FINDING" { seq++; t = $5; for (i = 6; i <= NF; i++) t = t "|" $i
+            r = ($2 == "critical") ? 0 : ($2 == "high") ? 1 : ($2 == "medium") ? 2 : ($2 == "low") ? 3 : 4
+            lab = haveprev ? (($3 in pf) ? "persisting" : "new") : ""
+            print r US idx US seq US tool US $2 US $3 US $4 US t US lab }' "$rdir/records" >> "$fl"
+        awk -F'|' -v tool="$name" -v US="$US" '$1 == "Q" { t = $3; for (i = 4; i <= NF; i++) t = t "|" $i; print tool US $2 US t }' "$rdir/records" >> "$ql"
+        if [ -n "$pb" ] && [ -f "$SPEC_RUN/$key/$pb/$name/records" ]; then
+          awk -F'|' -v tool="$name" -v curf="$rdir/records" '
+            BEGIN { while ((getline l < curf) > 0) { split(l, c, "|"); if (c[1] == "FINDING") cf[c[3]] = 1 } }
+            $1 == "FINDING" && !($3 in cf) { t = $5; for (i = 6; i <= NF; i++) t = t "|" $i; print tool ": " t }' \
+            "$SPEC_RUN/$key/$pb/$name/records" >> "$rl"
+        fi
+      fi
+      if gates_at "$stage" && { [ "$v" = nogo ] || [ -n "$why" ]; }; then unmet="$unmet $name"; fi
+    elif [ -f "$rdir/order" ]; then
+      printf '  %s: waiting for its agent (an AGENT| work order is open)\n' "$desc" >> "$tl"
+      gates_at "$stage" && unmet="$unmet $name"
+    elif [ -n "$T_ERR" ]; then
+      printf '  %s: declaration error: %s\n' "$name" "$T_ERR" >> "$tl"
+      gates_at "$stage" && unmet="$unmet $name"
+    elif ! tool_trusted; then
+      printf '  %s: new or changed on this machine, so it did not run; reply "run tools" to trust it\n' "$desc" >> "$tl"
+      gates_at "$stage" && unmet="$unmet $name"
+    else
+      # Only a go/nogo is "stale": a skip or an error at older bytes billed nothing and says nothing
+      # about these, and a rerun=ask tool tries again on its own after one.
+      prev=$(hist_last_other "$key" "$name" "$b12" goonly)
+      if [ -n "$prev" ]; then
+        pb="${prev%%|*}"; v=$(printf '%s' "$prev" | cut -d'|' -f2); n=$(printf '%s' "$prev" | cut -d'|' -f3)
+        printf '  %s: stale since your edit (last %s, %s finding(s), at content %s); reply review to re-run\n' "$desc" "$(verdict_word "$v")" "$n" "$pb" >> "$tl"
+      else
+        printf '  %s: not run on this %s yet; reply review to run it\n' "$desc" "$stage" >> "$tl"
+      fi
+      gates_at "$stage" && unmet="$unmet $name"
+    fi
+    [ -n "$T_WARN" ] && printf '    note: %s\n' "$T_WARN" >> "$tl"
+  done
+  [ "$any" = 1 ] || return 0
+
+  say "REVIEW spec tools at content=$b12"
+  cat "$tl"
+  # F1..F8: every critical/high finding is shown (never cut), then lower ones fill up to 8.
+  local sorted="$TMPD/r.sorted" shown="$TMPD/r.shown" total hidden nq=0
+  sort -t"$US" -k1,1n -k2,2n -k3,3n "$fl" > "$sorted"
+  awk -F"$US" -v US="$US" '{ if ($1 <= 1 || c < 8) { c++; print c US $0 } }' "$sorted" > "$shown"
+  total=$(wc -l < "$sorted" | tr -d ' '); hidden=$(( total - $(wc -l < "$shown" | tr -d ' ') ))
+  while IFS="$US" read -r fnum r i s tool sev fp loc title lab; do
+    printf '  F%s %s %s %s: %s%s\n' "$fnum" "$sev" "$loc" "$tool" "$title" "${lab:+ [$lab]}"
+  done < "$shown"
+  # Q1..Q5, attached to the shown findings in F order.
+  while IFS="$US" read -r fnum r i s tool sev fp loc title lab; do
+    while IFS="$US" read -r qt qfp qtext; do
+      [ "$qt" = "$tool" ] && [ "$qfp" = "$fp" ] || continue
+      nq=$((nq + 1)); [ "$nq" -le 5 ] || break 2
+      printf '    Q%s (F%s) %s\n' "$nq" "$fnum" "$qtext"
+    done < "$ql"
+  done < "$shown"
+  if [ -s "$rl" ]; then
+    printf '  resolved since the last round: %s (%s)\n' "$(wc -l < "$rl" | tr -d ' ')" "$(head -3 "$rl" | paste -sd';' - | sed 's/;/; /g')"
+  fi
+  [ "$hidden" -gt 0 ] && printf '  +%s lower-severity finding(s) not shown: %s\n' "$hidden" "$SPEC_RUN/$key/$b12/<tool>/findings.md"
+  if [ "$stage" = task ]; then
+    for name in $unmet; do
+      printf '  block: %s has no GO at this content; the task stays held in draft until it has one\n' "$name"
+    done
+    return 0
+  fi
+  if wb_out "$key"; then
+    local st; st=$(wb_state_file "$key")
+    printf '  OUT in %s since %s: approval waits until you pull it back (/whip --pull) or drop it (/whip --pull --drop)\n' "$(kv_get "$st" tool)" "$(age_of "$(kv_get "$st" since)")"
+  fi
+  for name in $unmet; do
+    printf '  block: %s has no usable GO at this content; approval needs a GO, or your reply "yes, override %s"\n' "$name" "$name"
+  done
+  local rep="yes"
+  [ "$nq" -gt 0 ] && rep="Q<n>: <answer> · defaults · $rep"
+  [ "$total" -gt 0 ] && rep="$rep · ignore F<n>: <reason>"
+  rep="$rep · review"
+  [ -n "$wbtools" ] && rep="$rep · push"
+  for name in $unmet; do rep="$rep · yes, override $name"; done
+  printf '  replies: %s\n' "$rep"
+}
+
+# review_block — render_review, redacted. The block is what the approval card embeds verbatim, and
+# it quotes declaration errors, tool reasons and hints, and finding titles: any of them may carry a
+# credential-shaped string (a mistyped driver= value, a tool that echoes its key in an error).
+review_block() {
+  local f; f=$(mktemp "$TMPD/rb.XXXXXX") || { warn "cannot render the REVIEW block (no temp file)"; return 0; }
+  render_review "$@" > "$f"
+  redact_file "$f"
+  rm -f "$f"
+}
+
+# ---- verbs ------------------------------------------------------------------------------------------
+cmd_list() {
+  local at="" machine=0 name
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --at) [ $# -ge 2 ] || die 2 "--at needs plan or task"; at="$2"; shift 2 ;;
+      --at=*) at="${1#--at=}"; shift ;;
+      --machine) machine=1; shift ;;
+      *) die 2 "list: unknown argument '$1'" ;;
+    esac
+  done
+  case "$at" in ''|plan|task) ;; *) die 2 "--at takes plan or task" ;; esac
+  warn_bad_names
+  local pol eat
+  for name in $(decl_names); do
+    load_tool "$name"
+    if [ -n "$T_ERR" ]; then
+      warn "spec tool $name: $T_ERR"
+      # A committed block tool whose local copy no longer parses still holds tasks, so the task stage
+      # must still exist for it: whip-task decides whether to review tasks at all from this listing.
+      if [ "$at" = task ] && gates_at task && [ "$T_HEAD_KIND" != agent ]; then
+        if [ "$machine" = 1 ]; then
+          printf 'TOOL|%s|%s|%s|block|%s|%s\n' "$name" "${T_HEAD_KIND:-review}" "$T_HEAD_AT" "${T_HEAD_RERUN:-every}" "$T_HEAD_TIMEOUT"
+        else
+          printf '%-16s %-7s at=%-10s policy=%-8s (declaration error: it holds every task until fixed)\n' "$name" "${T_HEAD_KIND:-?}" "$T_HEAD_AT" block
+        fi
+      fi
+      continue
+    fi
+    if [ -n "$at" ]; then
+      in_stage "$at" || continue
+      # The task stage is a background run: nobody is there to dispatch an agent tool's subagent.
+      if [ "$at" = task ] && [ "$T_KIND" = agent ]; then warn "spec tool $name is an agent tool: agent tools run at the plan stage only"; continue; fi
+      pol=$(stage_policy "$at")
+    else
+      pol=$(policy_now)
+    fi
+    eat=$(at_now)
+    caps_load
+    if [ "$machine" = 1 ]; then
+      printf 'TOOL|%s|%s|%s|%s|%s|%s\n' "$name" "$T_KIND" "${eat:--}" "$pol" "$(tool_rerun)" "$T_TIMEOUT"
+    else
+      printf '%-16s %-7s at=%-10s policy=%-8s rerun=%-5s timeout=%ss%s\n' "$name" "$T_KIND" "${eat:--}" "$pol" "$(tool_rerun)" "$T_TIMEOUT" "${T_WARN:+  ($(redact "$T_WARN"))}"
+    fi
+  done
+  return 0
+}
+
+# trust [<name>|<name>=<key>]... — the "run tools" reply. It trusts the version the operator was
+# SHOWN in full (a TRUST| notice recorded it; a status card does not), or exactly <key> when given,
+# and never a version that changed after the notice: that one is shown now instead, for the next
+# reply. So a card's "run tools" prints the full notice, and the reply after it trusts.
+cmd_trust() {
+  local arg name want names="$*" n=0 shown=0 ok
+  [ -n "$names" ] || names=$(decl_names)
+  [ -n "$names" ] || { say "no spec tools declared"; return 0; }
+  ensure_run_ignored
+  lint_scope_or_die
+  for arg in $names; do
+    name="${arg%%=*}"; want=""
+    [ "$name" = "$arg" ] || want="${arg#*=}"
+    is_re "$name" "$NAME_RE" || die 2 "'$name' is not a spec tool name"
+    load_tool "$name"
+    if [ -n "$T_ERR" ]; then warn "not trusting $name: $T_ERR"; continue; fi
+    if tool_trusted; then say "TRUSTED|$name"; n=$((n + 1)); continue; fi
+    ok=0
+    if [ -n "$want" ]; then [ "$want" = "$T_TRUSTKEY" ] && ok=1; else was_shown && ok=1; fi
+    if [ "$ok" = 1 ]; then
+      trust_record; say "TRUSTED|$name"; n=$((n + 1))
+    else
+      say "  $name was NOT trusted: this exact version was not shown in full yet, or it changed since. Read what it runs now, then reply \"run tools\" again:"
+      trust_notice
+      shown=$((shown + 1))
+    fi
+  done
+  [ "$n" -gt 0 ] || [ "$shown" -gt 0 ] || return 2
+  return 0
+}
+
+# print_decl <name> — what a trust-on-first-use notice shows: every non-comment line, in full (the
+# notice IS the consent, so nothing is capped or cut). parse_decl already refuses a declaration with
+# a control character, so this never meets one; if it did, each such byte prints as a visible <ctl>
+# marker, never raw, so no viewer can reflow or repaint the line into something else. Redacted like
+# every other echo of declaration text.
+print_decl() {
+  local f="$DECL_DIR/$1" out
+  [ -f "$f" ] || f="$TMPD/head.$1"
+  out=$(mktemp "$TMPD/decl.XXXXXX") || return 0
+  grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -v '^[[:space:]]*$' \
+    | LC_ALL=C sed -e "s/$CR\$//" -e "s/[$(printf '\001-\010\013-\037\177')]/<ctl>/g" -e 's/^/      /' > "$out"
+  redact_file "$out"
+  rm -f "$out"
+}
+trust_notice() {
+  trust_shown
+  printf 'TRUST|%s|%s|version=%s\n' "$T_NAME" "$(cell "new or changed on this machine: $T_KIND $T_TARGET")" "$T_TRUSTKEY"
+  printf '  spec tool "%s" is new or changed on this machine, so it did not run. It declares:\n' "$T_NAME"
+  print_decl "$T_NAME"
+  [ -n "$T_DRIVER" ] && printf '    it executes %s (%s)\n' "$T_DRIVER" "$T_ORIGIN"
+  [ "$T_KIND" = agent ] && printf '    it hands %s to a subagent\n' "$DECL_REL/$T_TARGET"
+  printf '    egress: %s\n' "$(tool_egress)"
+  printf '  Reply "run tools" to trust exactly this version (acfw-spec trust %s=%s), then review again.\n' "$T_NAME" "$T_TRUSTKEY"
+}
+
+cmd_review() {
+  local stage=plan fresh=0 all=0 machine=0 trustnow=0 sel="" pos=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stage) [ $# -ge 2 ] || die 2 "--stage needs plan or task"; stage="$2"; shift 2 ;;
+      --stage=*) stage="${1#--stage=}"; shift ;;
+      --fresh) fresh=1; shift ;;
+      --all) all=1; shift ;;
+      --machine) machine=1; shift ;;
+      --trust) trustnow=1; shift ;;
+      --tool) [ $# -ge 2 ] || die 2 "--tool needs a name"; sel="$sel $2"; shift 2 ;;
+      --tool=*) sel="$sel ${1#--tool=}"; shift ;;
+      --) shift; while [ $# -gt 0 ]; do pos[${#pos[@]}]="$1"; shift; done ;;
+      -*) die 2 "review: unknown flag '$1'" ;;
+      *) pos[${#pos[@]}]="$1"; shift ;;
+    esac
+  done
+  case "$stage" in
+    task) review_task "$machine" "$fresh" ${pos[@]+"${pos[@]}"} ;;
+    plan) [ ${#pos[@]} -eq 1 ] || die 2 "usage: acfw-spec review <plan> [--fresh] [--tool <n>]... [--all] [--trust] [--machine]"
+          review_plan "${pos[0]}" "$fresh" "$all" "$machine" "$trustnow" "$sel" ;;
+    *) die 2 "--stage takes plan or task" ;;
+  esac
+}
+
+review_plan() { # <plan> <fresh> <all> <machine> <trust> <selected>
+  local fresh="$2" all="$3" machine="$4" trustnow="$5" sel="$6" names name mode=hook
+  local trustout="" k=0 res declerr=0
+  resolve_plan "$1" need
+  names=$(decl_names)
+  [ -n "$names" ] || return 0
+  if [ "${ACFW_SPEC:-}" = off ]; then
+    say "spec tools are off (ACFW_SPEC=off): nothing ran. A block tool still needs GO or your recorded override at approval."
+    return 0
+  fi
+  for name in $sel; do printf '%s\n' "$names" | grep -qxF "$name" || die 2 "no spec tool named '$name' (declared: $(printf '%s' "$names" | paste -sd' ' -))"; done
+  # Hook mode reviews bytes that are up for a yes. An abandoned or closed cycle, or one approved at
+  # exactly these bytes, has none: reviewing it billed a rerun=ask tool or opened an agent work order
+  # for a card that can never be approved. The record is read from HEAD when the cycle is tracked,
+  # as acfw-cycle reads it, so a working-tree edit to record.md cannot switch a review off. An
+  # explicit review (--all or --tool) still runs.
+  if [ -z "$sel" ] && [ "$all" != 1 ]; then
+    local rec_txt st ac
+    rec_txt=$(git -C "$REPO_ROOT" show "HEAD:docs/cycles/$KEY/record.md" 2>/dev/null) || rec_txt=$(cat "$REC_FILE" 2>/dev/null) || rec_txt=""
+    st=$(printf '%s\n' "$rec_txt" | acfw_plan_meta - Status 2>/dev/null)
+    case "$st" in
+      abandoned|closed) return 0 ;;
+      approved)
+        ac=$(printf '%s\n' "$rec_txt" | acfw_plan_meta - 'Approved Content' 2>/dev/null)
+        [ -n "$ac" ] && [ "$(acfw_plan_c12 "$ac")" = "$(acfw_plan_c12 "$(acfw_plan_content "$PLAN_FILE")")" ] && return 0 ;;
+    esac
+  fi
+  { [ -n "$sel" ] || [ "$all" = 1 ]; } && mode=explicit
+  ensure_run_ignored
+  # The plan is linted together with the scope, never after it. secret_die exits on the first hit
+  # list, so a tracked .env literal hid a literal in plan.md. /whip stops only on a plan.md location,
+  # so it then rendered an approval card whose yes commits that literal.
+  lint_scope
+  LINT_HITS=$(printf '%s\n%s\n' "$(lint_hits "$PLAN_FILE" "docs/cycles/$KEY/plan.md" content)" "$LINT_HITS" | grep -v '^[[:space:]]*$' || true)
+  [ -z "$LINT_HITS" ] || secret_die "$LINT_HITS"
+  freeze "$KEY" "$PLAN_FILE" plan.md
+  AGENT_LINES=""
+  for name in $names; do
+    if [ -n "$sel" ]; then case " $sel " in *" $name "*) ;; *) continue ;; esac; fi
+    load_tool "$name"
+    if [ -n "$T_ERR" ]; then
+      warn "spec tool $name did not run: $T_ERR"
+      [ -n "$sel" ] && declerr=1
+      continue
+    fi
+    if [ "$mode" = hook ]; then
+      in_stage plan || [ -f "$SPEC_RUN/$KEY/$F_B12/$name/order" ] || continue
+    elif [ -z "$sel" ]; then
+      # "review" means every PLAN reviewer, the on-request ones included, but not a task-only tool:
+      # it was written for task documents, and its NO-GO on a plan is noise the card would show.
+      if in_stage task && ! in_stage plan && ! gates_at plan; then continue; fi
+    fi
+    [ -n "$T_WARN" ] && warn "spec tool $name: $T_WARN"
+    [ "$trustnow" = 1 ] && was_shown && trust_record
+    if ! tool_trusted; then trustout="$trustout$(trust_notice)
+"; continue; fi
+    if [ "$T_KIND" = agent ]; then agent_review_step "$mode" "$fresh"; continue; fi
+    [ "$T_KIND" = driver ] && { caps_load probe || warn "spec tool $name: capabilities probe failed ($CAPS_ERR); treating it as paid (rerun=ask)"; }
+    res="$SPEC_RUN/$KEY/$F_B12/$name/result"
+    if [ "$T_KIND" = driver ] && { tool_offers review; [ $? -eq 1 ]; }; then
+      mkdir -p "$(dirname "$res")"
+      set_outcome skip "its driver does not offer review (VERBS: $(caps_field VERBS)); it is a workbench: use push and pull" 1
+      note_findings "$(dirname "$res")"; store_result "$(dirname "$res")" "$KEY" "$F_B12" "$F_BLOB" plan
+      continue
+    fi
+    # rerun=ask: the first card that gets a go/nogo runs it; after that it runs only when asked
+    # (review --all/--tool), and the card shows its last result as stale. A cached result at THIS
+    # content is always used. A skip or error does not use the first card up (hist_ran).
+    if [ "$mode" = hook ] && [ "$(tool_rerun)" = ask ] && hist_ran "$KEY" "$name" && ! result_restore "$(dirname "$res")"; then continue; fi
+    SPEC_FRESH="$fresh"
+    run_review_one "$KEY" "$F_B12" "$F_BLOB" "$F_FILE" plan "$fresh"
+    SPEC_FRESH=0
+  done
+  if [ "$machine" = 1 ]; then
+    for name in $names; do
+      load_tool "$name"; caps_load
+      emit_reviewed "$KEY" "$F_B12" plan && k=$((k + 1))
+    done
+    printf 'END|lines=%s\n' "$k"
+  else
+    review_block "$KEY" "$F_B12"
+  fi
+  [ -n "$trustout" ] && printf '%s' "$trustout"
+  if [ -n "$AGENT_LINES" ]; then
+    printf '%s' "$AGENT_LINES"
+    echo "Dispatch one subagent per AGENT line above, all in a single message; each runs the command at the end of its line and follows the prompt it prints. Then run the same review command again to collect the results." >&2
+    exit 21
+  fi
+  [ "$declerr" = 1 ] && exit 2
+  return 0
+}
+
+review_task() { # <machine> <fresh> <task-file>... — background-safe: no agents, no prompts, <= 4 concurrent
+  local machine="$1" fresh="$2"; shift 2
+  local files=("$@") tools="" errtools="" name i f stem nf=$# t k=0
+  local stems=() b12s=() blobs=() frozen=() secret=() pids=()
+  if [ "${ACFW_SPEC:-}" = off ]; then [ "$machine" = 1 ] && echo "END|lines=0"; return 0; fi
+  [ "$nf" -gt 0 ] || die 2 "usage: acfw-spec review --stage task [--machine] <task-file>..."
+  # The task-tool set is decided the way the gate decides: a tool is a task tool when HEAD's at= or
+  # the working tree's names task, so a local edit cannot drop a committed block tool from the stage.
+  # One that cannot run here (its local copy no longer parses) still reports, and holds: see emit_reviewed.
+  for name in $(decl_names); do
+    load_tool "$name"
+    if [ -n "$T_ERR" ]; then
+      warn "spec tool $name did not run: $T_ERR"
+      gates_at task && [ "$T_HEAD_KIND" != agent ] && errtools="$errtools $name"
+      continue
+    fi
+    in_stage task || continue
+    [ "$T_KIND" = agent ] && { warn "spec tool $name is an agent tool: agent tools run at the plan stage only"; continue; }
+    tools="$tools $name"
+  done
+  if [ -z "$tools$errtools" ]; then [ "$machine" = 1 ] && echo "END|lines=0"; return 0; fi
+  ensure_run_ignored
+  lint_scope_or_die
+  i=0
+  for f in "${files[@]}"; do
+    [ -f "$f" ] || die 2 "no such task file: $f"
+    stem=$(basename "$f"); stem="${stem%.md}"
+    is_re "$stem" "$KEY_RE" || die 2 "task file name '$stem' is not a task key"
+    freeze "$stem" "$f" task.md
+    stems[$i]="$stem"; b12s[$i]="$F_B12"; blobs[$i]="$F_BLOB"; frozen[$i]="$F_FILE"
+    if [ -n "$(lint_hits "$f" x content)" ]; then secret[$i]=1; else secret[$i]=0; fi
+    i=$((i + 1))
+  done
+  # Probe capabilities once, sequentially, before any job: two jobs of one tool must not race on the
+  # cache file, and a probe inside every job would multiply a remote call by the task count.
+  # Only TRUSTED drivers: a capabilities verb is code execution too.
+  for name in $tools; do
+    load_tool "$name"
+    [ "$T_KIND" = driver ] && tool_trusted && { caps_load probe || true; }
+  done
+  for name in $tools; do
+    load_tool "$name"
+    caps_load
+    i=0
+    while [ "$i" -lt "$nf" ]; do
+      t="$SPEC_RUN/${stems[$i]}/${b12s[$i]}/$name"; mkdir -p "$t"
+      # Both refusals below are the ENGINE not running the tool, not the tool failing, so they are
+      # no-result placeholders (unrun=1): an advisory tool shows them, a block tool holds the task.
+      if [ "${secret[$i]}" = 1 ]; then
+        set_outcome error "the task document contains a credential literal, so it was not sent to any tool: delete it and ROTATE the key" 1
+        V_UNRUN=1
+        note_findings "$t"; store_result "$t" "${stems[$i]}" "${b12s[$i]}" "${blobs[$i]}" task
+      elif ! tool_trusted; then
+        set_outcome skip "new or changed on this machine, so it did not run: trust it with a \"run tools\" reply in /whip" 1
+        V_UNRUN=1
+        note_findings "$t"
+        store_result "$t" "${stems[$i]}" "${b12s[$i]}" "${blobs[$i]}" task
+      else
+        # bash 3.2 has no `wait -n`: poll the live set and start the next job when one finishes.
+        while :; do
+          local live=() p
+          for p in ${pids[@]+"${pids[@]}"}; do kill -0 "$p" 2>/dev/null && live[${#live[@]}]="$p"; done
+          pids=(${live[@]+"${live[@]}"})
+          [ "${#pids[@]}" -lt "$MAX_JOBS" ] && break
+          sleep 0.2
+        done
+        ( SPEC_FRESH="$fresh"; run_review_one "${stems[$i]}" "${b12s[$i]}" "${blobs[$i]}" "${frozen[$i]}" task "$fresh" ) &
+        pids[${#pids[@]}]=$!
+      fi
+      i=$((i + 1))
+    done
+  done
+  wait
+  if [ "$machine" != 1 ]; then
+    # Human form, for /whip --review <stem> on a held task: one REVIEW block per task.
+    i=0
+    while [ "$i" -lt "$nf" ]; do
+      say "== ${stems[$i]}"
+      review_block "${stems[$i]}" "${b12s[$i]}" task
+      i=$((i + 1))
+    done
+    return 0
+  fi
+  # Policy and verdict are decided HERE, from the tool as it stands now, never read back from the
+  # result file: a result cached under an uncommitted declaration must not keep saying advisory once
+  # the same bytes are committed, and an edited or dirty copy must not release a task a committed
+  # block tool would hold.
+  i=0
+  while [ "$i" -lt "$nf" ]; do
+    for name in $tools $errtools; do
+      load_tool "$name"; caps_load
+      emit_reviewed "${stems[$i]}" "${b12s[$i]}" task \
+        || printf 'REVIEWED|%s|%s|advisory|error|0|-|-\n' "${stems[$i]}" "$name"
+      k=$((k + 1))
+    done
+    i=$((i + 1))
+  done
+  printf 'END|lines=%s\n' "$k"
+}
+
+cmd_show() {
+  local plan="" blob=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --blob) [ $# -ge 2 ] || die 2 "--blob needs a content hash"; blob="$2"; shift 2 ;;
+      --blob=*) blob="${1#--blob=}"; shift ;;
+      -*) die 2 "show: unknown flag '$1'" ;;
+      *) plan="$1"; shift ;;
+    esac
+  done
+  resolve_plan "$plan"
+  [ -n "$(decl_names)" ] || return 0
+  if [ -z "$blob" ]; then
+    [ -f "$PLAN_FILE" ] || return 0
+    blob=$(acfw_plan_content "$PLAN_FILE")
+  fi
+  blob="${blob#v1:}"
+  is_re "$blob" '^[0-9a-f]{12,}$' || die 2 "--blob must be at least 12 lowercase hex characters"
+  review_block "$KEY" "${blob:0:12}"
+}
+
+cmd_status() {
+  local plan="" machine=0 names name facts="" cards="" summ="" warns="" keys k st tool url le cur lint n=0 badf bf risk
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --machine) machine=1; shift ;;
+      -*) die 2 "status: unknown flag '$1'" ;;
+      *) plan="$1"; shift ;;
+    esac
+  done
+  [ -n "$plan" ] && resolve_plan "$plan"
+  names=$(decl_names)
+  badf=$(bad_decl_files)
+  if [ -n "$plan" ]; then keys="$KEY"
+  else keys=$(for st in "$WB_RUN"/*/state; do [ -f "$st" ] && basename "$(dirname "$st")"; done)
+  fi
+  if [ -z "$names" ] && [ -z "$badf" ] && [ -z "$(for k in $keys; do wb_out "$k" && echo x; done)" ]; then return 0; fi
+  if [ "${ACFW_SPEC:-}" = off ]; then
+    facts="${facts}spec tools: off (ACFW_SPEC=off): nothing runs, and a block tool still needs GO or your override at approval
+"
+  fi
+  while IFS= read -r bf; do
+    [ -n "$bf" ] || continue
+    cards="${cards}CARD|$(cell "$(bad_name_text "$bf")")|$(cell "if it was meant to review or gate, it does neither: nothing runs it")|$(cell "rename it (lowercase letters, digits, dashes, no extension) and commit")
+"
+  done <<EOF
+$badf
+EOF
+  for name in $names; do
+    load_tool "$name"
+    if [ -n "$T_ERR" ]; then
+      summ="$summ $name(error)"
+      if gates_at plan || gates_at task; then risk="it cannot run, and its committed policy=block still gates: approval needs your override, and tasks are held"
+      else risk="it cannot run until the declaration is fixed"; fi
+      cards="${cards}CARD|$(cell "spec tool $name has a declaration error: $T_ERR")|$(cell "$risk")|$(cell "fix $DECL_REL/$name and commit it")
+"
+      continue
+    fi
+    caps_load
+    if [ -n "$(at_now)" ]; then summ="$summ $name($(at_now | tr ',' '+'),$(policy_now),$(tool_rerun))"
+    elif [ "$T_KIND" = driver ] && { tool_offers review; [ $? -eq 1 ]; }; then summ="$summ $name(workbench)"
+    else summ="$summ $name(on request,$(policy_now),$(tool_rerun))"; fi
+    [ -n "$T_WARN" ] && warns="${warns:+$warns; }$name: $T_WARN"
+    if [ -n "$(lint_hits "$DECL_DIR/$name" x)$(lint_hits "$TMPD/head.$name" x)" ]; then
+      # No trust card for a declaration holding a credential literal: trust is refused until the
+      # literal is gone (the secret card below says so), and the card would quote the command.
+      :
+    elif ! tool_trusted; then
+      # A card is NOT a trust notice: its cells are capped at 160 characters and '|' becomes '/', so
+      # a long command's tail (`...; touch x` after 150 characters of harmless padding) would never
+      # be on screen. The card records nothing; its "run tools" reply prints the full notice first,
+      # and only a "run tools" after that notice trusts. The command sits LAST in the risk cell, so
+      # the cap cuts it rather than the instructions.
+      cards="${cards}CARD|$(cell "spec tool $name (version $T_TRUSTKEY) is new or changed on this machine, so it did not run")|$(cell "run tools shows everything it declares; a second run tools trusts that exact version (egress: $(tool_egress)). It runs: ${T_DRIVER:-$T_KIND $T_TARGET}")|run tools
+"
+    fi
+  done
+  [ -n "$summ" ] && facts="${facts}spec tools:$summ
+"
+  [ -n "$warns" ] && facts="${facts}spec tools WARN: $warns
+"
+  for k in $keys; do
+    wb_out "$k" || continue
+    st=$(wb_state_file "$k"); tool=$(kv_get "$st" tool); url=$(kv_get "$st" url)
+    le=unknown
+    if [ -f "$REPO_ROOT/docs/cycles/$k/plan.md" ]; then
+      cur=$(acfw_plan_content "$REPO_ROOT/docs/cycles/$k/plan.md")
+      if [ "$cur" = "$(kv_get "$st" base)" ]; then le=no; else le=yes; fi
+    fi
+    facts="${facts}OUT $k → $tool since $(age_of "$(kv_get "$st" since)"), local edits: $le${url:+, $(redact "$(flat "$url" | tr -d '|')")}
+"
+  done
+  if [ -n "$names" ]; then
+    lint_scope
+    if [ -n "$LINT_HITS" ]; then
+      for lint in $LINT_HITS; do
+        n=$((n + 1)); [ "$n" -le 3 ] || continue
+        cards="${cards}CARD|$(cell "credential literal in $lint (the value is not shown)")|$(cell "anyone with the repo can use it, and it stays in git history; spec tools refuse to run until it is gone")|$(cell "delete the literal, commit, and ROTATE the key")
+"
+      done
+      [ "$n" -gt 3 ] && facts="${facts}secret lint: $((n - 3)) more credential literal(s) not shown as cards
+"
+    fi
+  fi
+  # Facts carry tool text (a workbench URL) and declaration text (a warning naming a prompt path):
+  # redacted like every other echo, before either form prints them.
+  facts=$(redact "$facts")
+  if [ "$machine" = 1 ]; then
+    printf '%s\n' "$facts" | grep -v '^$' | sed 's/^/FACT|/'
+    printf '%s' "$cards" | grep -v '^$' || true
+  else
+    printf '%s\n' "$facts" | grep -v '^$' | sed 's/^/  /'
+    printf '%s' "$cards" | grep -v '^$' | while IFS='|' read -r _ w r p; do
+      printf '  WHAT %s\n  RISK %s\n  REPLY %s\n' "$w" "$r" "$p"
+    done
+  fi
+  return 0
+}
+
+cmd_gate() {
+  local plan="" blob="" overrides="" name res v n ref titles email rows="" orows="" unmet="" ok reason used=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --blob) [ $# -ge 2 ] || die 2 "--blob needs a content hash"; blob="$2"; shift 2 ;;
+      --blob=*) blob="${1#--blob=}"; shift ;;
+      --override) [ $# -ge 2 ] || die 2 "--override needs a tool name"; overrides="$overrides $2"; shift 2 ;;
+      --override=*) overrides="$overrides ${1#--override=}"; shift ;;
+      -*) die 2 "gate: unknown flag '$1'" ;;
+      *) plan="$1"; shift ;;
+    esac
+  done
+  resolve_plan "$plan"
+  blob="${blob#v1:}"
+  is_re "$blob" '^[0-9a-f]{12,}$' || die 2 "gate needs --blob <content hash> (at least 12 lowercase hex)"
+  blob="${blob:0:12}"
+  # A plan out in a workbench may be changing there right now: approving the local copy would bless
+  # text the operator has not seen merged. Not overridable: pull it back or drop it.
+  if wb_out "$KEY"; then
+    local st; st=$(wb_state_file "$KEY")
+    printf 'GATE|out|%s|since=%s\n' "$(kv_get "$st" tool)" "$(kv_get "$st" since)"
+    echo "the plan is OUT in $(kv_get "$st" tool) since $(age_of "$(kv_get "$st" since)"): pull it back (/whip --pull) or drop it (/whip --pull --drop) before approving" >&2
+    exit 26
+  fi
+  email=$(by_email)
+  for name in $(decl_names); do
+    load_tool "$name"; caps_load
+    res="$SPEC_RUN/$KEY/$blob/$name/result"
+    [ -n "$T_ERR" ] || [ -f "$SPEC_RUN/$KEY/$blob/$name/order" ] || result_restore "$SPEC_RUN/$KEY/$blob/$name" || true
+    # Gate policy and at= are HEAD's (gates_at), and only a result produced by the committed
+    # declaration on these exact bytes (and a clean executable) can satisfy it: gate_problem, the same
+    # test the card applies, so the card and the gate never disagree. A review run before the commit
+    # still counts once the bytes it ran are committed and clean: making a paid tool run again for
+    # that would bill twice for identical work. ACFW_SPEC=off changes nothing here: with no result, a
+    # block tool still needs the override.
+    if gates_at plan; then
+      ok=0
+      reason=$(gate_problem "$res")
+      if [ -z "$reason" ]; then
+        v=$(kv_get "$res" verdict)
+        case "$v" in
+          go|skip|error) ok=1 ;;   # a tool that could not run never blocks (skip/error are non-gates)
+          nogo) reason="NO-GO with $(kv_get "$res" n) finding(s)" ;;
+          *) reason="no usable result" ;;
+        esac
+      fi
+      if [ "$ok" = 0 ]; then
+        if case " $overrides " in *" $name "*) true ;; *) false ;; esac; then
+          used="$used $name"
+          if [ "$(kv_get "$res" verdict)" = nogo ] && [ "$(kv_get "$res" declsha)" = "$T_HEADSHA" ]; then
+            orows="${orows}ROW|overridden|$(cell "$email")|$blob|$(cell "$name NO-GO overridden")
+"
+          else
+            orows="${orows}ROW|overridden|$(cell "$email")|$blob|$(cell "$name unreviewed, overridden")
+"
+          fi
+        else
+          unmet="${unmet}$name|$reason
+"
+        fi
+      fi
+    fi
+    if [ -f "$res" ]; then
+      v=$(kv_get "$res" verdict); n=$(kv_get "$res" n); ref=$(kv_get "$res" ref)
+      ref_ok "$ref" || ref=""
+      # Critical first, then high, at most 8; links are cut per title BEFORE joining, so a URL at
+      # the end of one title cannot swallow the separator and glue two titles together.
+      titles=$(awk -F'|' '$1 == "FINDING" && ($2 == "critical" || $2 == "high") {
+          t = $5; for (i = 6; i <= NF; i++) t = t "|" $i
+          gsub(/[A-Za-z][A-Za-z0-9+.-]*:\/\/[^ ]*/, "<link>", t); gsub(/;/, ",", t)
+          if ($2 == "critical") c[++nc] = t; else h[++nh] = t }
+        END { for (i = 1; i <= nc && k < 8; i++) { k++; print c[i] } for (i = 1; i <= nh && k < 8; i++) { k++; print h[i] } }' \
+        "$SPEC_RUN/$KEY/$blob/$name/records" 2>/dev/null | paste -sd';' - | sed 's/;/; /g')
+      case "$v" in skip|error) titles=$(kv_get "$res" reason) ;; esac
+      rows="${rows}ROW|reviewed|$(cell "$name")|$blob|$(cell "$v n=${n:-0}${ref:+ ref=$ref}${titles:+: $titles}")
+"
+    elif in_stage plan || gates_at plan; then
+      # A plan reviewer with nothing at these bytes still gets its row: the retro reads the Plan Log
+      # and must tell "declared, but never reviewed what was approved" from "not declared".
+      rows="${rows}ROW|reviewed|$(cell "$name")|$blob|$(cell "not run at this content ($(norun_reason "$KEY" "$blob"))")
+"
+    fi
+  done
+  rows="$rows$orows"
+  for name in $overrides; do
+    case " $used " in *" $name "*) ;; *) warn "--override $name ignored: $name is not a block tool gating this approval without a GO at this content" ;; esac
+  done
+  if [ -n "$unmet" ]; then
+    printf '%s' "$unmet" | grep -v '^$' | while IFS='|' read -r name reason; do
+      printf 'GATE|unmet|%s|%s\n' "$name" "$(cell "$reason")"
+      printf 'spec gate: %s (policy=block): %s. Fix the plan and review again, or reply "yes, override %s" (recorded with your email).\n' "$name" "$(redact "$reason")" "$name" >&2
+    done
+    exit 22
+  fi
+  printf '%s' "$rows" | grep -v '^$' || true
+  return 0
+}
+
+# ---- workbench round-trip ---------------------------------------------------------------------------
+pick_workbench_tool() { # <verb> <requested> → PICK
+  local name cands="" nc=0 maybe="" nm=0 rc
+  PICK=""
+  if [ -n "$2" ]; then
+    decl_names | grep -qxF "$2" || die 2 "no spec tool named '$2'"
+    PICK="$2"; return 0
+  fi
+  for name in $(decl_names); do
+    load_tool "$name"
+    [ -z "$T_ERR" ] || continue
+    # Probe only what is already trusted: a capabilities verb is code execution too. An untrusted
+    # driver whose verbs are unknown is a "maybe"; wb_prepare_tool then prints its trust notice.
+    if tool_trusted; then caps_load probe || true; else caps_load; fi
+    tool_offers "$1"; rc=$?
+    case "$rc" in
+      0) cands="$cands $name"; nc=$((nc + 1)) ;;
+      2) maybe="$maybe $name"; nm=$((nm + 1)) ;;
+    esac
+  done
+  if [ "$nc" -eq 0 ]; then cands="$maybe"; nc="$nm"; fi
+  [ "$nc" -gt 0 ] || die 25 "no declared spec tool offers $1 (a driver lists it in VERBS|, an agent prompt has a ## $1 section). Declare a workbench first: spec-tools/README.md, e.g. acfw-spec add dir"
+  [ "$nc" -eq 1 ] || die 2 "several spec tools offer $1 ($cands ): pass --tool <name>"
+  PICK="${cands# }"
+}
+wb_prepare_tool() { # <verb> <trustnow> — load PICK, refuse what cannot run it
+  load_tool "$PICK"
+  [ -z "$T_ERR" ] || die 2 "spec tool $PICK: $T_ERR"
+  [ "$T_KIND" != review ] || die 25 "spec tool $PICK is a review= command: it offers review only, not $1"
+  [ "$2" = 1 ] && was_shown && trust_record
+  if ! tool_trusted; then trust_notice; exit 25; fi
+  if [ "$T_KIND" = driver ]; then
+    caps_load probe || warn "spec tool $PICK: capabilities probe failed ($CAPS_ERR)"
+    if { tool_offers "$1"; [ $? -eq 1 ]; }; then
+      # Ask once more before refusing: the verb may have lit up since the cached answer.
+      caps_load fresh || true
+      tool_offers "$1"; [ $? -eq 1 ] && die 25 "spec tool $PICK does not offer $1 (its VERBS| line: $(caps_field VERBS))"
+    fi
+  elif ! tool_offers "$1"; then
+    die 25 "spec tool $PICK's prompt $DECL_REL/$T_TARGET has no ## $1 section"
+  fi
+  return 0
+}
+# wb_run <odir> <verb> <key> <file> <blob> <ref> <same> — driver: run it; agent: order or collect.
+# Returns 0 done (IO_* and <odir>/out filled), 21 (AGENT line queued), or exits 25 with the reason.
+# An agent order is collected on a LATER run, and the plan may have moved in between, so a
+# collection must know what the agent actually worked from. WB_ORDER_FILE/WB_ORDER_BLOB hand that
+# back: a push records BASE as those bytes (not today's plan.md), so the next pull 3-way merges the
+# agent's draft against what it drafted from and keeps every edit made since. A pull or from order
+# issued for another base or ref is not collected at all: it is discarded and issued afresh.
+WB_ORDER_FILE=""; WB_ORDER_BLOB=""
+wb_run() {
+  local odir="$1" verb="$2" rem secs fe oref stale=""
+  WB_ORDER_FILE=""; WB_ORDER_BLOB=""
+  mkdir -p "$odir"
+  if [ "$T_KIND" = agent ]; then
+    if [ -f "$odir/order" ] && [ "$(kv_get "$odir/order" verb)" = "$verb" ]; then
+      WB_ORDER_FILE=$(kv_get "$odir/order" file); WB_ORDER_BLOB=$(kv_get "$odir/order" blob); oref=$(kv_get "$odir/order" ref)
+      case "$verb" in
+        push)
+          if [ ! -f "$WB_ORDER_FILE" ] || [ "$(acfw_plan_content "$WB_ORDER_FILE")" != "$WB_ORDER_BLOB" ]; then
+            stale="the frozen copy it drafted from is gone"
+          fi ;;
+        pull) { [ "$WB_ORDER_BLOB" = "$5" ] && [ "$oref" = "$6" ]; } || stale="it was issued for another base or workbench ref" ;;
+        *) [ "$oref" = "$6" ] || stale="it was issued for another ref" ;;
+      esac
+      rm -f "$odir/order"
+      if [ -z "$stale" ]; then
+        [ -f "$odir/out/stdout" ] || die 25 "the $PICK agent finished without writing $odir/out/stdout; run the command again to re-issue its work order"
+        cp "$odir/out/stdout" "$odir/raw.stdout"; : > "$odir/raw.stderr"
+        classify "$odir/raw.stdout" "$odir/parsed"; read_io "$odir/parsed" "$odir/answers"
+        return 0
+      fi
+      warn "discarded the open $PICK $verb work order ($stale); issuing a fresh one"
+      WB_ORDER_FILE=""; WB_ORDER_BLOB=""
+    fi
+    agent_order "$odir" "$verb" "$3" "$4" "$5" "$6" "$7" plan
+    return 21
+  fi
+  rem=$(( DEADLINE - $(now) )); secs="$T_TIMEOUT"; [ "$secs" -gt "$rem" ] && secs="$rem"
+  rm -rf "$odir/out"
+  run_tool "$odir" "$verb" plan "$3" "$4" "$5" "$secs" "$6" "$7"
+  classify "$odir/raw.stdout" "$odir/parsed"; read_io "$odir/parsed" "$odir/answers"
+  fe=$(first_line "$odir/raw.stderr")
+  case "$RUN_RC" in
+    0) return 0 ;;
+    3) [ -n "$IO_HINT" ] && say "HINT|$(redact "$(flat "$IO_HINT")")"
+       die 25 "spec tool $PICK could not $verb: ${fe:-unavailable (exit 3)}" ;;
+    124) die 25 "spec tool $PICK timed out during $verb after ${secs}s (its process group was killed)" ;;
+    *) die 25 "spec tool $PICK failed during $verb (exit $RUN_RC)${fe:+: $fe}" ;;
+  esac
+}
+pending_append() { # <ID> <event> <by> <c12> <details> — acfw-cycle's approve folds these into ## Plan Log
+  local d="$RUN_DIR/cycle/$1" line tries=0 locked=0
+  mkdir -p "$d"
+  line="$(utc)|$(cell "$2")|$(cell "$3")|$(cell "$4")|$(cell "$5")"
+  # The same mkdir lock acfw-cycle holds while it folds and truncates pending.log. A lock that stays
+  # busy for 10 s is treated as stale: losing an audit row is worse than a rare interleave.
+  while [ "$tries" -lt 50 ]; do
+    if mkdir "$d/.lock" 2>/dev/null; then locked=1; break; fi
+    tries=$((tries + 1)); sleep 0.2
+  done
+  [ "$locked" = 1 ] || warn "pending.log lock $d/.lock stayed busy for 10s; appending anyway"
+  printf '%s\n' "$line" >> "$d/pending.log"
+  [ "$locked" = 1 ] && rmdir "$d/.lock" 2>/dev/null
+  return 0
+}
+normalize_text() { # <in> <out> — workbench text: CRLF, NBSP, zero-width space, BOM, trailing blanks
+  if [ "$HAVE_PERL" = 1 ]; then
+    perl -pe 's/\r\n?/\n/g; s/\xC2\xA0/ /g; s/\xE2\x80\x8B//g; s/\xEF\xBB\xBF//g; s/[ \t]+$//;' "$1" > "$2.pre"
+  else
+    sed -e "s/$CR\$//" "$1" > "$2.pre"
+  fi
+  acfw_plan_normalize "$2.pre" > "$2"; rm -f "$2.pre"
+}
+record_source() { # the Source: metadata of this cycle's record.md (HEAD first)
+  { git -C "$REPO_ROOT" show "HEAD:docs/cycles/$KEY/record.md" 2>/dev/null || cat "$REC_FILE" 2>/dev/null; } \
+    | sed -n 's/^- \*\*Source\*\*:[[:space:]]*//p' | head -1
+}
+recorded_dids() { # D-ids named in record.md ## Tasks, comma-joined (HEAD first)
+  { git -C "$REPO_ROOT" show "HEAD:docs/cycles/$KEY/record.md" 2>/dev/null || cat "$REC_FILE" 2>/dev/null; } | awk '
+    /^## / { inT = ($0 ~ /^## Tasks[ \t]*$/); next }
+    inT && /^\|/ { l = $0; sub(/^\|[ \t]*/, "", l); split(l, c, "|"); d = c[1]; sub(/[ \t]+$/, "", d); if (d ~ /^D[0-9]+$/) print d }' \
+    | sort -u | paste -sd, - 2>/dev/null
+}
+tasks_nonempty() {
+  { git -C "$REPO_ROOT" show "HEAD:docs/cycles/$KEY/record.md" 2>/dev/null || cat "$REC_FILE" 2>/dev/null; } | awk '
+    /^## / { inT = ($0 ~ /^## Tasks[ \t]*$/); next }
+    inT && /^\|/ && !/^\|[ \t]*Deliverable[ \t]*\|/ && !/^\|[ \t:-]*\|/ { f = 1 } END { exit !f }'
+}
+validate_pull() { # <candidate> <reference-for-deliverables> → 0, or prints the reason and returns 24
+  local cand="$1" ref="$2" recorded old="$TMPD/v.old" why
+  if ! grep -q '[^[:space:]]' "$cand" 2>/dev/null; then echo "the pulled text is empty"; return 24; fi
+  if grep -Eq '^(<<<<<<<|>>>>>>>)( |$)' "$cand"; then echo "the pulled text contains git conflict markers"; return 24; fi
+  if [ -s "$ref" ] && grep -Eq '^## Deliverables[[:space:]]*$' "$ref" && ! grep -Eq '^## Deliverables[[:space:]]*$' "$cand"; then
+    echo "## Deliverables is gone from the pulled text (a workbench export likely rewrote the headings); the plan keeps it"; return 24
+  fi
+  # D-id permanence applies only once tasks name the D-ids (record.md ## Tasks non-empty). Before
+  # that, deliverables may be merged, split or dropped freely.
+  recorded=$(recorded_dids)
+  if [ -n "$recorded" ]; then
+    git -C "$REPO_ROOT" show "HEAD:docs/cycles/$KEY/plan.md" > "$old" 2>/dev/null || cp "$ref" "$old"
+    why=$(acfw_plan_rule10 "$old" "$cand" "$recorded"); [ $? -eq 0 ] || { echo "D-ids are permanent once tasks name them: $why"; return 24; }
+  fi
+  return 0
+}
+d_notes() { # <before> <after> — "D3 removed" style notes while ## Tasks is still empty
+  local b="$TMPD/dn.b" a="$TMPD/dn.a"
+  acfw_plan_dids "$1" 2>/dev/null > "$b"; acfw_plan_dids "$2" 2>/dev/null > "$a"
+  awk -F'\t' 'NR == FNR { old[$1] = substr($0, length($1) + 2); next }
+    { seen[$1] = 1; if (!($1 in old)) print "NOTE|" $1 " added"; else if (old[$1] != substr($0, length($1) + 2)) print "NOTE|" $1 " renamed" }
+    END { for (d in old) if (!(d in seen)) print "NOTE|" d " removed" }' "$b" "$a" | sort
+}
+clip_read() {
+  if command -v pbpaste >/dev/null 2>&1; then pbpaste
+  elif command -v wl-paste >/dev/null 2>&1; then wl-paste --no-newline
+  elif command -v xclip >/dev/null 2>&1; then xclip -selection clipboard -o
+  elif command -v xsel >/dev/null 2>&1; then xsel --clipboard --output
+  else return 1; fi
+}
+
+cmd_push() {
+  local plan="" req="" trustnow=0 wdir st ref same rc src bfile bblob bb12
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tool) [ $# -ge 2 ] || die 2 "--tool needs a name"; req="$2"; shift 2 ;;
+      --tool=*) req="${1#--tool=}"; shift ;;
+      --trust) trustnow=1; shift ;;
+      -*) die 2 "push: unknown flag '$1'" ;;
+      *) plan="$1"; shift ;;
+    esac
+  done
+  if [ "${ACFW_SPEC:-}" = off ]; then say "spec tools are off (ACFW_SPEC=off): nothing was pushed"; return 0; fi
+  resolve_plan "$plan" need
+  ensure_run_ignored
+  wdir="$WB_RUN/$KEY"; st=$(wb_state_file "$KEY")
+  if wb_out "$KEY"; then
+    die 26 "the plan is already OUT in $(kv_get "$st" tool) since $(age_of "$(kv_get "$st" since)"): pull it back first (/whip --pull) or drop it (/whip --pull --drop)"
+  fi
+  # Linted together with the scope, as in review_plan: a scope hit must not hide a plan.md one.
+  lint_scope
+  LINT_HITS=$(printf '%s\n%s\n' "$(lint_hits "$PLAN_FILE" "docs/cycles/$KEY/plan.md" content)" "$LINT_HITS" | grep -v '^[[:space:]]*$' || true)
+  [ -z "$LINT_HITS" ] || secret_die "$LINT_HITS"
+  pick_workbench_tool push "$req"
+  wb_prepare_tool push "$trustnow"
+  freeze "$KEY" "$PLAN_FILE" plan.md
+  ref=$(refs_latest "$KEY" "$PICK"); same=$(refs_at "$KEY" "$PICK" "$F_B12")
+  # Lineage for a cycle started with --from <tool> <ref>: push back to the document it came from.
+  if [ -z "$ref" ]; then src=$(record_source); [ "${src%%:*}" = "$PICK" ] && ref="${src#*:}"; ref_ok "$ref" || ref=""; fi
+  wb_run "$wdir/push" push "$KEY" "$F_FILE" "$F_BLOB" "$ref" "$same"; rc=$?
+  if [ "$rc" = 21 ]; then printf '%s' "$AGENT_LINES"; exit 21; fi
+  ref_ok "$IO_REF" || die 25 "spec tool $PICK pushed but returned no usable REF| (a plain id, never a link or a credential), so there is nothing to pull back from"
+  # BASE is what the workbench got. For an agent that is the bytes its order froze, which may be older
+  # than plan.md now: recording today's bytes instead would make the next pull a fast-forward over
+  # every edit made while the agent worked.
+  bfile="$F_FILE"; bblob="$F_BLOB"
+  if [ -n "$WB_ORDER_BLOB" ]; then bfile="$WB_ORDER_FILE"; bblob="$WB_ORDER_BLOB"; fi
+  bb12=$(b12_of "$bblob")
+  cp "$bfile" "$wdir/base.md.$$" && mv -f "$wdir/base.md.$$" "$wdir/base.md"; chmod u+w "$wdir/base.md" 2>/dev/null
+  kv_write "$st" "tool=$PICK" "ref=$IO_REF" "base=$bblob" "b12=$bb12" "since=$(now)" "url=$(flat "$IO_URL")"
+  refs_append "$KEY" "$PICK" "$bb12" "$IO_REF" push
+  pending_append "$KEY" pushed "$PICK" "$bb12" "ref=$IO_REF base=$bb12"
+  say "PUSHED|$PICK|ref=$IO_REF|content=$bb12"
+  [ "$bblob" != "$F_BLOB" ] && say "  note: $PICK drafted from content $bb12; plan.md changed since ($F_B12), and your edits will be merged, not replaced, when you pull"
+  [ -n "$IO_URL" ] && say "  open: $(redact "$(flat "$IO_URL")")"
+  [ -n "$IO_HINT" ] && say "  note: $(redact "$(flat "$IO_HINT")")"
+  say "  The plan is OUT: approval waits until you pull it back (/whip --pull $KEY) or drop it (--drop)."
+  return 0
+}
+
+cmd_pull() {
+  local plan="" req="" srcf="" clip=0 favor="" drop=0 trustnow=0 wdir st tool ref basefile="" baseblob="" how
+  local src theirs ours base res r1 r2 rc label fromcopy newc answers="" n=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tool) [ $# -ge 2 ] || die 2 "--tool needs a name"; req="$2"; shift 2 ;;
+      --tool=*) req="${1#--tool=}"; shift ;;
+      --file) [ $# -ge 2 ] || die 2 "--file needs a path"; srcf="$2"; shift 2 ;;
+      --file=*) srcf="${1#--file=}"; shift ;;
+      --clipboard) clip=1; shift ;;
+      --ours) [ -z "$favor" ] || die 2 "--ours and --theirs are exclusive"; favor=ours; shift ;;
+      --theirs) [ -z "$favor" ] || die 2 "--ours and --theirs are exclusive"; favor=theirs; shift ;;
+      --drop) drop=1; shift ;;
+      --trust) trustnow=1; shift ;;
+      -*) die 2 "pull: unknown flag '$1'" ;;
+      *) plan="$1"; shift ;;
+    esac
+  done
+  [ -n "$srcf" ] && [ "$clip" = 1 ] && die 2 "--file and --clipboard are exclusive"
+  resolve_plan "$plan" need
+  ensure_run_ignored
+  wdir="$WB_RUN/$KEY"; st=$(wb_state_file "$KEY")
+  if [ "$drop" = 1 ]; then
+    wb_out "$KEY" || die 26 "the plan is not OUT in a workbench: nothing to drop"
+    tool=$(kv_get "$st" tool); rm -f "$st"
+    say "DROPPED|$tool"
+    say "  The workbench copy was left where it is and the plan is back in; approval is unblocked. Your local plan.md was not changed."
+    return 0
+  fi
+  if [ "${ACFW_SPEC:-}" = off ]; then say "spec tools are off (ACFW_SPEC=off): nothing was pulled"; return 0; fi
+  if wb_out "$KEY"; then
+    tool=$(kv_get "$st" tool); ref=$(kv_get "$st" ref); baseblob=$(kv_get "$st" base); basefile="$wdir/base.md"
+    [ -z "$req" ] || [ "$req" = "$tool" ] || [ -n "$srcf" ] || [ "$clip" = 1 ] || die 26 "the plan is OUT in $tool, not $req"
+  elif [ -n "$srcf" ] || [ "$clip" = 1 ]; then
+    # Re-merging a changed original (or a paste) with no push: BASE is the last synced text if there
+    # is one. With none, an empty BASE makes every differing line a conflict, which loses nothing.
+    if [ -n "$srcf" ]; then tool="${req:-file}"; else tool="${req:-clipboard}"; fi
+    ref=""; [ -f "$wdir/base.md" ] && basefile="$wdir/base.md"
+  else
+    src=$(record_source)
+    tool="${src%%:*}"; ref="${src#*:}"
+    if [ -n "$src" ] && [ "$tool" != "$src" ] && decl_names | grep -qxF "$tool" && { [ -z "$req" ] || [ "$req" = "$tool" ]; }; then
+      # A cycle started with --from <tool> <ref>: pulling again needs no push.
+      fromcopy="$WB_RUN/_from/$tool/$(printf '%s' "$ref" | git hash-object --stdin | cut -c1-12)/remote.md"
+      if [ -f "$wdir/base.md" ]; then basefile="$wdir/base.md"; elif [ -f "$fromcopy" ]; then basefile="$fromcopy"; fi
+    else
+      die 26 "the plan is not OUT in a workbench: push it first (/whip --push $KEY), or merge a file with --file <path>"
+    fi
+  fi
+  theirs="$TMPD/theirs.md"; ours="$TMPD/ours.md"; base="$TMPD/base.md"
+  if [ -n "$srcf" ]; then
+    [ -f "$srcf" ] || die 2 "no such file: $srcf"
+    normalize_text "$srcf" "$theirs"
+  elif [ "$clip" = 1 ]; then
+    clip_read > "$TMPD/clip.raw" 2>/dev/null || die 2 "no clipboard reader found (pbpaste, wl-paste, xclip or xsel): save the text to a file and use --file"
+    normalize_text "$TMPD/clip.raw" "$theirs"
+  else
+    PICK="$tool"
+    # A pull RUNS the tool: the same refusal as review and push while a literal sits in a declaration.
+    lint_scope_or_die
+    wb_prepare_tool pull "$trustnow"
+    if [ -n "$basefile" ]; then
+      freeze "$KEY" "$basefile" plan.md
+    else
+      freeze "$KEY" "$PLAN_FILE" plan.md
+    fi
+    wb_run "$wdir/pull" pull "$KEY" "$F_FILE" "${baseblob:-$F_BLOB}" "$ref" ""; rc=$?
+    if [ "$rc" = 21 ]; then printf '%s' "$AGENT_LINES"; exit 21; fi
+    [ -n "$IO_REF" ] && ref_ok "$IO_REF" && ref="$IO_REF"
+    [ -s "$wdir/pull/answers" ] && answers=$(cat "$wdir/pull/answers")
+    if [ ! -f "$wdir/pull/out/remote.md" ]; then
+      [ -n "$answers" ] || die 25 "spec tool $tool's pull returned neither \$ACFW_SPEC_OUT/remote.md nor ANSWER| lines${IO_HINT:+ ($(flat "$IO_HINT"))}; the plan stays OUT"
+      # Decisions only: the session folds them in exactly like typed replies. The pull is complete.
+      rm -f "$st"
+      pending_append "$KEY" pulled "$tool" "$(b12_of "$(acfw_plan_content "$PLAN_FILE")")" "ref=${ref:--} base=$(b12_of "${baseblob:--}") answers=$(printf '%s\n' "$answers" | grep -c '^ANSWER|')"
+      say "PULLED|$tool|answers|content=$(b12_of "$(acfw_plan_content "$PLAN_FILE")")"
+      printf '%s\n' "$(redact "$answers")"
+      say "  Fold each ANSWER into the plan exactly like a typed reply, then show a fresh card: /whip $KEY"
+      return 0
+    fi
+    normalize_text "$wdir/pull/out/remote.md" "$theirs"
+  fi
+  lint_file_or_die "$theirs" "pulled text (line numbers are the workbench copy's)" content
+  acfw_plan_normalize "$PLAN_FILE" > "$ours"
+  if [ -n "$basefile" ] && [ -f "$basefile" ]; then acfw_plan_normalize "$basefile" > "$base"; else : > "$base"; fi
+  local vref="$base"; [ -s "$base" ] || vref="$ours"
+  if ! r1=$(validate_pull "$theirs" "$vref"); then say "REFUSED|$tool|$r1"; echo "pull refused: $r1. Nothing was changed; the plan stays OUT." >&2; exit 24; fi
+  res="$TMPD/result.md"
+  if cmp -s "$theirs" "$ours"; then how=noop; cp "$ours" "$res"
+  elif [ -s "$base" ] && cmp -s "$theirs" "$base"; then how=noop; cp "$ours" "$res"
+  elif [ -s "$base" ] && cmp -s "$ours" "$base"; then how=ffwd; cp "$theirs" "$res"
+  else
+    git merge-file -p --diff3 -L "plan.md (yours)" -L "base (last sync)" -L "$tool (workbench)" "$ours" "$base" "$theirs" > "$res" 2>/dev/null; rc=$?
+    if [ "$rc" -eq 0 ]; then how=merged
+    elif [ "$rc" -ge 255 ]; then die 2 "git merge-file failed"
+    elif [ -z "$favor" ]; then
+      mkdir -p "$wdir"
+      cp "$res" "$wdir/$KEY.conflict.md"
+      say "CONFLICT|$tool|$wdir/$KEY.conflict.md"
+      if wb_out "$KEY"; then
+        echo "pull conflict: $rc region(s) changed on both sides. plan.md was NOT changed and the plan stays OUT. Resolve with /whip --pull --ours (keep yours) or --theirs (take the workbench's); either saves the side it discards as a patch. Or edit plan.md yourself and --drop. The merged text with conflict markers: $wdir/$KEY.conflict.md" >&2
+      else
+        echo "pull conflict: $rc region(s) changed on both sides. plan.md was NOT changed. Run the same pull again with --ours (keep yours) or --theirs (take the other side); either saves the side it discards as a patch. Or merge by hand from the text with conflict markers: $wdir/$KEY.conflict.md" >&2
+      fi
+      exit 23
+    else
+      r1="$TMPD/res.ours"; r2="$TMPD/res.theirs"
+      git merge-file -p --ours "$ours" "$base" "$theirs" > "$r1" 2>/dev/null
+      git merge-file -p --theirs "$ours" "$base" "$theirs" > "$r2" 2>/dev/null
+      label=$(date -u +%Y%m%dT%H%M%SZ)
+      if [ "$favor" = ours ]; then
+        cp "$r1" "$res"; how=ours
+        diff -u "$r1" "$r2" | sed -e '1s|^--- .*|--- plan.md|' -e '2s|^+++ .*|+++ plan.md|' > "$wdir/discarded-theirs-$label.patch"
+        say "  discarded workbench side saved: $wdir/discarded-theirs-$label.patch"
+      else
+        cp "$r2" "$res"; how=theirs
+        diff -u "$r2" "$r1" | sed -e '1s|^--- .*|--- plan.md|' -e '2s|^+++ .*|+++ plan.md|' > "$wdir/discarded-yours-$label.patch"
+        say "  discarded local side saved: $wdir/discarded-yours-$label.patch"
+      fi
+    fi
+  fi
+  if ! r1=$(validate_pull "$res" "$vref"); then say "REFUSED|$tool|$r1"; echo "pull refused: $r1. Nothing was changed; the plan stays OUT." >&2; exit 24; fi
+  if [ "$how" != noop ] && ! cmp -s "$res" "$PLAN_FILE"; then
+    cp "$res" "$PLAN_FILE.acfw.$$" && mv -f "$PLAN_FILE.acfw.$$" "$PLAN_FILE" || die 2 "could not write $PLAN_FILE"
+  fi
+  if ! tasks_nonempty; then d_notes "$ours" "$res"; fi
+  cp "$theirs" "$wdir/base.md.$$" && mv -f "$wdir/base.md.$$" "$wdir/base.md"
+  rm -f "$st" "$wdir/$KEY.conflict.md"
+  newc=$(b12_of "$(acfw_plan_content "$PLAN_FILE")")
+  pending_append "$KEY" pulled "$tool" "$newc" "ref=${ref:--} base=$(if [ -s "$base" ]; then b12_of "$(acfw_plan_content "$base")"; else echo -; fi)"
+  say "PULLED|$tool|$how|content=$newc"
+  [ -n "$answers" ] && printf '%s\n' "$(redact "$answers")"
+  say "  The plan is back in (a pull never approves and never commits). Next: a fresh review and card, /whip $KEY"
+  return 0
+}
+
+cmd_from() {
+  local tool="${1:-}" arg="${2:-}" trustnow=0 odir rc keydir title
+  [ -n "$tool" ] && [ -n "$arg" ] || die 2 "usage: acfw-spec from <tool> <ref|url>"
+  [ "${3:-}" = --trust ] && trustnow=1
+  if [ "${ACFW_SPEC:-}" = off ]; then say "spec tools are off (ACFW_SPEC=off): nothing was fetched"; return 0; fi
+  ensure_run_ignored
+  lint_scope_or_die
+  PICK="$tool"
+  decl_names | grep -qxF "$tool" || die 2 "no spec tool named '$tool' (declare it first: acfw-spec add $tool)"
+  wb_prepare_tool from "$trustnow"
+  odir="$WB_RUN/_from/$tool"
+  wb_run "$odir/fetch" from "" "" "" "$arg" ""; rc=$?
+  if [ "$rc" = 21 ]; then printf '%s' "$AGENT_LINES"; exit 21; fi
+  [ -f "$odir/fetch/out/remote.md" ] || die 25 "spec tool $tool's from wrote no \$ACFW_SPEC_OUT/remote.md"
+  normalize_text "$odir/fetch/out/remote.md" "$TMPD/from.md"
+  lint_file_or_die "$TMPD/from.md" "fetched text" content
+  grep -q '[^[:space:]]' "$TMPD/from.md" || die 24 "spec tool $tool returned an empty spec"
+  if ref_ok "$IO_REF"; then keydir="$IO_REF"; else IO_REF=""; keydir="$arg"; fi
+  keydir="$odir/$(printf '%s' "$keydir" | git hash-object --stdin | cut -c1-12)"
+  mkdir -p "$keydir"
+  cp "$TMPD/from.md" "$keydir/remote.md"
+  title=$(sed -n 's/^# \{1,\}//p' "$keydir/remote.md" | head -1)
+  say "FROM|$keydir/remote.md"
+  say "REF|${IO_REF:--}"
+  say "TITLE|$(cell "$title")"
+  return 0
+}
+
+cmd_prompt() {
+  local tool="${1:-}" verb="${2:-}" order="" body file out state ref key blob
+  [ -n "$tool" ] && [ -n "$verb" ] || die 2 "usage: acfw-spec prompt <tool> <verb> [--order <file>]"
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --order) [ $# -ge 2 ] || die 2 "--order needs a path"; order="$2"; shift 2 ;;
+      *) die 2 "prompt: unknown argument '$1'" ;;
+    esac
+  done
+  decl_names | grep -qxF "$tool" || die 2 "no spec tool named '$tool'"
+  load_tool "$tool"
+  [ -z "$T_ERR" ] || die 2 "spec tool $tool: $T_ERR"
+  [ "$T_KIND" = agent ] || die 25 "spec tool $tool is not an agent= tool, so it has no prompt"
+  # The prompt goes to a subagent verbatim: a key pasted into it would be handed on and echoed.
+  lint_file_or_die "$T_MD" "$DECL_REL/$T_TARGET"
+  # And it is what the subagent will DO, so it is held to trust like a command: a prompt edited (or
+  # pulled in) after its work order was issued is shown first, never handed on unseen.
+  if ! tool_trusted; then trust_notice; exit 25; fi
+  body=$(md_section "$T_MD" "$verb")
+  printf '%s' "$body" | grep -q '[^[:space:]]' || die 25 "$DECL_REL/$T_TARGET has no ## $verb section"
+  if [ -n "$order" ]; then
+    [ -r "$order" ] || die 2 "no work order at $order"
+    file=$(kv_get "$order" file); out=$(kv_get "$order" out); state=$(kv_get "$order" state)
+    ref=$(kv_get "$order" ref); key=$(kv_get "$order" key); blob=$(kv_get "$order" blob)
+  else
+    file='<ACFW_SPEC_FILE>'; out='<ACFW_SPEC_OUT>'; state='<ACFW_SPEC_STATE>'; ref=''; key='<key>'; blob='<content>'
+  fi
+  cat <<EOF
+You are the acf-whip spec tool "$tool", running its "$verb" verb as a subagent.
+
+Inputs:
+  ACFW_SPEC_VERB=$verb
+  ACFW_SPEC_KEY=${key:-(none)}
+  ACFW_SPEC_BLOB=${blob:-(none)}
+  ACFW_SPEC_FILE=${file:-(none)}   (a frozen, read-only copy: read it, never edit it)
+  ACFW_SPEC_REF=${ref:-(none)}
+  ACFW_SPEC_OUT=$out   (your output directory)
+  ACFW_SPEC_STATE=$state   (yours to keep notes in; it persists across plan edits)
+
+Rules:
+- Never edit the real plan (docs/cycles/.../plan.md), record.md, or any other repository file.
+- Write ONLY inside the output and state directories above.
+- Never put a URL with a token, an API key, or any credential in a record or a file.
+- When you are done, reply with the single word: done.
+
+Output: create $out/stdout, one record per line, nothing else in it:
+  FINDING|<critical|high|medium|low|info>|<fp>|<loc>|<one-line title>
+      fp: a short stable slug for the issue (the same issue gets the same fp on every run)
+      loc: L<line>, D<n>, AC<n>.<m>, or -
+  Q|<a closed question about the finding above> (default: <the answer you would pick>)
+  REF|<plain id>        (optional; an id, never a link)
+  URL|<link>            (optional; shown to the human, never committed)
+  ANSWER|<fp>|<decision>   (pull only: a decision instead of text)
+  SUMMARY|verdict=<go|nogo>   (REQUIRED for review: nogo only if a finding must be fixed before building)
+For pull and from, write the full plan text to $out/remote.md (and still create $out/stdout).
+
+Instructions for this tool ($DECL_REL/$T_TARGET, section "## $verb"):
+
+$body
+EOF
+}
+
+cmd_add() {
+  local name="${1:-}" decl ex="" c copied="" md commitpaths="" p need v sha
+  [ -n "$name" ] || die 2 "usage: acfw-spec add <name>"
+  is_re "$name" "$NAME_RE" || die 2 "'$name' is not a spec tool name (lowercase letters, digits, dashes)"
+  decl="$DECL_DIR/$name"
+  ensure_run_ignored
+  if [ ! -f "$decl" ]; then
+    for c in "$PLUGIN_ROOT/spec-tools/$name/$name.example" "$PLUGIN_ROOT/spec-tools/examples/$name.example"; do
+      [ -f "$c" ] && { ex="$c"; break; }
+    done
+    if [ -z "$ex" ]; then
+      die 2 "no declaration $DECL_REL/$name and no shipped example named '$name' (shipped: $(ls "$PLUGIN_ROOT"/spec-tools/*/*.example 2>/dev/null | sed 's|.*/||; s|\.example$||' | sort -u | paste -sd' ' -)). Write the declaration yourself (spec-tools/README.md), then run add again to probe, trust and commit it."
+    fi
+    mkdir -p "$DECL_DIR"
+    cp "$ex" "$decl"; copied="$decl"
+    if parse_decl "$ex" && [ "$D_KIND" = agent ] && [ ! -f "$DECL_DIR/$D_TARGET" ] && [ -f "$(dirname "$ex")/$D_TARGET" ]; then
+      mkdir -p "$(dirname "$DECL_DIR/$D_TARGET")"
+      cp "$(dirname "$ex")/$D_TARGET" "$DECL_DIR/$D_TARGET"; copied="$copied $DECL_DIR/$D_TARGET"
+    fi
+    say "copied $ex -> $DECL_REL/$name"
+  fi
+  lint_scope
+  if [ -n "$LINT_HITS" ]; then [ -n "$copied" ] && rm -f $copied; secret_die "$LINT_HITS"; fi
+  load_tool "$name"
+  if [ -n "$T_ERR" ]; then [ -n "$copied" ] && rm -f $copied; die 2 "spec tool $name: $T_ERR"; fi
+  say "DECL|$name|$T_KIND|at=${T_AT:--}|policy=$T_DECL_POLICY|timeout=${T_TIMEOUT}s"
+  case "$T_KIND" in
+    driver)
+      say "  driver: $T_DRIVER ($T_ORIGIN)"
+      if caps_load fresh; then
+        say "  verbs: $(redact "$(caps_field VERBS)")"
+        for need in $(caps_field NEEDS); do
+          is_re "$need" '^[A-Za-z_][A-Za-z0-9_]*$' || continue
+          if [ -n "${!need:-}" ]; then v="set"
+          elif [ -f "$REPO_ROOT/.env" ] && grep -Eq "^[[:space:]]*(export[[:space:]]+)?$need=." "$REPO_ROOT/.env" && git -C "$REPO_ROOT" check-ignore -q .env 2>/dev/null; then v="set (from the gitignored .env)"
+          else v="NOT set: export it in your shell (in a separate terminal) or add it to a gitignored .env"; fi
+          say "  needs $need: $v"
+        done
+        say "  egress: $(redact "$(tool_egress)")"
+        if printf '%s\n' "$CAPS" | grep -q '^COST|'; then say "  cost: $(redact "$(caps_field COST)") (rerun defaults to ask)"; else say "  cost: none declared (rerun defaults to every)"; fi
+      else
+        warn "capabilities probe failed: $CAPS_ERR"
+      fi ;;
+    review) say "  runs: $T_TARGET"; say "  egress: whatever that command contacts" ;;
+    agent)
+      say "  prompt: $DECL_REL/$T_TARGET"
+      for v in review push pull from; do tool_offers "$v" && say "  offers: $v"; done
+      say "  runs as an in-session subagent at the plan stage only" ;;
+  esac
+  trust_record
+  for p in "$decl" ${T_MD:+"$T_MD"}; do
+    path_clean "$p" || commitpaths="$commitpaths ${p#"$REPO_ROOT"/}"
+  done
+  if [ -z "$commitpaths" ]; then
+    say "ADDED|$name|unchanged"
+    return 0
+  fi
+  for p in $commitpaths; do
+    git -C "$REPO_ROOT" ls-files --error-unmatch -- "$p" >/dev/null 2>&1 || git -C "$REPO_ROOT" add -N -- "$p" 2>/dev/null
+  done
+  if ! ( cd "$REPO_ROOT" && git_with_lock_backoff commit -q -o -m "chore(spec-tools): add $name" -- $commitpaths ); then
+    die 2 "the declaration is written but the commit failed (see above). Commit $commitpaths yourself; until then it runs advisory."
+  fi
+  sha=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null)
+  load_tool "$name"; trust_record
+  say "ADDED|$name|committed|$sha"
+  return 0
+}
+
+# ---- dispatch ----------------------------------------------------------------------------------------
+# Load the secret patterns once, here: warn/die/cell redact through them, and the task stage's
+# parallel jobs must inherit a finished pattern file rather than race to (re)write it.
+prep_patterns
+SUB="${1:-}"
+[ $# -gt 0 ] && shift
+case "$SUB" in
+  list)   cmd_list "$@" ;;
+  add)    cmd_add "$@" ;;
+  trust)  cmd_trust "$@" ;;
+  review) cmd_review "$@" ;;
+  show)   cmd_show "$@" ;;
+  status) cmd_status "$@" ;;
+  gate)   cmd_gate "$@" ;;
+  push)   cmd_push "$@" ;;
+  pull)   cmd_pull "$@" ;;
+  from)   cmd_from "$@" ;;
+  prompt) cmd_prompt "$@" ;;
+  -h|--help|help) sed -n '/^# Usage:/,/^# Portability:/p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  '') sed -n '/^# Usage:/,/^# Portability:/p' "$SELF" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+  *) die 2 "unknown verb '$SUB' (list add trust review show status gate push pull from prompt)" ;;
+esac

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# fake-curl — stands in for curl on PATH so phase21-gaptrap-driver can exercise the driver's REAL
+# transport (no ACFW_GAPTRAP_TRANSPORT) offline, and watch it from outside with ps.
+#
+# It understands exactly the flags the driver passes (-sS --max-time -X -K -H --data-binary -o -w URL),
+# records what arrived in $GT_CURL_LOG, then answers from fake-transport's recorded fixtures. What it
+# records is what the key-safety assertions need:
+#   auth=ok|missing   the -K config carried "Authorization: Bearer <key>" (compared in pure bash
+#                     against $GT_EXPECT_KEY, so the key never lands in a grep argv while ps is looking)
+#   cfg=<path>        the config path (a /dev/fd/NN pipe when the driver used process substitution)
+#   env_key=present|absent   whether GAPTRAP_API_KEY was in curl's environment
+#   hdr=<header>      each -H header; url=<url>; method=<-X value>
+# GT_CURL_DELAY=<s> with GT_CURL_DELAY_ON=<tool> sleeps on that tool's call, holding the process open
+# for ps.
+set -u
+cfg="" out="" data="" url="" method="" hdrs=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -K|--config) cfg="$2"; shift 2 ;;
+    -o|--output) out="$2"; shift 2 ;;
+    -w|--write-out|--max-time) shift 2 ;;
+    -X|--request) method="$2"; shift 2 ;;
+    -H|--header) hdrs="${hdrs}hdr=$2
+"; shift 2 ;;
+    --data-binary|-d|--data) data="$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+auth=""; [ -n "$cfg" ] && auth=$(cat "$cfg" 2>/dev/null)
+case "$auth" in *"Authorization: Bearer ${GT_EXPECT_KEY:-unset}"*) a=ok ;; *) a=missing ;; esac
+e=absent; env | grep -q '^GAPTRAP_API_KEY=' && e=present
+body_in=$(mktemp "${TMPDIR:-/tmp}/gt-fakecurl.XXXXXX")
+case "$data" in @-) cat > "$body_in" ;; @*) cat "${data#@}" > "$body_in" ;; *) printf '%s' "$data" > "$body_in" ;; esac
+{ printf 'call url=%s method=%s auth=%s cfg=%s env_key=%s\n' "$url" "$method" "$a" "$cfg" "$e"; printf '%s' "$hdrs"; } >> "$GT_CURL_LOG"
+if [ -n "${GT_CURL_DELAY:-}" ] && grep -q "\"${GT_CURL_DELAY_ON:-create_spec}\"" "$body_in"; then sleep "$GT_CURL_DELAY"; fi
+reply=$(bash "${GT_FIX:?GT_FIX must name the fixture dir}/fake-transport" < "$body_in"); rm -f "$body_in"
+printf '%s\n' "$reply" | sed 1d > "$out"
+printf '%s' "$(printf '%s\n' "$reply" | head -n 1)"

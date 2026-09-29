@@ -1,0 +1,9 @@
+# A one-shot critic through the Claude Code CLI in print mode (claude -p), run as a plain command.
+# The verdict comes from its SUMMARY line; a run with no SUMMARY is an error, never GO.
+# Model usage is billed on every run, so it reviews on the first card and again when you reply
+# "review". Add ",task" to at= to also review every task /task writes (one call per task).
+review=command -v claude >/dev/null 2>&1 || { echo "the claude CLI is not on PATH" >&2; exit 3; }; out=$(claude -p "You review a software plan, given on stdin, as a skeptical senior engineer. Print only lines of these forms and nothing else. FINDING|<critical, high, medium or low>|<a short kebab-case slug naming the issue, the same slug for the same issue on every run>|<L followed by the line number, or D followed by the deliverable number, or ->|<a one-line title>. Optionally after a finding: Q|<a closed question> (default: <the answer you would pick>). End with exactly one line: SUMMARY|verdict=nogo if a critical or high finding must be fixed before building, else SUMMARY|verdict=go." < "$ACFW_SPEC_FILE") || exit 2; printf '%s\n' "$out"; printf '%s\n' "$out" | grep -q '^SUMMARY|verdict=' || { echo "claude printed no SUMMARY line" >&2; exit 2; }; printf '%s\n' "$out" | grep -q '^SUMMARY|verdict=nogo' && exit 1; exit 0
+at=plan
+policy=advisory
+rerun=ask
+timeout=300

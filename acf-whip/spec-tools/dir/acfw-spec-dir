@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# acfw-spec-dir: a folder as a spec workbench (an Obsidian vault, iCloud Drive, Dropbox, a network
+# share). push copies the frozen plan to $ACFW_WORKBENCH_DIR/<cycle-id>.md, you edit it there with
+# any editor or on any synced device, and pull hands it back for acfw-spec's 3-way merge. It is also
+# the offline test double for the workbench round-trip. Protocol: spec-tools/CONTRACT.md.
+#
+# A synced folder changes behind your back: a phone edit can land after the last pull (or a pull can
+# read a copy the sync client had not updated yet). So the driver remembers, in $ACFW_SPEC_STATE,
+# the hash of what it last wrote or read. A push that would overwrite a folder copy matching neither
+# that nor the new bytes saves the copy aside, refuses once (exit 3) and names it; the next push
+# overwrites. Nothing typed into the folder is ever lost without a copy.
+set -u
+verb="${ACFW_SPEC_VERB:-${1:-}}"
+dir="${ACFW_WORKBENCH_DIR:-}"
+if [ "$verb" = capabilities ]; then
+  echo "VERBS|push pull from"
+  echo "NEEDS|ACFW_WORKBENCH_DIR"
+  echo "EGRESS|local folder ${dir:-(ACFW_WORKBENCH_DIR unset)}"
+  exit 0
+fi
+[ -n "$dir" ] || { echo "ACFW_WORKBENCH_DIR is not set" >&2; echo "HINT|export ACFW_WORKBENCH_DIR=<folder>, for example a synced notes vault"; exit 3; }
+[ -d "$dir" ] || { echo "ACFW_WORKBENCH_DIR is not a directory: $dir" >&2; exit 3; }
+# A ref is a bare file name inside the folder: never a path, so it can never escape the folder.
+name_ok() { case "$1" in ''|*/*|.*) return 1 ;; esac; return 0; }
+state="${ACFW_SPEC_STATE:-}"
+sum() { git hash-object "$1" 2>/dev/null || cksum < "$1"; }
+remember() { [ -n "$state" ] && [ -d "$state" ] && sum "$dir/$name" > "$state/$name.sha"; return 0; }
+case "$verb" in
+  push)
+    name="${ACFW_SPEC_REF:-${ACFW_SPEC_KEY:-}.md}"
+    name_ok "$name" || { echo "refusing workbench name '$name'" >&2; exit 2; }
+    if [ -f "$dir/$name" ] && ! cmp -s "$ACFW_SPEC_FILE" "$dir/$name"; then
+      cur=$(sum "$dir/$name")
+      if [ -z "$state" ] || [ ! -d "$state" ]; then
+        echo "the workbench already has $dir/$name and ACFW_SPEC_STATE is unset, so its sync history is unknown: not overwriting it" >&2; exit 3
+      elif [ "$cur" != "$(cat "$state/$name.sha" 2>/dev/null)" ]; then
+        aside="$state/unsynced-$(date -u +%Y%m%dT%H%M%SZ)-$name"
+        cp "$dir/$name" "$aside" || exit 2
+        echo "$cur" > "$state/$name.sha"   # acknowledged: the next push may overwrite it
+        echo "the workbench copy $dir/$name changed since this checkout last synced it: nothing was overwritten, and a copy is saved at $aside" >&2
+        echo "HINT|merge that copy first: /whip --pull --file '$aside', then push again (the next push replaces the folder copy)"
+        exit 3
+      fi
+    fi
+    if ! cmp -s "$ACFW_SPEC_FILE" "$dir/$name" 2>/dev/null; then
+      # Temp file + rename in the same folder, so a sync client never uploads half a plan.
+      cat "$ACFW_SPEC_FILE" > "$dir/.$name.acfw.$$" && mv -f "$dir/.$name.acfw.$$" "$dir/$name" || exit 2
+    fi
+    remember
+    echo "REF|$name"; echo "URL|file://$dir/$name"
+    echo "HINT|edit $dir/$name, then run /whip --pull" ;;
+  pull|from)
+    if [ "$verb" = pull ]; then name="${ACFW_SPEC_REF:-${ACFW_SPEC_KEY:-}.md}"
+    else
+      # from takes a name in the folder, or a path to a file IN the folder. A path elsewhere is not
+      # this workbench's to read: reducing it to its basename silently imported a same-named, unrelated
+      # file from the folder. Compared physically, so a symlinked or /tmp vs /private/tmp spelling agrees.
+      name="${ACFW_SPEC_REF##*/}"
+      case "$ACFW_SPEC_REF" in
+        */*) if [ "$(cd "$(dirname "$ACFW_SPEC_REF")" 2>/dev/null && pwd -P)" != "$(cd "$dir" && pwd -P)" ]; then
+               echo "$ACFW_SPEC_REF is not in the workbench folder $dir" >&2
+               echo "HINT|to start a cycle from a file elsewhere, import it directly: /whip $ACFW_SPEC_REF"; exit 3
+             fi ;;
+      esac
+    fi
+    name_ok "$name" || { echo "refusing workbench name '$name'" >&2; exit 2; }
+    [ -f "$dir/$name" ] || { echo "not in the workbench: $dir/$name" >&2; exit 3; }
+    cat "$dir/$name" > "$ACFW_SPEC_OUT/remote.md" || exit 2
+    [ "$verb" = pull ] && remember
+    echo "REF|$name" ;;
+  *)
+    echo "the dir workbench does not offer '$verb'" >&2
+    echo "HINT|dir is a workbench only: use /whip --push and /whip --pull"
+    exit 3 ;;
+esac
