@@ -39,6 +39,10 @@ phase19-doctor-graph
 phase19-research-preflight
 phase9-adapter-multica
 phase9-adapter-linear
+phase20-cycle
+phase21-spec-tools
+phase21-gaptrap-driver
+phase22-cycle-e2e
 $OPTIONAL
 "
 SUITES_MJS="
@@ -54,6 +58,8 @@ phase19-routing
 phase15-first-run-autoreject
 phase16-gate-legibility
 phase17-template-drift
+phase20-task-plan
+phase21-spec-task
 "
 
 TOTAL_PASS=0 TOTAL_FAIL=0 FAILED_SUITES="" SKIPPED=""
@@ -142,6 +148,33 @@ for b in skills/lib/bin/acfw-child-scaffold skills/lib/bin/acfw-child-validate s
     printf '  %-34s FAIL  (syntax error or not chmod +x)\n' "$(basename "$b")"; STATIC_FAIL=1
   fi
 done
+# The 3.5.0 cycle engines and the shipped spec-tool drivers. acfw-cycle and acfw-spec are invoked
+# as `bash <path>` by the skills, but acfw-cycle runs `acfw-spec` only when it is executable next to
+# it, and driver discovery requires an executable acfw-spec-<name>: a lost mode bit turns the spec
+# gate off silently instead of failing. So both halves are checked, like the child scripts above.
+for b in skills/lib/bin/acfw-cycle skills/lib/bin/acfw-spec spec-tools/*/acfw-spec-*; do
+  if [ -x "$b" ] && bash -n "$b" 2>/dev/null; then
+    printf '  %-34s ok    (syntax + executable)\n' "$(basename "$b")"
+  else
+    printf '  %-34s FAIL  (syntax error or not chmod +x)\n' "$(basename "$b")"; STATIC_FAIL=1
+  fi
+done
+if bash -n skills/lib/acfw-plan.sh 2>/dev/null; then
+  printf '  %-34s ok    (syntax)\n' 'acfw-plan.sh'
+else
+  printf '  %-34s FAIL  (syntax)\n' 'acfw-plan.sh'; STATIC_FAIL=1
+fi
+# Claude Code substitutes only the BRACED ${CLAUDE_PLUGIN_ROOT} when it loads a skill. A bare
+# $CLAUDE_PLUGIN_ROOT is left for the shell, where nothing guarantees it is set, so a command in
+# that block can run against /skills/... and fail.
+# -E, not a BRE `\|`: alternation in a basic regex is a GNU extension.
+UNBRACED=$(grep -nE '\$CLAUDE_PLUGIN_ROOT([^}]|$)' skills/*/SKILL.md 2>/dev/null || true)
+if [ -z "$UNBRACED" ]; then
+  printf '  %-34s ok    (every SKILL.md braces ${CLAUDE_PLUGIN_ROOT})\n' 'skill-plugin-root'
+else
+  printf '  %-34s FAIL  (unbraced $CLAUDE_PLUGIN_ROOT; Claude Code expands only the braced form)\n' 'skill-plugin-root'
+  printf '%s\n' "$UNBRACED" | sed 's/^/      /'; STATIC_FAIL=1
+fi
 # Adapters were outside every static gate: a syntax error in one is invisible until a run
 # hits that backend, and three of the four have no offline suite at all.
 for a in adapters/*/acfw-store-*; do
@@ -215,8 +248,10 @@ done
 # fixed it introduced the same shape into apply-transition.sh, where `exit "$rc"` exited 0 while a
 # commit had failed and deliverables sat staged. It is invisible in review and in testing (the happy
 # path is identical), so it gets a grep.
+# --others --exclude-standard: untracked scripts too. A plain `git ls-files` lists only what is
+# committed, so a new script was invisible to this gate until after the commit that shipped it.
 NEG_FAIL=0
-for f in $(git ls-files '*.sh' 'skills/lib/bin/*' 'adapters/*/acfw-store-*' 2>/dev/null); do
+for f in $(git ls-files --cached --others --exclude-standard -- '*.sh' 'skills/lib/bin/*' 'adapters/*/acfw-store-*' 'spec-tools/*/acfw-spec-*' 2>/dev/null); do
   [ -f "$f" ] || continue
   HIT=$(awk 'prev ~ /^[[:space:]]*if[[:space:]]*!/ && $0 ~ /(rc|RC)=\$\?/ {print NR} {prev=$0}' "$f" 2>/dev/null)
   if [ -n "$HIT" ]; then
