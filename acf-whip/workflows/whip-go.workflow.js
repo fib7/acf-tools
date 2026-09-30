@@ -2193,7 +2193,10 @@ Return the ScanResult.`
   // A mismatch is routed into the SAME retry -> text-fallback ladder as an unparseable echo, because
   // the remedy is identical (ask again) — only the terminal reason differs, and it has to: telling an
   // operator the scan "degraded" when the board was silently halved sends them to the wrong place.
-  let snap = null, relayShort = null
+  // relayVerified: this iteration's payload matched a header the producer wrote, so what arrived is
+  // exactly what the store emitted. The scope cross-check below reads it to tell a store-side
+  // inconsistency from a relay loss.
+  let snap = null, relayShort = null, relayVerified = false
   const parseScan = (sc) => {
     if (!sc) return null
     let o = null
@@ -2202,6 +2205,7 @@ Return the ScanResult.`
     if (!rc.ok) { relayShort = rc; log(`iter ${iter}: RELAY SHORT — ${rc.why}`); return null }
     if (rc.unverifiable && iter === 1 && !relayWarned) { relayWarned = true; log('note: this store emits no relay header, so snapshot completeness cannot be verified (third-party adapter)') }
     relayShort = null
+    relayVerified = !rc.unverifiable
     return o
   }
   snap = parseScan(scan)
@@ -2224,7 +2228,7 @@ Return the ScanResult.`
     const fb = await textScanFallback(`scan#${iter}:text`)
     if (fb) {
       const rcf = relayCheck(fb, store)
-      if (rcf.ok) { snap = fb; relayShort = null; log(`iter ${iter}: recovered snapshot via text fallback (doctor recheck skipped this iteration)`) }
+      if (rcf.ok) { snap = fb; relayShort = null; relayVerified = !rcf.unverifiable; log(`iter ${iter}: recovered snapshot via text fallback (doctor recheck skipped this iteration)`) }
       else { relayShort = rcf; log(`iter ${iter}: text fallback ALSO incomplete — ${rcf.why}`) }
     }
   }
@@ -2336,6 +2340,16 @@ Return the ScanResult.`
     ])
     const missingFromIndex = resolvedVals.filter((st) => !idx.byStem.has(st) && !idx.satByStem.has(st) && !heldOut.has(st))
     const unaccounted = ONLY.filter((tok) => !accountedFor.has(tok))
+    // A stem missing under a VERIFIED header was never lost in transit: the payload matched the count
+    // and the stem checksum the store wrote, so the store emitted a snapshot that contradicts its own
+    // scope. That is a defect in the snapshot script, and the relay remedies (re-run, narrow, raise the
+    // shell model) cannot fix it. The run stops exactly as before; only the diagnosis differs.
+    // `unaccounted` stays a relay failure, because scope metadata sits outside what the header covers.
+    if (missingFromIndex.length && !unaccounted.length && relayVerified) {
+      stopReason = 'snapshot-inconsistent'
+      await unlock('Iterate')
+      return { aborted: true, stopReason, reason: `the store resolved ${resolvedVals.length} of the tasks you named, so the ids are NOT missing from the backlog, and the snapshot arrived intact (its relay header verified), but it does not contain ${missingFromIndex.join(', ')}. The store emitted a snapshot that contradicts its own scope. That is a defect in the snapshot script, not a relay loss, so re-running /go or raising the shell model will not help. Nothing was dispatched. Report it with the output of: acfw-store snapshot --digest --mode ${mode}${ONLY_FLAGS}`, scopeFilter: SCOPE_FILTER, scopedTo: ONLY, mode, iteration: iter, ...abortWarnings() }
+    }
     if (missingFromIndex.length || unaccounted.length) {
       stopReason = 'relay-truncated'
       await unlock('Iterate')

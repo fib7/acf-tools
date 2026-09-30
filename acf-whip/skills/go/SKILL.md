@@ -378,11 +378,16 @@ across iterations**. The legacy loop grows your context every iteration. Prefer 
      a snapshot that arrives *without* one is also `relay-truncated`: a model that drops entries is
      at least as likely to drop a header it does not understand. Only a third-party adapter may omit
      it. There the run says once that it could not verify completeness, and carries on.
+     `stopReason: 'snapshot-inconsistent'` is different. The header verified, so the payload
+     arrived exactly as the store emitted it, but a task the store itself resolved is missing from
+     it. The snapshot script contradicted itself. Nothing was dispatched. Re-running and raising
+     `models.shell` will not help, so do not suggest them. Tell the operator to report it with the
+     snapshot command the reason quotes.
 
    `stopReason: 'scope-unresolved'` still means an id in `only` matched no task, but only when the
    store itself could not resolve it. A resolved id missing from the relayed snapshot is reported as
-   a relay failure instead, because "check the ids" is the wrong advice for someone whose ids were
-   fine. `'gated[]'` explains a `no-progress` exit by naming the dependency each pending task is
+   a relay failure instead (`snapshot-inconsistent` when the header verified), because "check the
+   ids" is the wrong advice for someone whose ids were fine. `'gated[]'` explains a `no-progress` exit by naming the dependency each pending task is
    waiting on.
 
    Also surface `escalation{}` and `agentsUsed`/`agentCap`. Without them an operator cannot tell a

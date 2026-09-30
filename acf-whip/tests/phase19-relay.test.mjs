@@ -221,9 +221,12 @@ const FIVE = ['t1', 't2', 't3', 't4', 't5'].map((s, i) => ({ stem: s, slug: `s${
   check('4g ...and says "Scope", never "Backlog"', /Scope 100%/.test(r.report.note || ''))
 }
 
-// ============================ 5. resolved-but-absent is a relay failure ======================
-// The store resolved the seed, so the id EXISTS. If the relayed payload lacks it, that is the hop
-// losing data — the one case where calling it a bad id is a lie the operator cannot see through.
+// ============================ 5. resolved-but-absent: never a missing id ======================
+// The store resolved the seed, so the id EXISTS; calling it a bad id is a lie the operator cannot see
+// through. WHICH failure it is depends on the header. Here the header matches the payload that
+// arrived, so the hop delivered exactly what the store emitted: the STORE emitted a snapshot that
+// contradicts its own scope. Re-running or raising the shell model (the relay remedies) cannot help,
+// so it has its own reason. The check is not loosened; the run still stops before dispatching.
 {
   const r = await runGo({
     tasks: FIVE,
@@ -231,10 +234,25 @@ const FIVE = ['t1', 't2', 't3', 't4', 't5'].map((s, i) => ({ stem: s, slug: `s${
     scopeMeta: () => ({ resolved: { t3: 't3' } }),
     onScan: (n, snap) => withRelay(Object.assign({}, snap, { tasks: snap.tasks.filter((t) => t.stem !== 't3') })),
   })
-  check('5a a resolved-but-absent stem is a relay failure', r.report.stopReason === 'relay-truncated')
+  check('5a a resolved-but-absent stem under a VERIFIED header is a store-side inconsistency',
+    r.report.stopReason === 'snapshot-inconsistent')
   check('5b ...explicitly NOT a missing id', /NOT missing from the backlog/.test(r.report.reason || ''))
-  check('5c nothing was dispatched', r.calls.legacy.length === 0)
-  check('5d the lock is released (nothing ran, so nothing needs protecting)', r.calls.unlock.length === 1)
+  check('5c ...and not sent to the relay remedies', !/name fewer tasks/.test(r.report.reason || '') && /will not help/.test(r.report.reason || ''))
+  check('5d nothing was dispatched', r.calls.legacy.length === 0)
+  check('5e the lock is released (nothing ran, so nothing needs protecting)', r.calls.unlock.length === 1)
+}
+// Without a header to verify against (a third-party adapter may omit it), the hop cannot be ruled
+// out, so the same absence stays a relay failure with the relay remedies.
+{
+  const r = await runGo({
+    tasks: FIVE,
+    goArgs: { only: ['t3'], store: 'acme-tracker' },
+    scopeMeta: () => ({ resolved: { t3: 't3' } }),
+    onScan: (n, snap) => Object.assign({}, snap, { tasks: snap.tasks.filter((t) => t.stem !== 't3') }),
+  })
+  check('5f an UNVERIFIABLE payload missing a resolved stem is still a relay failure', r.report.stopReason === 'relay-truncated')
+  check('5g ...still NOT a missing id', /NOT missing from the backlog/.test(r.report.reason || ''))
+  check('5h nothing was dispatched', r.calls.legacy.length === 0)
 }
 
 // ============================ 6. a genuinely unknown id still refuses =======================
