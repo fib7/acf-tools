@@ -2,6 +2,54 @@
 
 All notable changes to acf-whip. The format loosely follows Keep a Changelog.
 
+## 3.6.1: a scoped run keeps the finished tasks it refers to
+
+On every store except `files`, a scoped `/go` lost finished tasks from its snapshot. A scoped run is
+any run with a focus (a bare `/go`), `/go <ids>`, a filter, or a `/whip --auto` step. The defect
+dates from 3.4.0, when the post-stage that narrows an API-backed store's snapshot was added. 3.6.0
+made scoped runs the normal path.
+
+### Fixed
+
+- **A scoped run stopped as `relay-truncated` when one of its tasks finished.** The post-stage
+  (`skills/lib/bin/acfw-scope-snapshot.sh`) first cut `tasks[]` down to the unfinished closure. Only
+  then did it choose its `satisfiedDeps` entries, from what was left, so a finished seed ended up in
+  neither array. The relay header was computed after the drop, so the relay verified, and the
+  orchestrator correctly refused a run whose own seed had vanished. When this hit depended on the
+  mode:
+  - in override mode, at a seed's acceptance;
+  - in default mode, at its integration, or at its acceptance for a `slug: none` task;
+  - a run scoped to work that was already finished stopped on its first iteration.
+
+  Finished tasks the view refers to are now chosen from the whole board and carried as
+  `satisfiedDeps` entries, as the `files` scanner has done since 3.4.0.
+- **A scoped task whose dependency was already done never dispatched.** The same drop removed the
+  dependency, so the task's dependency token dangled. The scheduler never dispatches past a dangling
+  token, and the run ended `no-progress`. The doctor could not see it, because it reads the full
+  snapshot from before narrowing. `acfw-focus status --live` also reported a finished focused task
+  as `<not found>` on these stores.
+- **An unscoped `--digest` dropped a finished dependency named by a stem prefix.** It kept a
+  finished target only on an exact stem or id match, while the scheduler also resolves a prefix.
+  Retention now resolves each token the way the scheduler does.
+- **The snapshot's `mode` said `default` under override** on every API-backed store. The enricher
+  filled in a default, and the stage that applies the mode never wrote it back. Both now record the
+  mode the snapshot was taken with.
+- **A snapshot that contradicts itself is no longer reported as a relay loss.** The orchestrator's
+  check stays as strict as before. When a payload with a verified relay header lacks a task the store
+  itself resolved, the run now stops as `snapshot-inconsistent` instead of `relay-truncated`. The
+  payload arrived intact, so the fault is in the snapshot script, and the old advice (re-run, or raise
+  `models.shell`) could not help.
+
+### Tests
+
+- `phase9-dispatcher`: the assertions that pinned the drop (`relay.sat == 0`) now require the
+  finished dependency in `satisfiedDeps`. A new matrix covers mode × digest × seeds, crossed with the
+  three ways a task counts as finished. For every cell it asserts that every resolved seed is in the
+  payload and that every dependency token resolves within it.
+- `phase19-relay`: every earlier case builds the producer's output by hand, and test 9 builds the
+  *correct* producer, which is why the defect went unseen. New cases pipe the board through the real
+  post-stage, driven by the real workflow body.
+
 ## 3.6.0: `/whip --auto` runs the cycle until a judge finds the goal met
 
 The 3.5.0 cycle hands control back to you after every step. `/whip "<goal>"` prints `/task`, `/task`

@@ -299,6 +299,18 @@ the project committed `ACFW_AUTOPILOT=approve`. Even then, the hook approves onl
 drafted (`approve --via autopilot`), never one that loosens a control, and never overrides, retires
 a lesson or pushes.
 
+**3.6.1 keeps the finished tasks a scoped snapshot refers to.** On every store except `files`,
+`acfw-scope-snapshot.sh` narrowed `tasks[]` to the unfinished closure *before* choosing its
+`satisfiedDeps` entries, so a finished seed or dependency was in neither array. The relay header
+was computed after the drop, so it still verified. A scoped run stopped as `relay-truncated` when a
+seed finished, a run scoped to finished work stopped on iteration 1, and a seed whose dependency was
+already done never dispatched. The defect dates from 3.4.0; 3.6.0's autopilot made scoped runs the
+common path. Retention is now chosen from the whole board, as the `files` scanner does, and new tests
+pipe boards through the *real* post-stage instead of a hand-built model of it. Also fixed: the
+snapshot's `mode` label said `default` under override. And a missing resolved task under a verified
+header now stops as `snapshot-inconsistent`, since the payload arrived intact and the relay remedies
+cannot help.
+
 See `acf-whip/CHANGELOG.md` for version history and `acf-whip/content/backlog/workflow.md` for the
 state-machine spec.
 
