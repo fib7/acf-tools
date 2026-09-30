@@ -185,7 +185,7 @@ case "$SUB" in
     else
       # Raw adapters know nothing about git: merge in the LP-CAS integration oracle,
       # worktree-branch facts, and the terminal-count model.
-      ENRICHED=$(printf '%s\n' "$OUT" | bash "$LIB_DIR/bin/acfw-enrich-snapshot.sh" "$REPO_ROOT") || exit $?
+      ENRICHED=$(printf '%s\n' "$OUT" | bash "$LIB_DIR/bin/acfw-enrich-snapshot.sh" --mode "$SNAP_MODE" "$REPO_ROOT") || exit $?
       # Tee the FULL snapshot before any narrowing. `doctor --snapshot` refuses a narrowed or digest
       # snapshot by design (the graph invariants are whole-graph properties), so the file written here
       # must be the pre-collapse one — that is what lets the scheduler and the doctor observe the SAME

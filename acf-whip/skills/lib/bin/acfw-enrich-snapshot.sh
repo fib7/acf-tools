@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # acfw-enrich-snapshot.sh — turn a RAW adapter snapshot into a full BacklogSnapshot.
 #
-# Usage: <adapter snapshot stdout> | acfw-enrich-snapshot.sh <repo-root>
+# Usage: <adapter snapshot stdout> | acfw-enrich-snapshot.sh [--mode override|default] <repo-root>
+#
+# --mode records the integration mode the snapshot is taken for (the dispatcher forwards the one it
+# was given). Without it the adapter's own `mode` stands, else "default".
 #
 # Adapters without the `snapshot-enriched` capability (beads, multica, third-party)
 # know nothing about git. This enricher adds every git-derived fact the whip-go
@@ -26,7 +29,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 command -v jq >/dev/null 2>&1 || { echo "FATAL: acfw-enrich-snapshot.sh requires jq" >&2; exit 5; }
 
-REPO_ROOT="${1:-${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}}"
+SNAP_MODE=""
+REPO_ARG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode)   [ $# -ge 2 ] || { echo "FATAL: --mode requires a value (override|default)" >&2; exit 2; }
+              SNAP_MODE="$2"; shift 2 ;;
+    --mode=*) SNAP_MODE="${1#--mode=}"; shift ;;
+    *)        REPO_ARG="${REPO_ARG:-$1}"; shift ;;
+  esac
+done
+[ -z "$SNAP_MODE" ] || [ "$SNAP_MODE" = "override" ] || SNAP_MODE=default
+REPO_ROOT="${REPO_ARG:-${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}}"
 [ -n "$REPO_ROOT" ] || { echo "FATAL: repo root unknown" >&2; exit 2; }
 
 # ---- git facts (mirrors scan-backlog.sh) ----
@@ -71,6 +85,7 @@ jq \
   --argjson timeoutH "$TIMEOUT_H" \
   --argjson now "$NOW_S" \
   --arg genTs "$GEN_TS" \
+  --arg snapMode "$SNAP_MODE" \
   --argjson ik "$IK_JSON" \
   --argjson wt "$WT_JSON" \
   --argjson wts "$WTS_JSON" '
@@ -139,7 +154,7 @@ jq \
       detachedHead: $detached,
       countsOnly: (.countsOnly // false),
       digest: (.digest // false),
-      mode: (.mode // "default"),
+      mode: (if $snapMode != "" then $snapMode else (.mode // "default") end),
       generatedAt: (.generatedAt // $genTs),
       inProgressTimeoutHours: $timeoutH,
       branchPrefix: $branchPrefix,

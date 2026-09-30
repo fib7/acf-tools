@@ -220,7 +220,8 @@ printf '%s' "$IN" | jq -c --arg mode "$MODE" --arg only "$ONLY" --argjson wantDi
   | ( [ ($outTasks[], $inactive2[], $outSat[]) | (.stem // "") | utf8bytelength ] | add // 0 ) as $rbytes
 
   | ( $snap
-      + { tasks: $outTasks, inactive: $inactive2, satisfiedDeps: $outSat }
+      # mode: the definition of "terminal" this stage applied, whatever an earlier stage filled in.
+      + { mode: $mode, tasks: $outTasks, inactive: $inactive2, satisfiedDeps: $outSat }
       + (if $dg.didCollapse then {digest: true} else {} end)
       + (if $closure == null then {} else {
           scopeApplied: true,

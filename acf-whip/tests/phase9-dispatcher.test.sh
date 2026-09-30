@@ -550,6 +550,7 @@ if command -v jq >/dev/null 2>&1; then
           CELL="[$VAR/$M/${DG:-full}/${SEEDS// /+}]"
           check "$CELL I1 every resolved seed is in the payload" "printf '%s' \"\$OUT\" | jq -e '$INV_I1' >/dev/null"
           check "$CELL I2 every dependency token resolves in the payload" "printf '%s' \"\$OUT\" | jq -e '$INV_I2' >/dev/null"
+          check "$CELL I3 the snapshot names the mode it applied" "printf '%s' \"\$OUT\" | jq -e '.mode == \"$M\"' >/dev/null"
           # Where A must be: a full record while it still has to be integrated (default, live branch,
           # no marker), otherwise a satisfiedDeps entry. Never in tasks[] once it is finished, or the
           # scoped view would carry work nobody may dispatch.
@@ -577,6 +578,14 @@ if command -v jq >/dev/null 2>&1; then
   check "--full-to writes a file" "[ -s \"\$FULLF\" ]"
   check "...holding the FULL board, not the narrowed view" "[ \"\$(jq -r '.tasks|length' \"\$FULLF\")\" = '5' ]"
   check "...unmarked by the narrowing that followed it" "! jq -e '.scopeApplied == true' \"\$FULLF\" >/dev/null"
+  # The label is the mode the snapshot was TAKEN with, on both copies. The enricher used to fill in
+  # "default" and the post-stage never wrote the applied mode back, so an override snapshot said
+  # "default" to anyone debugging from it.
+  FULLO="$WORK/full-snap-ovr.json"
+  S_MO=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot --digest --mode override --only ui-021-login --full-to "$FULLO")
+  check "an override snapshot says override" "printf '%s' \"\$S_MO\" | jq -e '.mode == \"override\"' >/dev/null"
+  check "...and so does its full tee" "jq -e '.mode == \"override\"' \"\$FULLO\" >/dev/null"
+  check "a snapshot taken without --mode says default" "printf '%s' \"\$S_PLAIN\" | jq -e '.mode == \"default\"' >/dev/null"
   # This is the point of the tee: doctor --snapshot refuses a narrowed/digest file by design, so the
   # file must be the pre-collapse one or the dispatcher would have to walk the store a second time.
   STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" doctor --snapshot "$FULLF" >/dev/null 2>&1; RC=$?
