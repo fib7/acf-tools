@@ -442,6 +442,10 @@ if command -v jq >/dev/null 2>&1; then
     "printf '%s' \"\$S_ONLY\" | jq -e '.scope.added|index(\"api-014-token\")' >/dev/null"
   check "...and stopping at a terminal-accepted one" \
     "! printf '%s' \"\$S_ONLY\" | jq -e '[.tasks[].stem]|index(\"db-001-schema\")' >/dev/null"
+  # Stopping is not dropping. api-014-token still depends on it, and a token the payload cannot resolve
+  # is dangling to the scheduler, which never dispatches past one.
+  check "...while carrying it in satisfiedDeps, so the task that depends on it can resolve it" \
+    "printf '%s' \"\$S_ONLY\" | jq -e '[.satisfiedDeps[].stem]|index(\"db-001-schema\")' >/dev/null"
   check "...never touching an unrelated task" \
     "! printf '%s' \"\$S_ONLY\" | jq -e '[.tasks[].stem]|index(\"unrelated-777\")' >/dev/null"
   check "--only sets scopeApplied" "printf '%s' \"\$S_ONLY\" | jq -e '.scopeApplied == true' >/dev/null"
@@ -455,13 +459,13 @@ if command -v jq >/dev/null 2>&1; then
   check "...and a scoped count is reported alongside" "printf '%s' \"\$S_ONLY\" | jq -e '.scopeCounts.total == 2' >/dev/null"
 
   # relay: the consumer must be able to PROVE it received everything the producer emitted.
-  check "relay header is emitted" "printf '%s' \"\$S_ONLY\" | jq -e '.relay.n == 2' >/dev/null"
+  check "relay header is emitted" "printf '%s' \"\$S_ONLY\" | jq -e '.relay.n == 3' >/dev/null"
   check "relay is the FIRST key (a tail-elided echo still carries the expectation)" \
     "printf '%s' \"\$S_ONLY\" | grep -q '^{\"relay\":'"
   check "relay counts each array separately (a short payload names which one)" \
-    "printf '%s' \"\$S_ONLY\" | jq -e '.relay.tasks == 2 and .relay.inactive == 0 and .relay.sat == 0' >/dev/null"
-  check "relay.bytes is the stem byte sum" \
-    "[ \"\$(printf '%s' \"\$S_ONLY\" | jq -r '.relay.bytes')\" = \"\$(printf '%s' \"\$S_ONLY\" | jq -r '[.tasks[].stem|length]|add')\" ]"
+    "printf '%s' \"\$S_ONLY\" | jq -e '.relay.tasks == 2 and .relay.inactive == 0 and .relay.sat == 1' >/dev/null"
+  check "relay.bytes is the stem byte sum over every array" \
+    "[ \"\$(printf '%s' \"\$S_ONLY\" | jq -r '.relay.bytes')\" = \"\$(printf '%s' \"\$S_ONLY\" | jq -r '[(.tasks[],.inactive[],.satisfiedDeps[]).stem|utf8bytelength]|add')\" ]"
 
   # An unscoped snapshot carries the header too — the relay hop is the same on every path.
   S_PLAIN=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$SCOPE_SNAP" bash "$STORE" snapshot)
@@ -514,6 +518,58 @@ if command -v jq >/dev/null 2>&1; then
   S_OVR=$(STUB_CAPS="$RAWCAPS" STUB_SNAPSHOT="$BR_SNAP" bash "$STORE" snapshot --digest --mode override)
   check "override collapses an accepted code task that default would keep" \
     "[ \"\$(printf '%s' \"\$S_OVR\" | jq -r '[.tasks[].stem]|index(\"solo-500-acc\")//\"gone\"')\" = 'gone' ]"
+
+  # ---- a narrowed view never refers to a task it does not carry (3.6.1) ----
+  # The post-stage narrowed tasks[] to the unfinished closure and only THEN chose which finished tasks
+  # to keep as satisfiedDeps, from what was left. A finished task the scope named, or depended on, was
+  # therefore in neither array. The header was computed after the drop, so the relay verified; the
+  # scheduler refused the run because its own seed had vanished, or never dispatched the dependent
+  # because its token dangled. Driven on the script directly: the enricher recomputes the ledger and
+  # branch facts from git, and each variant below needs them set.
+  SCOPE="$ACF_WHIP/skills/lib/bin/acfw-scope-snapshot.sh"
+  # I1: every stem the store resolved is in the payload (the scheduler's own check).
+  # I2: every dependency token of every emitted record resolves within the payload, by the scheduler's
+  #     rules: exact id, exact stem, then stem prefix, over records and satisfiedDeps alike.
+  INV_I1='. as $p | [($p.scope.resolved // {})[]] | all(. as $s | [($p.tasks[],$p.inactive[],$p.satisfiedDeps[]) | .stem] | index($s) != null)'
+  INV_I2='. as $p | [($p.tasks[],$p.inactive[]) | (.deps // [])[]] | all(. as $k | [$p.tasks[],$p.inactive[],$p.satisfiedDeps[]] | any((.id // "") == $k or (.stem // "") == $k or ((.stem // "") | startswith($k))))'
+  # A (API-14) is finished three ways; B (UI-21) is pending and depends on it by id.
+  for VAR in live none integrated; do
+    case "$VAR" in
+      live)       A_SLUG=api;  A_IA=false; A_WB=true ;;   # accepted, branch unmerged: default must still integrate it
+      none)       A_SLUG=none; A_IA=false; A_WB=false ;;
+      integrated) A_SLUG=api;  A_IA=true;  A_WB=true ;;
+    esac
+    BOARD='{"counts":{},"inactive":[],"satisfiedDeps":[],"tasks":[
+      {"stem":"api-014-token","id":"API-14","backendId":"MUL-14","folder":"accepted","slug":"'"$A_SLUG"'","hasIntegratedAt":'"$A_IA"',"hasWorktreeBranch":'"$A_WB"',"deps":[]},
+      {"stem":"ui-021-login","id":"UI-21","backendId":"MUL-21","folder":"pending","slug":"ui","hasIntegratedAt":false,"hasWorktreeBranch":false,"deps":["API-14"]}]}'
+    for M in override default; do
+      for DG in "" --digest; do
+        for SEEDS in "API-14 UI-21" "UI-21"; do
+          OA=(); for s in $SEEDS; do OA+=(--only "$s"); done
+          OUT=$(printf '%s' "$BOARD" | bash "$SCOPE" --mode "$M" $DG "${OA[@]}")
+          CELL="[$VAR/$M/${DG:-full}/${SEEDS// /+}]"
+          check "$CELL I1 every resolved seed is in the payload" "printf '%s' \"\$OUT\" | jq -e '$INV_I1' >/dev/null"
+          check "$CELL I2 every dependency token resolves in the payload" "printf '%s' \"\$OUT\" | jq -e '$INV_I2' >/dev/null"
+          # Where A must be: a full record while it still has to be integrated (default, live branch,
+          # no marker), otherwise a satisfiedDeps entry. Never in tasks[] once it is finished, or the
+          # scoped view would carry work nobody may dispatch.
+          if [ "$VAR" = live ] && [ "$M" = default ]; then WANT=tasks; else WANT=satisfiedDeps; fi
+          check "$CELL the finished task is carried in $WANT" \
+            "printf '%s' \"\$OUT\" | jq -e '[.${WANT}[].stem]|index(\"api-014-token\")' >/dev/null"
+          check "$CELL ...and tasks[] holds only what the scope may schedule" \
+            "printf '%s' \"\$OUT\" | jq -e '.scopeCounts.total == (.tasks|length) and (.tasks|map(.stem)|index(\"ui-021-login\")) != null' >/dev/null"
+        done
+      done
+    done
+  done
+  # Unscoped --digest had the same gap for a dependency token that is a stem PREFIX: the scheduler
+  # resolves it, but the digest kept a finished target only on an exact stem or id match.
+  PFX='{"counts":{},"inactive":[],"satisfiedDeps":[],"tasks":[
+    {"stem":"db-001-schema","id":"db-001-schema","folder":"accepted","slug":"none","hasIntegratedAt":false,"hasWorktreeBranch":false,"deps":[]},
+    {"stem":"ui-021-login","id":"ui-021-login","folder":"pending","slug":"ui","hasIntegratedAt":false,"hasWorktreeBranch":false,"deps":["db-001"]}]}'
+  OUT=$(printf '%s' "$PFX" | bash "$SCOPE" --mode default --digest)
+  check "unscoped --digest keeps a finished target named by a stem prefix" \
+    "printf '%s' \"\$OUT\" | jq -e '$INV_I2' >/dev/null"
 
   # ---- --full-to: one store walk feeds BOTH the scheduler and the doctor ----
   FULLF="$WORK/full-snap.json"

@@ -13,8 +13,8 @@
 #
 # WHY BOTH BACKENDS. Every scenario runs twice, against the files store and against the offline
 # multica fake (tests/fixtures/multica-fake.sh). They differ exactly where the cycle is most fragile:
-# a raw adapter's `snapshot --only` drops an accepted seed from tasks[] (it survives only in
-# scope.resolved), while the files scanner keeps it. A status that read coverage from tasks[] alone
+# a raw adapter's `snapshot --only` carries a finished seed in satisfiedDeps, not tasks[], while the
+# files scanner in full mode keeps it in tasks[]. A status that read coverage from tasks[] alone
 # would call every finished multica task a phantom and re-decompose it; a files-only suite would pass.
 #
 # WHY A PLUGIN COPY. `status --if-cycle` must make ZERO acfw-store calls (it runs after every /go, and
@@ -1281,8 +1281,10 @@ sc_phantom() {
   check "$S (fixture: the store resolves the real stem and not the ghost)" \
     "printf '%s' \"\$SNAP\" | jq -e '.scope.resolved[\"ph-001-real\"] == \"ph-001-real\" and (.scope.unresolved | index(\"ph-002-ghost\"))' >/dev/null"
   if [ "$STORE_NAME" = multica ]; then
-    check "$S (fixture: this backend drops the accepted seed from tasks[], the path under test)" \
+    check "$S (fixture: this backend keeps the accepted seed out of tasks[], the path under test)" \
       "printf '%s' \"\$SNAP\" | jq -e '[.tasks[] | select(.stem == \"ph-001-real\")] | length == 0' >/dev/null"
+    check "$S (fixture: ...and carries it in satisfiedDeps, so the id still resolves)" \
+      "printf '%s' \"\$SNAP\" | jq -e '[.satisfiedDeps[].stem] | index(\"ph-001-real\")' >/dev/null"
   fi
   cy status
   ck "$S status exits 0" rc_is 0

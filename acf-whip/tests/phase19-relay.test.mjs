@@ -352,5 +352,57 @@ const FIVE = ['t1', 't2', 't3', 't4', 't5'].map((s, i) => ({ stem: s, slug: `s${
   check('10h ...dispatching nothing', r.calls.legacy.length === 0)
 }
 
+// ============================ 11. the REAL raw-store post-stage, not a model of it ==============
+// Every case above hand-builds what the producer emits, and test 9 models it retaining a finished
+// seed. The raw-adapter post-stage (acfw-scope-snapshot.sh) did not: it narrowed tasks[] to the
+// unfinished closure FIRST and chose satisfiedDeps from what was left, so a finished task the scope
+// named or depended on was in neither array. The header was computed after the drop, so the relay
+// verified, and the consumer's check (correctly) refused a run whose own seed had vanished. Modelled
+// producers could not see that. Here the board goes through the real script, parsed from the very
+// command line the scan prompt carries.
+{
+  const { execFileSync, spawnSync } = await import('node:child_process')
+  const SCOPE = join(HERE, '..', 'skills', 'lib', 'bin', 'acfw-scope-snapshot.sh')
+  if (spawnSync('jq', ['--version']).status !== 0) {
+    ok('jq absent (real post-stage cases skipped)')
+  } else {
+    const realStage = (n, snap, prompt) => {
+      const argv = ['--mode', (/--mode (\w+)/.exec(prompt) || [])[1] || 'default']
+      if (/--digest/.test(prompt)) argv.push('--digest')
+      for (const m of prompt.matchAll(/--only '([^']*)'/g)) argv.push('--only', m[1])
+      const out = execFileSync('bash', [SCOPE, ...argv], { input: JSON.stringify(snap), encoding: 'utf8' })
+      return JSON.parse(out)
+    }
+    // Seed side. One slug, so the second seed waits a whole iteration behind the first: the scan that
+    // follows the first acceptance is exactly the one that used to lose it. In override an accepted
+    // task is terminal at once; in default a code task is terminal once integrated.
+    for (const mode of ['override', 'default']) {
+      const two = [{ stem: 'u1', slug: 'one' }, { stem: 'u2', slug: 'one' }]
+      const r = await runGo({ tasks: two, goArgs: { only: ['u1', 'u2'], mode }, onScan: realStage })
+      check(`11a ${mode}: a scoped run survives its first seed finishing (${r.report.stopReason})`,
+        r.report.stopReason === 'complete')
+      check(`11b ${mode}: ...and both seeds ran`, r.calls.legacy.length === 2)
+    }
+    // Dependency side. The seed depends on a task that was finished before the run started. Losing that
+    // dependency from the payload leaves the seed's token dangling, so it is never dispatched.
+    for (const mode of ['override', 'default']) {
+      const board = [
+        { stem: 'd1', slug: 'none', folder: 'accepted', hasIntegratedAt: true, hasWorktreeBranch: false },
+        { stem: 'd2', slug: 'two', deps: ['d1'] },
+      ]
+      const r = await runGo({ tasks: board, goArgs: { only: ['d2'], mode }, onScan: realStage })
+      check(`11c ${mode}: a seed whose dependency is already done is dispatched (${r.report.stopReason})`,
+        r.calls.legacy.length === 1 && r.report.stopReason === 'complete')
+    }
+    // A seed that was already done when the run started: legal, and the scope is simply complete.
+    {
+      const board = [{ stem: 'f1', slug: 'none', folder: 'accepted', hasIntegratedAt: true, hasWorktreeBranch: false }]
+      const r = await runGo({ tasks: board, goArgs: { only: ['f1'], mode: 'override' }, onScan: realStage })
+      check(`11d a run scoped to finished work reports it complete (${r.report.stopReason})`,
+        r.report.stopReason === 'complete' && r.calls.legacy.length === 0)
+    }
+  }
+}
+
 console.log(`\nphase19-relay: ${PASS} passed, ${FAIL} failed`)
 process.exit(FAIL ? 1 : 0)

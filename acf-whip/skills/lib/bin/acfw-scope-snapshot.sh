@@ -19,6 +19,10 @@
 #   --digest      collapse terminal-accepted tasks the same three ways the files scanner does
 #   --only K...   emit only the closure of the named tasks (seeds + their unmet dependencies)
 #
+# Either way, every finished task the emitted view still refers to (a seed, or a dependency of a
+# record emitted in full) is carried as a compact satisfiedDeps entry. A view never names a task it
+# does not carry.
+#
 # and state, in the output, exactly what was emitted, so the consumer can prove it received all of it.
 #
 # WHERE IT RUNS
@@ -173,26 +177,36 @@ printf '%s' "$IN" | jq -c --arg mode "$MODE" --arg only "$ONLY" --argjson wantDi
   | ( if $closure == null then $tasks    else [ $tasks[]    | select($closure.scope[.stem] // false) ] end ) as $tasks2
   | ( if $closure == null then $inactive else [ $inactive[] | select($closure.scope[.stem] // false) ] end ) as $inactive2
 
-  # ---- digest: the three-way split. A terminal-accepted task that something still depends on stays
-  # as a compact satisfiedDeps entry (dependency resolution must never see a null); one nothing
-  # depends on survives only in the aggregate counts; everything else is emitted in full. An
-  # accepted task with a live branch and no ledger marker is NOT terminal in default mode — it still
-  # has to be integrated — so it stays a full record and the integrator can still find it.
-  | ( [ $tasks2[] | select(.deps // [] | length > 0) | .deps[] ] ) as $depToks
-  | ( reduce $depToks[] as $d ({}; .[$d] = true) ) as $depSet
-  | ( if $wantDigest == 1
-      then
-        [ $tasks2[] | select( (. | acceptedTerminal) | not ) ] as $keep
-        | [ $tasks2[]
-            | select(. | acceptedTerminal)
-            | select( ($depSet[.stem] // false) or ($depSet[.id // ""] // false) )
-            | {stem: .stem, id: (.id // ""), backendId: (.backendId // "")} ] as $collapsed
-        | {tasks: $keep, sat: ($sat + $collapsed), didCollapse: (($tasks2 | length) != ($keep | length))}
-      else {tasks: $tasks2, sat: $sat, didCollapse: false}
-      end ) as $dg
+  # ---- the records emitted in full. A scoped view is exactly the closure, which holds no
+  # terminal-accepted task by construction. An unscoped --digest drops every terminal-accepted task
+  # from tasks[]. An accepted task with a live branch and no ledger marker is NOT terminal in default
+  # mode (it still has to be integrated), so it stays a full record and the integrator can find it.
+  | ( if $closure != null then $tasks2
+      elif $wantDigest == 1 then [ $tasks2[] | select( (. | acceptedTerminal) | not ) ]
+      else $tasks2 end ) as $outTasks
+  | ( $closure == null and $wantDigest != 1 ) as $passThrough
 
-  | $dg.tasks as $outTasks
-  | $dg.sat   as $outSat
+  # ---- retention: which finished tasks the emitted view still REFERS to. Each becomes a compact
+  # satisfiedDeps entry, which the scheduler synthesizes as accepted and integrated. It is chosen from the
+  # WHOLE board, never from the narrowed list: a finished task is outside the closure by definition,
+  # so choosing from the closure retains nothing, and a view that names a task it does not carry
+  # makes the scheduler refuse its own seed or treat a dependency as dangling. Two kinds are retained,
+  # as in the files scanner: a resolved seed, and a dependency of any record emitted in full. The
+  # dependency is resolved the way the scheduler resolves it (id, stem, prefix), not by matching the
+  # token against the stem and id. A finished task nothing refers to survives only in the counts.
+  | ( if $passThrough then []
+      else [ ($outTasks[], $inactive2[]) | (.deps // [])[] ] | unique
+           | map( resolveTok(.) | select( . != null and (.ambiguous // null) == null and ((.terminal // false) | not) ) | .stem )
+      end ) as $depStems
+  | ( reduce ($depStems + [ $seedInfo.resolved[] ])[] as $s ({}; .[$s] = true) ) as $refSet
+  | ( if $passThrough then []
+      else [ $tasks[]
+             | select(. | acceptedTerminal)
+             | select($refSet[.stem] // false)
+             | {stem: .stem, id: (.id // ""), backendId: (.backendId // "")} ]
+      end ) as $retained
+  | ( $sat + $retained ) as $outSat
+  | { didCollapse: ( $closure == null and (($tasks2 | length) != ($outTasks | length)) ) } as $dg
 
   # ---- scoped counts (the narrowed view), alongside the untouched store-wide counts.
   | def cnt($st): [ $outTasks[] | select((.folder // "") == $st) ] | length;
