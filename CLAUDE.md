@@ -8,20 +8,20 @@
 
 ## Repository Overview
 
-**Purpose**: Plugin distribution for ACF cognitive modes and workflow tools
+**Purpose**: Source and distribution for the ACF cognitive modes and workflow tools
 
 **This repository is**:
-- The distribution package for 7 ACF plugins
+- Where the 7 ACF plugins are developed, tested and released
 - Self-contained plugin implementations, ready to install
 - The marketplace registry that lists them for Claude Code
+- Open source under the Apache License 2.0; every plugin carries its own `LICENSE` copy
 
 **It is not**:
-- An active development project (plugins are developed elsewhere)
 - A pattern extraction toolkit (no complex documentation workflow)
 - A documentation repository (each plugin documents itself)
 
-**Repository type**: Distribution. Maintain plugin quality, publish updates, keep the marketplace
-in sync.
+**Repository type**: Source and distribution. Develop and test the plugins here, publish updates,
+keep the marketplace in sync. Outside contributors start at `CONTRIBUTING.md`.
 
 ---
 
@@ -37,7 +37,7 @@ in sync.
 | **acf-whip** | Functional | The ACF cycle via `/whip`: plan records in docs/cycles/ with content-bound approval, /task --plan, per-deliverable coverage, /retro lessons, pluggable spec tools, and `/whip --auto`, which runs the loop until a judge agent finds the goal met. Underneath, the backlog engine: workflow-native and concurrency-safe, a child workflow authored per task, LP-CAS integration, pluggable task stores (files/beads/multica/linear), focus-driven bare /go, store-side snapshot narrowing with a verified relay, per-task integrity quarantine, tiered model routing, an offline contract suite for every backend | 191 |
 | **acf-advisor** | Functional | Consult another LLM (thinking-on) via OpenAI-compatible endpoint | 17 |
 
-**Total**: 248 plugin files + 14 project/docs files = 262 tracked files.
+**Total**: 248 plugin files + 19 project/docs files = 267 tracked files.
 
 **acf-mission-control** has priced sessions itself since **1.3.0**. Claude Code only knows rates for
 the models it ships, so a model behind a gateway (`nebius/zai-org/GLM-5.2`, `zai-org/GLM-5.2`)
@@ -330,6 +330,9 @@ acf-tools/
 ├── .gitignore                       # Standard exclusions
 ├── README.md                        # User-facing documentation
 ├── CLAUDE.md                        # This file (AI instructions)
+├── CONTRIBUTING.md                  # How to contribute: tests, DCO sign-off, commit rules
+├── LICENSE                          # Apache License 2.0 (each plugin has its own copy)
+├── .github/                         # Code of conduct, security policy, PR and issue templates
 ├── .claude-plugin/
 │   └── marketplace.json             # Plugin registry (7 plugins)
 ├── acf-challenger-mode/             # Logic validation (6 files)
@@ -347,16 +350,15 @@ acf-tools/
 
 ### Repository Philosophy
 
-This is a **distribution repository**, not a development repository. An update goes through four
-steps:
+The plugins are developed here and released from here. A release goes through four steps:
 
-1. Receive plugin updates from development sources
+1. Land the plugin change and its tests on `main` (your own commits, or a merged pull request)
 2. Test plugin installation and execution
-3. Update marketplace.json if versions change
-4. Commit and publish to distribution channels
+3. Bump the version in `plugin.json` and `marketplace.json`, with a CHANGELOG entry
+4. Commit and publish (see "Commit and Publish" below)
 
-**This repository needs no complex ACF workflow.** It distributes the ACF tools; it does not use
-them to build itself.
+**This repository needs no complex ACF workflow.** It builds and distributes the ACF tools; it
+does not use them to build itself.
 
 ### Git Conventions
 
@@ -417,6 +419,24 @@ git config core.hooksPath .githooks
 Never bypass with `--no-verify`. Full rules: `docs/acf/git/commit-conventions.md`,
 which the acf-librarian SessionStart hook injects into every session.
 
+#### Merging outside pull requests
+
+The hooks run only in a clone that opted in, never on GitHub, and this repository has no CI.
+GitHub's merge and squash buttons would land a pull request unchecked, and a squash merge composes
+`Co-authored-by:` trailers from the pull request's commits. **Never merge with GitHub's buttons.**
+Merge locally, from a clone with the hooks on:
+
+```bash
+gh pr checkout <N> --branch pr-<N>
+git log --format='%h %an <%ae>%n%(trailers:key=Signed-off-by)' main..pr-<N>
+git checkout main && git merge --no-ff pr-<N> && git push origin main
+```
+
+- Refuse the merge if any commit lacks a `Signed-off-by:` matching its author. Outside
+  contributions come in under the DCO (`CONTRIBUTING.md`).
+- `--no-ff` keeps the contributor's commits and SHAs, so GitHub marks the pull request merged.
+- `pre-push` checks every commit the push adds, so an attributed commit is refused here.
+
 ### Quality Standards
 
 **Plugin integrity checks**:
@@ -451,10 +471,10 @@ which the acf-librarian SessionStart hook injects into every session.
 
 ## Plugin Update Workflow
 
-When receiving plugin updates from development:
+When a plugin change is ready to ship:
 
-### 1. Receive Update
-- Copy updated plugin directory to this repository
+### 1. Prepare the Update
+- Land the change and its tests on `main`
 - Note version changes and new features
 
 ### 2. Validate Update
@@ -660,7 +680,7 @@ claude plugin validate .
 
 ## Important Notes
 
-### This Is Not a Development Repository
+### Keep the Repository Lean
 
 **Do not add**:
 - Complex documentation organization (docs/patterns/, etc.). The six files under `docs/acf/` are
@@ -673,7 +693,7 @@ claude plugin validate .
   `acf-whip/tests/` and `acf-librarian/tests/` do)
 
 **This repository's scope**:
-- Distribute 7 working plugins
+- Develop and distribute 7 working plugins
 - Keep marketplace.json synchronized
 - Maintain plugin integrity
 - Update documentation as plugins evolve
@@ -689,19 +709,21 @@ The plugins create documentation in the projects they are installed in:
 - Users need no docs up front; the plugins create them
 - This repository never runs cycles, so it has no `docs/cycles/` of its own
 
-**Do not copy** user project documentation patterns into this distribution repository.
+**Do not copy** user project documentation patterns into this repository.
 
 ---
 
 ## Support and Contact
 
-**Issues**: Report in individual plugin README files or repository issues
+**Issues**: https://github.com/fib7/acf-tools/issues
+**Contributing**: `CONTRIBUTING.md`
+**Security reports**: `.github/SECURITY.md` (private reporting, never a public issue)
 **Email**: acf@fib7.ai
 **Distribution updates**: Follow git log for changelog
 
 ---
 
 **Repository Version**: v1.0
-**Last Updated**: 2026-09-29
+**Last Updated**: 2026-10-27
 **Marketplace Plugins**: 7
-**Total Files**: 262 (tracked)
+**Total Files**: 267 (tracked)
