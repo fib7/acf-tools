@@ -4,8 +4,10 @@
   "description": "SHHH! The librarian enforces naming and organization conventions. Everything must be in its proper place.",
   "author": {
     "name": "ACF Tools",
-    "email": "acf@example.com"
+    "email": "acf@fib7.ai"
   },
+  "homepage": "https://github.com/fib7/acf-tools",
+  "repository": "https://github.com/fib7/acf-tools",
   "license": "Apache-2.0",
   "keywords": [
     "acf",

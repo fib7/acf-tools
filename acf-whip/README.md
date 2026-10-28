@@ -473,8 +473,8 @@ never overwrites an existing file. Example output:
 ```bash
 # Add the acf-tools marketplace
 /plugin marketplace add ./acf-tools
-# OR from GitHub (when published):
-# /plugin marketplace add owner/acf-tools
+# OR from GitHub:
+# /plugin marketplace add fib7/acf-tools
 
 # Install acf-whip plugin
 /plugin install acf-whip@acf-tools

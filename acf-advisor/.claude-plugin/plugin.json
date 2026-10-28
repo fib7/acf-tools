@@ -6,6 +6,8 @@
     "name": "ACF Tools",
     "email": "acf@fib7.ai"
   },
+  "homepage": "https://github.com/fib7/acf-tools",
+  "repository": "https://github.com/fib7/acf-tools",
   "license": "Apache-2.0",
   "keywords": [
     "acf",

@@ -37,7 +37,7 @@ conventions because they are in front of it; `/audit-acf-conventions` finds the 
 
 ```bash
 # Clone acf-tools (if you haven't already)
-git clone https://github.com/yourusername/acf-tools.git
+git clone https://github.com/fib7/acf-tools.git
 cd /path/to/parent/directory  # Directory CONTAINING acf-tools
 
 # Start Claude Code

@@ -292,12 +292,11 @@ still misjudge a dependency.
 
 ## Contributing
 
-See the [Contributing Guide](../../CONTRIBUTING.md) to propose changes to this mode.
+See the [Contributing Guide](../CONTRIBUTING.md) to propose changes to this mode.
 
 ## Support
 
 - Issues: [GitHub Issues](https://github.com/fib7/acf-tools/issues)
-- Discussions: [GitHub Discussions](https://github.com/fib7/acf-tools/discussions)
 
 ## License
 

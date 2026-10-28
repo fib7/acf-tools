@@ -242,12 +242,11 @@ Human attention is scarce in ACF, so spend Challenger's scrutiny where a wrong s
 
 ## Contributing
 
-See [Contributing Guide](../../CONTRIBUTING.md) for how to propose improvements to this cognitive mode.
+See [Contributing Guide](../CONTRIBUTING.md) for how to propose improvements to this cognitive mode.
 
 ## Support
 
-- Issues: [GitHub Issues](https://github.com/yourusername/acf-tools/issues)
-- Discussions: [GitHub Discussions](https://github.com/yourusername/acf-tools/discussions)
+- Issues: [GitHub Issues](https://github.com/fib7/acf-tools/issues)
 
 ## License
 

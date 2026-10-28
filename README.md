@@ -74,7 +74,7 @@ NEXT /whip "<goal>"
 
 ### 1. Install
 
-The repository is private: you need a license and read access to it. Then, in Claude Code:
+In Claude Code:
 
 ```shell
 /plugin marketplace add fib7/acf-tools
@@ -390,9 +390,10 @@ whole loop with no one at the keyboard, use `/whip --auto` (see [Going further](
 
 ## For maintainers
 
-Instructions for working on this repository are in [`CLAUDE.md`](CLAUDE.md). Turn on the commit hooks
-once per clone with `git config core.hooksPath .githooks`. After pushing a release, run
-`/plugin marketplace update acf-tools` and restart. Version history lives in the `CHANGELOG.md` of
+To contribute, start with [`CONTRIBUTING.md`](CONTRIBUTING.md). Instructions for working on this
+repository are in [`CLAUDE.md`](CLAUDE.md). Turn on the commit hooks once per clone with
+`git config core.hooksPath .githooks`. After pushing a release, run `/plugin marketplace update acf-tools`
+and restart. Version history lives in the `CHANGELOG.md` of
 acf-whip, acf-librarian, acf-mission-control and acf-arazor-mode, for example [acf-whip](acf-whip/CHANGELOG.md).
 
 ## Acknowledgements and license

@@ -205,12 +205,11 @@ If you share Arazor output with a team, say which mode produced it. The verdicts
 
 ## Contributing
 
-See [Contributing Guide](../../CONTRIBUTING.md) for proposing improvements.
+See [Contributing Guide](../CONTRIBUTING.md) for proposing improvements.
 
 ## Support
 
-- Issues: [GitHub Issues](https://github.com/yourusername/acf-tools/issues)
-- Discussions: [GitHub Discussions](https://github.com/yourusername/acf-tools/discussions)
+- Issues: [GitHub Issues](https://github.com/fib7/acf-tools/issues)
 
 ## License
 
