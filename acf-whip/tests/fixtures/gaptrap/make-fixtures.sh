@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # make-fixtures.sh — regenerates the recorded GapTrap replies (*.http) that phase21-gaptrap-driver replays.
-# Shapes follow gaptrap-live: mcp.ts ok()/fail() envelopes, specService.ts status/report/list cores,
-# firestore_client.py StoredReport + gap dict. Values are synthetic.
+# Shapes follow GapTrap's MCP replies: the ok/error envelopes, the status/report/list results, and the
+# stored report with its gap dicts. Values are synthetic.
 set -eu
 FIX="$(cd "$(dirname "$0")" && pwd)"
 cd "$FIX"
@@ -57,10 +57,10 @@ rpc_ok status-completed-personal "$(jq -cn --arg s "$S1" --arg u "$UID_" --arg t
 
 G1='{"gap_id":"3f0c9a52-1d7e-4b8a-9c11-2e5f7a6b8d01","pattern":"undefined_behavior","severity":"high","title":"Per-seat price has no billing period","description":"The notice quotes a per-seat price but never says whether it is monthly or annual.","impact_summary":"Owners may misread the charge and dispute it.","extraction_text":"the per-seat price","source_offset":[211,229],"resolution_questions":[{"question":"Is the per-seat price shown per month or per year? (default: per month)","impact":"Sets the unit the email quotes."}]}'
 G2='{"gap_id":"8b2d4e6f-0a1c-4d3e-8f5a-6b7c9d0e1f23","pattern":"missing_state_handling","severity":"medium","title":"No behavior when the audit write fails","description":"Nothing says what happens to the seat change when the audit row cannot be written.","impact_summary":"A silent audit gap on billing events.","extraction_text":"Record every seat change","source_offset":[252,276],"resolution_questions":[{"question":"Should a failed audit write block the seat change?","impact":"Decides consistency versus availability."},{"question":"How long are audit rows kept? (default: forever)","impact":""}]}'
-# G3 is write-2's synthesized card for an absent required template section, in the exact shape
-# gap_detector.py synthesize_missing_section_gaps builds and firestore_client.py stores: a stable
-# section-keyed gap_id (not a uuid), "<Title> is empty", extraction_text "<Title> (section is empty)",
-# source_offset [0,0], and the template's missing_question (feature_contract.yaml functional_acceptance).
+# G3 is write-2's synthesized card for an absent required template section, in the shape GapTrap
+# reports it: a stable section-keyed gap_id (not a uuid), "<Title> is empty", extraction_text
+# "<Title> (section is empty)", source_offset [0,0], and the built-in template's missing_question
+# for its functional_acceptance section.
 G3_ID="missing-section-functional_acceptance-$(printf '%s' functional_acceptance | shasum -a 1 | cut -c1-16)"
 G3=$(jq -cn --arg id "$G3_ID" --arg t "Functional Acceptance Criteria" '{gap_id:$id, pattern:"missing_required_section", severity:"high",
   title:("\($t) is empty"), description:("The \($t) section is required but the spec leaves it empty. It must be filled before the spec is build-ready."),

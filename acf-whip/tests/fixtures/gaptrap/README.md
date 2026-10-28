@@ -25,21 +25,20 @@ a `createdAt` close to now.
 
 ## Where the shapes come from
 
-The envelopes and fields follow the GapTrap source, not a live capture:
+The envelopes are synthetic, shaped after the replies GapTrap's MCP endpoint sends:
 
-- `functions/src/api/mcp.ts`: `ok()` wraps a payload as one JSON text block; `fail()` sets
-  `isError: true` with `{error: {code, message}}`; 401 and 403 `plan_required` are HTTP-level JSON
+- A successful tool call wraps its payload as one JSON text block. A tool error sets
+  `isError: true` with `{error: {code, message}}`. 401 and 403 `plan_required` are HTTP-level JSON
   bodies, not JSON-RPC.
 - MCP SDK 1.29 `mcp.js`: an unknown tool, or an uncaught throw inside a tool, comes back as
   `isError` with plain text, not JSON (`unknown-tool.http`, `create-throw.http`).
-- `functions/src/services/specService.ts`: the `create_spec`, `get_analysis_status`,
-  `get_analysis_report` and `list_specs` result fields (`list_specs` carries `filename` and
-  `createdAt` in both scopes, newest first), and the `quota_exceeded`, `spec_too_large` and
-  `NOT_FOUND` codes. `create_spec` deletes the spec before it answers with any of its own codes.
-- `analysis-service/src/gaptrap/firestore_client.py`: the stored report (`verdict`,
-  `contractStatus`, snake_case gap fields such as `source_offset` and `resolution_questions`).
-- `analysis-service/src/gaptrap/gap_detector.py` `synthesize_missing_section_gaps`: the
-  write-2 card for an empty required section (`<Title> is empty`, extraction text
+- The `create_spec`, `get_analysis_status`, `get_analysis_report` and `list_specs` result fields
+  (`list_specs` carries `filename` and `createdAt` in both scopes, newest first), and the
+  `quota_exceeded`, `spec_too_large` and `NOT_FOUND` codes. `create_spec` deletes the spec before
+  it answers with any of its own codes.
+- The report: `verdict`, `contractStatus`, and snake_case gap fields such as `source_offset` and
+  `resolution_questions`.
+- The write-2 card for an empty required section (`<Title> is empty`, extraction text
   `<Title> (section is empty)`, offset `[0, 0]`, a section-keyed `gap_id`), here for the built-in
   template's `functional_acceptance` section and its `missing_question`.
 
@@ -47,7 +46,7 @@ The values are synthetic. Gap offsets are Python codepoint indices into `plan.md
 computed from the files themselves. One gap in `report-rerun-go.http` uses camelCase keys on purpose,
 because the report's key casing is mixed.
 
-`get_spec` and `list_answers` do not exist in GapTrap yet. Their fixtures use the shapes proposed in
-the companion tasks (`{content, format, parentSpecId, contentSha256, webUrl}` and
-`{answers: [{gapId, questionIndex, question, answerText}]}`). Update them when GapTrap ships the
-real tools.
+`get_spec` and `list_answers` are optional. The driver probes `tools/list` for them and turns pull
+and answers off when they are absent. Their fixtures use the shapes
+`{content, format, parentSpecId, contentSha256, webUrl}` and
+`{answers: [{gapId, questionIndex, question, answerText}]}`.

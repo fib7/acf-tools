@@ -14,8 +14,8 @@
 # only go/nogo, so a timeout, a watchdog kill or a `failed` analysis would otherwise create a new spec
 # on the next card. Three things close that:
 #   - STATE/creating/<blob> is written BEFORE create_spec is sent, naming the attempt. GapTrap commits
-#     the spec and reserves the unit before it answers (specService createOrgSpecCore: set, reserve,
-#     enqueue, an awaited diagram prewarm), so a reply lost to a timeout, a reset, a 5xx or a SIGKILL
+#     the spec and reserves the unit before it answers, and the answer can take a while, so a reply
+#     lost to a timeout, a reset, a 5xx or a SIGKILL
 #     may still have been billed. create_spec is therefore never re-sent blind: the next run asks the
 #     free list_specs for the spec by its attempt-tagged filename and adopts it. Only a request curl
 #     never sent (no DNS, no connect, no TLS) is retried, or a transient failure once GapTrap lists
@@ -35,7 +35,7 @@
 # reported, since write-2 only ever adds NO-GO, and a still-extracting GO is an error, never a GO.
 # GapTrap stamps `failed` and keeps write-1's verdict when extraction outlives its join budget, but a
 # write-2 that fails after its one retry, or an instance that dies after write-1, leaves `extracting`
-# forever. So 15 minutes after the spec was created (past the 600 s Cloud Tasks wall) write-1's
+# forever. So 15 minutes after the spec was created (past the server's 600 s limit) write-1's
 # verdict is accepted as GapTrap's own timeout path would have, and the SUMMARY says so.
 #
 # FINDINGS. gap_id is a fresh uuid4 on every analysis, so fp = the first 12 hex of the git blob hash of
@@ -76,7 +76,7 @@ ROOT="${ACFW_TRUNK_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 TAB=$(printf '\t')
 NL='
 '
-STUCK=900   # seconds after creation: past GapTrap's 600 s Cloud Tasks wall, nothing more will land
+STUCK=900   # seconds after creation: past the server's 600 s limit, nothing more will land
 
 # Progress lines ("created GapTrap spec X (1 unit)") are held and printed after the outcome: the
 # protocol reads the FIRST stderr line as the reason, and a progress line must never displace it.

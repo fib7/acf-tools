@@ -20,8 +20,8 @@
 #   - VERBS is static (acfw-spec caches it), and pull/from stay "not offered yet" until GapTrap lists
 #     get_spec / list_answers.
 #
-# Fixtures (tests/fixtures/gaptrap/*.http) are JSON-RPC replies in the exact envelopes gaptrap-live
-# returns (mcp.ts ok()/fail(), specService.ts cores, firestore_client.py report shape); values are
+# Fixtures (tests/fixtures/gaptrap/*.http) are JSON-RPC replies in the envelopes GapTrap's MCP
+# endpoint returns (ok/error envelopes, status/report/list results, the report shape); values are
 # synthetic. They are replayed by fixtures/gaptrap/fake-transport through ACFW_GAPTRAP_TRANSPORT.
 # Nothing here reaches the network: every run sets the seam or puts the fake curl first on PATH, and
 # the fake-curl runs point at a .invalid host.
@@ -156,8 +156,8 @@ scen capsa tools-list=tools-list-answers
 drive capabilities
 check "list_answers alone: stderr says answers=on" 'has_line "VERBS|review push pull from" && printf "%s" "$ERR" | grep -q "pull=off answers=on lineage=off"'
 scen caps1 tools-list=tools-list-base
-drive capabilities GAPTRAP_MCP_URL=https://gaptrap-4758f.web.app/mcp
-check "EGRESS follows GAPTRAP_MCP_URL" 'has_line "EGRESS|gaptrap-4758f.web.app"'
+drive capabilities GAPTRAP_MCP_URL=https://gaptrap-alt.example.invalid/mcp
+check "EGRESS follows GAPTRAP_MCP_URL" 'has_line "EGRESS|gaptrap-alt.example.invalid"'
 scen caps401 tools-list=err-401
 drive capabilities
 check "401 on the probe: exit 3, reason first, static records still printed" \

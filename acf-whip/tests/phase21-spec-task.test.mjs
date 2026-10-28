@@ -600,7 +600,9 @@ try {
   sec('3d. real engine: a credential literal in a task document')
   {
     const R = mkRepo({ decls: { adv: TBD_DECL('advisory') } })
-    stage(R, { [A]: taskDoc(A, 'key sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n'), [B]: taskDoc(B) })
+    // Built at run time so the source never holds a key-shaped literal a secret scanner would flag.
+    const FAKE_KEY = 'sk-ant-api03-' + 'A'.repeat(44)
+    stage(R, { [A]: taskDoc(A, `key ${FAKE_KEY}\n`), [B]: taskDoc(B) })
     const { r, ran } = await realRun(R, {})
     check('the engine refuses to send it: verdict error', /^REVIEWED\|feature-002-login-api\|adv\|advisory\|error\|/m.test(ran.review[0].out))
     check('...an error never holds: A lands in pending', r.report.review.held.length === 0 && existsSync(join(R.repo, '.backlog/pending', `${A}.md`)))
