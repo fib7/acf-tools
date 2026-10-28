@@ -6,7 +6,7 @@
     "name": "ACF Tools",
     "email": "acf@fib7.ai"
   },
-  "license": "Proprietary",
+  "license": "Apache-2.0",
   "keywords": [
     "acf",
     "advisor",

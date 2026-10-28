@@ -223,3 +223,7 @@ detached process; the status line never blocks on one. It runs after each assist
 
 - Issues: [GitHub Issues](https://github.com/fib7/acf-tools/issues)
 - Email: acf@fib7.ai
+
+## License
+
+Copyright 2025-2026 Fibonacci Seven, LLC. Licensed under the Apache License, Version 2.0; see [LICENSE](LICENSE).

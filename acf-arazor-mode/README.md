@@ -211,3 +211,7 @@ See [Contributing Guide](../../CONTRIBUTING.md) for proposing improvements.
 
 - Issues: [GitHub Issues](https://github.com/yourusername/acf-tools/issues)
 - Discussions: [GitHub Discussions](https://github.com/yourusername/acf-tools/discussions)
+
+## License
+
+Copyright 2025-2026 Fibonacci Seven, LLC. Licensed under the Apache License, Version 2.0; see [LICENSE](LICENSE).

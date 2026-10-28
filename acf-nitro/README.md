@@ -298,3 +298,7 @@ See the [Contributing Guide](../../CONTRIBUTING.md) to propose changes to this m
 
 - Issues: [GitHub Issues](https://github.com/fib7/acf-tools/issues)
 - Discussions: [GitHub Discussions](https://github.com/fib7/acf-tools/discussions)
+
+## License
+
+Copyright 2025-2026 Fibonacci Seven, LLC. Licensed under the Apache License, Version 2.0; see [LICENSE](LICENSE).

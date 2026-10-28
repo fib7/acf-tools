@@ -8,7 +8,7 @@
   },
   "homepage": "https://github.com/fib7/acf-tools",
   "repository": "https://github.com/fib7/acf-tools",
-  "license": "Proprietary",
+  "license": "Apache-2.0",
   "keywords": [
     "cognitive-mode",
     "validation",

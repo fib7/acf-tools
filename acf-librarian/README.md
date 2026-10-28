@@ -555,6 +555,4 @@ New librarian lines are welcome, as long as she stays disapproving.
 
 ## License
 
-Proprietary License - Copyright 2025 Fibonacci Seven, LLC
-
-Commercial use requires a separate written license; see `LICENSE`.
+Copyright 2025-2026 Fibonacci Seven, LLC. Licensed under the Apache License, Version 2.0; see [LICENSE](LICENSE).

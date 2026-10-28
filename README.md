@@ -8,7 +8,7 @@ You approve a plan once. Agents split it into tasks, then build, review and inte
 checks what landed against the plan, and when something went wrong, a retro writes lessons that feed
 the next plan. The other six are optional helpers.
 
-Proprietary: any use beyond reading the source, including installing it, needs a [license](#acknowledgements-and-license) from Fibonacci Seven. Requires Claude Code 2.1.154 or later.
+Open source under the [Apache License 2.0](LICENSE). Requires Claude Code 2.1.154 or later.
 
 [Quick start](#quick-start) · [How a cycle works](#how-a-cycle-works) · [What's in the box](#whats-in-the-box) · [Principles](#principles) · [FAQ](#faq)
 
@@ -401,6 +401,5 @@ The cycle borrows its sequencing and presentation from [the-gibson](https://gith
 and ideas about compounding lessons from [Compound Engineering](https://github.com/EveryInc/compound-engineering-plugin).
 The GapTrap spec tool talks to [GapTrap](https://gaptrap.ai).
 
-Proprietary License. Copyright 2025 Fibonacci Seven, LLC. The source is available for viewing only;
-installing or running it, commercially or not, needs a written license. See [`LICENSE`](LICENSE) and
-the LICENSE file in each plugin. Contact: acf@fib7.ai.
+Copyright 2025-2026 Fibonacci Seven, LLC. Licensed under the [Apache License, Version 2.0](LICENSE). Each
+plugin carries its own copy of the license in its directory.

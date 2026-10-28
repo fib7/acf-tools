@@ -6,7 +6,7 @@
     "name": "ACF Tools",
     "email": "acf@example.com"
   },
-  "license": "Proprietary",
+  "license": "Apache-2.0",
   "keywords": [
     "acf",
     "conventions",
