@@ -2,6 +2,13 @@
 
 All notable changes to acf-mission-control. The format loosely follows Keep a Changelog.
 
+## 1.3.5: open source under Apache-2.0
+
+- **Relicensed under the Apache License 2.0.** acf-mission-control was proprietary and view-only;
+  you can now use, modify and redistribute it under Apache-2.0. `LICENSE` holds the full text and
+  `plugin.json` declares `Apache-2.0`. The status line script is unchanged, so an installed
+  `.claude/scripts/status-line.py` is not refreshed.
+
 ## 1.3.1: the self-priced figure covers the whole session
 
 1.3.0 added self-pricing so proxied models would stop reading `$0.00`. An audit before release showed

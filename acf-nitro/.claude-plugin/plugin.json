@@ -1,6 +1,6 @@
 {
   "name": "acf-nitro",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Parallel execution enforcement mode - Enthusiastic speed demon who catches sequential execution violations and calculates time waste. Enforces TodoWrite batching, parallel Task spawning, and parallel tool calls.",
   "author": {
     "name": "ACF Project",

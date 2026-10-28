@@ -3,6 +3,14 @@
 All notable changes to acf-librarian. Format loosely follows Keep a Changelog. Releases before 1.3.0
 are recorded only in the git history.
 
+## 1.3.1: open source under Apache-2.0
+
+- **Relicensed under the Apache License 2.0.** acf-librarian was proprietary and view-only; you can
+  now use, modify and redistribute it under Apache-2.0. `LICENSE` holds the full text and
+  `plugin.json` declares `Apache-2.0`. No behavior changes.
+- The manifest's placeholder contact `acf@example.com` is now `acf@fib7.ai`, and it gains the
+  `homepage` and `repository` fields.
+
 ## 1.3.0: convention documents that update themselves
 
 - **Your convention documents now update themselves.** Before this release the SessionStart hook

@@ -339,6 +339,8 @@ Copyright 2025-2026 Fibonacci Seven, LLC. Licensed under the Apache License, Ver
 
 ## Changelog
 
+- **v1.3.8**: relicensed under the Apache License 2.0. The plugin was proprietary and view-only;
+  you can now use, modify and redistribute it under Apache-2.0. No behavior changes.
 - **v1.3.7**: the documentation caught up with the code, and two skill defects are fixed.
   - **`board.py` has not existed since v1.3.0**, when the panel moved to parallel Claude tool calls.
     The README still documented a "Direct CLI use of the board" section with a manifest schema and an

@@ -2,6 +2,12 @@
 
 All notable changes to acf-arazor-mode. Format loosely follows Keep a Changelog.
 
+## 1.0.5: open source under Apache-2.0
+
+- **Relicensed under the Apache License 2.0.** acf-arazor-mode was proprietary and view-only; you
+  can now use, modify and redistribute it under Apache-2.0. `LICENSE` holds the full text and
+  `plugin.json` declares `Apache-2.0`. No behavior changes.
+
 ## 1.0.4: the SessionStart hook finds its content
 
 - **The mode was never injected.** `hooks/handlers/session-start.sh` computed the plugin root as

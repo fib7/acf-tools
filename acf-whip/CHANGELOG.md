@@ -2,6 +2,18 @@
 
 All notable changes to acf-whip. The format loosely follows Keep a Changelog.
 
+## 3.6.2: open source under Apache-2.0
+
+- **Relicensed under the Apache License 2.0.** acf-whip was proprietary and view-only; you can now
+  use, modify and redistribute it under Apache-2.0. `LICENSE` holds the full text and `plugin.json`
+  declares `Apache-2.0`. No behavior changes.
+- **The GapTrap test fixtures no longer describe GapTrap's server internals.** The fixture README,
+  `make-fixtures.sh`, the driver test and the driver's comments now describe the envelopes as
+  synthetic, shaped after GapTrap's MCP replies. The EGRESS test uses
+  `gaptrap-alt.example.invalid`. Fixture bytes and driver behavior are unchanged.
+- `tests/phase21-spec-task.test.mjs` builds its dummy `sk-ant` key at run time, so secret scanners
+  no longer flag the source.
+
 ## 3.6.1: a scoped run keeps the finished tasks it refers to
 
 On every store except `files`, a scoped `/go` lost finished tasks from its snapshot. A scoped run is
